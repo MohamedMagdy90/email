@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { api } from "../lib/api";
-import { Button, Input } from "../lib/ui";
 
 export default function Login({ onSuccess }: { onSuccess: () => void }) {
   const [username, setUsername] = useState("");
@@ -20,6 +19,9 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
       setLoading(false);
     }
   }
+
+  const inputCls =
+    "w-full rounded-xl border border-white/15 bg-white/[0.06] px-3.5 py-2.5 text-sm text-cream placeholder:text-cream/35 outline-none transition-colors focus:border-white/40 focus:ring-2 focus:ring-white/10";
 
   return (
     <div className="relative flex h-screen w-screen items-center justify-center overflow-hidden bg-ink px-4">
@@ -42,40 +44,40 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
           <div className="space-y-4">
             <div>
               <div className="mb-1.5 text-[13px] font-medium text-cream/75">Username</div>
-              <Input
+              <input
+                className={inputCls}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="Enter username"
                 autoFocus
                 autoComplete="username"
-                className="border-white/10 bg-white/[0.04] text-cream placeholder:text-cream/30 focus:border-white/30 focus:ring-white/5"
               />
             </div>
             <div>
               <div className="mb-1.5 text-[13px] font-medium text-cream/75">Password</div>
-              <Input
+              <input
                 type="password"
+                className={inputCls}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="Enter password"
                 autoComplete="current-password"
-                className="border-white/10 bg-white/[0.04] text-cream placeholder:text-cream/30 focus:border-white/30 focus:ring-white/5"
               />
             </div>
 
             {error && (
-              <div className="rounded-xl border border-bad/30 bg-bad/10 px-3.5 py-2.5 text-[13px] text-[#ff9b8f]">
+              <div className="rounded-xl border border-[#ff6b5c]/30 bg-[#ff6b5c]/10 px-3.5 py-2.5 text-[13px] text-[#ff9b8f]">
                 {error}
               </div>
             )}
 
-            <Button
+            <button
               type="submit"
-              loading={loading}
-              className="w-full bg-cream text-ink hover:bg-cream/90"
+              disabled={loading}
+              className="flex h-10 w-full items-center justify-center gap-2 rounded-full bg-cream px-5 text-sm font-medium text-ink transition-all hover:bg-cream/90 active:scale-[0.98] disabled:opacity-50"
             >
-              Sign in
-            </Button>
+              {loading ? "Signing in…" : "Sign in"}
+            </button>
           </div>
         </form>
 
