@@ -1,9 +1,15 @@
 {
   "name": "dna-outreach",
   "private": true,
+  "type": "module",
   "scripts": {
+    "start": "bun backend/src/index.ts",
     "dev": "concurrently -n api,web -c magenta,green --restart-tries 5 --restart-after 800 \"cd backend && bun run dev\" \"cd frontend && bun run dev\"",
     "install:all": "cd backend && bun install && cd ../frontend && bun install"
+  },
+  "dependencies": {
+    "hono": "^4.6.15",
+    "postgres": "^3.4.5"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
