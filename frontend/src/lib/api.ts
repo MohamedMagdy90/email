@@ -1,0 +1,164 @@
+const BASE = (import.meta as any).env?.VITE_API_URL || "";
+
+export interface Contact {
+  id: string;
+  email: string;
+  company?: string;
+  country?: string;
+  industry?: string;
+  role_based?: boolean;
+  source?: string;
+  status: string;
+  created_at: string;
+}
+
+export interface Template {
+  id: string;
+  type: "customer" | "partner";
+  name: string;
+  subject: string;
+  body: string;
+  created_at: string;
+}
+
+export interface Domain {
+  id: string;
+  domain: string;
+  from_name: string;
+  from_email: string;
+  daily_cap: number;
+  sent_today: number;
+  active: boolean;
+}
+
+export interface SendRow {
+  id: string;
+  contact_email: string;
+  company?: string;
+  subject: string;
+  status: string;
+  error?: string;
+  opened: boolean;
+  sent_at?: string;
+  created_at: string;
+}
+
+export interface Job {
+  id: string;
+  type: string;
+  status: "running" | "done" | "error";
+  progress: number;
+  total: number;
+  processed: number;
+  logs: any[];
+  result: any;
+  error?: string;
+}
+
+async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    throw new Error(e.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export const api = {
+  // contacts
+  getContacts: (params: { status?: string; q?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.status) qs.set("status", params.status);
+    if (params.q) qs.set("q", params.q);
+    if (params.limit) qs.set("limit", String(params.limit));
+    return req<{ contacts: Contact[]; counts: { status: string; n: number }[]; total: number }>(
+      `/api/contacts?${qs.toString()}`
+    );
+  },
+  addContact: (c: Partial<Contact>) =>
+    req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
+  bulkContacts: (contacts: Partial<Contact>[]) =>
+    req<{ added: number; skipped: number }>(`/api/contacts/bulk`, {
+      method: "POST",
+      body: JSON.stringify({ contacts }),
+    }),
+  importCsv: (csv: string) =>
+    req<{ added: number; skipped: number }>(`/api/contacts/import-csv`, {
+      method: "POST",
+      body: JSON.stringify({ csv }),
+    }),
+  deleteContacts: (ids: string[]) =>
+    req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),
+
+  // templates
+  getTemplates: () => req<{ templates: Template[] }>(`/api/templates`),
+  saveTemplate: (t: Partial<Template>) =>
+    req<{ template: Template }>(`/api/templates`, { method: "POST", body: JSON.stringify(t) }),
+  updateTemplate: (id: string, t: Partial<Template>) =>
+    req<{ template: Template }>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(t) }),
+  deleteTemplate: (id: string) => req(`/api/templates/${id}`, { method: "DELETE" }),
+
+  // domains
+  getDomains: () => req<{ domains: Domain[] }>(`/api/domains`),
+  saveDomain: (d: Partial<Domain>) =>
+    req<{ domain: Domain }>(`/api/domains`, { method: "POST", body: JSON.stringify(d) }),
+  updateDomain: (id: string, d: Partial<Domain>) =>
+    req<{ domain: Domain }>(`/api/domains/${id}`, { method: "PUT", body: JSON.stringify(d) }),
+  deleteDomain: (id: string) => req(`/api/domains/${id}`, { method: "DELETE" }),
+  resetCounts: () => req(`/api/domains/reset-counts`, { method: "POST" }),
+
+  // settings
+  getSettings: () => req<{ resendConfigured: boolean; appUrl: string }>(`/api/settings`),
+  saveSettings: (s: { resend_api_key?: string; app_url?: string }) =>
+    req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
+
+  // crawl
+  startCrawl: (body: any) => req<{ jobId: string }>(`/api/crawl`, { method: "POST", body: JSON.stringify(body) }),
+  getCrawl: (id: string) => req<Job>(`/api/crawl/${id}`),
+
+  // send
+  startSend: (body: any) => req<{ jobId: string }>(`/api/send`, { method: "POST", body: JSON.stringify(body) }),
+  getSend: (id: string) => req<Job>(`/api/send/${id}`),
+
+  // lead finder
+  getLeadCategories: () => req<{ categories: string[] }>(`/api/leads/categories`),
+  findLeads: (location: string, category: string, limit: number) =>
+    req<{ companies: { name: string; website: string; city: string; email: string | null }[] }>(
+      `/api/leads/find`,
+      { method: "POST", body: JSON.stringify({ location, category, limit }) }
+    ),
+
+  // export
+  exportContacts: async (params: { status?: string; q?: string } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.status && params.status !== "all") qs.set("status", params.status);
+    if (params.q) qs.set("q", params.q);
+    const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`);
+    return res.text();
+  },
+
+  // overview
+  getOverview: () =>
+    req<{
+      contacts: { status: string; n: number }[];
+      sends: { status: string; n: number }[];
+      opens: number;
+      totalContacts: number;
+      totalSends: number;
+      daily: { d: string; n: number }[];
+    }>(`/api/overview`),
+
+  // history + stats
+  getHistory: (limit = 200) => req<{ sends: SendRow[] }>(`/api/history?limit=${limit}`),
+  getStats: () =>
+    req<{
+      contacts: { status: string; n: number }[];
+      sends: { status: string; n: number }[];
+      opens: number;
+      totalContacts: number;
+      totalSends: number;
+    }>(`/api/stats`),
+};

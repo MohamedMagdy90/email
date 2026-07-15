@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --font-clash: "Clash Display", ui-sans-serif, system-ui, sans-serif;
+  --font-satoshi: "Satoshi", ui-sans-serif, system-ui, sans-serif;
+
+  --color-ink: #0b0b0b;
+  --color-ink-soft: #1a1a1a;
+  --color-cream: #f2eee6;
+  --color-paper: #fbf9f4;
+  --color-line: #e3dcce;
+  --color-line-soft: #ece6da;
+  --color-muted: #837c6f;
+  --color-accent: #ff5a36;
+  --color-good: #1f9d55;
+  --color-warn: #d9822b;
+  --color-bad: #d64545;
+}
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  border-color: var(--color-line);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-satoshi);
+  background: var(--color-cream);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.font-clash {
+  font-family: var(--font-clash);
+  letter-spacing: -0.02em;
+}
+
+.prism-bar {
+  background: linear-gradient(
+    90deg,
+    #ff5a36,
+    #ffb020,
+    #3ddc84,
+    #36a2ff,
+    #a15cff
+  );
+}
+
+.prism-text {
+  background: linear-gradient(90deg, #ff5a36, #ffb020, #3ddc84, #36a2ff, #a15cff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Thin, refined scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d8cfbf;
+  border-radius: 999px;
+  border: 3px solid var(--color-cream);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #c7bca8;
+}
+
+/* Mono label used across the DNA brand */
+.mono-label {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 11px;
+}

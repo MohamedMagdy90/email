@@ -1,0 +1,12 @@
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.pgdata/
+**/.pgdata/
+data.sqlite
+**/data.sqlite*
+*.log
+.env
+.env.*
+.DS_Store

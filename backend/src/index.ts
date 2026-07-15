@@ -1,0 +1,490 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { serveStatic } from "hono/bun";
+import { q, ensureSchema, getSetting, setSetting, nowIso } from "./db";
+import { createJob, getJob, log, type Job } from "./jobs";
+import { crawlMany, type CrawlOptions } from "./crawler";
+import { sendEmail, getResendKey } from "./resend";
+import { renderTemplate, wrapHtml } from "./template";
+import { findLeads, LEAD_CATEGORIES } from "./leads";
+
+await ensureSchema();
+
+const app = new Hono();
+app.use("*", cors());
+
+const uid = () => crypto.randomUUID();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
+
+/* ----------------------------- Contacts ----------------------------- */
+
+app.get("/api/contacts", async (c) => {
+  const status = c.req.query("status");
+  const search = c.req.query("q");
+  const limit = Math.min(Number(c.req.query("limit") || 500), 2000);
+  const offset = Number(c.req.query("offset") || 0);
+
+  const where: string[] = [];
+  const params: any[] = [];
+  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
+  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const rows = await q(`SELECT * FROM contacts ${clause} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+  const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
+  const total = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`);
+  return c.json({ contacts: rows, counts, total: total[0]?.n ?? 0 });
+});
+
+app.post("/api/contacts", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const email = String(b.email || "").trim().toLowerCase();
+  if (!email || !email.includes("@")) return c.json({ error: "valid email required" }, 400);
+  const rows = await q(
+    `INSERT INTO contacts (id,email,company,country,industry,role_based,source,status,created_at)
+     VALUES (?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
+    [uid(), email, b.company || null, b.country || null, b.industry || null, b.role_based ? 1 : 0, b.source || "manual", nowIso()]
+  );
+  if (!rows.length) return c.json({ error: "duplicate", duplicate: true }, 409);
+  return c.json({ contact: rows[0] });
+});
+
+app.post("/api/contacts/bulk", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const items: any[] = Array.isArray(b.contacts) ? b.contacts : [];
+  let added = 0, skipped = 0;
+  for (const it of items) {
+    const email = String(it.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) { skipped++; continue; }
+    const rows = await q(
+      `INSERT INTO contacts (id,email,company,country,industry,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, it.company || null, it.country || null, it.industry || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
+    );
+    if (rows.length) added++; else skipped++;
+  }
+  return c.json({ added, skipped });
+});
+
+app.post("/api/contacts/import-csv", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const rows = parseCsv(String(b.csv || ""));
+  if (!rows.length) return c.json({ added: 0, skipped: 0 });
+  const header = rows[0].map((h) => h.trim().toLowerCase());
+  const hasHeader = header.includes("email");
+  const cols = hasHeader ? header : ["email", "company", "country", "industry"];
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+  const idx = (name: string) => cols.indexOf(name);
+
+  let added = 0, skipped = 0;
+  for (const r of dataRows) {
+    const email = String(r[idx("email")] ?? r[0] ?? "").trim().toLowerCase();
+    if (!email || !email.includes("@")) { skipped++; continue; }
+    const ins = await q(
+      `INSERT INTO contacts (id,email,company,country,industry,source,status,created_at)
+       VALUES (?,?,?,?,?,'csv','new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, idx("company") >= 0 ? r[idx("company")] || null : null, idx("country") >= 0 ? r[idx("country")] || null : null, idx("industry") >= 0 ? r[idx("industry")] || null : null, nowIso()]
+    );
+    if (ins.length) added++; else skipped++;
+  }
+  return c.json({ added, skipped });
+});
+
+app.post("/api/contacts/delete", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) return c.json({ deleted: 0 });
+  const ph = ids.map(() => "?").join(",");
+  await q(`DELETE FROM contacts WHERE id IN (${ph})`, ids);
+  return c.json({ deleted: ids.length });
+});
+
+app.get("/api/contacts/export", async (c) => {
+  const status = c.req.query("status");
+  const search = c.req.query("q");
+  const where: string[] = [];
+  const params: any[] = [];
+  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
+  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const rows = await q(`SELECT email,company,country,industry,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
+  const header = ["email", "company", "country", "industry", "role_based", "status", "source", "created_at"];
+  const csv = [header.join(",")].concat(rows.map((r) => header.map((h) => csvCell(r[h])).join(","))).join("\n");
+  return new Response(csv, {
+    headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="contacts.csv"` },
+  });
+});
+
+/* ----------------------------- Templates ---------------------------- */
+
+app.get("/api/templates", async (c) => {
+  return c.json({ templates: await q(`SELECT * FROM templates ORDER BY created_at DESC`) });
+});
+
+app.post("/api/templates", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (!b.name || !b.subject || !b.body) return c.json({ error: "name, subject, body required" }, 400);
+  const type = b.type === "partner" ? "partner" : "customer";
+  const rows = await q(
+    `INSERT INTO templates (id,type,name,subject,body,created_at) VALUES (?,?,?,?,?,?) RETURNING *`,
+    [uid(), type, b.name, b.subject, b.body, nowIso()]
+  );
+  return c.json({ template: rows[0] });
+});
+
+app.put("/api/templates/:id", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const type = b.type === "partner" ? "partner" : "customer";
+  const rows = await q(
+    `UPDATE templates SET type=?, name=?, subject=?, body=? WHERE id=? RETURNING *`,
+    [type, b.name, b.subject, b.body, c.req.param("id")]
+  );
+  if (!rows.length) return c.json({ error: "not found" }, 404);
+  return c.json({ template: rows[0] });
+});
+
+app.delete("/api/templates/:id", async (c) => {
+  await q(`DELETE FROM templates WHERE id=?`, [c.req.param("id")]);
+  return c.json({ ok: true });
+});
+
+/* ------------------------------ Domains ----------------------------- */
+
+app.get("/api/domains", async (c) => {
+  return c.json({ domains: await q(`SELECT * FROM domains ORDER BY created_at`) });
+});
+
+app.post("/api/domains", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (!b.domain || !b.from_email) return c.json({ error: "domain and from_email required" }, 400);
+  const rows = await q(
+    `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,created_at) VALUES (?,?,?,?,?,1,?) RETURNING *`,
+    [uid(), b.domain, b.from_name || "DNA Outreach", b.from_email, Number(b.daily_cap) || 40, nowIso()]
+  );
+  return c.json({ domain: rows[0] });
+});
+
+app.put("/api/domains/:id", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const rows = await q(
+    `UPDATE domains SET domain=?, from_name=?, from_email=?, daily_cap=?, active=? WHERE id=? RETURNING *`,
+    [b.domain, b.from_name || "DNA Outreach", b.from_email, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
+  );
+  if (!rows.length) return c.json({ error: "not found" }, 404);
+  return c.json({ domain: rows[0] });
+});
+
+app.delete("/api/domains/:id", async (c) => {
+  await q(`DELETE FROM domains WHERE id=?`, [c.req.param("id")]);
+  return c.json({ ok: true });
+});
+
+app.post("/api/domains/reset-counts", async (c) => {
+  await q(`UPDATE domains SET sent_today = 0`);
+  return c.json({ ok: true });
+});
+
+/* ------------------------------ Settings ---------------------------- */
+
+app.get("/api/settings", async (c) => {
+  const key = await getResendKey();
+  const appUrl = (await getSetting("app_url")) || process.env.APP_URL || "";
+  return c.json({ resendConfigured: !!key, appUrl });
+});
+
+app.post("/api/settings", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (typeof b.resend_api_key === "string" && b.resend_api_key.trim()) await setSetting("resend_api_key", b.resend_api_key.trim());
+  if (typeof b.app_url === "string") await setSetting("app_url", b.app_url.trim());
+  return c.json({ ok: true });
+});
+
+/* ------------------------------- Crawl ------------------------------ */
+
+app.post("/api/crawl", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const urls: string[] = (Array.isArray(b.urls) ? b.urls : String(b.urls || "").split(/[\n,]/))
+    .map((u: string) => u.trim())
+    .filter(Boolean);
+  if (!urls.length) return c.json({ error: "provide at least one URL" }, 400);
+
+  const options: CrawlOptions = {
+    maxPages: clamp(Number(b.maxPages) || 25, 1, 60),
+    maxDepth: clamp(Number(b.maxDepth) || 2, 0, 3),
+    respectRobots: b.respectRobots !== false,
+    checkMx: b.checkMx !== false,
+    concurrency: clamp(Number(b.concurrency) || 3, 1, 6),
+  };
+
+  const job = createJob("crawl", urls.length);
+  job.result = { sites: [], emails: [] };
+
+  (async () => {
+    try {
+      await crawlMany(urls, options, (p) => {
+        if (p.type === "site-done") {
+          job.processed = p.done;
+          job.progress = p.total ? p.done / p.total : 1;
+          job.result.sites.push(p.result);
+          for (const e of p.result.emails) job.result.emails.push(e);
+          log(job, { level: "info", msg: `${p.result.site}: ${p.result.emails.length} email(s) [${p.result.status}]` });
+        } else if (p.type === "site-start") {
+          log(job, { level: "info", msg: `Crawling ${p.seed} ...` });
+        } else if (p.type === "page" && p.found > 0) {
+          log(job, { level: "hit", msg: `+${p.found} on ${shorten(p.url)}` });
+        }
+      });
+      const map = new Map<string, any>();
+      for (const e of job.result.emails) if (!map.has(e.email)) map.set(e.email, e);
+      job.result.emails = [...map.values()];
+      job.status = "done";
+      job.progress = 1;
+    } catch (e: any) {
+      job.status = "error";
+      job.error = String(e?.message || e);
+    }
+  })();
+
+  return c.json({ jobId: job.id });
+});
+
+app.get("/api/crawl/:id", (c) => {
+  const job = getJob(c.req.param("id"));
+  if (!job) return c.json({ error: "job not found" }, 404);
+  return c.json(serializeJob(job));
+});
+
+/* -------------------------------- Send ------------------------------ */
+
+app.post("/api/send", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const templateId = String(b.templateId || "");
+  const contactIds: string[] = Array.isArray(b.contactIds) ? b.contactIds : [];
+  const perMinute = clamp(Number(b.perMinute) || 20, 1, 120);
+  if (!templateId) return c.json({ error: "templateId required" }, 400);
+  if (!contactIds.length) return c.json({ error: "select at least one contact" }, 400);
+
+  const job = createJob("send", contactIds.length);
+  job.result = { sent: 0, failed: 0, skipped: 0 };
+
+  (async () => {
+    try {
+      await runSendJob(job, templateId, contactIds, perMinute);
+      job.status = "done";
+      job.progress = 1;
+    } catch (e: any) {
+      job.status = "error";
+      job.error = String(e?.message || e);
+    }
+  })();
+
+  return c.json({ jobId: job.id });
+});
+
+app.get("/api/send/:id", (c) => {
+  const job = getJob(c.req.param("id"));
+  if (!job) return c.json({ error: "job not found" }, 404);
+  return c.json(serializeJob(job));
+});
+
+async function runSendJob(job: Job, templateId: string, contactIds: string[], perMinute: number) {
+  const tpl = (await q(`SELECT * FROM templates WHERE id=?`, [templateId]))[0];
+  if (!tpl) { job.status = "error"; job.error = "template not found"; return; }
+
+  const domains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
+  const appUrl = (await getSetting("app_url")) || process.env.APP_URL || "";
+  const dryRun = !(await getResendKey());
+  if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
+  if (!domains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend test sender." });
+
+  const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
+  let di = 0;
+
+  for (const cid of contactIds) {
+    if (job.status === "error") break;
+    const contact = (await q(`SELECT * FROM contacts WHERE id=?`, [cid]))[0];
+    if (!contact) { job.result.skipped++; job.processed++; continue; }
+    if (contact.status === "unsubscribed" || contact.status === "bounced") {
+      job.result.skipped++;
+      job.processed++;
+      job.progress = job.total ? job.processed / job.total : 1;
+      log(job, { level: "skip", msg: `Skipped ${contact.email} (${contact.status})` });
+      continue;
+    }
+
+    let domain: any = null;
+    if (domains.length) {
+      for (let k = 0; k < domains.length; k++) {
+        const cand = domains[(di + k) % domains.length];
+        if (cand.sent_today < cand.daily_cap) { domain = cand; di = (di + k + 1) % domains.length; break; }
+      }
+      if (!domain) { log(job, { level: "warn", msg: "All domains hit their daily cap — stopping." }); break; }
+    }
+
+    const from = domain ? `${domain.from_name} <${domain.from_email}>` : "DNA Outreach <onboarding@resend.dev>";
+    const subject = renderTemplate(tpl.subject, contact);
+    const sendId = uid();
+    const unsub = `${appUrl}/api/unsubscribe?c=${contact.id}`;
+    const pixel = `${appUrl}/api/open?s=${sendId}`;
+    const html = wrapHtml(renderTemplate(tpl.body, contact), unsub, pixel);
+
+    const result = await sendEmail({
+      from, to: contact.email, subject, html,
+      headers: { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
+    });
+
+    const status = result.ok ? (result.dryRun ? "sent (dry-run)" : "sent") : "failed";
+    await q(
+      `INSERT INTO sends (id,contact_id,contact_email,template_id,domain_id,subject,status,error,sent_at,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [sendId, contact.id, contact.email, tpl.id, domain?.id ?? null, subject, status, result.error ?? null, nowIso(), nowIso()]
+    );
+
+    if (result.ok) {
+      job.result.sent++;
+      await q(`UPDATE contacts SET status='sent' WHERE id=? AND status='new'`, [contact.id]);
+      if (domain) { await q(`UPDATE domains SET sent_today = sent_today + 1 WHERE id=?`, [domain.id]); domain.sent_today++; }
+      log(job, { level: "sent", msg: `${status} → ${contact.email}` });
+    } else {
+      job.result.failed++;
+      log(job, { level: "fail", msg: `failed → ${contact.email}: ${result.error}` });
+    }
+
+    job.processed++;
+    job.progress = job.total ? job.processed / job.total : 1;
+    if (job.processed < job.total) await sleep(delayMs);
+  }
+}
+
+/* --------------------------- Tracking / opt-out --------------------- */
+
+const PIXEL = Uint8Array.from(atob("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"), (ch) => ch.charCodeAt(0));
+
+app.get("/api/open", async (c) => {
+  const s = c.req.query("s");
+  if (s) await q(`UPDATE sends SET opened=1 WHERE id=?`, [s]).catch(() => {});
+  return new Response(PIXEL, { headers: { "Content-Type": "image/gif", "Cache-Control": "no-store, max-age=0" } });
+});
+
+app.get("/api/unsubscribe", async (c) => {
+  const id = c.req.query("c");
+  if (id) await q(`UPDATE contacts SET status='unsubscribed' WHERE id=?`, [id]).catch(() => {});
+  return c.html(`<!doctype html><html><head><meta charset="utf-8"><title>Unsubscribed</title>
+  <style>body{font-family:Arial,Helvetica,sans-serif;background:#f2eee6;color:#0b0b0b;display:flex;height:100vh;margin:0;align-items:center;justify-content:center}
+  .card{background:#fff;border:1px solid #e3dcce;border-radius:16px;padding:40px;max-width:420px;text-align:center}</style></head>
+  <body><div class="card"><h2>You're unsubscribed</h2><p>You won't receive further emails from us. Sorry to see you go.</p></div></body></html>`);
+});
+
+/* ---------------------------- Lead Finder --------------------------- */
+
+app.get("/api/leads/categories", (c) => c.json({ categories: Object.keys(LEAD_CATEGORIES) }));
+
+app.post("/api/leads/find", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const location = String(b.location || "").trim();
+  const category = String(b.category || "Companies (general)");
+  const limit = clamp(Number(b.limit) || 40, 5, 120);
+  if (!location) return c.json({ error: "location required" }, 400);
+  try {
+    return c.json({ companies: await findLeads(location, category, limit) });
+  } catch (e: any) {
+    return c.json({ error: String(e?.message || e) }, 500);
+  }
+});
+
+/* ------------------------------ History ----------------------------- */
+
+app.get("/api/history", async (c) => {
+  const limit = Math.min(Number(c.req.query("limit") || 200), 1000);
+  const rows = await q(
+    `SELECT s.*, c.company AS company FROM sends s
+     LEFT JOIN contacts c ON c.id = s.contact_id
+     ORDER BY s.created_at DESC LIMIT ?`,
+    [limit]
+  );
+  return c.json({ sends: rows });
+});
+
+app.get("/api/stats", async (c) => {
+  const contacts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
+  const sends = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM sends GROUP BY status`);
+  const opens = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE opened=1`))[0]?.n ?? 0;
+  const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
+  const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
+  return c.json({ contacts, sends, opens, totalContacts, totalSends });
+});
+
+app.get("/api/overview", async (c) => {
+  const contacts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
+  const sends = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM sends GROUP BY status`);
+  const opens = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE opened=1`))[0]?.n ?? 0;
+  const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
+  const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
+
+  const cutoff = new Date(Date.now() - 14 * 86400000).toISOString();
+  const recent = await q(`SELECT created_at FROM sends WHERE created_at > ?`, [cutoff]);
+  const bucket: Record<string, number> = {};
+  for (const r of recent) { const d = String(r.created_at).slice(0, 10); bucket[d] = (bucket[d] || 0) + 1; }
+  const daily = Object.entries(bucket).map(([d, n]) => ({ d, n })).sort((a, b) => (a.d < b.d ? -1 : 1));
+
+  return c.json({ contacts, sends, opens, totalContacts, totalSends, daily });
+});
+
+/* ------------------------------ Helpers ----------------------------- */
+
+function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
+function shorten(u: string) { try { const x = new URL(u); return x.hostname + x.pathname; } catch { return u; } }
+
+function csvCell(v: any): string {
+  if (v == null) return "";
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function serializeJob(job: Job) {
+  return {
+    id: job.id, type: job.type, status: job.status, progress: job.progress,
+    total: job.total, processed: job.processed, logs: job.logs.slice(-120),
+    result: job.result, error: job.error,
+  };
+}
+
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let cur: string[] = [];
+  let val = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') { if (text[i + 1] === '"') { val += '"'; i++; } else inQuotes = false; }
+      else val += ch;
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ",") { cur.push(val); val = ""; }
+      else if (ch === "\n") { cur.push(val); rows.push(cur); cur = []; val = ""; }
+      else if (ch === "\r") { /* skip */ }
+      else val += ch;
+    }
+  }
+  if (val.length || cur.length) { cur.push(val); rows.push(cur); }
+  return rows.filter((r) => r.some((cell) => cell.trim() !== ""));
+}
+
+/* ------------------ Static frontend (single-process) ---------------- */
+// Serves the built frontend (frontend/dist) so the whole app can run as one
+// server on one port. In the split deploy (Netlify + Railway) this simply
+// no-ops because dist isn't present on the API host.
+
+const DIST = process.env.FRONTEND_DIST || "../frontend/dist";
+app.use("/*", serveStatic({ root: DIST }));
+app.get("*", serveStatic({ path: `${DIST}/index.html` }));
+
+/* ------------------------------- Boot ------------------------------- */
+
+const port = Number(process.env.PORT) || 3001;
+console.log(`[dna-outreach] API listening on :${port}`);
+
+export default { port, fetch: app.fetch };

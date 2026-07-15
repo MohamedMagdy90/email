@@ -1,0 +1,13 @@
+{
+  "name": "dna-outreach-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts"
+  },
+  "dependencies": {
+    "hono": "^4.6.15",
+    "postgres": "^3.4.5"
+  }
+}
