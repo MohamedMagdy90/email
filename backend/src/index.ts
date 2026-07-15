@@ -7,16 +7,56 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, LEAD_CATEGORIES } from "./leads";
+import { seedAuthFromEnv, verifyCredentials, createToken, verifyToken } from "./auth";
 
 await ensureSchema();
+await seedAuthFromEnv();
 
 const app = new Hono();
-app.use("*", cors());
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
+
+/* ------------------------------- Auth ------------------------------- */
+// Public endpoints (also hit by email recipients, so they must NOT require a token).
+const PUBLIC_API = new Set([
+  "/api/health",
+  "/api/auth/login",
+  "/api/open",
+  "/api/unsubscribe",
+]);
+
+// Gate every /api/* route except the public ones above.
+app.use("/api/*", async (c, next) => {
+  if (c.req.method === "OPTIONS") return next();
+  if (PUBLIC_API.has(c.req.path)) return next();
+  const header = c.req.header("Authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!(await verifyToken(token))) return c.json({ error: "Unauthorized" }, 401);
+  return next();
+});
+
+app.post("/api/auth/login", async (c) => {
+  const { username, password } = await c.req.json().catch(() => ({}));
+  if (!username || !password) return c.json({ error: "Missing username or password" }, 400);
+  const ok = await verifyCredentials(String(username), String(password));
+  if (!ok) return c.json({ error: "Invalid username or password" }, 401);
+  const token = await createToken(String(username));
+  return c.json({ token, username });
+});
+
+// Reaching here means the middleware already validated the token.
+app.get("/api/auth/me", (c) => c.json({ ok: true }));
 
 /* ----------------------------- Contacts ----------------------------- */
 

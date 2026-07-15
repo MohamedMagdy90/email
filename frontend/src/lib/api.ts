@@ -1,5 +1,21 @@
 const BASE = (import.meta as any).env?.VITE_API_URL || "";
 
+/* ------------------------------- Auth ------------------------------- */
+const TOKEN_KEY = "dna_auth_token";
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
+export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+function authHeaders(): Record<string, string> {
+  const t = getToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+function onUnauthorized() {
+  clearToken();
+  window.dispatchEvent(new Event("dna-unauthorized"));
+}
+
 export interface Contact {
   id: string;
   email: string;
@@ -57,9 +73,13 @@ export interface Job {
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers as any) },
   });
+  if (res.status === 401) {
+    onUnauthorized();
+    throw new Error("Unauthorized");
+  }
   if (!res.ok) {
     const e = await res.json().catch(() => ({}));
     throw new Error(e.error || `HTTP ${res.status}`);
@@ -68,6 +88,32 @@ async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  // auth
+  login: async (username: string, password: string) => {
+    const res = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error(e.error || "Login failed");
+    }
+    const data = (await res.json()) as { token: string; username: string };
+    setToken(data.token);
+    return data;
+  },
+  checkAuth: async (): Promise<boolean> => {
+    if (!getToken()) return false;
+    try {
+      await req("/api/auth/me");
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  logout: () => clearToken(),
+
   // contacts
   getContacts: (params: { status?: string; q?: string; limit?: number } = {}) => {
     const qs = new URLSearchParams();
@@ -136,7 +182,13 @@ export const api = {
     const qs = new URLSearchParams();
     if (params.status && params.status !== "all") qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
-    const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`);
+    const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`, {
+      headers: { ...authHeaders() },
+    });
+    if (res.status === 401) {
+      onUnauthorized();
+      throw new Error("Unauthorized");
+    }
     return res.text();
   },
 

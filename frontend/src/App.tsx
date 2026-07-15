@@ -1,5 +1,7 @@
-import { useState } from "react";
-import { cn, Toaster } from "./lib/ui";
+import { useEffect, useState } from "react";
+import { cn, Toaster, Spinner } from "./lib/ui";
+import { api, clearToken } from "./lib/api";
+import Login from "./screens/Login";
 import Overview from "./screens/Overview";
 import Contacts from "./screens/Contacts";
 import Templates from "./screens/Templates";
@@ -20,6 +22,30 @@ const NAV: { id: Tab; label: string; num: string }[] = [
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
+  const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
+
+  useEffect(() => {
+    api.checkAuth().then(setAuthed);
+    const onUnauth = () => setAuthed(false);
+    window.addEventListener("dna-unauthorized", onUnauth);
+    return () => window.removeEventListener("dna-unauthorized", onUnauth);
+  }, []);
+
+  function logout() {
+    clearToken();
+    setAuthed(false);
+    setTab("overview");
+  }
+
+  if (authed === null) {
+    return (
+      <div className="grid h-screen w-screen place-items-center bg-ink">
+        <Spinner className="h-6 w-6 text-cream/60" />
+      </div>
+    );
+  }
+
+  if (!authed) return <Login onSuccess={() => setAuthed(true)} />;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-cream">
@@ -57,7 +83,16 @@ export default function App() {
           })}
         </nav>
 
-        <div className="px-6 py-5 text-[11px] leading-relaxed text-cream/35">
+        <div className="px-3 pb-3">
+          <button
+            onClick={logout}
+            className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-cream/55 transition-colors hover:bg-white/[0.05] hover:text-cream/90"
+          >
+            <span className="mono-label w-6 text-cream/30">↩</span>
+            <span className="font-medium">Log out</span>
+          </button>
+        </div>
+        <div className="px-6 pb-5 text-[11px] leading-relaxed text-cream/35">
           Cold outreach — send from secondary domains, never your primary.
         </div>
       </aside>
