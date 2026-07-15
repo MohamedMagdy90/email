@@ -2,18 +2,13 @@
   command = "bun run build"
   publish = "dist"
 
-# --- OPTION A (recommended): proxy /api to your Railway backend ---
-# Uncomment and replace the URL with your Railway backend URL.
-# This keeps the frontend same-origin (no CORS) and needs no VITE_API_URL.
-# [[redirects]]
-#   from = "/api/*"
-#   to = "https://YOUR-BACKEND.up.railway.app/api/:splat"
-#   status = 200
-#   force = true
-
-# --- OPTION B: instead of the proxy above, set VITE_API_URL in Netlify env ---
-#   VITE_API_URL = https://YOUR-BACKEND.up.railway.app
-# (CORS is already enabled on the backend.)
+# Proxy API calls to the Railway backend.
+# Same-origin for the browser (no CORS), and no VITE_API_URL needed.
+[[redirects]]
+  from = "/api/*"
+  to = "https://email-production-3c14.up.railway.app/api/:splat"
+  status = 200
+  force = true
 
 # SPA fallback (keep this LAST)
 [[redirects]]
