@@ -92,6 +92,56 @@ export async function ensureSchema() {
     key TEXT PRIMARY KEY,
     value TEXT
   )`);
+
+  // Persistent crawl ledger: remembers every domain we've ever scanned so we
+  // never waste time (or rate-limit budget) re-crawling the same site.
+  await q(`CREATE TABLE IF NOT EXISTS crawled_domains (
+    domain TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'ok',
+    emails_found INTEGER NOT NULL DEFAULT 0,
+    pages_crawled INTEGER NOT NULL DEFAULT 0,
+    first_crawled_at TEXT NOT NULL,
+    last_crawled_at TEXT NOT NULL
+  )`);
+}
+
+/* ---------------------------- Crawl ledger ---------------------------- */
+
+// Upsert a domain into the ledger. Keeps the original first_crawled_at,
+// always refreshes last_crawled_at / status / counts.
+export async function recordCrawledDomain(
+  domain: string,
+  status: string,
+  emailsFound: number,
+  pagesCrawled: number
+): Promise<void> {
+  const d = (domain || "").toLowerCase();
+  if (!d) return;
+  const now = nowIso();
+  await q(
+    `INSERT INTO crawled_domains (domain,status,emails_found,pages_crawled,first_crawled_at,last_crawled_at)
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT (domain) DO UPDATE SET
+       status = ?, emails_found = ?, pages_crawled = ?, last_crawled_at = ?`,
+    [d, status, emailsFound, pagesCrawled, now, now, status, emailsFound, pagesCrawled, now]
+  );
+}
+
+// Domains crawled at or after `sinceIso` (used to skip recently-scanned sites).
+export async function getKnownDomains(sinceIso: string): Promise<Map<string, string>> {
+  const rows = await q(
+    `SELECT domain, last_crawled_at FROM crawled_domains WHERE last_crawled_at >= ?`,
+    [sinceIso]
+  );
+  const m = new Map<string, string>();
+  for (const r of rows) m.set(String(r.domain).toLowerCase(), String(r.last_crawled_at));
+  return m;
+}
+
+// All email addresses we already have (to derive domains we've captured).
+export async function getContactEmails(): Promise<string[]> {
+  const rows = await q(`SELECT email FROM contacts`);
+  return rows.map((r) => String(r.email || "").toLowerCase()).filter(Boolean);
 }
 
 export async function getSetting(key: string): Promise<string | null> {

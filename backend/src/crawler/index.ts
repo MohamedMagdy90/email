@@ -9,6 +9,7 @@ import {
 } from "./urls";
 import { loadRobots } from "./robots";
 import { extractEmails } from "./extract";
+import { discoverFromSitemap } from "./sitemap";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./validate";
 
 export interface CrawlOptions {
@@ -16,15 +17,30 @@ export interface CrawlOptions {
   maxDepth?: number;
   respectRobots?: boolean;
   checkMx?: boolean;
+  guessInbox?: boolean; // synthesize info@domain when a site exposes no email
+  useSitemap?: boolean; // discover pages via sitemap.xml
   timeoutMs?: number;
   politenessMs?: number;
   concurrency?: number; // sites in parallel
 }
 
+// How trustworthy an extracted address is. Drives sorting + UI badges.
+export type Confidence = "high" | "medium" | "low" | "guessed";
+
+const METHOD_CONFIDENCE: Record<string, Confidence> = {
+  mailto: "high",
+  jsonld: "high",
+  cloudflare: "high",
+  text: "medium",
+  deobfuscated: "low",
+  guessed: "guessed",
+};
+
 export interface FoundEmail {
   email: string;
   role_based: boolean;
   method: string;
+  confidence: Confidence;
   source: string; // page URL where found
   domain: string; // site registrable domain
   mx?: boolean;
@@ -57,6 +73,8 @@ export async function crawlSite(
     maxDepth = 2,
     respectRobots = true,
     checkMx = true,
+    guessInbox = false,
+    useSitemap = true,
     timeoutMs = 15000,
     politenessMs = 250,
   } = opts;
@@ -74,6 +92,14 @@ export async function crawlSite(
   const queue: { url: string; depth: number }[] = [{ url: seed, depth: 0 }];
   for (const p of SEED_PATHS) {
     try { queue.push({ url: new URL(p, origin).toString(), depth: 1 }); } catch {}
+  }
+
+  // Jump straight to contact-like pages listed in the sitemap (even unlinked ones).
+  if (useSitemap) {
+    try {
+      const smUrls = await discoverFromSitemap(origin, seed, 8, Math.min(timeoutMs, 8000));
+      for (const u of smUrls) queue.push({ url: u, depth: 1 });
+    } catch {}
   }
 
   const emailMap = new Map<string, FoundEmail>();
@@ -113,6 +139,7 @@ export async function crawlSite(
           email: c,
           role_based: isRole(c),
           method: h.method,
+          confidence: METHOD_CONFIDENCE[h.method] ?? "low",
           source: res.url || norm,
           domain: siteDomain,
         });
@@ -134,22 +161,39 @@ export async function crawlSite(
 
   let emails = [...emailMap.values()];
 
+  // Smart inbox inference: if the site exposed no address but its mail domain
+  // can actually receive mail, synthesize the best-practice role inbox. Clearly
+  // flagged as "guessed" so the operator knows it's lower confidence.
+  if (guessInbox && emails.length === 0 && siteDomain) {
+    if (await hasMx(siteDomain)) {
+      emails.push({
+        email: `info@${siteDomain}`,
+        role_based: true,
+        method: "guessed",
+        confidence: "guessed",
+        source: seed,
+        domain: siteDomain,
+        mx: true,
+      });
+    }
+  }
+
   // Deliverability: keep only domains that can actually receive mail.
   if (checkMx && emails.length) {
     const domains = [...new Set(emails.map((e) => e.email.split("@")[1]))];
     const mxMap = new Map<string, boolean>();
     await Promise.all(domains.map(async (d) => mxMap.set(d, await hasMx(d))));
     emails = emails
-      .map((e) => ({ ...e, mx: mxMap.get(e.email.split("@")[1]) }))
+      .map((e) => ({ ...e, mx: e.mx ?? mxMap.get(e.email.split("@")[1]) }))
       .filter((e) => e.mx !== false);
   }
 
   // Order: role inboxes first (best for outreach), then by extraction reliability.
-  const rank: Record<string, number> = { mailto: 0, cloudflare: 1, text: 2, deobfuscated: 3 };
+  const rank: Record<string, number> = { mailto: 0, jsonld: 1, cloudflare: 2, text: 3, deobfuscated: 4, guessed: 9 };
   emails.sort(
     (a, b) =>
       Number(b.role_based) - Number(a.role_based) ||
-      (rank[a.method] ?? 9) - (rank[b.method] ?? 9) ||
+      (rank[a.method] ?? 8) - (rank[b.method] ?? 8) ||
       a.email.localeCompare(b.email)
   );
 

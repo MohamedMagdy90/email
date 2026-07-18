@@ -207,9 +207,20 @@ export const api = {
   // lead finder
   getLeadCategories: () => req<{ categories: string[] }>(`/api/leads/categories`),
   findLeads: (location: string, category: string, limit: number) =>
-    req<{ companies: { name: string; website: string; city: string; email: string | null }[] }>(
-      `/api/leads/find`,
-      { method: "POST", body: JSON.stringify({ location, category, limit }) }
+    req<{
+      companies: {
+        name: string; website: string; city: string;
+        email: string | null; phone: string | null; hasWebsite: boolean;
+        domain: string; inContacts: boolean; crawled: boolean;
+      }[];
+      summary: { total: number; new: number };
+    }>(`/api/leads/find`, { method: "POST", body: JSON.stringify({ location, category, limit }) }),
+
+  // check which pasted URLs are already known (dedup preview)
+  checkCrawl: (urls: string[]) =>
+    req<{ total: number; inContacts: number; crawled: number; fresh: number }>(
+      `/api/crawl/check`,
+      { method: "POST", body: JSON.stringify({ urls }) }
     ),
 
   // export

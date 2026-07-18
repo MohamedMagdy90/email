@@ -7,6 +7,7 @@ interface Found {
   email: string;
   role_based: boolean;
   method: string;
+  confidence?: "high" | "medium" | "low" | "guessed";
   domain: string;
   source: string;
   mx?: boolean;
@@ -16,6 +17,11 @@ interface Company {
   website: string;
   city: string;
   email: string | null;
+  phone: string | null;
+  hasWebsite: boolean;
+  domain: string;
+  inContacts: boolean;
+  crawled: boolean;
 }
 
 const FALLBACK_CATS = [
@@ -44,17 +50,22 @@ export default function Crawler({
   const [discovering, setDiscovering] = useState(false);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [pickedCos, setPickedCos] = useState<Set<string>>(new Set());
+  const [hideKnown, setHideKnown] = useState(true);
 
   // urls
   const [urls, setUrls] = useState("");
   const [tagCountry, setTagCountry] = useState("");
   const [tagIndustry, setTagIndustry] = useState("");
+  const [urlCheck, setUrlCheck] = useState<{ total: number; inContacts: number; crawled: number; fresh: number } | null>(null);
+  const [checking, setChecking] = useState(false);
 
   // options
   const [maxPages, setMaxPages] = useState(20);
   const [maxDepth, setMaxDepth] = useState(2);
   const [respectRobots, setRespectRobots] = useState(true);
   const [checkMx, setCheckMx] = useState(true);
+  const [skipKnown, setSkipKnown] = useState(true);
+  const [guessInbox, setGuessInbox] = useState(false);
 
   // job
   const [job, setJob] = useState<Job | null>(null);
@@ -65,6 +76,7 @@ export default function Crawler({
 
   const running = job?.status === "running";
   const results: Found[] = job?.result?.emails || [];
+  const skippedList: any[] = job?.result?.skipped || [];
 
   useEffect(() => {
     api.getLeadCategories().then((r) => {
@@ -81,9 +93,12 @@ export default function Crawler({
     setCompanies([]);
     try {
       const r = await api.findLeads(location.trim(), category, limit);
-      setCompanies(r.companies);
-      setPickedCos(new Set(r.companies.map((c) => c.website)));
-      if (!r.companies.length) toast("No companies with websites found — try a broader area", "info");
+      setCompanies(r.companies as Company[]);
+      // Pre-select only genuinely new, crawlable targets — never waste a crawl.
+      const fresh = r.companies.filter((c) => c.hasWebsite && !c.inContacts && !c.crawled);
+      setPickedCos(new Set(fresh.map((c) => c.website)));
+      if (!r.companies.length) toast("No companies found — try a broader area or category", "info");
+      else if (!fresh.length) toast("All results are already in your contacts or previously crawled", "info");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
@@ -95,14 +110,29 @@ export default function Crawler({
     n.has(w) ? n.delete(w) : n.add(w);
     setPickedCos(n);
   }
-  const allCos = companies.length > 0 && pickedCos.size === companies.length;
-  const pickedWithEmail = companies.filter((c) => pickedCos.has(c.website) && c.email);
+
+  const visibleCos = companies.filter((c) => !(hideKnown && (c.inContacts || c.crawled)));
+  const crawlable = companies.filter((c) => c.hasWebsite);
+  const newCount = companies.filter((c) => !c.inContacts && !c.crawled).length;
+  const knownCount = companies.length - newCount;
+  const pickedCrawlable = crawlable.filter((c) => pickedCos.has(c.website));
+  const allVisibleSelected = visibleCos.length > 0 && visibleCos.every((c) => !c.hasWebsite || pickedCos.has(c.website));
+  const pickedWithEmail = companies.filter((c) => (pickedCos.has(c.website) || !c.hasWebsite) && c.email && !c.inContacts);
+
+  function toggleAllVisible() {
+    if (allVisibleSelected) {
+      setPickedCos(new Set());
+    } else {
+      setPickedCos(new Set(visibleCos.filter((c) => c.hasWebsite).map((c) => c.website)));
+    }
+  }
 
   async function addListedEmails() {
-    if (!pickedWithEmail.length) return;
+    const list = companies.filter((c) => c.email && !c.inContacts && (pickedCos.has(c.website) || !c.hasWebsite));
+    if (!list.length) return toast("No listed emails to add", "info");
     try {
       const r = await api.bulkContacts(
-        pickedWithEmail.map((c) => ({
+        list.map((c) => ({
           email: c.email!,
           company: c.name,
           country: location || undefined,
@@ -111,10 +141,24 @@ export default function Crawler({
           source: "osm",
         }))
       );
-      toast(`Added ${r.added} listed email(s)`, "success");
+      toast(`Added ${r.added} · skipped ${r.skipped} duplicate(s)`, "success");
       onAdded();
     } catch (e: any) {
       toast(e.message, "error");
+    }
+  }
+
+  /* --------------------------- paste check -------------------------- */
+  async function checkUrls() {
+    const list = urls.split(/[\n,]/).map((u) => u.trim()).filter(Boolean);
+    if (!list.length) return;
+    setChecking(true);
+    try {
+      setUrlCheck(await api.checkCrawl(list));
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -126,7 +170,7 @@ export default function Crawler({
     setStage("job");
     setJob(null);
     try {
-      const { jobId } = await api.startCrawl({ urls: list, maxPages, maxDepth, respectRobots, checkMx });
+      const { jobId } = await api.startCrawl({ urls: list, maxPages, maxDepth, respectRobots, checkMx, skipKnown, guessInbox });
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = window.setInterval(async () => {
         const j = await api.getCrawl(jobId).catch(() => null);
@@ -143,7 +187,7 @@ export default function Crawler({
   }
 
   function crawlDiscovered() {
-    const list = companies.filter((c) => pickedCos.has(c.website)).map((c) => c.website);
+    const list = pickedCrawlable.map((c) => c.website);
     startCrawl(list, { country: location || undefined, industry: category || undefined });
   }
   function crawlUrls() {
@@ -184,8 +228,8 @@ export default function Crawler({
   function exportResults() {
     if (!results.length) return;
     const csv = toCsv(
-      results.map((r) => ({ email: r.email, type: r.role_based ? "role" : "personal", method: r.method, domain: r.domain, source: r.source })),
-      ["email", "type", "method", "domain", "source"]
+      results.map((r) => ({ email: r.email, type: r.role_based ? "role" : "personal", confidence: r.confidence || "", method: r.method, domain: r.domain, source: r.source })),
+      ["email", "type", "confidence", "method", "domain", "source"]
     );
     downloadCsv("crawl-results.csv", csv);
   }
@@ -199,6 +243,7 @@ export default function Crawler({
   function close() {
     reset();
     setCompanies([]);
+    setUrlCheck(null);
     onClose();
   }
 
@@ -242,28 +287,55 @@ export default function Crawler({
 
               {companies.length > 0 && (
                 <div className="rounded-xl border border-line">
-                  <div className="flex items-center justify-between border-b border-line px-3 py-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-2">
                     <label className="flex items-center gap-2 text-[13px] font-medium">
-                      <input type="checkbox" checked={allCos} onChange={() => setPickedCos(allCos ? new Set() : new Set(companies.map((c) => c.website)))} className="accent-ink" />
-                      {companies.length} companies · {pickedCos.size} selected
+                      <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-ink" />
+                      {companies.length} found · <span className="text-good">{newCount} new</span>
+                      {knownCount > 0 && <span className="text-muted">· {knownCount} known</span>}
                     </label>
-                    {pickedWithEmail.length > 0 && (
-                      <Button size="sm" variant="outline" onClick={addListedEmails}>
-                        Add {pickedWithEmail.length} listed email(s)
-                      </Button>
-                    )}
+                    <div className="flex items-center gap-3">
+                      {knownCount > 0 && (
+                        <button onClick={() => setHideKnown((v) => !v)} className="text-xs font-medium text-ink/60 underline hover:text-ink">
+                          {hideKnown ? "Show known" : "Hide known"}
+                        </button>
+                      )}
+                      {pickedWithEmail.length > 0 && (
+                        <Button size="sm" variant="outline" onClick={addListedEmails}>
+                          Add {pickedWithEmail.length} listed
+                        </Button>
+                      )}
+                    </div>
                   </div>
                   <div className="max-h-52 overflow-y-auto">
-                    {companies.map((c) => (
-                      <div key={c.website} className="flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0">
-                        <input type="checkbox" checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="accent-ink" />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-medium">{c.name}</div>
-                          <div className="truncate text-xs text-muted">{c.website.replace(/^https?:\/\//, "")}{c.city ? ` · ${c.city}` : ""}</div>
+                    {visibleCos.length === 0 && (
+                      <div className="px-3 py-6 text-center text-xs text-muted">All results are already known. Toggle “Show known” to review them.</div>
+                    )}
+                    {visibleCos.map((c) => {
+                      const known = c.inContacts || c.crawled;
+                      return (
+                        <div key={c.website || c.email || c.name} className={cn("flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0", known && "opacity-60")}>
+                          <input
+                            type="checkbox"
+                            disabled={!c.hasWebsite}
+                            checked={pickedCos.has(c.website)}
+                            onChange={() => toggleCo(c.website)}
+                            className="accent-ink disabled:opacity-30"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium">{c.name}</div>
+                            <div className="truncate text-xs text-muted">
+                              {c.hasWebsite ? c.website.replace(/^https?:\/\//, "") : "no website"}{c.city ? ` · ${c.city}` : ""}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            {c.email && <Tag tone="green">email</Tag>}
+                            {c.inContacts && <Tag tone="blue">in contacts</Tag>}
+                            {!c.inContacts && c.crawled && <Tag tone="amber">crawled</Tag>}
+                            {!c.hasWebsite && !c.email && <Tag tone="gray">no site</Tag>}
+                          </div>
                         </div>
-                        {c.email && <span className="rounded-md bg-[#e7f6ec] px-1.5 py-0.5 text-[10px] text-[#1f8b4c]">email</span>}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -271,8 +343,18 @@ export default function Crawler({
           ) : (
             <div className="space-y-4">
               <Field label="Company websites" hint="One per line (or comma-separated). Bare domains are fine.">
-                <Textarea rows={5} value={urls} onChange={(e) => setUrls(e.target.value)} placeholder={"acme-trading.com\nhttps://www.example-contractor.qa"} className="font-mono text-xs" />
+                <Textarea rows={5} value={urls} onChange={(e) => { setUrls(e.target.value); setUrlCheck(null); }} placeholder={"acme-trading.com\nhttps://www.example-contractor.qa"} className="font-mono text-xs" />
               </Field>
+              <div className="flex items-center gap-3">
+                <Button size="sm" variant="outline" onClick={checkUrls} loading={checking} disabled={!urls.trim()}>Check for duplicates</Button>
+                {urlCheck && (
+                  <span className="text-xs text-muted">
+                    {urlCheck.total} domain(s): <span className="text-good">{urlCheck.fresh} new</span>
+                    {urlCheck.inContacts > 0 && <> · {urlCheck.inContacts} in contacts</>}
+                    {urlCheck.crawled > 0 && <> · {urlCheck.crawled} already crawled</>}
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Tag country (optional)"><Input value={tagCountry} onChange={(e) => setTagCountry(e.target.value)} placeholder="Qatar" /></Field>
                 <Field label="Tag industry (optional)"><Input value={tagIndustry} onChange={(e) => setTagIndustry(e.target.value)} placeholder="Construction" /></Field>
@@ -290,7 +372,9 @@ export default function Crawler({
                 <Select value={maxDepth} onChange={(e) => setMaxDepth(Number(e.target.value))}>{[1, 2, 3].map((n) => <option key={n} value={n}>{n}</option>)}</Select>
               </Field>
             </div>
-            <div className="flex flex-wrap gap-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Toggle label="Skip already-crawled sites" hint="Never re-scan a domain you've done before" checked={skipKnown} onChange={setSkipKnown} />
+              <Toggle label="Guess role inbox if none found" hint="Add info@domain when a site hides its email" checked={guessInbox} onChange={setGuessInbox} />
               <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
               <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
             </div>
@@ -299,9 +383,9 @@ export default function Crawler({
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
             {mode === "discover" ? (
-              <Button onClick={crawlDiscovered} disabled={!pickedCos.size}>Find emails on {pickedCos.size || ""} site(s)</Button>
+              <Button onClick={crawlDiscovered} disabled={!pickedCrawlable.length}>Find emails on {pickedCrawlable.length || ""} site(s)</Button>
             ) : (
-              <Button onClick={crawlUrls}>Start crawl</Button>
+              <Button onClick={crawlUrls} disabled={!urls.trim()}>Start crawl</Button>
             )}
           </div>
         </div>
@@ -325,6 +409,12 @@ export default function Crawler({
               <div className="prism-bar h-full rounded-full transition-all duration-300" style={{ width: `${Math.round((job?.progress || 0) * 100)}%` }} />
             </div>
           </div>
+
+          {skippedList.length > 0 && (
+            <div className="rounded-lg border border-line bg-cream px-3 py-2 text-xs text-ink/70">
+              Skipped <span className="font-semibold">{skippedList.length}</span> already-known site(s) — they were previously crawled or are already in your contacts.
+            </div>
+          )}
 
           <div ref={logRef} className="h-24 overflow-y-auto rounded-xl bg-ink px-3 py-2.5 font-mono text-[11px] leading-relaxed text-cream/80">
             {(job?.logs || []).map((l, i) => (
@@ -352,8 +442,8 @@ export default function Crawler({
                       <tr key={r.email} className="border-b border-line-soft last:border-0">
                         <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="accent-ink" /></td>
                         <td className="px-1 py-2 font-medium">{r.email}</td>
+                        <td className="px-1 py-2"><ConfidenceTag c={r.confidence} /></td>
                         <td className="px-1 py-2 text-xs text-muted">{r.role_based ? "role" : "personal"}</td>
-                        <td className="px-1 py-2 text-xs text-muted">{r.method}</td>
                         <td className="px-1 py-2 text-xs text-ink/60">{r.domain}</td>
                       </tr>
                     ))}
@@ -376,13 +466,38 @@ export default function Crawler({
   );
 }
 
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+function Tag({ children, tone }: { children: React.ReactNode; tone: "green" | "blue" | "amber" | "gray" }) {
+  const tones = {
+    green: "bg-[#e7f6ec] text-[#1f8b4c]",
+    blue: "bg-[#eaf3ff] text-[#2563a8]",
+    amber: "bg-[#fef3e2] text-[#b06b16]",
+    gray: "bg-ink/[0.06] text-ink/50",
+  };
+  return <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-medium", tones[tone])}>{children}</span>;
+}
+
+function ConfidenceTag({ c }: { c?: "high" | "medium" | "low" | "guessed" }) {
+  if (!c) return null;
+  const map = {
+    high: { tone: "green" as const, label: "high" },
+    medium: { tone: "blue" as const, label: "medium" },
+    low: { tone: "amber" as const, label: "low" },
+    guessed: { tone: "gray" as const, label: "guessed" },
+  };
+  const { tone, label } = map[c];
+  return <Tag tone={tone}>{label}</Tag>;
+}
+
+function Toggle({ label, hint, checked, onChange }: { label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <button type="button" onClick={() => onChange(!checked)} className="flex items-center gap-2 text-[13px] font-medium text-ink/80">
-      <span className={cn("relative h-5 w-9 rounded-full transition-colors", checked ? "bg-ink" : "bg-ink/15")}>
+    <button type="button" onClick={() => onChange(!checked)} className="flex items-start gap-2 text-left text-[13px] font-medium text-ink/80">
+      <span className={cn("relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors", checked ? "bg-ink" : "bg-ink/15")}>
         <span className={cn("absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all", checked ? "left-[18px]" : "left-0.5")} />
       </span>
-      {label}
+      <span>
+        {label}
+        {hint && <span className="block text-[11px] font-normal text-muted">{hint}</span>}
+      </span>
     </button>
   );
 }

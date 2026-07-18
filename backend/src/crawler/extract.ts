@@ -7,7 +7,7 @@
 
 export interface EmailHit {
   email: string;
-  method: "cloudflare" | "mailto" | "text" | "deobfuscated";
+  method: "cloudflare" | "mailto" | "jsonld" | "text" | "deobfuscated";
 }
 
 function safeChar(code: number): string {
@@ -85,6 +85,14 @@ export function extractEmails(rawHtml: string): EmailHit[] {
     push(addr.trim(), "mailto");
   }
 
+  // 2b) JSON-LD (schema.org) structured data — Organization / ContactPoint
+  //     often expose an "email" field that never appears in visible text.
+  const ld = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let lm: RegExpExecArray | null;
+  while ((lm = ld.exec(rawHtml))) {
+    for (const e of emailsFromJsonLd(lm[1])) push(e, "jsonld");
+  }
+
   // 3) plain-text emails
   let em: RegExpExecArray | null;
   EMAIL_RE.lastIndex = 0;
@@ -99,4 +107,44 @@ export function extractEmails(rawHtml: string): EmailHit[] {
   }
 
   return hits;
+}
+
+// Walk a JSON-LD blob (object/array/nested) and collect any string that looks
+// like an email, plus explicit `email` / `contactPoint.email` fields.
+function emailsFromJsonLd(raw: string): string[] {
+  const out: string[] = [];
+  let data: any;
+  try {
+    data = JSON.parse(raw.trim());
+  } catch {
+    // Some sites embed multiple JSON objects or trailing commas — salvage any
+    // "email": "..." pairs with a targeted regex as a fallback.
+    const re = /"email"\s*:\s*"([^"]+)"/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(raw))) out.push(m[1].replace(/^mailto:/i, "").trim());
+    return out;
+  }
+  const seen = new Set<any>();
+  const walk = (node: any) => {
+    if (!node || typeof node !== "object") return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const it of node) walk(it);
+      return;
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof v === "string") {
+        const cand = v.replace(/^mailto:/i, "").trim();
+        // Accept explicit email fields, or any value that looks like an address.
+        if (k.toLowerCase() === "email" || /^mailto:/i.test(v) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cand)) {
+          if (cand.includes("@")) out.push(cand);
+        }
+      } else if (v && typeof v === "object") {
+        walk(v);
+      }
+    }
+  };
+  walk(data);
+  return out;
 }

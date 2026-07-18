@@ -1,9 +1,13 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/bun";
-import { q, ensureSchema, getSetting, setSetting, nowIso } from "./db";
+import {
+  q, ensureSchema, getSetting, setSetting, nowIso,
+  recordCrawledDomain, getKnownDomains, getContactEmails,
+} from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
 import { crawlMany, type CrawlOptions } from "./crawler";
+import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, LEAD_CATEGORIES } from "./leads";
@@ -357,21 +361,62 @@ app.post("/api/settings/test-email", async (c) => {
 
 app.post("/api/crawl", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const urls: string[] = (Array.isArray(b.urls) ? b.urls : String(b.urls || "").split(/[\n,]/))
+  const rawUrls: string[] = (Array.isArray(b.urls) ? b.urls : String(b.urls || "").split(/[\n,]/))
     .map((u: string) => u.trim())
     .filter(Boolean);
-  if (!urls.length) return c.json({ error: "provide at least one URL" }, 400);
+  if (!rawUrls.length) return c.json({ error: "provide at least one URL" }, 400);
+
+  const skipKnown = b.skipKnown !== false; // default ON
+  const recrawlDays = clamp(Number(b.recrawlDays) || 60, 1, 365);
+
+  // ---- Dedup pass: drop targets we've already handled ---------------------
+  // 1) domains crawled within the freshness window (crawl ledger)
+  // 2) domains we already have a contact for (no need to re-find)
+  const sinceIso = new Date(Date.now() - recrawlDays * 86400000).toISOString();
+  const knownDomains = skipKnown ? await getKnownDomains(sinceIso) : new Map<string, string>();
+  const contactDomains = new Set<string>();
+  if (skipKnown) {
+    for (const email of await getContactEmails()) {
+      const d = registrableDomain((email.split("@")[1] || ""));
+      if (d) contactDomains.add(d);
+    }
+  }
+
+  const urls: string[] = [];
+  const skipped: { url: string; domain: string; reason: string; lastCrawledAt?: string }[] = [];
+  const seenSeed = new Set<string>();
+  for (const u of rawUrls) {
+    const domain = registrableDomain(hostOf(/^https?:\/\//i.test(u) ? u : "https://" + u));
+    if (!domain) { urls.push(u); continue; }
+    if (seenSeed.has(domain)) { skipped.push({ url: u, domain, reason: "duplicate" }); continue; }
+    seenSeed.add(domain);
+    if (skipKnown && contactDomains.has(domain)) { skipped.push({ url: u, domain, reason: "in_contacts" }); continue; }
+    if (skipKnown && knownDomains.has(domain)) { skipped.push({ url: u, domain, reason: "crawled", lastCrawledAt: knownDomains.get(domain) }); continue; }
+    urls.push(u);
+  }
 
   const options: CrawlOptions = {
     maxPages: clamp(Number(b.maxPages) || 25, 1, 60),
     maxDepth: clamp(Number(b.maxDepth) || 2, 0, 3),
     respectRobots: b.respectRobots !== false,
     checkMx: b.checkMx !== false,
+    guessInbox: b.guessInbox === true,
+    useSitemap: b.useSitemap !== false,
     concurrency: clamp(Number(b.concurrency) || 3, 1, 6),
   };
 
   const job = createJob("crawl", urls.length);
-  job.result = { sites: [], emails: [] };
+  job.result = { sites: [], emails: [], skipped };
+
+  if (skipped.length) {
+    log(job, { level: "info", msg: `Skipped ${skipped.length} already-known site(s). Scanning ${urls.length} new site(s).` });
+  }
+  if (!urls.length) {
+    job.status = "done";
+    job.progress = 1;
+    log(job, { level: "info", msg: "Nothing new to crawl — every target was already known." });
+    return c.json({ jobId: job.id });
+  }
 
   (async () => {
     try {
@@ -382,6 +427,9 @@ app.post("/api/crawl", async (c) => {
           job.result.sites.push(p.result);
           for (const e of p.result.emails) job.result.emails.push(e);
           log(job, { level: "info", msg: `${p.result.site}: ${p.result.emails.length} email(s) [${p.result.status}]` });
+          // Remember this domain so we never waste a crawl on it again.
+          const dom = registrableDomain(hostOf(p.result.seed || p.result.site));
+          if (dom) recordCrawledDomain(dom, p.result.status, p.result.emails.length, p.result.pagesCrawled).catch(() => {});
         } else if (p.type === "site-start") {
           log(job, { level: "info", msg: `Crawling ${p.seed} ...` });
         } else if (p.type === "page" && p.found > 0) {
@@ -560,10 +608,63 @@ app.post("/api/leads/find", async (c) => {
   const limit = clamp(Number(b.limit) || 40, 5, 120);
   if (!location) return c.json({ error: "location required" }, 400);
   try {
-    return c.json({ companies: await findLeads(location, category, limit) });
+    const companies = await findLeads(location, category, limit);
+
+    // Annotate each result so the operator sees what's new BEFORE crawling:
+    //  - inContacts: we already hold an email from this domain (or this exact email)
+    //  - crawled:    we've already scanned this domain (crawl ledger, any time)
+    const contactDomains = new Set<string>();
+    const contactEmails = new Set<string>();
+    for (const email of await getContactEmails()) {
+      contactEmails.add(email);
+      const d = registrableDomain(email.split("@")[1] || "");
+      if (d) contactDomains.add(d);
+    }
+    const everCrawled = await getKnownDomains("0000-01-01T00:00:00.000Z");
+
+    const annotated = companies.map((co) => {
+      const domain = co.website ? registrableDomain(hostOf(co.website)) : "";
+      const emailDomain = co.email ? registrableDomain(co.email.split("@")[1] || "") : "";
+      const inContacts =
+        (!!co.email && contactEmails.has(co.email.toLowerCase())) ||
+        (!!domain && contactDomains.has(domain)) ||
+        (!!emailDomain && contactDomains.has(emailDomain));
+      const crawled = !!domain && everCrawled.has(domain);
+      return { ...co, domain, inContacts, crawled };
+    });
+
+    const newCount = annotated.filter((a) => !a.inContacts && !a.crawled).length;
+    return c.json({ companies: annotated, summary: { total: annotated.length, new: newCount } });
   } catch (e: any) {
     return c.json({ error: String(e?.message || e) }, 500);
   }
+});
+
+// Report which of the given URLs are already known (for the "Paste websites" flow).
+app.post("/api/crawl/check", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const urls: string[] = (Array.isArray(b.urls) ? b.urls : String(b.urls || "").split(/[\n,]/))
+    .map((u: string) => u.trim())
+    .filter(Boolean);
+  const recrawlDays = clamp(Number(b.recrawlDays) || 60, 1, 365);
+  const sinceIso = new Date(Date.now() - recrawlDays * 86400000).toISOString();
+  const known = await getKnownDomains(sinceIso);
+  const contactDomains = new Set<string>();
+  for (const email of await getContactEmails()) {
+    const d = registrableDomain(email.split("@")[1] || "");
+    if (d) contactDomains.add(d);
+  }
+  let inContacts = 0, crawled = 0, fresh = 0;
+  const seen = new Set<string>();
+  for (const u of urls) {
+    const domain = registrableDomain(hostOf(/^https?:\/\//i.test(u) ? u : "https://" + u));
+    if (!domain || seen.has(domain)) continue;
+    seen.add(domain);
+    if (contactDomains.has(domain)) inContacts++;
+    else if (known.has(domain)) crawled++;
+    else fresh++;
+  }
+  return c.json({ total: seen.size, inContacts, crawled, fresh });
 });
 
 /* ------------------------------ History ----------------------------- */
