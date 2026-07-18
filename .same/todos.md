@@ -1,43 +1,39 @@
-# DNA Outreach — Email Discovery Redesign
+# DNA Outreach — Directory Harvester + Phone capture
 
-## Contact categories (current)
-- [x] DB: contacts.category column + migration; categories list in settings
-- [x] API: GET/POST /api/categories; category on add/edit/bulk; category filter; export includes category
-- [x] API: CSV import = upsert (update existing, PRESERVE status; insert new)
-- [x] csv.ts: parse category, template includes category
-- [x] Settings: manage categories (add/remove)
-- [x] Contacts: category select on add/edit, category column, category filter, bulk-set, import shows updated count
-- [x] Send: filter/send by category
-- [x] Crawler: choose category to save fetched emails under
-- [x] Verified: upsert keeps "sent" status + updates category; category filter; export has category
+## Phase 1 — Contacts get a phone field ✅
+- [x] db.ts: `phone` column + migration; inserts/updates/upsert/export
+- [x] index.ts routes: POST/PUT/bulk/export accept + return phone
+- [x] api.ts: Contact.phone
+- [x] csv.ts: parse phone column + template
+- [x] Contacts.tsx: phone column + Add/Edit inputs + import preview
 
-## Tier-one search upgrade (done)
-- [x] Overpass 504 fix: 5 mirrors, race + 3-round retry with backoff, 30s abort
-- [x] Searchable location dropdown: Photon autocomplete ("qat"→Qatar), Nominatim fallback
-- [x] Keyword search engine: DuckDuckGo-based, finds companies by website content
-- [x] Resilient search: UA rotation, retry/backoff, html+lite fallback, 10-min cache
-- [x] Keyword content-match in crawler + "Must mention / Required" filter + badges
-- [x] Verified: Photon autocomplete, place-based discovery, "car rental" search→crawl→match
+## Phase 2 — Phone + name extraction (crawler) ✅
+- [x] libphonenumber-js added
+- [x] crawler/phones.ts: extractPhones() mobile-vs-fixed, country/TLD defaults, chrome-safe
+- [x] directory.ts: extractName() (og/h1/jsonld/title + suffix strip)
+- [x] normal crawler (discover/keyword/paste): captures site phone (mobile pref)
+- [x] normal crawl adds contact even with NO phone (phone optional)
+- [x] defaultCountry hint passed from discover location / paste country tag
+- [x] discover/keyword "Add listed" + crawl results pass phone through
 
-## Goal
-Make email discovery genuinely high-yield AND never waste work re-crawling
-domains/emails we already know.
+## Phase 3 — Directory crawler (backend) ✅
+- [x] crawler/directory.ts: pagination detect (?page/​/page/​/rel=next) + detail-link
+      auto-detect (template + first-seg fallback) + 2-pass chrome filtering
+- [x] /api/crawl mode:"directory" → job.result.contacts, inContacts annotation
 
-## Plan
-- [x] Fix corrupted local SQLite DB (backed up, fresh start) + restart dev servers
-- [x] DB: add `crawled_domains` ledger + helpers (record / known-since / contact-domains)
-- [x] Crawler: sitemap.xml discovery of contact/about/team pages
-- [x] Crawler: JSON-LD (schema.org) email extraction
-- [x] Crawler: smart role-inbox inference (info@domain) when page has none + MX ok
-- [x] Crawler: confidence tiers on every email
-- [x] Leads: broaden Overpass query + capture OSM-native emails/phones (grouped value-regex, race mirrors)
-- [x] API /api/crawl: skip already-known domains (ledger + contacts), record results
-- [x] API /api/leads/find: annotate companies (inContacts / crawled) + /api/crawl/check
-- [x] Frontend: skip-known toggle, guess-inbox toggle, dedup badges, confidence, skipped summary
-- [x] Verified live: dedup (crawled/in_contacts/dupe), JSON-LD, guess-inbox (tesla→info@), OSM emails
+## Phase 4 — Frontend directory mode ✅
+- [x] Crawler.tsx: "Directory" tab (paste URL + country + max pages/listings)
+- [x] leads table (company | email | phone+mobile | tag) + select + add w/ category + export
 
-## Verified
-- fsf.org → campaigns@fsf.org (mailto/high); re-crawl skipped via ledger
-- Malta IT discovery → 15 companies in ~12s incl. OSM emails (sales@scanmalta.com)
-- tesla.com (hides email) + guessInbox → info@tesla.com (guessed, MX-verified)
-- extract unit test → jsonld + mailto + text + deobfuscated all captured
+## Verified (live)
+- qatarcontact.com/listings/31 → 10–12 leads: real emails + phones; mediaplus
+  site-chrome contact correctly filtered out
+- odoo.com/partners/country/qatar-180 → 12 leads: INFORISE/Zmakan/etc. emails +
+  Qatar mobiles; Odoo's own +1 footer number filtered by country preference
+- phone round-trips: bulk add → GET (phone kept) → CSV export (phone column)
+- extractPhones proven on FSF contact page (+1 617 542 5942); wired identically
+  into normal crawlSite
+- frontend tsc clean · backend bundles · vite build clean
+
+## Next (optional)
+- [ ] push to GitHub for Railway (on request)

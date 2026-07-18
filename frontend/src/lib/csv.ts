@@ -55,19 +55,20 @@ export interface ParsedContact {
   country: string;
   industry: string;
   category: string;
+  phone: string;
   valid: boolean; // email looks valid
   duplicate: boolean; // duplicated earlier in this same file
 }
 
 // Parse a pasted / uploaded CSV into contact rows with validation flags.
 // Recognizes an optional header row; otherwise assumes column order:
-// email, company, country, industry, category.
+// email, company, country, industry, category, phone.
 export function parseContacts(text: string): ParsedContact[] {
   const rows = parseCsvRows(text);
   if (!rows.length) return [];
   const header = rows[0].map((h) => h.trim().toLowerCase());
   const hasHeader = header.includes("email");
-  const cols = hasHeader ? header : ["email", "company", "country", "industry", "category"];
+  const cols = hasHeader ? header : ["email", "company", "country", "industry", "category", "phone"];
   const dataRows = hasHeader ? rows.slice(1) : rows;
   const idx = (name: string) => cols.indexOf(name);
   const at = (r: string[], name: string, fallback = -1) => {
@@ -83,17 +84,18 @@ export function parseContacts(text: string): ParsedContact[] {
     const country = at(r, "country", 2);
     const industry = at(r, "industry", 3);
     const category = at(r, "category", 4);
-    if (!email && !company && !country && !industry && !category) continue; // blank line
+    const phone = at(r, "phone", 5);
+    if (!email && !company && !country && !industry && !category && !phone) continue; // blank line
     const valid = EMAIL_RE.test(email);
     const duplicate = valid && seen.has(email);
     if (valid) seen.add(email);
-    out.push({ email, company, country, industry, category, valid, duplicate });
+    out.push({ email, company, country, industry, category, phone, valid, duplicate });
   }
   return out;
 }
 
 // A ready-to-fill template users can download, edit in Excel/Sheets, and re-import.
-export const CONTACTS_TEMPLATE = `email,company,country,industry,category
-info@acme-trading.com,Acme Trading,Qatar,Trading,Customer
-sales@example-construction.qa,Example Construction Co,Qatar,Construction,Partner
-hello@brightsoftware.ae,Bright Software,UAE,IT & Software,Reseller`;
+export const CONTACTS_TEMPLATE = `email,company,country,industry,category,phone
+info@acme-trading.com,Acme Trading,Qatar,Trading,Customer,+974 4432 4853
+sales@example-construction.qa,Example Construction Co,Qatar,Construction,Partner,+974 5012 3456
+hello@brightsoftware.ae,Bright Software,UAE,IT & Software,Reseller,+971 50 123 4567`;

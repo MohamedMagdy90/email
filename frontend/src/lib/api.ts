@@ -23,6 +23,7 @@ export interface Contact {
   country?: string;
   industry?: string;
   category?: string;
+  phone?: string;
   role_based?: boolean;
   source?: string;
   status: string;

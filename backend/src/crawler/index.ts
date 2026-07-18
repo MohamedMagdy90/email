@@ -9,6 +9,7 @@ import {
 } from "./urls";
 import { loadRobots } from "./robots";
 import { extractEmails } from "./extract";
+import { extractPhones, bestPhone, regionFromCountryName, type PhoneHit } from "./phones";
 import { discoverFromSitemap } from "./sitemap";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./validate";
 
@@ -21,6 +22,7 @@ export interface CrawlOptions {
   useSitemap?: boolean; // discover pages via sitemap.xml
   keywords?: string[]; // only keep sites whose content mentions these
   requireKeyword?: boolean; // drop sites that mention none of the keywords
+  defaultCountry?: string; // country hint for parsing local-format phone numbers
   timeoutMs?: number;
   politenessMs?: number;
   concurrency?: number; // sites in parallel
@@ -47,6 +49,8 @@ export interface FoundEmail {
   domain: string; // site registrable domain
   mx?: boolean;
   keywordsMatched?: string[]; // site-level: which target keywords the site mentions
+  phone?: string; // site-level best phone (mobile preferred), international format
+  phoneMobile?: boolean; // whether that phone is a mobile/cell number
 }
 
 export interface SiteResult {
@@ -56,6 +60,8 @@ export interface SiteResult {
   pagesCrawled: number;
   emails: FoundEmail[];
   matchedKeywords?: string[];
+  phone?: string; // site-level best phone (mobile preferred)
+  phoneMobile?: boolean;
   note?: string;
 }
 
@@ -97,10 +103,13 @@ export async function crawlSite(
     useSitemap = true,
     keywords = [],
     requireKeyword = false,
+    defaultCountry,
     timeoutMs = 15000,
     politenessMs = 250,
   } = opts;
   const matchedKw = new Set<string>();
+  const region = regionFromCountryName(defaultCountry);
+  const sitePhones = new Map<string, PhoneHit>();
 
   if (!seed) {
     return { seed: seedInput, site: seedInput, status: "error", pagesCrawled: 0, emails: [], note: "invalid URL" };
@@ -153,6 +162,12 @@ export async function crawlSite(
     }
 
     if (keywords.length) for (const k of matchKeywords(res.html, keywords)) matchedKw.add(k);
+
+    // Capture the company's phone number(s) from this page too (mobile preferred).
+    for (const ph of extractPhones(res.html, { defaultCountry: region, hostname: siteHost })) {
+      const prev = sitePhones.get(ph.number);
+      if (!prev || (ph.isMobile && !prev.isMobile)) sitePhones.set(ph.number, ph);
+    }
 
     const hits = extractEmails(res.html);
     let newlyFound = 0;
@@ -232,13 +247,24 @@ export async function crawlSite(
     emails = emails.map((e) => ({ ...e, keywordsMatched: matchedKeywords }));
   }
 
+  // Attach the best phone (mobile-first) to every email so it rides along into
+  // contacts. If no phone was found the email is still returned — phone is
+  // purely optional enrichment and never blocks a contact from being added.
+  const sitePhone = bestPhone([...sitePhones.values()], region);
+  if (sitePhone) {
+    emails = emails.map((e) => ({ ...e, phone: sitePhone.formatted, phoneMobile: sitePhone.type === "mobile" }));
+  }
+
   let status: SiteResult["status"] = "ok";
   if (pagesCrawled === 0) status = "error";
   else if (emails.length === 0) {
     status = requireKeyword && keywords.length && matchedKeywords.length === 0 ? "empty" : blockedHits > 0 ? "blocked" : "empty";
   }
 
-  return { seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords };
+  return {
+    seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords,
+    phone: sitePhone?.formatted, phoneMobile: sitePhone ? sitePhone.type === "mobile" : undefined,
+  };
 }
 
 export async function crawlMany(

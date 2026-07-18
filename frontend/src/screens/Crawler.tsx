@@ -12,6 +12,19 @@ interface Found {
   source: string;
   mx?: boolean;
   keywordsMatched?: string[];
+  phone?: string;
+  phoneMobile?: boolean;
+}
+// A harvested directory listing (company + email + phone).
+interface Lead {
+  name: string;
+  email: string | null;
+  phone: string | null;
+  phoneMobile?: boolean;
+  role_based?: boolean;
+  detailUrl: string;
+  domain: string;
+  inContacts?: boolean;
 }
 type Company = LeadCompany;
 
@@ -21,7 +34,7 @@ const FALLBACK_CATS = [
   "Advertising & Marketing", "Insurance", "Trading & Retail", "Companies (general)",
 ];
 
-type Mode = "discover" | "keyword" | "urls";
+type Mode = "discover" | "keyword" | "urls" | "directory";
 
 export default function Crawler({
   open,
@@ -61,6 +74,13 @@ export default function Crawler({
   const [urlCheck, setUrlCheck] = useState<{ total: number; inContacts: number; crawled: number; fresh: number } | null>(null);
   const [checking, setChecking] = useState(false);
 
+  // directory harvest
+  const [dirUrls, setDirUrls] = useState("");
+  const [dirCountry, setDirCountry] = useState("");
+  const [dirMaxPages, setDirMaxPages] = useState(20);
+  const [dirMaxListings, setDirMaxListings] = useState(200);
+  const [dirSelected, setDirSelected] = useState<Set<string>>(new Set());
+
   // options
   const [maxPages, setMaxPages] = useState(20);
   const [maxDepth, setMaxDepth] = useState(2);
@@ -85,6 +105,13 @@ export default function Crawler({
   const running = job?.status === "running";
   const results: Found[] = job?.result?.emails || [];
   const skippedList: any[] = job?.result?.skipped || [];
+
+  // directory job
+  const isDirJob = job?.result?.mode === "directory";
+  const leads: Lead[] = job?.result?.contacts || [];
+  const leadKey = (l: Lead) => l.email || l.phone || l.detailUrl;
+  const addableLeads = leads.filter((l) => l.email && !l.inContacts);
+  const leadsWithPhone = leads.filter((l) => l.phone).length;
 
   useEffect(() => {
     api.getLeadCategories().then((r) => {
@@ -167,6 +194,7 @@ export default function Crawler({
           country: location || undefined,
           industry: mode === "discover" ? category : keywords || undefined,
           category: saveCategory || undefined,
+          phone: c.phone || undefined,
           role_based: /^(info|sales|contact|support|admin|office)/i.test(c.email!),
           source: mode === "keyword" ? "search" : "osm",
         }))
@@ -193,6 +221,17 @@ export default function Crawler({
   }
 
   /* ------------------------------ crawl ----------------------------- */
+  function beginPoll(jobId: string) {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = window.setInterval(async () => {
+      const j = await api.getCrawl(jobId).catch(() => null);
+      if (j) {
+        setJob(j);
+        if (j.status !== "running" && pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      }
+    }, 1000);
+  }
+
   async function startCrawl(list: string[], tags: { country?: string; industry?: string }) {
     if (!list.length) return toast("Nothing selected to crawl", "error");
     addTags.current = tags;
@@ -204,20 +243,84 @@ export default function Crawler({
       const { jobId } = await api.startCrawl({
         urls: list, maxPages, maxDepth, respectRobots, checkMx, skipKnown, guessInbox,
         keywords: kw, requireKeyword: requireKeyword && kw.length > 0,
+        defaultCountry: tags.country || undefined,
       });
-      if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = window.setInterval(async () => {
-        const j = await api.getCrawl(jobId).catch(() => null);
-        if (j) {
-          setJob(j);
-          if (j.status !== "running" && pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-        }
-      }, 1000);
+      beginPoll(jobId);
       setJob(await api.getCrawl(jobId));
     } catch (e: any) {
       toast(e.message, "error");
       setStage("input");
     }
+  }
+
+  /* --------------------------- directory ---------------------------- */
+  async function startDirectory() {
+    const list = dirUrls.split(/[\n,]/).map((u) => u.trim()).filter(Boolean);
+    if (!list.length) return toast("Paste a directory URL to harvest", "error");
+    setDirSelected(new Set());
+    setStage("job");
+    setJob(null);
+    try {
+      const { jobId } = await api.startCrawl({
+        mode: "directory",
+        urls: list,
+        maxPages: dirMaxPages,
+        maxDetails: dirMaxListings,
+        defaultCountry: dirCountry || undefined,
+        respectRobots,
+        checkMx,
+      });
+      beginPoll(jobId);
+      setJob(await api.getCrawl(jobId));
+    } catch (e: any) {
+      toast(e.message, "error");
+      setStage("input");
+    }
+  }
+
+  function toggleLead(k: string) {
+    const n = new Set(dirSelected);
+    n.has(k) ? n.delete(k) : n.add(k);
+    setDirSelected(n);
+  }
+  const allLeadsSelected = addableLeads.length > 0 && addableLeads.every((l) => dirSelected.has(leadKey(l)));
+  function toggleAllLeads() {
+    setDirSelected(allLeadsSelected ? new Set() : new Set(addableLeads.map(leadKey)));
+  }
+
+  async function addDirectorySelected() {
+    const chosen = leads.filter((l) => dirSelected.has(leadKey(l)) && l.email);
+    if (!chosen.length) return toast("Select leads that have an email to add", "info");
+    try {
+      const r = await api.bulkContacts(
+        chosen.map((l) => ({
+          email: l.email!,
+          company: l.name,
+          phone: l.phone || undefined,
+          country: dirCountry || undefined,
+          category: saveCategory || undefined,
+          role_based: l.role_based,
+          source: "directory",
+        })),
+        true
+      );
+      const parts = [`Added ${r.added}`];
+      if (r.updated) parts.push(`updated ${r.updated}`);
+      if (r.skipped) parts.push(`skipped ${r.skipped}`);
+      toast(parts.join(" · "), "success");
+      onAdded();
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  }
+
+  function exportLeads() {
+    if (!leads.length) return;
+    const csv = toCsv(
+      leads.map((l) => ({ company: l.name, email: l.email || "", phone: l.phone || "", mobile: l.phoneMobile ? "yes" : "", domain: l.domain, source: l.detailUrl })),
+      ["company", "email", "phone", "mobile", "domain", "source"]
+    );
+    downloadCsv("directory-leads.csv", csv);
   }
 
   function crawlDiscovered() {
@@ -249,6 +352,7 @@ export default function Crawler({
           country: addTags.current.country,
           industry: addTags.current.industry,
           category: saveCategory || undefined,
+          phone: c.phone || undefined,
           role_based: c.role_based,
           source: mode === "keyword" ? "search" : "crawler",
         }))
@@ -264,8 +368,8 @@ export default function Crawler({
   function exportResults() {
     if (!results.length) return;
     const csv = toCsv(
-      results.map((r) => ({ email: r.email, type: r.role_based ? "role" : "personal", confidence: r.confidence || "", method: r.method, domain: r.domain, mentions: (r.keywordsMatched || []).join(" "), source: r.source })),
-      ["email", "type", "confidence", "method", "domain", "mentions", "source"]
+      results.map((r) => ({ email: r.email, phone: r.phone || "", type: r.role_based ? "role" : "personal", confidence: r.confidence || "", method: r.method, domain: r.domain, mentions: (r.keywordsMatched || []).join(" "), source: r.source })),
+      ["email", "phone", "type", "confidence", "method", "domain", "mentions", "source"]
     );
     downloadCsv("crawl-results.csv", csv);
   }
@@ -274,6 +378,7 @@ export default function Crawler({
     if (pollRef.current) clearInterval(pollRef.current);
     setJob(null);
     setSelected(new Set());
+    setDirSelected(new Set());
     setStage("input");
   }
   function close() {
@@ -291,7 +396,7 @@ export default function Crawler({
         <div className="space-y-5">
           {/* mode switch */}
           <div className="flex rounded-full border border-line bg-cream p-1 w-fit">
-            {([["discover", "Discover companies"], ["keyword", "Keyword search"], ["urls", "Paste websites"]] as const).map(([m, label]) => (
+            {([["discover", "Discover companies"], ["keyword", "Keyword search"], ["directory", "Directory"], ["urls", "Paste websites"]] as const).map(([m, label]) => (
               <button
                 key={m}
                 onClick={() => { setMode(m); setCompanies([]); }}
@@ -421,7 +526,53 @@ export default function Crawler({
             </div>
           )}
 
-          {/* shared options */}
+          {mode === "directory" && (
+            <div className="space-y-4">
+              <Field label="Directory URL" hint="Paste a listing/directory page. It walks every page, opens each listing, and pulls company + email + phone.">
+                <Textarea
+                  rows={3}
+                  value={dirUrls}
+                  onChange={(e) => setDirUrls(e.target.value)}
+                  placeholder={"https://www.qatarcontact.com/listings/31\nhttps://www.odoo.com/partners/country/qatar-180"}
+                  className="font-mono text-xs"
+                />
+              </Field>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <Field label="Country" hint="Helps read local phone numbers">
+                  <Input value={dirCountry} onChange={(e) => setDirCountry(e.target.value)} placeholder="Qatar" />
+                </Field>
+                <Field label="Max pages to walk">
+                  <Select value={dirMaxPages} onChange={(e) => setDirMaxPages(Number(e.target.value))}>
+                    {[5, 10, 20, 30, 50, 100].map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                </Field>
+                <Field label="Max listings">
+                  <Select value={dirMaxListings} onChange={(e) => setDirMaxListings(Number(e.target.value))}>
+                    {[50, 100, 200, 500, 1000, 2000].map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                </Field>
+              </div>
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-ink/[0.03] p-3">
+                <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
+                <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
+                {categories.length > 0 && (
+                  <div className="ml-auto flex items-center gap-2">
+                    <span className="text-[13px] text-muted">Save under</span>
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                      <option value="">No category</option>
+                      {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-muted">
+                Extracts company, email &amp; phone (mobile preferred) from each listing. The directory's own contact details are filtered out automatically.
+              </p>
+            </div>
+          )}
+
+          {/* shared crawl options (not needed for directory mode) */}
+          {mode !== "directory" && (
           <div className="rounded-xl bg-ink/[0.03] p-3">
             <div className="mb-2 grid grid-cols-2 gap-3">
               <Field label="Max pages / site">
@@ -448,11 +599,14 @@ export default function Crawler({
               <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
             </div>
           </div>
+          )}
 
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
             {listMode ? (
               <Button onClick={crawlDiscovered} disabled={!pickedCrawlable.length}>Find emails on {pickedCrawlable.length || ""} site(s)</Button>
+            ) : mode === "directory" ? (
+              <Button onClick={startDirectory} disabled={!dirUrls.trim()}>Harvest directory</Button>
             ) : (
               <Button onClick={crawlUrls} disabled={!urls.trim()}>Start crawl</Button>
             )}
@@ -469,10 +623,10 @@ export default function Crawler({
                 ) : job?.status === "error" ? (
                   <span className="text-bad">Error: {job.error}</span>
                 ) : (
-                  <span className="text-good">Done — {results.length} unique email(s) found</span>
+                  <span className="text-good">Done — {isDirJob ? `${leads.length} lead(s) harvested` : `${results.length} unique email(s) found`}</span>
                 )}
               </span>
-              <span className="text-muted">{job?.processed ?? 0}/{job?.total ?? 0} sites</span>
+              <span className="text-muted">{isDirJob ? (running ? "walking…" : `${job?.result?.sites?.[0]?.detailPages ?? 0} pages`) : `${job?.processed ?? 0}/${job?.total ?? 0} sites`}</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-ink/[0.07]">
               <div className="prism-bar h-full rounded-full transition-all duration-300" style={{ width: `${Math.round((job?.progress || 0) * 100)}%` }} />
@@ -492,7 +646,53 @@ export default function Crawler({
             {!job?.logs?.length && <span className="text-cream/40">Starting…</span>}
           </div>
 
-          {results.length > 0 && (
+          {isDirJob && leads.length > 0 && (
+            <div className="rounded-xl border border-line">
+              <div className="flex items-center justify-between border-b border-line px-3 py-2">
+                <label className="flex items-center gap-2 text-[13px] font-medium">
+                  <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="accent-ink" />
+                  {leads.length} lead(s) · <span className="text-muted">{leadsWithPhone} with phone</span>
+                </label>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-muted">{dirSelected.size} selected</span>
+                  <button onClick={exportLeads} className="text-xs font-medium text-ink/60 underline hover:text-ink">Export CSV</button>
+                </div>
+              </div>
+              <div className="max-h-56 overflow-y-auto">
+                <table className="w-full text-sm">
+                  <tbody>
+                    {leads.map((l) => {
+                      const k = leadKey(l);
+                      return (
+                        <tr key={k} className={cn("border-b border-line-soft last:border-0", l.inContacts && "opacity-60")}>
+                          <td className="w-8 px-3 py-2">
+                            <input type="checkbox" disabled={!l.email || l.inContacts} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-ink disabled:opacity-30" />
+                          </td>
+                          <td className="px-1 py-2">
+                            <div className="font-medium leading-tight">{l.name || l.domain}</div>
+                            <div className="truncate text-xs text-muted">{l.email || <span className="italic">no email</span>}</div>
+                          </td>
+                          <td className="px-1 py-2 text-xs">
+                            {l.phone ? (
+                              <span className="inline-flex items-center gap-1 tabular-nums text-ink/75">{l.phone}{l.phoneMobile && <Tag tone="green">mobile</Tag>}</span>
+                            ) : (
+                              <span className="text-muted">—</span>
+                            )}
+                          </td>
+                          <td className="px-1 py-2 text-right">
+                            {l.inContacts && <Tag tone="blue">in contacts</Tag>}
+                            {!l.inContacts && !l.email && l.phone && <Tag tone="gray">phone only</Tag>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {!isDirJob && results.length > 0 && (
             <div className="rounded-xl border border-line">
               <div className="flex items-center justify-between border-b border-line px-3 py-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
@@ -516,6 +716,16 @@ export default function Crawler({
                             <span className="ml-2 align-middle"><Tag tone="green">mentions {r.keywordsMatched[0]}</Tag></span>
                           )}
                         </td>
+                        <td className="px-1 py-2 text-xs">
+                          {r.phone ? (
+                            <span className="inline-flex items-center gap-1 tabular-nums text-ink/75">
+                              {r.phone}
+                              {r.phoneMobile && <Tag tone="green">mobile</Tag>}
+                            </span>
+                          ) : (
+                            <span className="text-muted">—</span>
+                          )}
+                        </td>
                         <td className="px-1 py-2"><ConfidenceTag c={r.confidence} /></td>
                         <td className="px-1 py-2 text-xs text-muted">{r.role_based ? "role" : "personal"}</td>
                         <td className="px-1 py-2 text-xs text-ink/60">{r.domain}</td>
@@ -537,7 +747,11 @@ export default function Crawler({
                 </Select>
               )}
               <Button variant="outline" onClick={close}>Close</Button>
-              <Button onClick={addSelected} disabled={!selected.size}>Add {selected.size || ""} to contacts</Button>
+              {isDirJob ? (
+                <Button onClick={addDirectorySelected} disabled={!dirSelected.size}>Add {dirSelected.size || ""} to contacts</Button>
+              ) : (
+                <Button onClick={addSelected} disabled={!selected.size}>Add {selected.size || ""} to contacts</Button>
+              )}
             </div>
           </div>
         </div>

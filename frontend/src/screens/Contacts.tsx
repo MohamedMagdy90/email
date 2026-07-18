@@ -202,6 +202,7 @@ export default function Contacts() {
                   </th>
                   <th className="px-2 py-3">Email</th>
                   <th className="px-2 py-3">Company</th>
+                  <th className="px-2 py-3">Phone</th>
                   <th className="px-2 py-3">Country</th>
                   <th className="px-2 py-3">Category</th>
                   <th className="px-2 py-3">Type</th>
@@ -222,6 +223,9 @@ export default function Contacts() {
                     </td>
                     <td className="px-2 py-2.5 font-medium">{c.email}</td>
                     <td className="px-2 py-2.5 text-ink/70">{c.company || "—"}</td>
+                    <td className="px-2 py-2.5 text-ink/70">
+                      {c.phone ? <span className="tabular-nums">{c.phone}</span> : <span className="text-muted">—</span>}
+                    </td>
                     <td className="px-2 py-2.5 text-ink/70">{c.country || "—"}</td>
                     <td className="px-2 py-2.5">
                       {c.category ? (
@@ -340,7 +344,7 @@ function CategoryField({ value, onChange, categories }: { value: string; onChang
 }
 
 function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClose: () => void; onDone: () => void; categories: string[] }) {
-  const [f, setF] = useState({ email: "", company: "", country: "", industry: "", category: "" });
+  const [f, setF] = useState({ email: "", company: "", country: "", industry: "", category: "", phone: "" });
   const [busy, setBusy] = useState(false);
 
   async function submit() {
@@ -349,7 +353,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
     try {
       await api.addContact(f);
       toast("Contact added", "success");
-      setF({ email: "", company: "", country: "", industry: "", category: "" });
+      setF({ email: "", company: "", country: "", industry: "", category: "", phone: "" });
       onDone();
       onClose();
     } catch (e: any) {
@@ -362,9 +366,14 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
   return (
     <Modal open={open} onClose={onClose} title="Add contact">
       <div className="space-y-4">
-        <Field label="Email">
-          <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} placeholder="name@company.com" />
-        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Email">
+            <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} placeholder="name@company.com" />
+          </Field>
+          <Field label="Phone" hint="Optional — mobile preferred">
+            <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
+          </Field>
+        </div>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
@@ -440,6 +449,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           country: c.country || undefined,
           industry: c.industry || undefined,
           category: c.category || undefined,
+          phone: c.phone || undefined,
           source: "csv",
         })),
         true
@@ -499,7 +509,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
             <div className="text-[13px] font-medium text-ink">
               {fileName ? `Loaded ${fileName}` : "Drop a CSV file here, or click to browse"}
             </div>
-            <div className="text-xs text-muted">Columns: email, company, country, industry, category</div>
+            <div className="text-xs text-muted">Columns: email, company, country, industry, category, phone</div>
             <input
               ref={fileRef}
               type="file"
@@ -517,7 +527,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
               rows={6}
               value={csv}
               onChange={(e) => { setCsv(e.target.value); setFileName(""); }}
-              placeholder={"email,company,country,industry,category\ninfo@acme.com,Acme Trading,Qatar,Trading,Customer"}
+              placeholder={"email,company,country,industry,category,phone\ninfo@acme.com,Acme Trading,Qatar,Trading,Customer,+974 4432 4853"}
               className="mt-2 font-mono text-xs"
             />
           </details>
@@ -541,8 +551,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="px-3 py-2">Email</th>
                     <th className="px-2 py-2">Company</th>
-                    <th className="px-2 py-2">Country</th>
-                    <th className="px-2 py-2">Industry</th>
+                    <th className="px-2 py-2">Phone</th>
                     <th className="px-2 py-2">Category</th>
                   </tr>
                 </thead>
@@ -560,8 +569,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                           {dup && <span className="ml-2 text-[11px] text-muted">dup</span>}
                         </td>
                         <td className="px-2 py-1.5 text-ink/70">{r.company || "—"}</td>
-                        <td className="px-2 py-1.5 text-ink/70">{r.country || "—"}</td>
-                        <td className="px-2 py-1.5 text-ink/70">{r.industry || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70 tabular-nums">{r.phone || "—"}</td>
                         <td className="px-2 py-1.5 text-ink/70">{r.category || "—"}</td>
                       </tr>
                     );
@@ -612,6 +620,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
     country: contact.country || "",
     industry: contact.industry || "",
     category: contact.category || "",
+    phone: contact.phone || "",
     status: contact.status,
   });
   const [busy, setBusy] = useState(false);
@@ -633,9 +642,14 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
   return (
     <Modal open onClose={onClose} title="Edit contact">
       <div className="space-y-4">
-        <Field label="Email">
-          <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
-        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Email">
+            <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
+          </Field>
+          <Field label="Phone" hint="Optional — mobile preferred">
+            <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
+          </Field>
+        </div>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />

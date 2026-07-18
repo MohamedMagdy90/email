@@ -8,6 +8,7 @@ import {
 } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
 import { crawlMany, type CrawlOptions } from "./crawler";
+import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
@@ -141,9 +142,9 @@ app.post("/api/contacts", async (c) => {
   const email = String(b.email || "").trim().toLowerCase();
   if (!email || !email.includes("@")) return c.json({ error: "valid email required" }, 400);
   const rows = await q(
-    `INSERT INTO contacts (id,email,company,country,industry,category,role_based,source,status,created_at)
-     VALUES (?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
-    [uid(), email, b.company || null, b.country || null, b.industry || null, b.category || null, b.role_based ? 1 : 0, b.source || "manual", nowIso()]
+    `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
+    [uid(), email, b.company || null, b.country || null, b.industry || null, b.category || null, b.phone || null, b.role_based ? 1 : 0, b.source || "manual", nowIso()]
   );
   if (!rows.length) return c.json({ error: "duplicate", duplicate: true }, 409);
   return c.json({ contact: rows[0] });
@@ -163,9 +164,9 @@ app.post("/api/contacts/bulk", async (c) => {
     if (!email || !email.includes("@")) { skipped++; continue; }
 
     const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,category,role_based,source,status,created_at)
-       VALUES (?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.phone || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
     );
     if (ins.length) { added++; continue; }
 
@@ -175,7 +176,7 @@ app.post("/api/contacts/bulk", async (c) => {
     // touches status, id, created_at, or source.
     const sets: string[] = [];
     const vals: any[] = [];
-    for (const field of ["company", "country", "industry", "category"] as const) {
+    for (const field of ["company", "country", "industry", "category", "phone"] as const) {
       const v = it[field];
       if (v !== undefined && v !== null && String(v).trim() !== "") { sets.push(`${field} = ?`); vals.push(String(v).trim()); }
     }
@@ -202,13 +203,14 @@ app.put("/api/contacts/:id", async (c) => {
   }
   const status = ["new", "sent", "unsubscribed", "bounced"].includes(b.status) ? b.status : existing.status;
   const rows = await q(
-    `UPDATE contacts SET email=?, company=?, country=?, industry=?, category=?, status=? WHERE id=? RETURNING *`,
+    `UPDATE contacts SET email=?, company=?, country=?, industry=?, category=?, phone=?, status=? WHERE id=? RETURNING *`,
     [
       email,
       b.company !== undefined ? b.company || null : existing.company,
       b.country !== undefined ? b.country || null : existing.country,
       b.industry !== undefined ? b.industry || null : existing.industry,
       b.category !== undefined ? b.category || null : existing.category,
+      b.phone !== undefined ? b.phone || null : existing.phone,
       status,
       id,
     ]
@@ -249,9 +251,9 @@ app.get("/api/contacts/export", async (c) => {
   }
   if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  // `email` first and `category` early so it's easy to edit and re-import.
-  const rows = await q(`SELECT email,company,country,industry,category,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
-  const header = ["email", "company", "country", "industry", "category", "role_based", "status", "source", "created_at"];
+  // `email` first and `category`/`phone` early so it's easy to edit and re-import.
+  const rows = await q(`SELECT email,company,country,industry,category,phone,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
+  const header = ["email", "company", "country", "industry", "category", "phone", "role_based", "status", "source", "created_at"];
   const csv = [header.join(",")].concat(rows.map((r) => header.map((h) => csvCell(r[h])).join(","))).join("\n");
   return new Response(csv, {
     headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="contacts.csv"` },
@@ -390,6 +392,59 @@ app.post("/api/crawl", async (c) => {
     .filter(Boolean);
   if (!rawUrls.length) return c.json({ error: "provide at least one URL" }, 400);
 
+  // ---- Directory harvest mode ------------------------------------------
+  // Paste a business-directory URL; walk its pages, open every listing, and
+  // extract company + email + phone. Different result shape (contacts, not
+  // per-domain emails), so it's handled separately from the per-company crawl.
+  if (b.mode === "directory") {
+    const dirOptions: DirectoryOptions = {
+      maxPages: clamp(Number(b.maxPages) || 20, 1, 100),
+      maxDetails: clamp(Number(b.maxDetails) || 300, 1, 2000),
+      concurrency: clamp(Number(b.concurrency) || 5, 1, 8),
+      respectRobots: b.respectRobots !== false,
+      checkMx: b.checkMx !== false,
+      defaultCountry: String(b.defaultCountry || "").trim() || undefined,
+    };
+    const job = createJob("crawl", rawUrls.length);
+    job.result = { mode: "directory", contacts: [], sites: [] };
+    log(job, { level: "info", msg: `Harvesting ${rawUrls.length} director${rawUrls.length === 1 ? "y" : "ies"}…` });
+
+    (async () => {
+      try {
+        const known = new Set(await getContactEmails());
+        const results = await crawlDirectoryMany(rawUrls, dirOptions, (p) => {
+          if ((p.type === "phase" || p.type === "page") && p.msg) log(job, { level: "info", msg: p.msg });
+          else if (p.type === "detail") {
+            if (p.detailTotal) job.progress = Math.min(0.98, (p.detailPages || 0) / p.detailTotal);
+            log(job, { level: "hit", msg: `opened ${p.detailPages}/${p.detailTotal} · ${p.contacts} lead(s)` });
+          }
+        });
+        const seen = new Set<string>();
+        const contacts: any[] = [];
+        for (const r of results) {
+          job.result.sites.push({ seed: r.seed, site: r.site, status: r.status, listingPages: r.listingPages, detailPages: r.detailPages, found: r.contacts.length });
+          log(job, { level: "info", msg: `${r.site}: ${r.contacts.length} lead(s) from ${r.detailPages} page(s) [${r.status}]` });
+          for (const co of r.contacts) {
+            const dk = String(co.email || co.phone || co.detailUrl).toLowerCase();
+            if (seen.has(dk)) continue;
+            seen.add(dk);
+            contacts.push({ ...co, inContacts: !!(co.email && known.has(co.email.toLowerCase())) });
+          }
+        }
+        job.result.contacts = contacts;
+        job.processed = job.total;
+        job.status = "done";
+        job.progress = 1;
+        log(job, { level: "info", msg: `Done — ${contacts.length} unique lead(s) harvested.` });
+      } catch (e: any) {
+        job.status = "error";
+        job.error = String(e?.message || e);
+      }
+    })();
+
+    return c.json({ jobId: job.id });
+  }
+
   const skipKnown = b.skipKnown !== false; // default ON
   const recrawlDays = clamp(Number(b.recrawlDays) || 60, 1, 365);
 
@@ -433,6 +488,7 @@ app.post("/api/crawl", async (c) => {
     useSitemap: b.useSitemap !== false,
     keywords,
     requireKeyword: b.requireKeyword === true && keywords.length > 0,
+    defaultCountry: String(b.defaultCountry || "").trim() || undefined,
     concurrency: clamp(Number(b.concurrency) || 3, 1, 6),
   };
 

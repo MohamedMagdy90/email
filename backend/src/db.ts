@@ -49,15 +49,17 @@ export async function ensureSchema() {
     country TEXT,
     industry TEXT,
     category TEXT,
+    phone TEXT,
     role_based INTEGER NOT NULL DEFAULT 0,
     source TEXT,
     status TEXT NOT NULL DEFAULT 'new',
     created_at TEXT NOT NULL
   )`);
 
-  // Migration for existing databases created before `category` existed.
-  // Safe to run every boot: a duplicate-column error is swallowed.
+  // Migrations for existing databases. Safe to run every boot: a duplicate-column
+  // error is swallowed, so this is idempotent.
   try { await q(`ALTER TABLE contacts ADD COLUMN category TEXT`); } catch { /* already exists */ }
+  try { await q(`ALTER TABLE contacts ADD COLUMN phone TEXT`); } catch { /* already exists */ }
 
   await q(`CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
