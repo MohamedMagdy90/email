@@ -80,12 +80,18 @@ export const LEAD_CATEGORIES: Record<string, { k: string; v?: string }[]> = {
 const CONTACT_KEYS = ["website", "email", "contact:email"];
 
 const NOMINATIM = "https://nominatim.openstreetmap.org/search";
+// Multiple public Overpass mirrors with independent rate limits. We race them
+// all and retry, so one mirror returning 504/429 never sinks the whole search.
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+  "https://overpass.osm.jp/api/interpreter",
 ];
 const UA = "DNA-Outreach/1.0 (dna.systems outreach tool)";
-const OVERPASS_TIMEOUT_MS = 35000; // abort a slow endpoint and fall through
+const OVERPASS_TIMEOUT_MS = 30000; // abort a slow endpoint and fall through
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface Company {
   name: string;
@@ -96,6 +102,17 @@ export interface Company {
   hasWebsite: boolean;
 }
 
+// A resolved place from the location autocomplete — lets us skip re-geocoding
+// and target the exact OSM area the user picked (no ambiguity).
+export interface Place {
+  display_name: string;
+  short_name: string;
+  osm_type: string;
+  osm_id: number;
+  type?: string;
+  boundingbox?: string[];
+}
+
 async function geocode(location: string) {
   const url = `${NOMINATIM}?format=json&limit=1&q=${encodeURIComponent(location)}`;
   const res = await fetch(url, { headers: { "User-Agent": UA, "Accept-Language": "en" } });
@@ -104,6 +121,86 @@ async function geocode(location: string) {
   if (!data?.length) return null;
   const it = data[0];
   return { osm_type: it.osm_type as string, osm_id: Number(it.osm_id), boundingbox: it.boundingbox as string[] };
+}
+
+// How much to float each kind of place up the list (countries first, then
+// regions, then cities). Photon already ranks well; this is a gentle nudge.
+const PLACE_BOOST: Record<string, number> = {
+  country: 0.6, state: 0.35, region: 0.3, province: 0.28, county: 0.18, district: 0.16,
+  city: 0.22, town: 0.12, municipality: 0.12, village: 0.03, suburb: 0.03,
+  island: 0.1, archipelago: 0.1,
+};
+const OSM_TYPE = { R: "relation", W: "way", N: "node" } as const;
+const PHOTON = "https://photon.komoot.io/api/";
+
+// Location autocomplete. Photon (komoot) is a free OSM geocoder purpose-built
+// for typeahead, so "qat" → Qatar works as you'd expect. Nominatim is a fallback.
+export async function geocodeSuggest(qStr: string, limit = 6): Promise<Place[]> {
+  const q = qStr.trim();
+  if (q.length < 2) return [];
+
+  try {
+    const url = `${PHOTON}?q=${encodeURIComponent(q)}&limit=12&lang=en&osm_tag=place&osm_tag=boundary`;
+    const res = await fetch(url, { headers: { "User-Agent": UA } });
+    if (res.ok) {
+      const data: any = await res.json().catch(() => ({}));
+      const scored: { place: Place; score: number }[] = [];
+      const seen = new Set<string>();
+      for (const f of data.features || []) {
+        const p = f.properties || {};
+        const kind = String(p.osm_value || p.type || "");
+        if (!(kind in PLACE_BOOST)) continue; // places only, not streets/POIs
+        const otype = (OSM_TYPE as any)[p.osm_type] || "relation";
+        const key = `${otype}/${p.osm_id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const parts = [p.name, kind === "country" ? null : p.state, p.country]
+          .filter(Boolean)
+          .filter((v: string, i: number, arr: string[]) => arr.indexOf(v) === i)
+          .slice(0, 3);
+        // Photon extent = [minLon, maxLat, maxLon, minLat] → Nominatim [S,N,W,E]
+        const ex = p.extent;
+        const bbox = Array.isArray(ex) && ex.length === 4
+          ? [String(ex[3]), String(ex[1]), String(ex[0]), String(ex[2])]
+          : undefined;
+        scored.push({
+          place: {
+            display_name: parts.join(", "),
+            short_name: parts.join(", ") || p.name,
+            osm_type: otype,
+            osm_id: Number(p.osm_id),
+            type: kind,
+            boundingbox: bbox,
+          },
+          score: (PLACE_BOOST[kind] || 0),
+        });
+      }
+      if (scored.length) {
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, limit).map((s) => s.place);
+      }
+    }
+  } catch { /* fall through to Nominatim */ }
+
+  // Fallback: Nominatim (less typeahead-friendly but reliable for full names).
+  const url = `${NOMINATIM}?format=jsonv2&addressdetails=1&limit=12&dedupe=1&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url, { headers: { "User-Agent": UA, "Accept-Language": "en" } }).catch(() => null);
+  if (!res || !res.ok) return [];
+  const data: any[] = await res.json().catch(() => []);
+  const scored: { place: Place; score: number }[] = [];
+  for (const it of data || []) {
+    const at = String(it.addresstype || it.type || "");
+    if (!(at in PLACE_BOOST) && it.class !== "boundary" && at !== "administrative") continue;
+    const a = it.address || {};
+    const primary = at === "country" ? (a.country || it.name) : (it.name || (it.display_name || "").split(",")[0]);
+    const parts = [primary, at === "country" ? null : a.state, a.country].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i).slice(0, 3);
+    scored.push({
+      place: { display_name: it.display_name, short_name: parts.join(", ") || primary, osm_type: it.osm_type, osm_id: Number(it.osm_id), type: at, boundingbox: it.boundingbox },
+      score: Number(it.importance || 0) + (PLACE_BOOST[at] || 0),
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((s) => s.place);
 }
 
 function buildQuery(filters: { k: string; v?: string }[], areaClause: string, limit: number) {
@@ -146,27 +243,46 @@ async function fetchOverpass(endpoint: string, query: string): Promise<any> {
   }
 }
 
-// Race every mirror and take whichever answers first. Different mirrors have
-// independent rate limits, so this routes around a busy/slow endpoint and
-// roughly halves worst-case latency for country-wide queries.
+// Race every mirror and take whichever answers first, then retry the whole
+// race a couple of times with backoff. With 5 independent mirrors × 3 rounds,
+// a transient 504/429 from any single server can't fail the search.
 async function runOverpass(query: string): Promise<any> {
-  try {
-    return await Promise.any(OVERPASS_ENDPOINTS.map((e) => fetchOverpass(e, query)));
-  } catch (agg: any) {
-    const first = agg?.errors?.[0];
-    const msg = first?.name === "AbortError" ? "timed out" : String(first?.message || "unavailable");
-    throw new Error(`Discovery service busy (${msg}). Try again or narrow the area.`);
+  const rounds = 3;
+  let lastErr: any = null;
+  for (let i = 0; i < rounds; i++) {
+    try {
+      return await Promise.any(OVERPASS_ENDPOINTS.map((e) => fetchOverpass(e, query)));
+    } catch (agg: any) {
+      lastErr = agg?.errors?.[0];
+      if (i < rounds - 1) await sleep(900 * (i + 1));
+    }
   }
+  const msg = lastErr?.name === "AbortError" ? "timed out" : String(lastErr?.message || "unavailable");
+  throw new Error(`Discovery service busy (${msg}). Try again in a moment or narrow the area.`);
 }
 
-export async function findLeads(location: string, category: string, limit: number): Promise<Company[]> {
+export async function findLeads(
+  location: string,
+  category: string,
+  limit: number,
+  place?: { osm_type?: string; osm_id?: number; boundingbox?: string[] }
+): Promise<Company[]> {
   const filters = LEAD_CATEGORIES[category] || LEAD_CATEGORIES["Companies (general)"];
-  const geo = await geocode(location);
+
+  // Use the exact place picked from autocomplete when available; else geocode.
+  let geo: { osm_type: string; osm_id: number; boundingbox?: string[] } | null = null;
+  if (place?.osm_type && place?.osm_id) {
+    geo = { osm_type: place.osm_type, osm_id: place.osm_id, boundingbox: place.boundingbox };
+  } else {
+    geo = await geocode(location);
+  }
   if (!geo) throw new Error("Could not find that location. Try a country or city name.");
 
   let areaClause: string;
   if (geo.osm_type === "relation") {
     areaClause = `(area:${3600000000 + geo.osm_id})`;
+  } else if (geo.osm_type === "way") {
+    areaClause = `(area:${2400000000 + geo.osm_id})`;
   } else if (geo.boundingbox?.length === 4) {
     const [s, n, w, e] = geo.boundingbox.map(Number);
     areaClause = `(${s},${w},${n},${e})`;

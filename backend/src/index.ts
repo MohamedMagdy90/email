@@ -10,7 +10,8 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
-import { findLeads, LEAD_CATEGORIES } from "./leads";
+import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
+import { searchCompanies } from "./search";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -395,6 +396,11 @@ app.post("/api/crawl", async (c) => {
     urls.push(u);
   }
 
+  const keywords: string[] = (Array.isArray(b.keywords) ? b.keywords : String(b.keywords || "").split(","))
+    .map((k: string) => k.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+
   const options: CrawlOptions = {
     maxPages: clamp(Number(b.maxPages) || 25, 1, 60),
     maxDepth: clamp(Number(b.maxDepth) || 2, 0, 3),
@@ -402,6 +408,8 @@ app.post("/api/crawl", async (c) => {
     checkMx: b.checkMx !== false,
     guessInbox: b.guessInbox === true,
     useSitemap: b.useSitemap !== false,
+    keywords,
+    requireKeyword: b.requireKeyword === true && keywords.length > 0,
     concurrency: clamp(Number(b.concurrency) || 3, 1, 6),
   };
 
@@ -601,40 +609,70 @@ app.get("/api/unsubscribe", async (c) => {
 
 app.get("/api/leads/categories", (c) => c.json({ categories: Object.keys(LEAD_CATEGORIES) }));
 
+// Location autocomplete for the searchable place picker.
+app.get("/api/leads/geocode", async (c) => {
+  const q = String(c.req.query("q") || "").trim();
+  if (q.length < 2) return c.json({ places: [] });
+  try {
+    return c.json({ places: await geocodeSuggest(q, 6) });
+  } catch {
+    return c.json({ places: [] });
+  }
+});
+
+// Annotate discovered companies with what we already know, so the operator can
+// see what's new BEFORE spending a crawl:
+//  - inContacts: we already hold an email from this domain (or this exact email)
+//  - crawled:    we've already scanned this domain (crawl ledger, any time)
+async function annotateCompanies(companies: any[]) {
+  const contactDomains = new Set<string>();
+  const contactEmails = new Set<string>();
+  for (const email of await getContactEmails()) {
+    contactEmails.add(email);
+    const d = registrableDomain(email.split("@")[1] || "");
+    if (d) contactDomains.add(d);
+  }
+  const everCrawled = await getKnownDomains("0000-01-01T00:00:00.000Z");
+
+  const annotated = companies.map((co) => {
+    const domain = co.website ? registrableDomain(hostOf(co.website)) : "";
+    const emailDomain = co.email ? registrableDomain(co.email.split("@")[1] || "") : "";
+    const inContacts =
+      (!!co.email && contactEmails.has(String(co.email).toLowerCase())) ||
+      (!!domain && contactDomains.has(domain)) ||
+      (!!emailDomain && contactDomains.has(emailDomain));
+    const crawled = !!domain && everCrawled.has(domain);
+    return { ...co, domain, inContacts, crawled };
+  });
+  const newCount = annotated.filter((a) => !a.inContacts && !a.crawled).length;
+  return { companies: annotated, summary: { total: annotated.length, new: newCount } };
+}
+
 app.post("/api/leads/find", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const location = String(b.location || "").trim();
   const category = String(b.category || "Companies (general)");
   const limit = clamp(Number(b.limit) || 40, 5, 120);
-  if (!location) return c.json({ error: "location required" }, 400);
+  const place = b.place && typeof b.place === "object" ? b.place : undefined;
+  if (!location && !place) return c.json({ error: "location required" }, 400);
   try {
-    const companies = await findLeads(location, category, limit);
+    const companies = await findLeads(location, category, limit, place);
+    return c.json(await annotateCompanies(companies));
+  } catch (e: any) {
+    return c.json({ error: String(e?.message || e) }, 500);
+  }
+});
 
-    // Annotate each result so the operator sees what's new BEFORE crawling:
-    //  - inContacts: we already hold an email from this domain (or this exact email)
-    //  - crawled:    we've already scanned this domain (crawl ledger, any time)
-    const contactDomains = new Set<string>();
-    const contactEmails = new Set<string>();
-    for (const email of await getContactEmails()) {
-      contactEmails.add(email);
-      const d = registrableDomain(email.split("@")[1] || "");
-      if (d) contactDomains.add(d);
-    }
-    const everCrawled = await getKnownDomains("0000-01-01T00:00:00.000Z");
-
-    const annotated = companies.map((co) => {
-      const domain = co.website ? registrableDomain(hostOf(co.website)) : "";
-      const emailDomain = co.email ? registrableDomain(co.email.split("@")[1] || "") : "";
-      const inContacts =
-        (!!co.email && contactEmails.has(co.email.toLowerCase())) ||
-        (!!domain && contactDomains.has(domain)) ||
-        (!!emailDomain && contactDomains.has(emailDomain));
-      const crawled = !!domain && everCrawled.has(domain);
-      return { ...co, domain, inContacts, crawled };
-    });
-
-    const newCount = annotated.filter((a) => !a.inContacts && !a.crawled).length;
-    return c.json({ companies: annotated, summary: { total: annotated.length, new: newCount } });
+// Tier-one keyword search: find companies by what their website says.
+app.post("/api/leads/search", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const keywords = String(b.keywords || "").trim();
+  const location = String(b.location || "").trim();
+  const limit = clamp(Number(b.limit) || 30, 5, 80);
+  if (!keywords) return c.json({ error: "Enter keywords to search for (e.g. \"auto partner\")." }, 400);
+  try {
+    const companies = await searchCompanies(keywords, location, limit);
+    return c.json(await annotateCompanies(companies));
   } catch (e: any) {
     return c.json({ error: String(e?.message || e) }, 500);
   }

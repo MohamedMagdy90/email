@@ -19,6 +19,8 @@ export interface CrawlOptions {
   checkMx?: boolean;
   guessInbox?: boolean; // synthesize info@domain when a site exposes no email
   useSitemap?: boolean; // discover pages via sitemap.xml
+  keywords?: string[]; // only keep sites whose content mentions these
+  requireKeyword?: boolean; // drop sites that mention none of the keywords
   timeoutMs?: number;
   politenessMs?: number;
   concurrency?: number; // sites in parallel
@@ -44,6 +46,7 @@ export interface FoundEmail {
   source: string; // page URL where found
   domain: string; // site registrable domain
   mx?: boolean;
+  keywordsMatched?: string[]; // site-level: which target keywords the site mentions
 }
 
 export interface SiteResult {
@@ -52,7 +55,24 @@ export interface SiteResult {
   status: "ok" | "blocked" | "error" | "empty";
   pagesCrawled: number;
   emails: FoundEmail[];
+  matchedKeywords?: string[];
   note?: string;
+}
+
+// Strip tags to plain lowercase text and report which keywords appear in it.
+function matchKeywords(html: string, keywords: string[]): string[] {
+  if (!keywords.length) return [];
+  const text = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  const found: string[] = [];
+  for (const kw of keywords) {
+    const k = kw.trim().toLowerCase();
+    if (k && text.includes(k)) found.push(kw);
+  }
+  return found;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -75,9 +95,12 @@ export async function crawlSite(
     checkMx = true,
     guessInbox = false,
     useSitemap = true,
+    keywords = [],
+    requireKeyword = false,
     timeoutMs = 15000,
     politenessMs = 250,
   } = opts;
+  const matchedKw = new Set<string>();
 
   if (!seed) {
     return { seed: seedInput, site: seedInput, status: "error", pagesCrawled: 0, emails: [], note: "invalid URL" };
@@ -128,6 +151,8 @@ export async function crawlSite(
       await sleep(politenessMs);
       continue;
     }
+
+    if (keywords.length) for (const k of matchKeywords(res.html, keywords)) matchedKw.add(k);
 
     const hits = extractEmails(res.html);
     let newlyFound = 0;
@@ -197,11 +222,23 @@ export async function crawlSite(
       a.email.localeCompare(b.email)
   );
 
+  const matchedKeywords = [...matchedKw];
+
+  // Keyword gate: if the caller requires a keyword match and this site mentions
+  // none of them, discard its emails — it isn't the kind of company they want.
+  if (requireKeyword && keywords.length && matchedKeywords.length === 0) {
+    emails = [];
+  } else if (matchedKeywords.length) {
+    emails = emails.map((e) => ({ ...e, keywordsMatched: matchedKeywords }));
+  }
+
   let status: SiteResult["status"] = "ok";
   if (pagesCrawled === 0) status = "error";
-  else if (emails.length === 0) status = blockedHits > 0 ? "blocked" : "empty";
+  else if (emails.length === 0) {
+    status = requireKeyword && keywords.length && matchedKeywords.length === 0 ? "empty" : blockedHits > 0 ? "blocked" : "empty";
+  }
 
-  return { seed, site: siteHost, status, pagesCrawled, emails };
+  return { seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords };
 }
 
 export async function crawlMany(

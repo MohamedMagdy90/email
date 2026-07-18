@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type Job } from "../lib/api";
+import { api, type Job, type Place, type LeadCompany } from "../lib/api";
 import { Button, Field, Input, Modal, Select, Spinner, Textarea, toast, cn } from "../lib/ui";
 import { toCsv, downloadCsv } from "../lib/csv";
 
@@ -11,24 +11,17 @@ interface Found {
   domain: string;
   source: string;
   mx?: boolean;
+  keywordsMatched?: string[];
 }
-interface Company {
-  name: string;
-  website: string;
-  city: string;
-  email: string | null;
-  phone: string | null;
-  hasWebsite: boolean;
-  domain: string;
-  inContacts: boolean;
-  crawled: boolean;
-}
+type Company = LeadCompany;
 
 const FALLBACK_CATS = [
   "Accounting & Tax", "IT & Software", "Construction & Contracting", "Consulting",
   "Engineering", "Real Estate", "Legal", "Logistics & Transport",
   "Advertising & Marketing", "Insurance", "Trading & Retail", "Companies (general)",
 ];
+
+type Mode = "discover" | "keyword" | "urls";
 
 export default function Crawler({
   open,
@@ -39,15 +32,24 @@ export default function Crawler({
   onClose: () => void;
   onAdded: () => void;
 }) {
-  const [mode, setMode] = useState<"discover" | "urls">("discover");
+  const [mode, setMode] = useState<Mode>("discover");
   const [stage, setStage] = useState<"input" | "job">("input");
+
+  // location (shared by discover + keyword)
+  const [location, setLocation] = useState("");
+  const [place, setPlace] = useState<Place | null>(null);
 
   // discover
   const [cats, setCats] = useState<string[]>(FALLBACK_CATS);
-  const [location, setLocation] = useState("");
   const [category, setCategory] = useState(FALLBACK_CATS[0]);
   const [limit, setLimit] = useState(40);
   const [discovering, setDiscovering] = useState(false);
+
+  // keyword search
+  const [keywords, setKeywords] = useState("");
+  const [searching, setSearching] = useState(false);
+
+  // results of discovery/search
   const [companies, setCompanies] = useState<Company[]>([]);
   const [pickedCos, setPickedCos] = useState<Set<string>>(new Set());
   const [hideKnown, setHideKnown] = useState(true);
@@ -66,6 +68,8 @@ export default function Crawler({
   const [checkMx, setCheckMx] = useState(true);
   const [skipKnown, setSkipKnown] = useState(true);
   const [guessInbox, setGuessInbox] = useState(false);
+  const [mustMention, setMustMention] = useState("");
+  const [requireKeyword, setRequireKeyword] = useState(false);
 
   // job
   const [job, setJob] = useState<Job | null>(null);
@@ -88,23 +92,46 @@ export default function Crawler({
 
   /* ---------------------------- discover ---------------------------- */
   async function discover() {
-    if (!location.trim()) return toast("Enter a country or city", "error");
+    if (!location.trim()) return toast("Choose a country or city", "error");
     setDiscovering(true);
     setCompanies([]);
     try {
-      const r = await api.findLeads(location.trim(), category, limit);
-      setCompanies(r.companies as Company[]);
-      // Pre-select only genuinely new, crawlable targets — never waste a crawl.
-      const fresh = r.companies.filter((c) => c.hasWebsite && !c.inContacts && !c.crawled);
-      setPickedCos(new Set(fresh.map((c) => c.website)));
+      const r = await api.findLeads(location.trim(), category, limit, place);
+      applyResults(r.companies);
       if (!r.companies.length) toast("No companies found — try a broader area or category", "info");
-      else if (!fresh.length) toast("All results are already in your contacts or previously crawled", "info");
+      else if (!r.summary.new) toast("All results are already in your contacts or previously crawled", "info");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
       setDiscovering(false);
     }
   }
+
+  async function searchByKeyword() {
+    if (!keywords.trim()) return toast("Enter keywords, e.g. \"auto partner\"", "error");
+    setSearching(true);
+    setCompanies([]);
+    try {
+      const r = await api.searchCompanies(keywords.trim(), location.trim(), limit);
+      applyResults(r.companies);
+      // Pre-arm the content filter with what you searched for.
+      setMustMention(keywords.trim());
+      setRequireKeyword(true);
+      if (!r.companies.length) toast("No company sites found for those keywords", "info");
+      else if (!r.summary.new) toast("All results are already in your contacts or previously crawled", "info");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function applyResults(list: Company[]) {
+    setCompanies(list);
+    const fresh = list.filter((c) => c.hasWebsite && !c.inContacts && !c.crawled);
+    setPickedCos(new Set(fresh.map((c) => c.website)));
+  }
+
   function toggleCo(w: string) {
     const n = new Set(pickedCos);
     n.has(w) ? n.delete(w) : n.add(w);
@@ -120,11 +147,8 @@ export default function Crawler({
   const pickedWithEmail = companies.filter((c) => (pickedCos.has(c.website) || !c.hasWebsite) && c.email && !c.inContacts);
 
   function toggleAllVisible() {
-    if (allVisibleSelected) {
-      setPickedCos(new Set());
-    } else {
-      setPickedCos(new Set(visibleCos.filter((c) => c.hasWebsite).map((c) => c.website)));
-    }
+    if (allVisibleSelected) setPickedCos(new Set());
+    else setPickedCos(new Set(visibleCos.filter((c) => c.hasWebsite).map((c) => c.website)));
   }
 
   async function addListedEmails() {
@@ -136,9 +160,9 @@ export default function Crawler({
           email: c.email!,
           company: c.name,
           country: location || undefined,
-          industry: category || undefined,
+          industry: mode === "discover" ? category : keywords || undefined,
           role_based: /^(info|sales|contact|support|admin|office)/i.test(c.email!),
-          source: "osm",
+          source: mode === "keyword" ? "search" : "osm",
         }))
       );
       toast(`Added ${r.added} · skipped ${r.skipped} duplicate(s)`, "success");
@@ -169,8 +193,12 @@ export default function Crawler({
     setSelected(new Set());
     setStage("job");
     setJob(null);
+    const kw = mustMention.split(",").map((k) => k.trim()).filter(Boolean);
     try {
-      const { jobId } = await api.startCrawl({ urls: list, maxPages, maxDepth, respectRobots, checkMx, skipKnown, guessInbox });
+      const { jobId } = await api.startCrawl({
+        urls: list, maxPages, maxDepth, respectRobots, checkMx, skipKnown, guessInbox,
+        keywords: kw, requireKeyword: requireKeyword && kw.length > 0,
+      });
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = window.setInterval(async () => {
         const j = await api.getCrawl(jobId).catch(() => null);
@@ -188,7 +216,8 @@ export default function Crawler({
 
   function crawlDiscovered() {
     const list = pickedCrawlable.map((c) => c.website);
-    startCrawl(list, { country: location || undefined, industry: category || undefined });
+    const industry = mode === "discover" ? category : keywords;
+    startCrawl(list, { country: location || undefined, industry: industry || undefined });
   }
   function crawlUrls() {
     const list = urls.split(/[\n,]/).map((u) => u.trim()).filter(Boolean);
@@ -214,7 +243,7 @@ export default function Crawler({
           country: addTags.current.country,
           industry: addTags.current.industry,
           role_based: c.role_based,
-          source: "crawler",
+          source: mode === "keyword" ? "search" : "crawler",
         }))
       );
       toast(`Added ${r.added} · skipped ${r.skipped} duplicate(s)`, "success");
@@ -228,8 +257,8 @@ export default function Crawler({
   function exportResults() {
     if (!results.length) return;
     const csv = toCsv(
-      results.map((r) => ({ email: r.email, type: r.role_based ? "role" : "personal", confidence: r.confidence || "", method: r.method, domain: r.domain, source: r.source })),
-      ["email", "type", "confidence", "method", "domain", "source"]
+      results.map((r) => ({ email: r.email, type: r.role_based ? "role" : "personal", confidence: r.confidence || "", method: r.method, domain: r.domain, mentions: (r.keywordsMatched || []).join(" "), source: r.source })),
+      ["email", "type", "confidence", "method", "domain", "mentions", "source"]
     );
     downloadCsv("crawl-results.csv", csv);
   }
@@ -247,28 +276,30 @@ export default function Crawler({
     onClose();
   }
 
+  const listMode = mode === "discover" || mode === "keyword";
+
   return (
     <Modal open={open} onClose={close} title="Find emails" wide>
       {stage === "input" ? (
         <div className="space-y-5">
           {/* mode switch */}
           <div className="flex rounded-full border border-line bg-cream p-1 w-fit">
-            {(["discover", "urls"] as const).map((m) => (
+            {([["discover", "Discover companies"], ["keyword", "Keyword search"], ["urls", "Paste websites"]] as const).map(([m, label]) => (
               <button
                 key={m}
-                onClick={() => setMode(m)}
+                onClick={() => { setMode(m); setCompanies([]); }}
                 className={cn("rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors", mode === m ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
               >
-                {m === "discover" ? "Discover companies" : "Paste websites"}
+                {label}
               </button>
             ))}
           </div>
 
-          {mode === "discover" ? (
+          {mode === "discover" && (
             <div className="space-y-4">
               <div className="grid grid-cols-[1fr_1fr_auto] items-end gap-3">
                 <Field label="Country or city">
-                  <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Qatar" onKeyDown={(e) => e.key === "Enter" && discover()} />
+                  <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="Start typing… e.g. Qatar" onEnter={discover} />
                 </Field>
                 <Field label="Industry">
                   <Select value={category} onChange={(e) => setCategory(e.target.value)}>
@@ -282,65 +313,80 @@ export default function Crawler({
                 <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="h-8 w-24">
                   {[20, 40, 60, 100].map((n) => <option key={n} value={n}>{n}</option>)}
                 </Select>
-                <span className="text-xs text-muted">Powered by OpenStreetMap — free & open data.</span>
+                <span className="text-xs text-muted">Business directory · OpenStreetMap.</span>
               </div>
-
-              {companies.length > 0 && (
-                <div className="rounded-xl border border-line">
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-2">
-                    <label className="flex items-center gap-2 text-[13px] font-medium">
-                      <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-ink" />
-                      {companies.length} found · <span className="text-good">{newCount} new</span>
-                      {knownCount > 0 && <span className="text-muted">· {knownCount} known</span>}
-                    </label>
-                    <div className="flex items-center gap-3">
-                      {knownCount > 0 && (
-                        <button onClick={() => setHideKnown((v) => !v)} className="text-xs font-medium text-ink/60 underline hover:text-ink">
-                          {hideKnown ? "Show known" : "Hide known"}
-                        </button>
-                      )}
-                      {pickedWithEmail.length > 0 && (
-                        <Button size="sm" variant="outline" onClick={addListedEmails}>
-                          Add {pickedWithEmail.length} listed
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                  <div className="max-h-52 overflow-y-auto">
-                    {visibleCos.length === 0 && (
-                      <div className="px-3 py-6 text-center text-xs text-muted">All results are already known. Toggle “Show known” to review them.</div>
-                    )}
-                    {visibleCos.map((c) => {
-                      const known = c.inContacts || c.crawled;
-                      return (
-                        <div key={c.website || c.email || c.name} className={cn("flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0", known && "opacity-60")}>
-                          <input
-                            type="checkbox"
-                            disabled={!c.hasWebsite}
-                            checked={pickedCos.has(c.website)}
-                            onChange={() => toggleCo(c.website)}
-                            className="accent-ink disabled:opacity-30"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm font-medium">{c.name}</div>
-                            <div className="truncate text-xs text-muted">
-                              {c.hasWebsite ? c.website.replace(/^https?:\/\//, "") : "no website"}{c.city ? ` · ${c.city}` : ""}
-                            </div>
-                          </div>
-                          <div className="flex shrink-0 items-center gap-1">
-                            {c.email && <Tag tone="green">email</Tag>}
-                            {c.inContacts && <Tag tone="blue">in contacts</Tag>}
-                            {!c.inContacts && c.crawled && <Tag tone="amber">crawled</Tag>}
-                            {!c.hasWebsite && !c.email && <Tag tone="gray">no site</Tag>}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
             </div>
-          ) : (
+          )}
+
+          {mode === "keyword" && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-[1.3fr_1fr_auto] items-end gap-3">
+                <Field label="Keywords" hint="What the company says about itself">
+                  <Input value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder='e.g. auto partner, spare parts distributor' onKeyDown={(e) => e.key === "Enter" && searchByKeyword()} />
+                </Field>
+                <Field label="Location (optional)">
+                  <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="e.g. Qatar" onEnter={searchByKeyword} />
+                </Field>
+                <Button onClick={searchByKeyword} loading={searching} className="mb-[1px]">Search</Button>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[13px] text-muted">Max results</span>
+                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="h-8 w-24">
+                  {[20, 40, 60, 80].map((n) => <option key={n} value={n}>{n}</option>)}
+                </Select>
+                <span className="text-xs text-muted">Searches the live web for matching companies.</span>
+              </div>
+            </div>
+          )}
+
+          {listMode && companies.length > 0 && (
+            <div className="rounded-xl border border-line">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-2">
+                <label className="flex items-center gap-2 text-[13px] font-medium">
+                  <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-ink" />
+                  {companies.length} found · <span className="text-good">{newCount} new</span>
+                  {knownCount > 0 && <span className="text-muted">· {knownCount} known</span>}
+                </label>
+                <div className="flex items-center gap-3">
+                  {knownCount > 0 && (
+                    <button onClick={() => setHideKnown((v) => !v)} className="text-xs font-medium text-ink/60 underline hover:text-ink">
+                      {hideKnown ? "Show known" : "Hide known"}
+                    </button>
+                  )}
+                  {pickedWithEmail.length > 0 && (
+                    <Button size="sm" variant="outline" onClick={addListedEmails}>Add {pickedWithEmail.length} listed</Button>
+                  )}
+                </div>
+              </div>
+              <div className="max-h-52 overflow-y-auto">
+                {visibleCos.length === 0 && (
+                  <div className="px-3 py-6 text-center text-xs text-muted">All results are already known. Toggle "Show known" to review them.</div>
+                )}
+                {visibleCos.map((c) => {
+                  const known = c.inContacts || c.crawled;
+                  return (
+                    <div key={c.website || c.email || c.name} className={cn("flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0", known && "opacity-60")}>
+                      <input type="checkbox" disabled={!c.hasWebsite} checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="accent-ink disabled:opacity-30" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium">{c.name}</div>
+                        <div className="truncate text-xs text-muted">
+                          {c.hasWebsite ? c.website.replace(/^https?:\/\//, "").replace(/\/$/, "") : "no website"}{c.city ? ` · ${c.city}` : ""}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {c.email && <Tag tone="green">email</Tag>}
+                        {c.inContacts && <Tag tone="blue">in contacts</Tag>}
+                        {!c.inContacts && c.crawled && <Tag tone="amber">crawled</Tag>}
+                        {!c.hasWebsite && !c.email && <Tag tone="gray">no site</Tag>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {mode === "urls" && (
             <div className="space-y-4">
               <Field label="Company websites" hint="One per line (or comma-separated). Bare domains are fine.">
                 <Textarea rows={5} value={urls} onChange={(e) => { setUrls(e.target.value); setUrlCheck(null); }} placeholder={"acme-trading.com\nhttps://www.example-contractor.qa"} className="font-mono text-xs" />
@@ -372,7 +418,17 @@ export default function Crawler({
                 <Select value={maxDepth} onChange={(e) => setMaxDepth(Number(e.target.value))}>{[1, 2, 3].map((n) => <option key={n} value={n}>{n}</option>)}</Select>
               </Field>
             </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="Must mention (optional)" hint="Only keep sites whose pages mention these words — comma-separated">
+              <div className="flex items-center gap-2">
+                <Input value={mustMention} onChange={(e) => setMustMention(e.target.value)} placeholder="auto partner, spare parts" className="flex-1" />
+                {mustMention.trim() && (
+                  <button type="button" onClick={() => setRequireKeyword((v) => !v)} className={cn("shrink-0 rounded-full border px-3 py-2 text-xs font-medium transition-colors", requireKeyword ? "border-ink bg-ink text-cream" : "border-line text-ink/60 hover:text-ink")}>
+                    {requireKeyword ? "Required" : "Optional"}
+                  </button>
+                )}
+              </div>
+            </Field>
+            <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Toggle label="Skip already-crawled sites" hint="Never re-scan a domain you've done before" checked={skipKnown} onChange={setSkipKnown} />
               <Toggle label="Guess role inbox if none found" hint="Add info@domain when a site hides its email" checked={guessInbox} onChange={setGuessInbox} />
               <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
@@ -382,7 +438,7 @@ export default function Crawler({
 
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
-            {mode === "discover" ? (
+            {listMode ? (
               <Button onClick={crawlDiscovered} disabled={!pickedCrawlable.length}>Find emails on {pickedCrawlable.length || ""} site(s)</Button>
             ) : (
               <Button onClick={crawlUrls} disabled={!urls.trim()}>Start crawl</Button>
@@ -412,7 +468,7 @@ export default function Crawler({
 
           {skippedList.length > 0 && (
             <div className="rounded-lg border border-line bg-cream px-3 py-2 text-xs text-ink/70">
-              Skipped <span className="font-semibold">{skippedList.length}</span> already-known site(s) — they were previously crawled or are already in your contacts.
+              Skipped <span className="font-semibold">{skippedList.length}</span> already-known site(s) — previously crawled or already in your contacts.
             </div>
           )}
 
@@ -441,7 +497,12 @@ export default function Crawler({
                     {results.map((r) => (
                       <tr key={r.email} className="border-b border-line-soft last:border-0">
                         <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="accent-ink" /></td>
-                        <td className="px-1 py-2 font-medium">{r.email}</td>
+                        <td className="px-1 py-2 font-medium">
+                          {r.email}
+                          {r.keywordsMatched && r.keywordsMatched.length > 0 && (
+                            <span className="ml-2 align-middle"><Tag tone="green">mentions {r.keywordsMatched[0]}</Tag></span>
+                          )}
+                        </td>
                         <td className="px-1 py-2"><ConfidenceTag c={r.confidence} /></td>
                         <td className="px-1 py-2 text-xs text-muted">{r.role_based ? "role" : "personal"}</td>
                         <td className="px-1 py-2 text-xs text-ink/60">{r.domain}</td>
@@ -466,6 +527,93 @@ export default function Crawler({
   );
 }
 
+/* --------------------- Location autocomplete ---------------------- */
+
+function LocationAutocomplete({
+  value, onChange, onPick, placeholder, onEnter,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onPick: (p: Place | null) => void;
+  placeholder?: string;
+  onEnter?: () => void;
+}) {
+  const [opts, setOpts] = useState<Place[]>([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [hi, setHi] = useState(0);
+  const tRef = useRef<number | null>(null);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  function change(v: string) {
+    onChange(v);
+    onPick(null);
+    if (tRef.current) clearTimeout(tRef.current);
+    if (v.trim().length < 2) { setOpts([]); setOpen(false); return; }
+    setLoading(true);
+    tRef.current = window.setTimeout(async () => {
+      try {
+        const r = await api.geocode(v.trim());
+        setOpts(r.places || []);
+        setHi(0);
+        setOpen(true);
+      } catch { setOpts([]); }
+      finally { setLoading(false); }
+    }, 260);
+  }
+
+  function pick(p: Place) {
+    onChange(p.short_name);
+    onPick(p);
+    setOpts([]);
+    setOpen(false);
+  }
+
+  return (
+    <div ref={boxRef} className="relative">
+      <div className="relative">
+        <Input
+          value={value}
+          onChange={(e) => change(e.target.value)}
+          onFocus={() => opts.length && setOpen(true)}
+          placeholder={placeholder}
+          onKeyDown={(e) => {
+            if (open && opts.length) {
+              if (e.key === "ArrowDown") { e.preventDefault(); setHi((h) => Math.min(h + 1, opts.length - 1)); }
+              else if (e.key === "ArrowUp") { e.preventDefault(); setHi((h) => Math.max(h - 1, 0)); }
+              else if (e.key === "Enter") { e.preventDefault(); pick(opts[hi]); }
+              else if (e.key === "Escape") setOpen(false);
+            } else if (e.key === "Enter") { onEnter?.(); }
+          }}
+        />
+        {loading && <Spinner className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink/40" />}
+      </div>
+      {open && opts.length > 0 && (
+        <div className="absolute z-30 mt-1 max-h-60 w-full overflow-y-auto rounded-xl border border-line bg-paper py-1 shadow-xl">
+          {opts.map((p, i) => (
+            <button
+              key={`${p.osm_type}/${p.osm_id}`}
+              type="button"
+              onMouseEnter={() => setHi(i)}
+              onClick={() => pick(p)}
+              className={cn("flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors", i === hi ? "bg-ink/[0.06]" : "hover:bg-ink/[0.04]")}
+            >
+              <span className="truncate">{p.short_name}</span>
+              {p.type && <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide text-muted">{p.type}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Tag({ children, tone }: { children: React.ReactNode; tone: "green" | "blue" | "amber" | "gray" }) {
   const tones = {
     green: "bg-[#e7f6ec] text-[#1f8b4c]",
@@ -473,7 +621,7 @@ function Tag({ children, tone }: { children: React.ReactNode; tone: "green" | "b
     amber: "bg-[#fef3e2] text-[#b06b16]",
     gray: "bg-ink/[0.06] text-ink/50",
   };
-  return <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-medium", tones[tone])}>{children}</span>;
+  return <span className={cn("inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium", tones[tone])}>{children}</span>;
 }
 
 function ConfidenceTag({ c }: { c?: "high" | "medium" | "low" | "guessed" }) {

@@ -71,6 +71,32 @@ export interface Job {
   error?: string;
 }
 
+export interface Place {
+  display_name: string;
+  short_name: string;
+  osm_type: string;
+  osm_id: number;
+  type?: string;
+  boundingbox?: string[];
+}
+
+export interface LeadCompany {
+  name: string;
+  website: string;
+  city: string;
+  email: string | null;
+  phone: string | null;
+  hasWebsite: boolean;
+  domain: string;
+  inContacts: boolean;
+  crawled: boolean;
+}
+
+export interface LeadResult {
+  companies: LeadCompany[];
+  summary: { total: number; new: number };
+}
+
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
@@ -206,15 +232,18 @@ export const api = {
 
   // lead finder
   getLeadCategories: () => req<{ categories: string[] }>(`/api/leads/categories`),
-  findLeads: (location: string, category: string, limit: number) =>
-    req<{
-      companies: {
-        name: string; website: string; city: string;
-        email: string | null; phone: string | null; hasWebsite: boolean;
-        domain: string; inContacts: boolean; crawled: boolean;
-      }[];
-      summary: { total: number; new: number };
-    }>(`/api/leads/find`, { method: "POST", body: JSON.stringify({ location, category, limit }) }),
+  geocode: (q: string) =>
+    req<{ places: Place[] }>(`/api/leads/geocode?q=${encodeURIComponent(q)}`),
+  findLeads: (location: string, category: string, limit: number, place?: Place | null) =>
+    req<LeadResult>(`/api/leads/find`, {
+      method: "POST",
+      body: JSON.stringify({ location, category, limit, place: place || undefined }),
+    }),
+  searchCompanies: (keywords: string, location: string, limit: number) =>
+    req<LeadResult>(`/api/leads/search`, {
+      method: "POST",
+      body: JSON.stringify({ keywords, location, limit }),
+    }),
 
   // check which pasted URLs are already known (dedup preview)
   checkCrawl: (urls: string[]) =>
