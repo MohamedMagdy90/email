@@ -10,6 +10,8 @@ export default function Settings() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [editing, setEditing] = useState<Domain | null>(null);
   const [savingKey, setSavingKey] = useState(false);
+  const [testTo, setTestTo] = useState("");
+  const [testing, setTesting] = useState(false);
 
   async function load() {
     const [s, d] = await Promise.all([api.getSettings(), api.getDomains()]);
@@ -30,6 +32,19 @@ export default function Settings() {
       toast(e.message, "error");
     } finally {
       setSavingKey(false);
+    }
+  }
+
+  async function sendTest() {
+    if (!testTo.includes("@")) return toast("Enter a valid email to send the test to", "error");
+    setTesting(true);
+    try {
+      const r = await api.sendTestEmail(testTo.trim());
+      toast(`Test sent from ${r.from}`, "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -67,9 +82,19 @@ export default function Settings() {
           <div className="flex justify-end">
             <Button loading={savingKey} onClick={saveKey}>Save</Button>
           </div>
+
+          <div className="border-t border-line pt-4">
+            <Field label="Send a test email" hint={resendOn ? "Uses your first active domain (or Resend's test sender)." : "Save a Resend API key first to enable test sends."}>
+              <div className="flex gap-2">
+                <Input value={testTo} onChange={(e) => setTestTo(e.target.value)} placeholder="you@youremail.com" disabled={!resendOn} />
+                <Button variant="outline" loading={testing} onClick={sendTest} disabled={!resendOn}>Send test</Button>
+              </div>
+            </Field>
+          </div>
         </Card>
 
         {/* Deliverability tips */}
+
         <Card className="space-y-3 p-5">
           <div className="font-clash text-lg font-semibold">Stay out of spam</div>
           <ul className="space-y-2 text-[13px] text-ink/75">
@@ -126,6 +151,12 @@ export default function Settings() {
         )}
       </div>
 
+      {/* Account */}
+      <div className="mt-8">
+        <div className="mb-3 font-clash text-lg font-semibold">Account</div>
+        <AccountCard />
+      </div>
+
       {editing && (
         <DomainModal
           key={editing.id || "new"}
@@ -135,6 +166,60 @@ export default function Settings() {
         />
       )}
     </div>
+  );
+}
+
+function AccountCard() {
+  const [current, setCurrent] = useState("");
+  const [username, setUsername] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    if (!current) return toast("Enter your current password to confirm changes", "error");
+    if (next && next !== confirm) return toast("New passwords don't match", "error");
+    if (next && next.length < 6) return toast("New password must be at least 6 characters", "error");
+    if (!username.trim() && !next) return toast("Nothing to change", "info");
+    setBusy(true);
+    try {
+      const r = await api.updateAccount({
+        currentPassword: current,
+        username: username.trim() || undefined,
+        newPassword: next || undefined,
+      });
+      toast(`Account updated${username.trim() ? ` — username is now "${r.username}"` : ""}`, "success");
+      setCurrent(""); setUsername(""); setNext(""); setConfirm("");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="space-y-4 p-5">
+      <p className="text-[13px] text-muted">
+        Change your login username or password. Enter your current password to confirm.
+      </p>
+      <Field label="Current password">
+        <Input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} placeholder="Current password" autoComplete="current-password" />
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="New username" hint="Leave blank to keep it.">
+          <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="New username" autoComplete="username" />
+        </Field>
+        <Field label="New password" hint="Leave blank to keep it.">
+          <Input type="password" value={next} onChange={(e) => setNext(e.target.value)} placeholder="New password" autoComplete="new-password" />
+        </Field>
+        <Field label="Confirm new password">
+          <Input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="Repeat new password" autoComplete="new-password" />
+        </Field>
+      </div>
+      <div className="flex justify-end">
+        <Button loading={busy} onClick={save}>Update account</Button>
+      </div>
+    </Card>
   );
 }
 

@@ -7,7 +7,15 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, LEAD_CATEGORIES } from "./leads";
-import { seedAuthFromEnv, verifyCredentials, createToken, verifyToken } from "./auth";
+import {
+  seedAuthFromEnv,
+  verifyCredentials,
+  createToken,
+  verifyToken,
+  isAuthConfigured,
+  getUsername,
+  setCredentials,
+} from "./auth";
 
 await ensureSchema();
 await seedAuthFromEnv();
@@ -32,6 +40,8 @@ app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
 const PUBLIC_API = new Set([
   "/api/health",
   "/api/auth/login",
+  "/api/auth/status",
+  "/api/auth/setup",
   "/api/open",
   "/api/unsubscribe",
 ]);
@@ -55,8 +65,45 @@ app.post("/api/auth/login", async (c) => {
   return c.json({ token, username });
 });
 
+// Public: does this instance have login credentials yet? (drives first-run setup)
+app.get("/api/auth/status", async (c) => {
+  return c.json({ configured: await isAuthConfigured() });
+});
+
+// Public first-run: create the very first credentials. Refuses once configured.
+app.post("/api/auth/setup", async (c) => {
+  if (await isAuthConfigured()) return c.json({ error: "Already configured" }, 403);
+  const { username, password } = await c.req.json().catch(() => ({}));
+  const u = String(username || "").trim();
+  const p = String(password || "");
+  if (u.length < 3) return c.json({ error: "Username must be at least 3 characters" }, 400);
+  if (p.length < 6) return c.json({ error: "Password must be at least 6 characters" }, 400);
+  await setCredentials(u, p);
+  const token = await createToken(u);
+  return c.json({ token, username: u });
+});
+
 // Reaching here means the middleware already validated the token.
-app.get("/api/auth/me", (c) => c.json({ ok: true }));
+app.get("/api/auth/me", async (c) => c.json({ ok: true, username: await getUsername() }));
+
+// Protected: change username and/or password (requires the current password).
+app.post("/api/account", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const currentPassword = String(b.currentPassword || "");
+  const username = (await getUsername()) || "";
+  if (!(await verifyCredentials(username, currentPassword))) {
+    return c.json({ error: "Current password is incorrect" }, 401);
+  }
+  const newUsername = String(b.username || username).trim();
+  const newPassword = String(b.newPassword || "");
+  if (newUsername.length < 3) return c.json({ error: "Username must be at least 3 characters" }, 400);
+  if (newPassword && newPassword.length < 6) {
+    return c.json({ error: "New password must be at least 6 characters" }, 400);
+  }
+  await setCredentials(newUsername, newPassword || currentPassword);
+  const token = await createToken(newUsername);
+  return c.json({ ok: true, token, username: newUsername });
+});
 
 /* ----------------------------- Contacts ----------------------------- */
 
@@ -130,6 +177,32 @@ app.post("/api/contacts/import-csv", async (c) => {
     if (ins.length) added++; else skipped++;
   }
   return c.json({ added, skipped });
+});
+
+app.put("/api/contacts/:id", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const id = c.req.param("id");
+  const existing = (await q(`SELECT * FROM contacts WHERE id=?`, [id]))[0];
+  if (!existing) return c.json({ error: "not found" }, 404);
+  const email = b.email != null ? String(b.email).trim().toLowerCase() : existing.email;
+  if (!email || !email.includes("@")) return c.json({ error: "valid email required" }, 400);
+  if (email !== existing.email) {
+    const dup = await q(`SELECT id FROM contacts WHERE email=? AND id<>?`, [email, id]);
+    if (dup.length) return c.json({ error: "duplicate", duplicate: true }, 409);
+  }
+  const status = ["new", "sent", "unsubscribed", "bounced"].includes(b.status) ? b.status : existing.status;
+  const rows = await q(
+    `UPDATE contacts SET email=?, company=?, country=?, industry=?, status=? WHERE id=? RETURNING *`,
+    [
+      email,
+      b.company !== undefined ? b.company || null : existing.company,
+      b.country !== undefined ? b.country || null : existing.country,
+      b.industry !== undefined ? b.industry || null : existing.industry,
+      status,
+      id,
+    ]
+  );
+  return c.json({ contact: rows[0] });
 });
 
 app.post("/api/contacts/delete", async (c) => {
@@ -241,6 +314,30 @@ app.post("/api/settings", async (c) => {
   return c.json({ ok: true });
 });
 
+// Send a real test email to verify Resend + domain are wired up correctly.
+app.post("/api/settings/test-email", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const to = String(b.to || "").trim().toLowerCase();
+  if (!to || !to.includes("@")) return c.json({ error: "A valid destination email is required" }, 400);
+
+  const key = await getResendKey();
+  if (!key) return c.json({ error: "No Resend API key set. Add one above and save first." }, 400);
+
+  const domains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
+  const domain = domains[0];
+  const from = domain ? `${domain.from_name} <${domain.from_email}>` : "DNA Outreach <onboarding@resend.dev>";
+
+  const html = wrapHtml(
+    `<p style="font-family:Arial,Helvetica,sans-serif">This is a test email from your DNA Outreach app.</p>
+     <p style="font-family:Arial,Helvetica,sans-serif">If you're reading this, Resend is connected and your sending domain works. You're ready to run real campaigns.</p>`,
+    "#",
+    ""
+  );
+  const result = await sendEmail({ from, to, subject: "DNA Outreach — test email", html });
+  if (!result.ok) return c.json({ error: result.error || "Send failed" }, 502);
+  return c.json({ ok: true, from });
+});
+
 /* ------------------------------- Crawl ------------------------------ */
 
 app.post("/api/crawl", async (c) => {
@@ -338,6 +435,7 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
   const dryRun = !(await getResendKey());
   if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
   if (!domains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend test sender." });
+  if (!dryRun && !appUrl) log(job, { level: "warn", msg: "App URL not set in Settings — unsubscribe & open-tracking links will not work. Add it before real sends." });
 
   const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
   let di = 0;
@@ -445,6 +543,21 @@ app.get("/api/history", async (c) => {
     [limit]
   );
   return c.json({ sends: rows });
+});
+
+app.get("/api/history/export", async (c) => {
+  const rows = await q(
+    `SELECT s.contact_email, c.company AS company, s.subject, s.status, s.opened, s.error, s.created_at
+     FROM sends s LEFT JOIN contacts c ON c.id = s.contact_id
+     ORDER BY s.created_at DESC`
+  );
+  const header = ["contact_email", "company", "subject", "status", "opened", "error", "created_at"];
+  const csv = [header.join(",")]
+    .concat(rows.map((r) => header.map((h) => csvCell(h === "opened" ? (r[h] ? "yes" : "no") : r[h])).join(",")))
+    .join("\n");
+  return new Response(csv, {
+    headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="send-history.csv"` },
+  });
 });
 
 app.get("/api/stats", async (c) => {

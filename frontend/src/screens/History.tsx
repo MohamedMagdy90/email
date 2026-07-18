@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, type SendRow } from "../lib/api";
-import { Button, Card, Spinner, StatusPill } from "../lib/ui";
+import { Button, Card, Input, Spinner, StatusPill, cn, toast } from "../lib/ui";
+import { downloadCsv } from "../lib/csv";
 import { Header } from "./Contacts";
+
+const FILTERS = ["all", "sent", "failed", "opened"];
 
 function timeAgo(iso?: string) {
   if (!iso) return "—";
@@ -17,10 +20,12 @@ export default function History() {
   const [sends, setSends] = useState<SendRow[]>([]);
   const [stats, setStats] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
 
   async function load() {
     setLoading(true);
-    const [h, s] = await Promise.all([api.getHistory(300), api.getStats()]);
+    const [h, s] = await Promise.all([api.getHistory(1000), api.getStats()]);
     setSends(h.sends);
     setStats(s);
     setLoading(false);
@@ -38,12 +43,41 @@ export default function History() {
     { label: "Unsubscribed", value: unsub },
   ];
 
+  const filtered = useMemo(() => {
+    return sends.filter((s) => {
+      const matchFilter =
+        filter === "all" ||
+        (filter === "sent" && s.status.startsWith("sent")) ||
+        (filter === "failed" && s.status === "failed") ||
+        (filter === "opened" && s.opened);
+      const q = search.trim().toLowerCase();
+      const matchSearch = !q || s.contact_email.toLowerCase().includes(q) || (s.subject || "").toLowerCase().includes(q);
+      return matchFilter && matchSearch;
+    });
+  }, [sends, filter, search]);
+
+  async function exportCsv() {
+    try {
+      const csv = await api.exportHistory();
+      if (!csv.trim() || csv.split("\n").length <= 1) return toast("Nothing to export", "info");
+      downloadCsv("send-history.csv", csv);
+      toast("Exported", "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  }
+
   return (
     <div>
       <Header
         title="History"
         subtitle="Every send, its status, and engagement."
-        actions={<Button size="sm" variant="outline" onClick={load}>Refresh</Button>}
+        actions={
+          <>
+            <Button size="sm" variant="ghost" onClick={exportCsv}>Export</Button>
+            <Button size="sm" variant="outline" onClick={load}>Refresh</Button>
+          </>
+        }
       />
 
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -55,11 +89,36 @@ export default function History() {
         ))}
       </div>
 
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="flex rounded-full border border-line bg-paper p-1">
+          {FILTERS.map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={cn(
+                "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
+                filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+              )}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+        <Input
+          placeholder="Search recipient or subject…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="ml-auto h-9 w-64"
+        />
+      </div>
+
       <Card className="overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center gap-2 py-16 text-muted"><Spinner /> Loading…</div>
-        ) : sends.length === 0 ? (
-          <div className="py-16 text-center text-sm text-muted">No sends yet. Head to the Send tab to start.</div>
+        ) : filtered.length === 0 ? (
+          <div className="py-16 text-center text-sm text-muted">
+            {sends.length === 0 ? "No sends yet. Head to the Send tab to start." : "No sends match this view."}
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -73,10 +132,10 @@ export default function History() {
                 </tr>
               </thead>
               <tbody>
-                {sends.map((s) => (
+                {filtered.map((s) => (
                   <tr key={s.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
                     <td className="px-4 py-2.5 font-medium">{s.contact_email}</td>
-                    <td className="max-w-[280px] truncate px-2 py-2.5 text-ink/70">{s.subject}</td>
+                    <td className="max-w-[280px] truncate px-2 py-2.5 text-ink/70" title={s.subject}>{s.subject}</td>
                     <td className="px-2 py-2.5"><StatusPill status={s.status} /></td>
                     <td className="px-2 py-2.5">{s.opened ? <span className="text-good">●</span> : <span className="text-ink/20">○</span>}</td>
                     <td className="px-2 py-2.5 text-xs text-muted">{timeAgo(s.created_at)}</td>

@@ -25,12 +25,19 @@ export function unresolvedTags(text: string): string[] {
 
 export function wrapHtml(inner: string, unsubUrl: string, pixelUrl: string): string {
   const looksLikeFullDoc = /<html[\s>]/i.test(inner);
-  const footer = `
-    <div style="margin-top:28px;padding-top:16px;border-top:1px solid #eee;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:#999;">
+  const hasUnsub = unsubUrl && unsubUrl !== "#";
+  const unsubBlock = hasUnsub
+    ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #eee;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:#999;">
       You received this because we believe it's relevant to your business.
       If not, <a href="${unsubUrl}" style="color:#999;text-decoration:underline;">unsubscribe here</a>.
-    </div>
-    <img src="${pixelUrl}" width="1" height="1" alt="" style="display:none;max-height:0;overflow:hidden;" />`;
+    </div>`
+    : "";
+  const pixelBlock = pixelUrl
+    ? `<img src="${pixelUrl}" width="1" height="1" alt="" style="display:none;max-height:0;overflow:hidden;" />`
+    : "";
+  const footer = `
+    ${unsubBlock}
+    ${pixelBlock}`;
 
   if (looksLikeFullDoc) {
     // inject footer before </body> if possible

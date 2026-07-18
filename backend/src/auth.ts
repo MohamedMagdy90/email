@@ -44,6 +44,17 @@ export async function isAuthConfigured(): Promise<boolean> {
   return !!u && !!h;
 }
 
+export async function getUsername(): Promise<string | null> {
+  return getSetting("auth_username");
+}
+
+/** Set (or replace) the login credentials. Password is stored hashed. */
+export async function setCredentials(username: string, password: string): Promise<void> {
+  const hash = await Bun.password.hash(password);
+  await setSetting("auth_username", username.trim());
+  await setSetting("auth_password_hash", hash);
+}
+
 export async function verifyCredentials(username: string, password: string): Promise<boolean> {
   const [storedUser, storedHash] = await Promise.all([
     getSetting("auth_username"),

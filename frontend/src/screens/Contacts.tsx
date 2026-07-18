@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Contact } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, Spinner, StatusPill, Textarea, toast, cn } from "../lib/ui";
-import { downloadCsv } from "../lib/csv";
+import { downloadCsv, parseContacts, CONTACTS_TEMPLATE, type ParsedContact } from "../lib/csv";
 import Crawler from "./Crawler";
 
 const FILTERS = ["all", "new", "sent", "unsubscribed", "bounced"];
@@ -17,6 +17,7 @@ export default function Contacts() {
   const [addOpen, setAddOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [crawlOpen, setCrawlOpen] = useState(false);
+  const [editing, setEditing] = useState<Contact | null>(null);
 
   async function load() {
     setLoading(true);
@@ -24,6 +25,10 @@ export default function Contacts() {
       const r = await api.getContacts({ status: filter, q: search, limit: 1000 });
       setContacts(r.contacts);
       setTotal(r.total);
+      setSelected((prev) => {
+        const visible = new Set(r.contacts.map((c) => c.id));
+        return new Set([...prev].filter((id) => visible.has(id)));
+      });
       const c: Record<string, number> = {};
       for (const row of r.counts) c[row.status] = row.n;
       setCounts(c);
@@ -165,11 +170,12 @@ export default function Contacts() {
                   <th className="px-2 py-3">Country</th>
                   <th className="px-2 py-3">Type</th>
                   <th className="px-2 py-3">Status</th>
+                  <th className="w-12 px-2 py-3" />
                 </tr>
               </thead>
               <tbody>
                 {contacts.map((c) => (
-                  <tr key={c.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
+                  <tr key={c.id} className="group border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
                     <td className="px-4 py-2.5">
                       <input
                         type="checkbox"
@@ -187,6 +193,15 @@ export default function Contacts() {
                     <td className="px-2 py-2.5">
                       <StatusPill status={c.status} />
                     </td>
+                    <td className="px-2 py-2.5 text-right">
+                      <button
+                        onClick={() => setEditing(c)}
+                        className="rounded-md px-2 py-1 text-xs font-medium text-ink/50 opacity-0 transition-opacity hover:bg-ink/[0.06] hover:text-ink group-hover:opacity-100"
+                        title="Edit contact"
+                      >
+                        Edit
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -198,6 +213,14 @@ export default function Contacts() {
       <AddModal open={addOpen} onClose={() => setAddOpen(false)} onDone={load} />
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} onDone={load} />
       <Crawler open={crawlOpen} onClose={() => setCrawlOpen(false)} onAdded={load} />
+      {editing && (
+        <EditModal
+          key={editing.id}
+          contact={editing}
+          onClose={() => setEditing(null)}
+          onDone={() => { setEditing(null); load(); }}
+        />
+      )}
     </div>
   );
 }
@@ -291,15 +314,57 @@ function AddModal({ open, onClose, onDone }: { open: boolean; onClose: () => voi
 
 function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone: () => void }) {
   const [csv, setCsv] = useState("");
+  const [fileName, setFileName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const parsed = useMemo<ParsedContact[]>(() => (csv.trim() ? parseContacts(csv) : []), [csv]);
+  const valid = parsed.filter((r) => r.valid && !r.duplicate);
+  const invalid = parsed.filter((r) => !r.valid);
+  const dupes = parsed.filter((r) => r.valid && r.duplicate);
+
+  function reset() {
+    setCsv("");
+    setFileName("");
+    if (fileRef.current) fileRef.current.value = "";
+  }
+  function close() {
+    reset();
+    onClose();
+  }
+
+  function readFile(file: File) {
+    if (!/\.(csv|txt)$/i.test(file.name)) return toast("Please choose a .csv file", "error");
+    const reader = new FileReader();
+    reader.onload = () => {
+      setCsv(String(reader.result || ""));
+      setFileName(file.name);
+    };
+    reader.onerror = () => toast("Could not read that file", "error");
+    reader.readAsText(file);
+  }
+
+  function downloadTemplate() {
+    downloadCsv("contacts-template.csv", CONTACTS_TEMPLATE);
+    toast("Template downloaded", "success");
+  }
 
   async function submit() {
-    if (!csv.trim()) return;
+    if (!valid.length) return toast("No valid rows to import", "error");
     setBusy(true);
     try {
-      const r = await api.importCsv(csv);
-      toast(`Imported ${r.added} · skipped ${r.skipped}`, "success");
-      setCsv("");
+      const r = await api.bulkContacts(
+        valid.map((c) => ({
+          email: c.email,
+          company: c.company || undefined,
+          country: c.country || undefined,
+          industry: c.industry || undefined,
+          source: "csv",
+        }))
+      );
+      toast(`Imported ${r.added} · skipped ${r.skipped} existing`, "success");
+      reset();
       onDone();
       onClose();
     } catch (e: any) {
@@ -310,23 +375,204 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="Import CSV" wide>
+    <Modal open={open} onClose={close} title="Import contacts from CSV" wide>
+      <div className="space-y-5">
+        {/* Step 1 — template */}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-ink/[0.02] px-4 py-3">
+          <div className="flex items-start gap-3">
+            <span className="mono-label mt-0.5 rounded-md bg-ink px-1.5 py-0.5 text-cream">01</span>
+            <div>
+              <div className="text-[13px] font-semibold text-ink">Get the template</div>
+              <div className="text-xs text-muted">Download it, fill in your contacts in Excel or Google Sheets, then upload it below.</div>
+            </div>
+          </div>
+          <Button size="sm" variant="outline" onClick={downloadTemplate}>Download template</Button>
+        </div>
+
+        {/* Step 2 — upload / paste */}
+        <div>
+          <div className="mb-2 flex items-center gap-3">
+            <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">02</span>
+            <div className="text-[13px] font-semibold text-ink">Upload or paste your data</div>
+          </div>
+
+          <div
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              const f = e.dataTransfer.files?.[0];
+              if (f) readFile(f);
+            }}
+            onClick={() => fileRef.current?.click()}
+            className={cn(
+              "flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed px-4 py-6 text-center transition-colors",
+              dragOver ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40 hover:bg-ink/[0.02]"
+            )}
+          >
+            <div className="prism-bar h-1 w-10 rounded-full opacity-60" />
+            <div className="text-[13px] font-medium text-ink">
+              {fileName ? `Loaded ${fileName}` : "Drop a CSV file here, or click to browse"}
+            </div>
+            <div className="text-xs text-muted">Columns: email, company, country, industry</div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".csv,text/csv,text/plain"
+              className="hidden"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) readFile(f); }}
+            />
+          </div>
+
+          <details className="mt-2">
+            <summary className="cursor-pointer select-none text-xs font-medium text-ink/55 hover:text-ink">
+              or paste CSV manually
+            </summary>
+            <Textarea
+              rows={6}
+              value={csv}
+              onChange={(e) => { setCsv(e.target.value); setFileName(""); }}
+              placeholder={"email,company,country,industry\ninfo@acme.com,Acme Trading,Qatar,Trading"}
+              className="mt-2 font-mono text-xs"
+            />
+          </details>
+        </div>
+
+        {/* Step 3 — preview */}
+        {parsed.length > 0 && (
+          <div>
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
+              <div className="text-[13px] font-semibold text-ink">Review</div>
+              <div className="ml-1 flex flex-wrap gap-1.5">
+                <Chip tone="good">{valid.length} ready</Chip>
+                {dupes.length > 0 && <Chip tone="muted">{dupes.length} duplicate in file</Chip>}
+                {invalid.length > 0 && <Chip tone="bad">{invalid.length} invalid</Chip>}
+              </div>
+            </div>
+            <div className="max-h-56 overflow-auto rounded-xl border border-line">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-paper">
+                  <tr className="border-b border-line text-left mono-label text-muted">
+                    <th className="px-3 py-2">Email</th>
+                    <th className="px-2 py-2">Company</th>
+                    <th className="px-2 py-2">Country</th>
+                    <th className="px-2 py-2">Industry</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {parsed.slice(0, 200).map((r, i) => {
+                    const bad = !r.valid;
+                    const dup = r.valid && r.duplicate;
+                    return (
+                      <tr key={i} className={cn("border-b border-line-soft last:border-0", bad && "bg-bad/[0.05]", dup && "bg-ink/[0.02]")}>
+                        <td className="px-3 py-1.5">
+                          <span className={cn("font-medium", bad && "text-bad", dup && "text-muted line-through")}>
+                            {r.email || <span className="italic text-bad">missing</span>}
+                          </span>
+                          {bad && <span className="ml-2 text-[11px] text-bad">invalid</span>}
+                          {dup && <span className="ml-2 text-[11px] text-muted">dup</span>}
+                        </td>
+                        <td className="px-2 py-1.5 text-ink/70">{r.company || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70">{r.country || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70">{r.industry || "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {parsed.length > 200 && (
+              <div className="mt-1 text-xs text-muted">Showing first 200 of {parsed.length} rows.</div>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-2 pt-1">
+          {csv.trim() ? (
+            <button onClick={reset} className="text-xs font-medium text-ink/50 underline hover:text-ink">Clear</button>
+          ) : (
+            <span className="text-xs text-muted">Existing contacts are skipped automatically.</span>
+          )}
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={close}>Cancel</Button>
+            <Button loading={busy} onClick={submit} disabled={!valid.length}>
+              Import {valid.length || ""} contact{valid.length === 1 ? "" : "s"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function Chip({ tone, children }: { tone: "good" | "bad" | "muted"; children: React.ReactNode }) {
+  const cls =
+    tone === "good"
+      ? "bg-[#e7f6ec] text-[#1f8b4c]"
+      : tone === "bad"
+      ? "bg-[#fde8e8] text-[#c0392b]"
+      : "bg-ink/[0.06] text-ink/55";
+  return <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-medium", cls)}>{children}</span>;
+}
+
+/* ---------------------------- Edit modal ---------------------------- */
+
+function EditModal({ contact, onClose, onDone }: { contact: Contact; onClose: () => void; onDone: () => void }) {
+  const [f, setF] = useState({
+    email: contact.email,
+    company: contact.company || "",
+    country: contact.country || "",
+    industry: contact.industry || "",
+    status: contact.status,
+  });
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    if (!f.email.includes("@")) return toast("Enter a valid email", "error");
+    setBusy(true);
+    try {
+      await api.updateContact(contact.id, f);
+      toast("Contact updated", "success");
+      onDone();
+    } catch (e: any) {
+      toast(e.message === "duplicate" ? "Another contact already uses that email" : e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="Edit contact">
       <div className="space-y-4">
-        <Field
-          label="Paste CSV"
-          hint="First row can be a header. Recognized columns: email, company, country, industry."
-        >
-          <Textarea
-            rows={9}
-            value={csv}
-            onChange={(e) => setCsv(e.target.value)}
-            placeholder={"email,company,country,industry\ninfo@acme.com,Acme Trading,Qatar,Trading"}
-            className="font-mono text-xs"
-          />
+        <Field label="Email">
+          <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
         </Field>
-        <div className="flex justify-end gap-2">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Company">
+            <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
+          </Field>
+          <Field label="Country">
+            <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Industry">
+            <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
+          </Field>
+          <Field label="Status" hint="Set to unsubscribed to permanently exclude from sends.">
+            <Select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>
+              <option value="new">new</option>
+              <option value="sent">sent</option>
+              <option value="unsubscribed">unsubscribed</option>
+              <option value="bounced">bounced</option>
+            </Select>
+          </Field>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button loading={busy} onClick={submit}>Import</Button>
+          <Button loading={busy} onClick={save}>Save changes</Button>
         </div>
       </div>
     </Modal>

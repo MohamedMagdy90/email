@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { cn, Toaster, Spinner } from "./lib/ui";
 import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
+import Setup from "./screens/Setup";
 import Overview from "./screens/Overview";
 import Contacts from "./screens/Contacts";
 import Templates from "./screens/Templates";
@@ -23,9 +24,18 @@ const NAV: { id: Tab; label: string; num: string }[] = [
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
+  const [needsSetup, setNeedsSetup] = useState(false);
 
   useEffect(() => {
-    api.checkAuth().then(setAuthed);
+    (async () => {
+      const { configured } = await api.authStatus();
+      if (!configured) {
+        setNeedsSetup(true);
+        setAuthed(false);
+        return;
+      }
+      setAuthed(await api.checkAuth());
+    })();
     const onUnauth = () => setAuthed(false);
     window.addEventListener("dna-unauthorized", onUnauth);
     return () => window.removeEventListener("dna-unauthorized", onUnauth);
@@ -43,6 +53,10 @@ export default function App() {
         <Spinner className="h-6 w-6 text-cream/60" />
       </div>
     );
+  }
+
+  if (needsSetup && !authed) {
+    return <Setup onSuccess={() => { setNeedsSetup(false); setAuthed(true); }} />;
   }
 
   if (!authed) return <Login onSuccess={() => setAuthed(true)} />;

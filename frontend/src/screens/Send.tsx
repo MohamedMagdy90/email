@@ -8,6 +8,7 @@ export default function Send() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [resendOn, setResendOn] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
   const [templateId, setTemplateId] = useState("");
   const [filter, setFilter] = useState("new");
@@ -32,6 +33,7 @@ export default function Send() {
       setDomains(d.domains);
       setResendOn(s.resendConfigured);
       if (t.templates[0]) setTemplateId(t.templates[0].id);
+      setLoaded(true);
     })();
   }, []);
 
@@ -73,6 +75,11 @@ export default function Send() {
       <Header title="Send" subtitle="Pick a template, choose who to reach, and send at a safe pace." />
 
       {/* Banners */}
+      {loaded && templates.length === 0 && (
+        <Banner tone="warn">
+          You don't have any templates yet. Create one on the <b>Templates</b> tab before you can send.
+        </Banner>
+      )}
       {!resendOn && (
         <Banner tone="warn">
           No Resend API key set — sends run in <b>dry-run</b> mode (nothing is delivered). Add your key in Settings to send for real.

@@ -112,6 +112,37 @@ export const api = {
       return false;
     }
   },
+  authStatus: async (): Promise<{ configured: boolean }> => {
+    try {
+      const res = await fetch(`${BASE}/api/auth/status`);
+      if (!res.ok) return { configured: true };
+      return await res.json();
+    } catch {
+      return { configured: true };
+    }
+  },
+  setup: async (username: string, password: string) => {
+    const res = await fetch(`${BASE}/api/auth/setup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error(e.error || "Setup failed");
+    }
+    const data = (await res.json()) as { token: string; username: string };
+    setToken(data.token);
+    return data;
+  },
+  updateAccount: async (body: { currentPassword: string; username?: string; newPassword?: string }) => {
+    const data = await req<{ ok: boolean; token: string; username: string }>(`/api/account`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (data.token) setToken(data.token);
+    return data;
+  },
   logout: () => clearToken(),
 
   // contacts
@@ -126,6 +157,8 @@ export const api = {
   },
   addContact: (c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
+  updateContact: (id: string, c: Partial<Contact>) =>
+    req<{ contact: Contact }>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(c) }),
   bulkContacts: (contacts: Partial<Contact>[]) =>
     req<{ added: number; skipped: number }>(`/api/contacts/bulk`, {
       method: "POST",
@@ -160,6 +193,8 @@ export const api = {
   getSettings: () => req<{ resendConfigured: boolean; appUrl: string }>(`/api/settings`),
   saveSettings: (s: { resend_api_key?: string; app_url?: string }) =>
     req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
+  sendTestEmail: (to: string) =>
+    req<{ ok: boolean; from: string }>(`/api/settings/test-email`, { method: "POST", body: JSON.stringify({ to }) }),
 
   // crawl
   startCrawl: (body: any) => req<{ jobId: string }>(`/api/crawl`, { method: "POST", body: JSON.stringify(body) }),
@@ -185,6 +220,14 @@ export const api = {
     const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`, {
       headers: { ...authHeaders() },
     });
+    if (res.status === 401) {
+      onUnauthorized();
+      throw new Error("Unauthorized");
+    }
+    return res.text();
+  },
+  exportHistory: async () => {
+    const res = await fetch(`${BASE}/api/history/export`, { headers: { ...authHeaders() } });
     if (res.status === 401) {
       onUnauthorized();
       throw new Error("Unauthorized");
