@@ -142,6 +142,11 @@ export default function Send() {
               <div className="h-2 overflow-hidden rounded-full bg-ink/[0.07]">
                 <div className="prism-bar h-full transition-all" style={{ width: `${Math.round((job.progress || 0) * 100)}%` }} />
               </div>
+              {job.status === "error" && job.error && (
+                <div className="rounded-lg border border-bad/30 bg-bad/[0.06] px-3 py-2 text-[12px] leading-relaxed text-bad">
+                  {job.error}
+                </div>
+              )}
               {job.result && (
                 <div className="flex gap-3 text-xs text-muted">
                   <span>sent {job.result.sent}</span>

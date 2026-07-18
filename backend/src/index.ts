@@ -271,19 +271,26 @@ app.get("/api/domains", async (c) => {
 
 app.post("/api/domains", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  if (!b.domain || !b.from_email) return c.json({ error: "domain and from_email required" }, 400);
+  const domain = String(b.domain || "").trim();
+  const fromEmail = String(b.from_email || "").trim();
+  if (!domain) return c.json({ error: "Domain is required" }, 400);
+  if (!isEmail(fromEmail)) return c.json({ error: "From email must be a full address like outreach@yourdomain.com" }, 400);
   const rows = await q(
     `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,created_at) VALUES (?,?,?,?,?,1,?) RETURNING *`,
-    [uid(), b.domain, b.from_name || "DNA Outreach", b.from_email, Number(b.daily_cap) || 40, nowIso()]
+    [uid(), domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, nowIso()]
   );
   return c.json({ domain: rows[0] });
 });
 
 app.put("/api/domains/:id", async (c) => {
   const b = await c.req.json().catch(() => ({}));
+  const domain = String(b.domain || "").trim();
+  const fromEmail = String(b.from_email || "").trim();
+  if (!domain) return c.json({ error: "Domain is required" }, 400);
+  if (!isEmail(fromEmail)) return c.json({ error: "From email must be a full address like outreach@yourdomain.com" }, 400);
   const rows = await q(
     `UPDATE domains SET domain=?, from_name=?, from_email=?, daily_cap=?, active=? WHERE id=? RETURNING *`,
-    [b.domain, b.from_name || "DNA Outreach", b.from_email, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
+    [domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
   );
   if (!rows.length) return c.json({ error: "not found" }, 404);
   return c.json({ domain: rows[0] });
@@ -325,7 +332,12 @@ app.post("/api/settings/test-email", async (c) => {
 
   const domains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
   const domain = domains[0];
-  const from = domain ? `${domain.from_name} <${domain.from_email}>` : "DNA Outreach <onboarding@resend.dev>";
+  let from = "DNA Outreach <onboarding@resend.dev>";
+  if (domain) {
+    const r = buildFrom(domain);
+    if ("error" in r) return c.json({ error: r.error }, 400);
+    from = r.from;
+  }
 
   const html = wrapHtml(
     `<p style="font-family:Arial,Helvetica,sans-serif">This is a test email from your DNA Outreach app.</p>
@@ -409,8 +421,8 @@ app.post("/api/send", async (c) => {
   (async () => {
     try {
       await runSendJob(job, templateId, contactIds, perMinute);
-      job.status = "done";
-      job.progress = 1;
+      // Don't override an error status that runSendJob set intentionally.
+      if (job.status === "running") { job.status = "done"; job.progress = 1; }
     } catch (e: any) {
       job.status = "error";
       job.error = String(e?.message || e);
@@ -430,11 +442,26 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
   const tpl = (await q(`SELECT * FROM templates WHERE id=?`, [templateId]))[0];
   if (!tpl) { job.status = "error"; job.error = "template not found"; return; }
 
-  const domains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
-  const appUrl = (await getSetting("app_url")) || process.env.APP_URL || "";
+  const activeDomains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
+  const appUrl = ((await getSetting("app_url")) || process.env.APP_URL || "").replace(/\/+$/, "");
   const dryRun = !(await getResendKey());
   if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
-  if (!domains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend test sender." });
+
+  // Validate each active domain's sender up front so a misconfigured "From email"
+  // gives a clear, actionable error instead of a cryptic Resend rejection per email.
+  const domains: any[] = [];
+  for (const d of activeDomains) {
+    const r = buildFrom(d);
+    if ("error" in r) log(job, { level: "warn", msg: r.error });
+    else { d.__from = r.from; domains.push(d); }
+  }
+  if (!dryRun && activeDomains.length && !domains.length) {
+    job.status = "error";
+    job.error = "Every active sending domain has an invalid \"From email\". Fix it in Settings → Sending domains (use a full address like outreach@yourdomain.com), then try again.";
+    log(job, { level: "fail", msg: job.error });
+    return;
+  }
+  if (!activeDomains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend's test sender (onboarding@resend.dev)." });
   if (!dryRun && !appUrl) log(job, { level: "warn", msg: "App URL not set in Settings — unsubscribe & open-tracking links will not work. Add it before real sends." });
 
   const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
@@ -461,16 +488,18 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
       if (!domain) { log(job, { level: "warn", msg: "All domains hit their daily cap — stopping." }); break; }
     }
 
-    const from = domain ? `${domain.from_name} <${domain.from_email}>` : "DNA Outreach <onboarding@resend.dev>";
+    const from = domain ? domain.__from : "DNA Outreach <onboarding@resend.dev>";
     const subject = renderTemplate(tpl.subject, contact);
     const sendId = uid();
-    const unsub = `${appUrl}/api/unsubscribe?c=${contact.id}`;
-    const pixel = `${appUrl}/api/open?s=${sendId}`;
+    const unsub = appUrl ? `${appUrl}/api/unsubscribe?c=${contact.id}` : "";
+    const pixel = appUrl ? `${appUrl}/api/open?s=${sendId}` : "";
     const html = wrapHtml(renderTemplate(tpl.body, contact), unsub, pixel);
 
     const result = await sendEmail({
       from, to: contact.email, subject, html,
-      headers: { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" },
+      headers: unsub
+        ? { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }
+        : undefined,
     });
 
     const status = result.ok ? (result.dryRun ? "sent (dry-run)" : "sent") : "failed";
@@ -589,6 +618,27 @@ app.get("/api/overview", async (c) => {
 
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
 function shorten(u: string) { try { const x = new URL(u); return x.hostname + x.pathname; } catch { return u; } }
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function isEmail(s: string) { return EMAIL_RE.test(String(s || "").trim()); }
+
+// Build an RFC-5322-safe "Name <email>" sender from a domain row.
+// Returns { from } on success or { error } with a clear, actionable message.
+function buildFrom(domain: any): { from: string } | { error: string } {
+  const email = String(domain?.from_email || "").trim();
+  if (!isEmail(email)) {
+    return {
+      error:
+        `Sending domain "${domain?.domain || "?"}" has an invalid "From email" (${email ? `"${email}"` : "empty"}). ` +
+        `It must be a full address like outreach@yourdomain.com. Fix it in Settings → Sending domains.`,
+    };
+  }
+  let name = String(domain?.from_name || "").trim();
+  if (!name) return { from: email };
+  // Quote the display name when it contains characters that would break the header.
+  if (/[",:;<>@\\]/.test(name)) name = `"${name.replace(/["\\]/g, "").trim()}"`;
+  return { from: `${name} <${email}>` };
+}
 
 function csvCell(v: any): string {
   if (v == null) return "";
