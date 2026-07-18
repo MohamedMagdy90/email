@@ -54,19 +54,20 @@ export interface ParsedContact {
   company: string;
   country: string;
   industry: string;
+  category: string;
   valid: boolean; // email looks valid
   duplicate: boolean; // duplicated earlier in this same file
 }
 
 // Parse a pasted / uploaded CSV into contact rows with validation flags.
 // Recognizes an optional header row; otherwise assumes column order:
-// email, company, country, industry.
+// email, company, country, industry, category.
 export function parseContacts(text: string): ParsedContact[] {
   const rows = parseCsvRows(text);
   if (!rows.length) return [];
   const header = rows[0].map((h) => h.trim().toLowerCase());
   const hasHeader = header.includes("email");
-  const cols = hasHeader ? header : ["email", "company", "country", "industry"];
+  const cols = hasHeader ? header : ["email", "company", "country", "industry", "category"];
   const dataRows = hasHeader ? rows.slice(1) : rows;
   const idx = (name: string) => cols.indexOf(name);
   const at = (r: string[], name: string, fallback = -1) => {
@@ -81,17 +82,18 @@ export function parseContacts(text: string): ParsedContact[] {
     const company = at(r, "company", 1);
     const country = at(r, "country", 2);
     const industry = at(r, "industry", 3);
-    if (!email && !company && !country && !industry) continue; // blank line
+    const category = at(r, "category", 4);
+    if (!email && !company && !country && !industry && !category) continue; // blank line
     const valid = EMAIL_RE.test(email);
     const duplicate = valid && seen.has(email);
     if (valid) seen.add(email);
-    out.push({ email, company, country, industry, valid, duplicate });
+    out.push({ email, company, country, industry, category, valid, duplicate });
   }
   return out;
 }
 
 // A ready-to-fill template users can download, edit in Excel/Sheets, and re-import.
-export const CONTACTS_TEMPLATE = `email,company,country,industry
-info@acme-trading.com,Acme Trading,Qatar,Trading
-sales@example-construction.qa,Example Construction Co,Qatar,Construction
-hello@brightsoftware.ae,Bright Software,UAE,IT & Software`;
+export const CONTACTS_TEMPLATE = `email,company,country,industry,category
+info@acme-trading.com,Acme Trading,Qatar,Trading,Customer
+sales@example-construction.qa,Example Construction Co,Qatar,Construction,Partner
+hello@brightsoftware.ae,Bright Software,UAE,IT & Software,Reseller`;

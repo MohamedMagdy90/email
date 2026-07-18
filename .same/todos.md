@@ -1,6 +1,17 @@
 # DNA Outreach — Email Discovery Redesign
 
-## Tier-one search upgrade (latest)
+## Contact categories (current)
+- [x] DB: contacts.category column + migration; categories list in settings
+- [x] API: GET/POST /api/categories; category on add/edit/bulk; category filter; export includes category
+- [x] API: CSV import = upsert (update existing, PRESERVE status; insert new)
+- [x] csv.ts: parse category, template includes category
+- [x] Settings: manage categories (add/remove)
+- [x] Contacts: category select on add/edit, category column, category filter, bulk-set, import shows updated count
+- [x] Send: filter/send by category
+- [x] Crawler: choose category to save fetched emails under
+- [x] Verified: upsert keeps "sent" status + updates category; category filter; export has category
+
+## Tier-one search upgrade (done)
 - [x] Overpass 504 fix: 5 mirrors, race + 3-round retry with backoff, 30s abort
 - [x] Searchable location dropdown: Photon autocomplete ("qat"→Qatar), Nominatim fallback
 - [x] Keyword search engine: DuckDuckGo-based, finds companies by website content

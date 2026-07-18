@@ -22,6 +22,7 @@ export interface Contact {
   company?: string;
   country?: string;
   industry?: string;
+  category?: string;
   role_based?: boolean;
   source?: string;
   status: string;
@@ -172,10 +173,11 @@ export const api = {
   logout: () => clearToken(),
 
   // contacts
-  getContacts: (params: { status?: string; q?: string; limit?: number } = {}) => {
+  getContacts: (params: { status?: string; q?: string; category?: string; limit?: number } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
+    if (params.category) qs.set("category", params.category);
     if (params.limit) qs.set("limit", String(params.limit));
     return req<{ contacts: Contact[]; counts: { status: string; n: number }[]; total: number }>(
       `/api/contacts?${qs.toString()}`
@@ -185,18 +187,18 @@ export const api = {
     req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
   updateContact: (id: string, c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(c) }),
-  bulkContacts: (contacts: Partial<Contact>[]) =>
-    req<{ added: number; skipped: number }>(`/api/contacts/bulk`, {
+  bulkContacts: (contacts: Partial<Contact>[], upsert = false) =>
+    req<{ added: number; updated?: number; skipped: number }>(`/api/contacts/bulk`, {
       method: "POST",
-      body: JSON.stringify({ contacts }),
-    }),
-  importCsv: (csv: string) =>
-    req<{ added: number; skipped: number }>(`/api/contacts/import-csv`, {
-      method: "POST",
-      body: JSON.stringify({ csv }),
+      body: JSON.stringify({ contacts, upsert }),
     }),
   deleteContacts: (ids: string[]) =>
     req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),
+
+  // categories
+  getCategories: () => req<{ categories: string[] }>(`/api/categories`),
+  saveCategories: (categories: string[]) =>
+    req<{ categories: string[] }>(`/api/categories`, { method: "POST", body: JSON.stringify({ categories }) }),
 
   // templates
   getTemplates: () => req<{ templates: Template[] }>(`/api/templates`),
@@ -253,10 +255,11 @@ export const api = {
     ),
 
   // export
-  exportContacts: async (params: { status?: string; q?: string } = {}) => {
+  exportContacts: async (params: { status?: string; q?: string; category?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status && params.status !== "all") qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
+    if (params.category && params.category !== "all") qs.set("category", params.category);
     const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`, {
       headers: { ...authHeaders() },
     });

@@ -12,6 +12,8 @@ export default function Contacts() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [categories, setCategories] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [addOpen, setAddOpen] = useState(false);
@@ -19,10 +21,15 @@ export default function Contacts() {
   const [crawlOpen, setCrawlOpen] = useState(false);
   const [editing, setEditing] = useState<Contact | null>(null);
 
+  async function loadCategories() {
+    try { setCategories((await api.getCategories()).categories || []); } catch { /* ignore */ }
+  }
+  useEffect(() => { loadCategories(); }, []);
+
   async function load() {
     setLoading(true);
     try {
-      const r = await api.getContacts({ status: filter, q: search, limit: 1000 });
+      const r = await api.getContacts({ status: filter, q: search, category: categoryFilter, limit: 1000 });
       setContacts(r.contacts);
       setTotal(r.total);
       setSelected((prev) => {
@@ -43,7 +50,7 @@ export default function Contacts() {
     const t = setTimeout(load, search ? 300 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, search]);
+  }, [filter, search, categoryFilter]);
 
   const allSelected = contacts.length > 0 && selected.size === contacts.length;
   function toggleAll() {
@@ -66,7 +73,7 @@ export default function Contacts() {
 
   async function exportCsv() {
     try {
-      const csv = await api.exportContacts({ status: filter, q: search });
+      const csv = await api.exportContacts({ status: filter, q: search, category: categoryFilter });
       if (!csv.trim() || csv.split("\n").length <= 1) return toast("Nothing to export", "info");
       downloadCsv("contacts.csv", csv);
       toast("Exported", "success");
@@ -134,11 +141,39 @@ export default function Contacts() {
             </button>
           ))}
         </div>
+        {categories.length > 0 && (
+          <Select
+            value={categoryFilter}
+            onChange={(e) => setCategoryFilter(e.target.value)}
+            className="h-9 w-44"
+          >
+            <option value="all">All categories</option>
+            {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__none__">Uncategorized</option>
+          </Select>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {selected.size > 0 && (
-            <Button variant="danger" size="sm" onClick={removeSelected}>
-              Delete {selected.size}
-            </Button>
+            <>
+              {categories.length > 0 && (
+                <BulkCategory
+                  categories={categories}
+                  onApply={async (cat) => {
+                    await api.bulkContacts(
+                      contacts.filter((c) => selected.has(c.id)).map((c) => ({ email: c.email, category: cat })),
+                      true
+                    );
+                    toast(`Set category on ${selected.size} contact(s)`, "success");
+                    setSelected(new Set());
+                    load();
+                  }}
+                />
+              )}
+              {/* bulk-set assigns a category; clearing is done via Edit */}
+              <Button variant="danger" size="sm" onClick={removeSelected}>
+                Delete {selected.size}
+              </Button>
+            </>
           )}
           <Input
             placeholder="Search email or company…"
@@ -168,6 +203,7 @@ export default function Contacts() {
                   <th className="px-2 py-3">Email</th>
                   <th className="px-2 py-3">Company</th>
                   <th className="px-2 py-3">Country</th>
+                  <th className="px-2 py-3">Category</th>
                   <th className="px-2 py-3">Type</th>
                   <th className="px-2 py-3">Status</th>
                   <th className="w-12 px-2 py-3" />
@@ -187,6 +223,13 @@ export default function Contacts() {
                     <td className="px-2 py-2.5 font-medium">{c.email}</td>
                     <td className="px-2 py-2.5 text-ink/70">{c.company || "—"}</td>
                     <td className="px-2 py-2.5 text-ink/70">{c.country || "—"}</td>
+                    <td className="px-2 py-2.5">
+                      {c.category ? (
+                        <span className="inline-flex items-center rounded-full bg-ink/[0.06] px-2 py-0.5 text-[11px] font-medium text-ink/70">{c.category}</span>
+                      ) : (
+                        <span className="text-xs text-muted">—</span>
+                      )}
+                    </td>
                     <td className="px-2 py-2.5">
                       <span className="text-xs text-muted">{c.role_based ? "role" : "personal"}</span>
                     </td>
@@ -210,13 +253,14 @@ export default function Contacts() {
         )}
       </Card>
 
-      <AddModal open={addOpen} onClose={() => setAddOpen(false)} onDone={load} />
+      <AddModal open={addOpen} onClose={() => setAddOpen(false)} onDone={load} categories={categories} />
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} onDone={load} />
       <Crawler open={crawlOpen} onClose={() => setCrawlOpen(false)} onAdded={load} />
       {editing && (
         <EditModal
           key={editing.id}
           contact={editing}
+          categories={categories}
           onClose={() => setEditing(null)}
           onDone={() => { setEditing(null); load(); }}
         />
@@ -264,8 +308,39 @@ function Empty({ onFind }: { onFind: () => void }) {
 
 /* ----------------------------- Add modal ---------------------------- */
 
-function AddModal({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone: () => void }) {
-  const [f, setF] = useState({ email: "", company: "", country: "", industry: "" });
+function BulkCategory({ categories, onApply }: { categories: string[]; onApply: (cat: string) => void }) {
+  const [val, setVal] = useState("");
+  return (
+    <Select
+      value={val}
+      onChange={(e) => {
+        const v = e.target.value;
+        setVal("");
+        if (v) onApply(v);
+      }}
+      className="h-8 w-40 text-[13px]"
+    >
+      <option value="">Set category…</option>
+      {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+    </Select>
+  );
+}
+
+// Free-form category picker: choose an existing category or type a new one.
+function CategoryField({ value, onChange, categories }: { value: string; onChange: (v: string) => void; categories: string[] }) {
+  return (
+    <Field label="Category" hint={categories.length ? undefined : "Add categories in Settings to build a list."}>
+      <Select value={categories.includes(value) || !value ? value : "__custom__"} onChange={(e) => onChange(e.target.value === "__custom__" ? value : e.target.value)}>
+        <option value="">None</option>
+        {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+        {value && !categories.includes(value) && <option value={value}>{value}</option>}
+      </Select>
+    </Field>
+  );
+}
+
+function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClose: () => void; onDone: () => void; categories: string[] }) {
+  const [f, setF] = useState({ email: "", company: "", country: "", industry: "", category: "" });
   const [busy, setBusy] = useState(false);
 
   async function submit() {
@@ -274,7 +349,7 @@ function AddModal({ open, onClose, onDone }: { open: boolean; onClose: () => voi
     try {
       await api.addContact(f);
       toast("Contact added", "success");
-      setF({ email: "", company: "", country: "", industry: "" });
+      setF({ email: "", company: "", country: "", industry: "", category: "" });
       onDone();
       onClose();
     } catch (e: any) {
@@ -298,9 +373,12 @@ function AddModal({ open, onClose, onDone }: { open: boolean; onClose: () => voi
             <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
           </Field>
         </div>
-        <Field label="Industry">
-          <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
-        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Industry">
+            <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
+          </Field>
+          <CategoryField value={f.category} onChange={(v) => setF({ ...f, category: v })} categories={categories} />
+        </div>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           <Button loading={busy} onClick={submit}>Add contact</Button>
@@ -354,16 +432,22 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
     if (!valid.length) return toast("No valid rows to import", "error");
     setBusy(true);
     try {
+      // upsert=true: existing contacts are UPDATED (status preserved), new ones added.
       const r = await api.bulkContacts(
         valid.map((c) => ({
           email: c.email,
           company: c.company || undefined,
           country: c.country || undefined,
           industry: c.industry || undefined,
+          category: c.category || undefined,
           source: "csv",
-        }))
+        })),
+        true
       );
-      toast(`Imported ${r.added} · skipped ${r.skipped} existing`, "success");
+      const parts = [`${r.added} added`];
+      if (r.updated) parts.push(`${r.updated} updated`);
+      if (r.skipped) parts.push(`${r.skipped} unchanged`);
+      toast(parts.join(" · "), "success");
       reset();
       onDone();
       onClose();
@@ -415,7 +499,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
             <div className="text-[13px] font-medium text-ink">
               {fileName ? `Loaded ${fileName}` : "Drop a CSV file here, or click to browse"}
             </div>
-            <div className="text-xs text-muted">Columns: email, company, country, industry</div>
+            <div className="text-xs text-muted">Columns: email, company, country, industry, category</div>
             <input
               ref={fileRef}
               type="file"
@@ -433,7 +517,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
               rows={6}
               value={csv}
               onChange={(e) => { setCsv(e.target.value); setFileName(""); }}
-              placeholder={"email,company,country,industry\ninfo@acme.com,Acme Trading,Qatar,Trading"}
+              placeholder={"email,company,country,industry,category\ninfo@acme.com,Acme Trading,Qatar,Trading,Customer"}
               className="mt-2 font-mono text-xs"
             />
           </details>
@@ -459,6 +543,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                     <th className="px-2 py-2">Company</th>
                     <th className="px-2 py-2">Country</th>
                     <th className="px-2 py-2">Industry</th>
+                    <th className="px-2 py-2">Category</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -477,6 +562,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                         <td className="px-2 py-1.5 text-ink/70">{r.company || "—"}</td>
                         <td className="px-2 py-1.5 text-ink/70">{r.country || "—"}</td>
                         <td className="px-2 py-1.5 text-ink/70">{r.industry || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70">{r.category || "—"}</td>
                       </tr>
                     );
                   })}
@@ -493,7 +579,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           {csv.trim() ? (
             <button onClick={reset} className="text-xs font-medium text-ink/50 underline hover:text-ink">Clear</button>
           ) : (
-            <span className="text-xs text-muted">Existing contacts are skipped automatically.</span>
+            <span className="text-xs text-muted">Existing contacts are updated (their status is kept); new ones are added.</span>
           )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
@@ -519,12 +605,13 @@ function Chip({ tone, children }: { tone: "good" | "bad" | "muted"; children: Re
 
 /* ---------------------------- Edit modal ---------------------------- */
 
-function EditModal({ contact, onClose, onDone }: { contact: Contact; onClose: () => void; onDone: () => void }) {
+function EditModal({ contact, categories, onClose, onDone }: { contact: Contact; categories: string[]; onClose: () => void; onDone: () => void }) {
   const [f, setF] = useState({
     email: contact.email,
     company: contact.company || "",
     country: contact.country || "",
     industry: contact.industry || "",
+    category: contact.category || "",
     status: contact.status,
   });
   const [busy, setBusy] = useState(false);
@@ -561,15 +648,16 @@ function EditModal({ contact, onClose, onDone }: { contact: Contact; onClose: ()
           <Field label="Industry">
             <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
           </Field>
-          <Field label="Status" hint="Set to unsubscribed to permanently exclude from sends.">
-            <Select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>
-              <option value="new">new</option>
-              <option value="sent">sent</option>
-              <option value="unsubscribed">unsubscribed</option>
-              <option value="bounced">bounced</option>
-            </Select>
-          </Field>
+          <CategoryField value={f.category} onChange={(v) => setF({ ...f, category: v })} categories={categories} />
         </div>
+        <Field label="Status" hint="Set to unsubscribed to permanently exclude from sends.">
+          <Select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>
+            <option value="new">new</option>
+            <option value="sent">sent</option>
+            <option value="unsubscribed">unsubscribed</option>
+            <option value="bounced">bounced</option>
+          </Select>
+        </Field>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           <Button loading={busy} onClick={save}>Save changes</Button>

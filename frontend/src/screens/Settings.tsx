@@ -156,6 +156,12 @@ export default function Settings() {
         )}
       </div>
 
+      {/* Categories */}
+      <div className="mt-8">
+        <div className="mb-3 font-clash text-lg font-semibold">Contact categories</div>
+        <CategoriesCard />
+      </div>
+
       {/* Account */}
       <div className="mt-8">
         <div className="mb-3 font-clash text-lg font-semibold">Account</div>
@@ -171,6 +177,85 @@ export default function Settings() {
         />
       )}
     </div>
+  );
+}
+
+function CategoriesCard() {
+  const [cats, setCats] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.getCategories().then((r) => setCats(r.categories || [])).catch(() => {}).finally(() => setLoading(false));
+  }, []);
+
+  async function persist(next: string[]) {
+    setBusy(true);
+    try {
+      const r = await api.saveCategories(next);
+      setCats(r.categories || next);
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function add() {
+    const v = input.trim();
+    if (!v) return;
+    if (cats.some((c) => c.toLowerCase() === v.toLowerCase())) { toast("That category already exists", "info"); setInput(""); return; }
+    const next = [...cats, v];
+    setCats(next);
+    setInput("");
+    persist(next);
+  }
+  function remove(name: string) {
+    const next = cats.filter((c) => c !== name);
+    setCats(next);
+    persist(next);
+  }
+
+  return (
+    <Card className="space-y-4 p-5">
+      <p className="text-[13px] text-muted">
+        Define the categories you use to organise contacts (e.g. Customer, Partner, Reseller).
+        They appear when adding contacts, finding emails, importing CSVs, and sending campaigns.
+      </p>
+      <div className="flex gap-2">
+        <Input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && add()}
+          placeholder="Add a category…"
+          className="flex-1"
+        />
+        <Button variant="outline" onClick={add} loading={busy} disabled={!input.trim()}>Add</Button>
+      </div>
+      {loading ? (
+        <div className="text-sm text-muted">Loading…</div>
+      ) : cats.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-line px-4 py-6 text-center text-[13px] text-muted">
+          No categories yet. Add your first one above.
+        </div>
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          {cats.map((c) => (
+            <span key={c} className="inline-flex items-center gap-1.5 rounded-full border border-line bg-cream py-1 pl-3 pr-1.5 text-[13px] font-medium">
+              {c}
+              <button
+                onClick={() => remove(c)}
+                className="grid h-5 w-5 place-items-center rounded-full text-ink/40 transition-colors hover:bg-ink/10 hover:text-ink"
+                title={`Remove ${c}`}
+              >
+                ✕
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+    </Card>
   );
 }
 

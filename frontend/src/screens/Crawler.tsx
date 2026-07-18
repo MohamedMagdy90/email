@@ -71,6 +71,10 @@ export default function Crawler({
   const [mustMention, setMustMention] = useState("");
   const [requireKeyword, setRequireKeyword] = useState(false);
 
+  // category to save fetched emails under
+  const [categories, setCategories] = useState<string[]>([]);
+  const [saveCategory, setSaveCategory] = useState("");
+
   // job
   const [job, setJob] = useState<Job | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -86,6 +90,7 @@ export default function Crawler({
     api.getLeadCategories().then((r) => {
       if (r.categories?.length) { setCats(r.categories); setCategory(r.categories[0]); }
     }).catch(() => {});
+    api.getCategories().then((r) => setCategories(r.categories || [])).catch(() => {});
   }, []);
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [job?.logs?.length]);
@@ -161,6 +166,7 @@ export default function Crawler({
           company: c.name,
           country: location || undefined,
           industry: mode === "discover" ? category : keywords || undefined,
+          category: saveCategory || undefined,
           role_based: /^(info|sales|contact|support|admin|office)/i.test(c.email!),
           source: mode === "keyword" ? "search" : "osm",
         }))
@@ -242,6 +248,7 @@ export default function Crawler({
           company: c.domain,
           country: addTags.current.country,
           industry: addTags.current.industry,
+          category: saveCategory || undefined,
           role_based: c.role_based,
           source: mode === "keyword" ? "search" : "crawler",
         }))
@@ -352,6 +359,12 @@ export default function Crawler({
                     <button onClick={() => setHideKnown((v) => !v)} className="text-xs font-medium text-ink/60 underline hover:text-ink">
                       {hideKnown ? "Show known" : "Hide known"}
                     </button>
+                  )}
+                  {categories.length > 0 && (
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-36 text-[13px]" title="Save under category">
+                      <option value="">No category</option>
+                      {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
                   )}
                   {pickedWithEmail.length > 0 && (
                     <Button size="sm" variant="outline" onClick={addListedEmails}>Add {pickedWithEmail.length} listed</Button>
@@ -516,7 +529,13 @@ export default function Crawler({
 
           <div className="flex items-center justify-between pt-1">
             <Button variant="ghost" onClick={reset} disabled={running}>Back</Button>
-            <div className="flex gap-2">
+            <div className="flex items-center gap-2">
+              {categories.length > 0 && (
+                <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-9 w-40 text-[13px]" title="Save under category">
+                  <option value="">No category</option>
+                  {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                </Select>
+              )}
               <Button variant="outline" onClick={close}>Close</Button>
               <Button onClick={addSelected} disabled={!selected.size}>Add {selected.size || ""} to contacts</Button>
             </div>

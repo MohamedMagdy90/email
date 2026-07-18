@@ -12,6 +12,8 @@ export default function Send() {
 
   const [templateId, setTemplateId] = useState("");
   const [filter, setFilter] = useState("new");
+  const [category, setCategory] = useState("all");
+  const [categories, setCategories] = useState<string[]>([]);
   const [perMinute, setPerMinute] = useState(20);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -20,24 +22,25 @@ export default function Send() {
   const logRef = useRef<HTMLDivElement>(null);
   const running = job?.status === "running";
 
-  async function loadContacts(status: string) {
-    const r = await api.getContacts({ status, limit: 1000 });
+  async function loadContacts(status: string, cat: string) {
+    const r = await api.getContacts({ status, category: cat, limit: 1000 });
     setContacts(r.contacts);
     setSelected(new Set(r.contacts.map((c) => c.id)));
   }
 
   useEffect(() => {
     (async () => {
-      const [t, d, s] = await Promise.all([api.getTemplates(), api.getDomains(), api.getSettings()]);
+      const [t, d, s, cats] = await Promise.all([api.getTemplates(), api.getDomains(), api.getSettings(), api.getCategories()]);
       setTemplates(t.templates);
       setDomains(d.domains);
       setResendOn(s.resendConfigured);
+      setCategories(cats.categories || []);
       if (t.templates[0]) setTemplateId(t.templates[0].id);
       setLoaded(true);
     })();
   }, []);
 
-  useEffect(() => { loadContacts(filter); }, [filter]);
+  useEffect(() => { loadContacts(filter, category); }, [filter, category]);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [job?.logs?.length]);
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
@@ -165,11 +168,20 @@ export default function Send() {
 
         {/* Right: recipients */}
         <Card className="flex flex-col overflow-hidden">
-          <div className="flex items-center justify-between border-b border-line px-4 py-3">
-            <div className="flex rounded-full border border-line bg-cream p-1">
-              {["new", "all"].map((f) => (
-                <button key={f} onClick={() => setFilter(f)} className={cn("rounded-full px-3 py-1 text-[13px] font-medium capitalize", filter === f ? "bg-ink text-cream" : "text-ink/55")}>{f}</button>
-              ))}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-full border border-line bg-cream p-1">
+                {["new", "all"].map((f) => (
+                  <button key={f} onClick={() => setFilter(f)} className={cn("rounded-full px-3 py-1 text-[13px] font-medium capitalize", filter === f ? "bg-ink text-cream" : "text-ink/55")}>{f}</button>
+                ))}
+              </div>
+              {categories.length > 0 && (
+                <Select value={category} onChange={(e) => setCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                  <option value="all">All categories</option>
+                  {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                  <option value="__none__">Uncategorized</option>
+                </Select>
+              )}
             </div>
             <label className="flex items-center gap-2 text-[13px]">
               <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(contacts.map((c) => c.id)))} className="accent-ink" />

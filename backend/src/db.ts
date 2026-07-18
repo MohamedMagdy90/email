@@ -48,11 +48,16 @@ export async function ensureSchema() {
     company TEXT,
     country TEXT,
     industry TEXT,
+    category TEXT,
     role_based INTEGER NOT NULL DEFAULT 0,
     source TEXT,
     status TEXT NOT NULL DEFAULT 'new',
     created_at TEXT NOT NULL
   )`);
+
+  // Migration for existing databases created before `category` existed.
+  // Safe to run every boot: a duplicate-column error is swallowed.
+  try { await q(`ALTER TABLE contacts ADD COLUMN category TEXT`); } catch { /* already exists */ }
 
   await q(`CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
@@ -155,4 +160,29 @@ export async function setSetting(key: string, value: string): Promise<void> {
      ON CONFLICT (key) DO UPDATE SET value = ?`,
     [key, value, value]
   );
+}
+
+/* ---------------------------- Categories ----------------------------- */
+// User-defined contact categories, stored as a JSON array in settings.
+
+export async function getCategories(): Promise<string[]> {
+  const raw = await getSetting("categories");
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === "string" && x.trim()) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function setCategories(list: string[]): Promise<void> {
+  const clean: string[] = [];
+  const seen = new Set<string>();
+  for (const s of list) {
+    const v = String(s || "").trim();
+    const key = v.toLowerCase();
+    if (v && !seen.has(key)) { seen.add(key); clean.push(v); }
+  }
+  await setSetting("categories", JSON.stringify(clean.slice(0, 100)));
 }

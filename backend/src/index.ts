@@ -4,6 +4,7 @@ import { serveStatic } from "hono/bun";
 import {
   q, ensureSchema, getSetting, setSetting, nowIso,
   recordCrawledDomain, getKnownDomains, getContactEmails,
+  getCategories, setCategories,
 } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
 import { crawlMany, type CrawlOptions } from "./crawler";
@@ -115,12 +116,17 @@ app.post("/api/account", async (c) => {
 app.get("/api/contacts", async (c) => {
   const status = c.req.query("status");
   const search = c.req.query("q");
+  const category = c.req.query("category");
   const limit = Math.min(Number(c.req.query("limit") || 500), 2000);
   const offset = Number(c.req.query("offset") || 0);
 
   const where: string[] = [];
   const params: any[] = [];
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (category && category !== "all") {
+    if (category === "__none__") where.push(`(category IS NULL OR category = '')`);
+    else { where.push(`category = ?`); params.push(category); }
+  }
   if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -135,53 +141,52 @@ app.post("/api/contacts", async (c) => {
   const email = String(b.email || "").trim().toLowerCase();
   if (!email || !email.includes("@")) return c.json({ error: "valid email required" }, 400);
   const rows = await q(
-    `INSERT INTO contacts (id,email,company,country,industry,role_based,source,status,created_at)
-     VALUES (?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
-    [uid(), email, b.company || null, b.country || null, b.industry || null, b.role_based ? 1 : 0, b.source || "manual", nowIso()]
+    `INSERT INTO contacts (id,email,company,country,industry,category,role_based,source,status,created_at)
+     VALUES (?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
+    [uid(), email, b.company || null, b.country || null, b.industry || null, b.category || null, b.role_based ? 1 : 0, b.source || "manual", nowIso()]
   );
   if (!rows.length) return c.json({ error: "duplicate", duplicate: true }, 409);
   return c.json({ contact: rows[0] });
 });
 
+// Bulk add contacts. `upsert:true` updates existing rows (company/country/
+// industry/category) while PRESERVING their status — used by CSV re-import so a
+// contact you've already emailed keeps its "sent" status. Default (crawler /
+// discovery) skips existing rows.
 app.post("/api/contacts/bulk", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const items: any[] = Array.isArray(b.contacts) ? b.contacts : [];
-  let added = 0, skipped = 0;
+  const upsert = b.upsert === true;
+  let added = 0, updated = 0, skipped = 0;
   for (const it of items) {
     const email = String(it.email || "").trim().toLowerCase();
     if (!email || !email.includes("@")) { skipped++; continue; }
-    const rows = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,role_based,source,status,created_at)
-       VALUES (?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, it.company || null, it.country || null, it.industry || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
-    );
-    if (rows.length) added++; else skipped++;
-  }
-  return c.json({ added, skipped });
-});
 
-app.post("/api/contacts/import-csv", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const rows = parseCsv(String(b.csv || ""));
-  if (!rows.length) return c.json({ added: 0, skipped: 0 });
-  const header = rows[0].map((h) => h.trim().toLowerCase());
-  const hasHeader = header.includes("email");
-  const cols = hasHeader ? header : ["email", "company", "country", "industry"];
-  const dataRows = hasHeader ? rows.slice(1) : rows;
-  const idx = (name: string) => cols.indexOf(name);
-
-  let added = 0, skipped = 0;
-  for (const r of dataRows) {
-    const email = String(r[idx("email")] ?? r[0] ?? "").trim().toLowerCase();
-    if (!email || !email.includes("@")) { skipped++; continue; }
     const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,source,status,created_at)
-       VALUES (?,?,?,?,?,'csv','new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, idx("company") >= 0 ? r[idx("company")] || null : null, idx("country") >= 0 ? r[idx("country")] || null : null, idx("industry") >= 0 ? r[idx("industry")] || null : null, nowIso()]
+      `INSERT INTO contacts (id,email,company,country,industry,category,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
     );
-    if (ins.length) added++; else skipped++;
+    if (ins.length) { added++; continue; }
+
+    if (!upsert) { skipped++; continue; }
+
+    // Existing row: update only provided, non-empty descriptive fields. Never
+    // touches status, id, created_at, or source.
+    const sets: string[] = [];
+    const vals: any[] = [];
+    for (const field of ["company", "country", "industry", "category"] as const) {
+      const v = it[field];
+      if (v !== undefined && v !== null && String(v).trim() !== "") { sets.push(`${field} = ?`); vals.push(String(v).trim()); }
+    }
+    if (sets.length) {
+      await q(`UPDATE contacts SET ${sets.join(", ")} WHERE email = ?`, [...vals, email]);
+      updated++;
+    } else {
+      skipped++;
+    }
   }
-  return c.json({ added, skipped });
+  return c.json({ added, updated, skipped });
 });
 
 app.put("/api/contacts/:id", async (c) => {
@@ -197,17 +202,29 @@ app.put("/api/contacts/:id", async (c) => {
   }
   const status = ["new", "sent", "unsubscribed", "bounced"].includes(b.status) ? b.status : existing.status;
   const rows = await q(
-    `UPDATE contacts SET email=?, company=?, country=?, industry=?, status=? WHERE id=? RETURNING *`,
+    `UPDATE contacts SET email=?, company=?, country=?, industry=?, category=?, status=? WHERE id=? RETURNING *`,
     [
       email,
       b.company !== undefined ? b.company || null : existing.company,
       b.country !== undefined ? b.country || null : existing.country,
       b.industry !== undefined ? b.industry || null : existing.industry,
+      b.category !== undefined ? b.category || null : existing.category,
       status,
       id,
     ]
   );
   return c.json({ contact: rows[0] });
+});
+
+/* ---------------------------- Categories ---------------------------- */
+
+app.get("/api/categories", async (c) => c.json({ categories: await getCategories() }));
+
+app.post("/api/categories", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (!Array.isArray(b.categories)) return c.json({ error: "categories array required" }, 400);
+  await setCategories(b.categories.map((x: any) => String(x)));
+  return c.json({ categories: await getCategories() });
 });
 
 app.post("/api/contacts/delete", async (c) => {
@@ -222,13 +239,19 @@ app.post("/api/contacts/delete", async (c) => {
 app.get("/api/contacts/export", async (c) => {
   const status = c.req.query("status");
   const search = c.req.query("q");
+  const category = c.req.query("category");
   const where: string[] = [];
   const params: any[] = [];
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (category && category !== "all") {
+    if (category === "__none__") where.push(`(category IS NULL OR category = '')`);
+    else { where.push(`category = ?`); params.push(category); }
+  }
   if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const rows = await q(`SELECT email,company,country,industry,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
-  const header = ["email", "company", "country", "industry", "role_based", "status", "source", "created_at"];
+  // `email` first and `category` early so it's easy to edit and re-import.
+  const rows = await q(`SELECT email,company,country,industry,category,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
+  const header = ["email", "company", "country", "industry", "category", "role_based", "status", "source", "created_at"];
   const csv = [header.join(",")].concat(rows.map((r) => header.map((h) => csvCell(r[h])).join(","))).join("\n");
   return new Response(csv, {
     headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="contacts.csv"` },
@@ -808,28 +831,6 @@ function serializeJob(job: Job) {
     total: job.total, processed: job.processed, logs: job.logs.slice(-120),
     result: job.result, error: job.error,
   };
-}
-
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let cur: string[] = [];
-  let val = "";
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inQuotes) {
-      if (ch === '"') { if (text[i + 1] === '"') { val += '"'; i++; } else inQuotes = false; }
-      else val += ch;
-    } else {
-      if (ch === '"') inQuotes = true;
-      else if (ch === ",") { cur.push(val); val = ""; }
-      else if (ch === "\n") { cur.push(val); rows.push(cur); cur = []; val = ""; }
-      else if (ch === "\r") { /* skip */ }
-      else val += ch;
-    }
-  }
-  if (val.length || cur.length) { cur.push(val); rows.push(cur); }
-  return rows.filter((r) => r.some((cell) => cell.trim() !== ""));
 }
 
 /* ------------------ Static frontend (single-process) ---------------- */
