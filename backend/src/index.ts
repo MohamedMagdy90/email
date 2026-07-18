@@ -271,10 +271,10 @@ app.get("/api/domains", async (c) => {
 
 app.post("/api/domains", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const domain = String(b.domain || "").trim();
-  const fromEmail = String(b.from_email || "").trim();
+  const domain = normalizeDomain(b.domain);
+  const fromEmail = resolveFromEmail(b.from_email, domain);
   if (!domain) return c.json({ error: "Domain is required" }, 400);
-  if (!isEmail(fromEmail)) return c.json({ error: "From email must be a full address like outreach@yourdomain.com" }, 400);
+  if (!isEmail(fromEmail)) return c.json({ error: `From email must be a full address like no-reply@${domain}` }, 400);
   const rows = await q(
     `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,created_at) VALUES (?,?,?,?,?,1,?) RETURNING *`,
     [uid(), domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, nowIso()]
@@ -284,10 +284,10 @@ app.post("/api/domains", async (c) => {
 
 app.put("/api/domains/:id", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const domain = String(b.domain || "").trim();
-  const fromEmail = String(b.from_email || "").trim();
+  const domain = normalizeDomain(b.domain);
+  const fromEmail = resolveFromEmail(b.from_email, domain);
   if (!domain) return c.json({ error: "Domain is required" }, 400);
-  if (!isEmail(fromEmail)) return c.json({ error: "From email must be a full address like outreach@yourdomain.com" }, 400);
+  if (!isEmail(fromEmail)) return c.json({ error: `From email must be a full address like no-reply@${domain}` }, 400);
   const rows = await q(
     `UPDATE domains SET domain=?, from_name=?, from_email=?, daily_cap=?, active=? WHERE id=? RETURNING *`,
     [domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
@@ -621,6 +621,18 @@ function shorten(u: string) { try { const x = new URL(u); return x.hostname + x.
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function isEmail(s: string) { return EMAIL_RE.test(String(s || "").trim()); }
+
+// Clean a domain input: strip protocol, path, and leading www.
+function normalizeDomain(s: string) {
+  return String(s || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/^www\./i, "").toLowerCase();
+}
+
+// Resolve a From email: if the user typed only a mailbox ("no-reply"), attach the domain.
+function resolveFromEmail(input: string, domain: string) {
+  let v = String(input || "").trim();
+  if (v && !v.includes("@") && domain) v = `${v}@${domain}`;
+  return v.toLowerCase();
+}
 
 // Build an RFC-5322-safe "Name <email>" sender from a domain row.
 // Returns { from } on success or { error } with a clear, actionable message.

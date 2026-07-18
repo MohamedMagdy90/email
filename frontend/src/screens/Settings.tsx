@@ -236,12 +236,28 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
   const [d, setD] = useState(domain);
   const [busy, setBusy] = useState(false);
 
+  // Resolve what the From email will actually be saved as (auto-append domain if the
+  // user typed only a mailbox like "no-reply").
+  const resolvedFrom =
+    d.from_email && !d.from_email.includes("@") && d.domain
+      ? `${d.from_email.trim()}@${d.domain.trim()}`
+      : d.from_email.trim();
+  const fromValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(resolvedFrom);
+
+  function completeEmail() {
+    if (d.from_email && !d.from_email.includes("@") && d.domain) {
+      setD((s) => ({ ...s, from_email: `${s.from_email.trim()}@${s.domain.trim()}` }));
+    }
+  }
+
   async function save() {
-    if (!d.domain || !d.from_email) return toast("Domain and from-email are required", "error");
+    if (!d.domain.trim()) return toast("Domain is required", "error");
+    if (!fromValid) return toast("Enter a full From email like no-reply@" + (d.domain || "yourdomain.com"), "error");
     setBusy(true);
     try {
-      if (d.id) await api.updateDomain(d.id, d);
-      else await api.saveDomain(d);
+      const payload = { ...d, from_email: resolvedFrom };
+      if (d.id) await api.updateDomain(d.id, payload);
+      else await api.saveDomain(payload);
       toast("Saved", "success");
       onSaved();
     } catch (e: any) {
@@ -254,19 +270,31 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
   return (
     <Modal open onClose={onClose} title={d.id ? "Edit domain" : "Add sending domain"}>
       <div className="space-y-4">
-        <Field label="Domain" hint="A verified domain in your Resend account.">
+        <Field label="Domain" hint="A domain you've verified in Resend (SPF/DKIM added).">
           <Input value={d.domain} onChange={(e) => setD({ ...d, domain: e.target.value })} placeholder="dna-erp.com" />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="From name">
-            <Input value={d.from_name} onChange={(e) => setD({ ...d, from_name: e.target.value })} />
+            <Input value={d.from_name} onChange={(e) => setD({ ...d, from_name: e.target.value })} placeholder="Solution ERP" />
           </Field>
           <Field label="Daily cap">
             <Input type="number" value={d.daily_cap} onChange={(e) => setD({ ...d, daily_cap: Number(e.target.value) })} />
           </Field>
         </div>
-        <Field label="From email">
-          <Input value={d.from_email} onChange={(e) => setD({ ...d, from_email: e.target.value })} placeholder="outreach@dna-erp.com" />
+        <Field
+          label="From email"
+          hint={
+            d.from_email && !d.from_email.includes("@") && d.domain
+              ? `Will be saved as ${resolvedFrom}`
+              : "The full address emails are sent from — must be on the verified domain above."
+          }
+        >
+          <Input
+            value={d.from_email}
+            onChange={(e) => setD({ ...d, from_email: e.target.value })}
+            onBlur={completeEmail}
+            placeholder="no-reply@dna-erp.com"
+          />
         </Field>
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="accent-ink" />
