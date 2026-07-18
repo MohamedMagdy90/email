@@ -311,13 +311,15 @@ app.post("/api/domains/reset-counts", async (c) => {
 app.get("/api/settings", async (c) => {
   const key = await getResendKey();
   const appUrl = (await getSetting("app_url")) || process.env.APP_URL || "";
-  return c.json({ resendConfigured: !!key, appUrl });
+  const replyTo = (await getSetting("reply_to")) || "";
+  return c.json({ resendConfigured: !!key, appUrl, replyTo });
 });
 
 app.post("/api/settings", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (typeof b.resend_api_key === "string" && b.resend_api_key.trim()) await setSetting("resend_api_key", b.resend_api_key.trim());
   if (typeof b.app_url === "string") await setSetting("app_url", b.app_url.trim());
+  if (typeof b.reply_to === "string") await setSetting("reply_to", b.reply_to.trim());
   return c.json({ ok: true });
 });
 
@@ -339,13 +341,14 @@ app.post("/api/settings/test-email", async (c) => {
     from = r.from;
   }
 
+  const replyTo = (await getSetting("reply_to")) || "";
   const html = wrapHtml(
     `<p style="font-family:Arial,Helvetica,sans-serif">This is a test email from your DNA Outreach app.</p>
      <p style="font-family:Arial,Helvetica,sans-serif">If you're reading this, Resend is connected and your sending domain works. You're ready to run real campaigns.</p>`,
     "#",
     ""
   );
-  const result = await sendEmail({ from, to, subject: "DNA Outreach — test email", html });
+  const result = await sendEmail({ from, to, subject: "DNA Outreach — test email", html, replyTo: replyTo || undefined });
   if (!result.ok) return c.json({ error: result.error || "Send failed" }, 502);
   return c.json({ ok: true, from });
 });
@@ -444,6 +447,7 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
 
   const activeDomains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
   const appUrl = ((await getSetting("app_url")) || process.env.APP_URL || "").replace(/\/+$/, "");
+  const replyTo = (await getSetting("reply_to")) || "";
   const dryRun = !(await getResendKey());
   if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
 
@@ -497,6 +501,7 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
 
     const result = await sendEmail({
       from, to: contact.email, subject, html,
+      replyTo: replyTo || undefined,
       headers: unsub
         ? { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }
         : undefined,

@@ -11,6 +11,7 @@ export interface SendArgs {
   subject: string;
   html: string;
   headers?: Record<string, string>;
+  replyTo?: string;
 }
 
 export interface SendResult {
@@ -39,6 +40,7 @@ export async function sendEmail(args: SendArgs): Promise<SendResult> {
         to: args.to,
         subject: args.subject,
         html: args.html,
+        reply_to: args.replyTo || undefined,
         headers: args.headers,
       }),
     });

@@ -190,8 +190,8 @@ export const api = {
   resetCounts: () => req(`/api/domains/reset-counts`, { method: "POST" }),
 
   // settings
-  getSettings: () => req<{ resendConfigured: boolean; appUrl: string }>(`/api/settings`),
-  saveSettings: (s: { resend_api_key?: string; app_url?: string }) =>
+  getSettings: () => req<{ resendConfigured: boolean; appUrl: string; replyTo: string }>(`/api/settings`),
+  saveSettings: (s: { resend_api_key?: string; app_url?: string; reply_to?: string }) =>
     req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
   sendTestEmail: (to: string) =>
     req<{ ok: boolean; from: string }>(`/api/settings/test-email`, { method: "POST", body: JSON.stringify({ to }) }),

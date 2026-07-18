@@ -7,6 +7,7 @@ export default function Settings() {
   const [resendKey, setResendKey] = useState("");
   const [resendOn, setResendOn] = useState(false);
   const [appUrl, setAppUrl] = useState("");
+  const [replyTo, setReplyTo] = useState("");
   const [domains, setDomains] = useState<Domain[]>([]);
   const [editing, setEditing] = useState<Domain | null>(null);
   const [savingKey, setSavingKey] = useState(false);
@@ -17,6 +18,7 @@ export default function Settings() {
     const [s, d] = await Promise.all([api.getSettings(), api.getDomains()]);
     setResendOn(s.resendConfigured);
     setAppUrl(s.appUrl || "");
+    setReplyTo(s.replyTo || "");
     setDomains(d.domains);
   }
   useEffect(() => { load(); }, []);
@@ -24,7 +26,7 @@ export default function Settings() {
   async function saveKey() {
     setSavingKey(true);
     try {
-      await api.saveSettings({ resend_api_key: resendKey || undefined, app_url: appUrl });
+      await api.saveSettings({ resend_api_key: resendKey || undefined, app_url: appUrl, reply_to: replyTo });
       toast("Settings saved", "success");
       setResendKey("");
       load();
@@ -78,6 +80,9 @@ export default function Settings() {
           </Field>
           <Field label="App URL" hint="Public URL of THIS app's backend — used for unsubscribe & open-tracking links. e.g. https://your-api.up.railway.app">
             <Input value={appUrl} onChange={(e) => setAppUrl(e.target.value)} placeholder="https://your-api.up.railway.app" />
+          </Field>
+          <Field label="Reply-to email" hint="Where replies land when someone hits Reply (e.g. a real inbox you monitor). Emails send from your domain, but replies go here.">
+            <Input value={replyTo} onChange={(e) => setReplyTo(e.target.value)} placeholder="inquiry@dna.systems" />
           </Field>
           <div className="flex justify-end">
             <Button loading={savingKey} onClick={saveKey}>Save</Button>
