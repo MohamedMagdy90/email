@@ -156,11 +156,11 @@ export function Modal({
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-ink/40 p-4 backdrop-blur-sm sm:p-8">
       <div
         className={cn(
-          "relative mt-4 w-full rounded-3xl border border-line bg-paper shadow-2xl sm:mt-10",
+          "relative mt-4 w-full overflow-hidden rounded-3xl border border-line bg-paper shadow-2xl sm:mt-10",
           wide ? "max-w-3xl" : "max-w-lg"
         )}
       >
-        <div className="prism-bar h-1 rounded-t-3xl" />
+        <div className="prism-bar h-1.5 w-full" />
         <div className="flex items-center justify-between px-6 py-4">
           <h3 className="font-clash text-lg font-semibold">{title}</h3>
           <button
