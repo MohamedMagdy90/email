@@ -72,16 +72,24 @@ function describeBlock(res: FetchResult): string {
 }
 
 // One-line summary attached to the result so the UI can explain an empty harvest.
-function blockNote(reason: BlockReason | undefined): string {
+// `hasProxy` = a scraping proxy was configured and attempted, which changes the
+// advice from "connect a proxy" to "your proxy couldn't get through".
+function blockNote(reason: BlockReason | undefined, hasProxy = false): string {
   switch (reason) {
     case "cloudflare":
-      return "This site is protected by Cloudflare's JavaScript challenge, so it can't be read by the harvester. It needs a JS-rendering scraping proxy to crawl.";
+      return hasProxy
+        ? "This site is protected by Cloudflare's JavaScript challenge and your scraping proxy couldn't solve it. Turn on Premium/stealth mode in Settings → Crawler, or try another provider."
+        : "This site is protected by Cloudflare's JavaScript challenge, so it can't be read directly. Connect a scraping proxy in Settings → Crawler — scraping proxy (ScrapingBee / ScraperAPI / ZenRows) to crawl it.";
     case "rate-limited":
       return "The site rate-limited the crawler (HTTP 429). Try again later or lower the concurrency.";
     case "forbidden":
-      return "The site refused the crawler (HTTP 403 bot protection).";
+      return hasProxy
+        ? "The site refused the crawler (HTTP 403) even through the proxy. Enable Premium/stealth mode in Settings → Crawler, or try another provider."
+        : "The site refused the crawler (HTTP 403 bot protection). Connect a scraping proxy in Settings → Crawler to get past it.";
     case "blocked":
-      return "The site served a block / captcha page instead of content.";
+      return hasProxy
+        ? "The site served a block / captcha page even through the proxy. Enable Premium/stealth mode, or try another provider."
+        : "The site served a block / captcha page. Connect a scraping proxy in Settings → Crawler to get past it.";
     default:
       return "The site blocked the crawler.";
   }
@@ -456,7 +464,7 @@ export async function crawlDirectory(
   let note: string | undefined;
   if (listingPages === 0) { status = "error"; note = "Could not open the URL."; }
   else if (finalContacts.length === 0) {
-    if (blocked > 0) { status = "blocked"; note = blockNote(blockReason); }
+    if (blocked > 0) { status = "blocked"; note = blockNote(blockReason, !!proxy); }
     else { status = "empty"; note = "No listings or contact details were found on the pages that loaded."; }
   }
 

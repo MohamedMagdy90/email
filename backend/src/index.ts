@@ -672,9 +672,23 @@ app.get("/api/crawl/:id", (c) => {
 app.post("/api/send", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const templateId = String(b.templateId || "");
-  const contactIds: string[] = Array.isArray(b.contactIds) ? b.contactIds : [];
+  let contactIds: string[] = Array.isArray(b.contactIds) ? b.contactIds : [];
   const perMinute = clamp(Number(b.perMinute) || 20, 1, 120);
   if (!templateId) return c.json({ error: "templateId required" }, 400);
+
+  // "Send to all matching" — resolve recipients server-side from the same filter
+  // the recipient list uses, so you can target 100k+ without shipping every id.
+  // Always excludes unsubscribed/bounced (they'd only be skipped anyway).
+  if (b.all === true) {
+    const { where, params } = contactWhere({ status: b.status, category: b.category });
+    const conds = [...where, `status NOT IN ('unsubscribed','bounced')`];
+    const rows = await q(
+      `SELECT id FROM contacts WHERE ${conds.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT 200000`,
+      params
+    );
+    contactIds = rows.map((r) => String(r.id));
+  }
+
   if (!contactIds.length) return c.json({ error: "select at least one contact" }, 400);
 
   const job = createJob("send", contactIds.length);

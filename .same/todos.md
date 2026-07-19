@@ -74,3 +74,11 @@
 - [x] Type-check clean (FE + BE)
 - [x] buildProxyUrl correct for all 3 providers (encoding + premium flags)
 - [x] Settings round-trip works; API key never exposed in GET
+
+## Send page — scale to unlimited recipients
+
+- [x] Backend `/api/send`: accept `all:true` + filter (status/category) to resolve recipients server-side (LIMIT 200k), excluding unsubscribed/bounced
+- [x] Frontend `Send.tsx`: paginated recipient preview (100/page, prev/next, showing X–Y of Z)
+- [x] "Select all N matching" (default) so a send targets the whole filtered set, not just the loaded page
+- [x] Fixed the 200-cap symptom (list endpoint clamp) by making sends filter-driven
+- [x] Verified: send-all resolved total=2 of 3 (unsubscribed excluded); throwaway data cleaned up; real data untouched
