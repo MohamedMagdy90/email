@@ -115,6 +115,11 @@ export default function Crawler({
   const isAdded = (l: Lead) => !!l.inContacts || dirAdded.has(leadKey(l));
   const addableLeads = leads.filter((l) => l.email && !isAdded(l));
   const leadsWithPhone = leads.filter((l) => l.phone).length;
+  // When a directory harvest finishes with nothing, explain why (e.g. Cloudflare).
+  const dirSites: any[] = job?.result?.sites || [];
+  const dirBlocked = isDirJob && !running && leads.length === 0 && dirSites.some((s) => s.status === "blocked");
+  const dirNote: string | undefined =
+    isDirJob && !running && leads.length === 0 ? dirSites.find((s) => s.note)?.note : undefined;
 
   useEffect(() => {
     api.getLeadCategories().then((r) => {
@@ -646,6 +651,22 @@ export default function Crawler({
           {skippedList.length > 0 && (
             <div className="rounded-lg border border-line bg-cream px-3 py-2 text-xs text-ink/70">
               Skipped <span className="font-semibold">{skippedList.length}</span> already-known site(s) — previously crawled or already in your contacts.
+            </div>
+          )}
+
+          {dirNote && (
+            <div
+              className={cn(
+                "rounded-lg border px-3 py-2.5 text-xs",
+                dirBlocked
+                  ? "border-[#f0c98a] bg-[#fff6e8] text-[#8a5a12]"
+                  : "border-line bg-cream text-ink/70"
+              )}
+            >
+              <div className="font-semibold">
+                {dirBlocked ? "This directory blocks crawlers" : "No leads found"}
+              </div>
+              <div className="mt-0.5 leading-relaxed">{dirNote}</div>
             </div>
           )}
 

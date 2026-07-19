@@ -5,21 +5,37 @@ import { downloadCsv, parseContacts, CONTACTS_TEMPLATE, type ParsedContact } fro
 import Crawler from "./Crawler";
 
 const FILTERS = ["all", "new", "sent", "unsubscribed", "bounced"];
+const PAGE_SIZES = [25, 50, 100];
 
 export default function Contacts() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [total, setTotal] = useState(0);
+  const [filteredTotal, setFilteredTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [categories, setCategories] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectAllMatching, setSelectAllMatching] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [crawlOpen, setCrawlOpen] = useState(false);
   const [editing, setEditing] = useState<Contact | null>(null);
+
+  // Keyset pagination: `cursor` fetches the current page, `prevStack` remembers
+  // the cursors used to get here so "Prev" works. `reloadTick` forces a refetch
+  // of the current page after a mutation.
+  const [pageSize, setPageSize] = useState(50);
+  const [cursor, setCursor] = useState<string | undefined>(undefined);
+  // History of cursors so "Prev" can walk back. Only ever mutated via the setter.
+  const [, setPrevStack] = useState<(string | undefined)[]>([]);
+  const [pageIndex, setPageIndex] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+
+  const headerCbRef = useRef<HTMLInputElement>(null);
 
   async function loadCategories() {
     try { setCategories((await api.getCategories()).categories || []); } catch { /* ignore */ }
@@ -29,13 +45,17 @@ export default function Contacts() {
   async function load() {
     setLoading(true);
     try {
-      const r = await api.getContacts({ status: filter, q: search, category: categoryFilter, limit: 1000 });
+      const r = await api.getContacts({ status: filter, q: search, category: categoryFilter, limit: pageSize, cursor });
       setContacts(r.contacts);
       setTotal(r.total);
-      setSelected((prev) => {
-        const visible = new Set(r.contacts.map((c) => c.id));
-        return new Set([...prev].filter((id) => visible.has(id)));
-      });
+      setFilteredTotal(r.filteredTotal);
+      setNextCursor(r.nextCursor);
+      if (!selectAllMatching) {
+        setSelected((prev) => {
+          const visible = new Set(r.contacts.map((c) => c.id));
+          return new Set([...prev].filter((id) => visible.has(id)));
+        });
+      }
       const c: Record<string, number> = {};
       for (const row of r.counts) c[row.status] = row.n;
       setCounts(c);
@@ -50,30 +70,117 @@ export default function Contacts() {
     const t = setTimeout(load, search ? 300 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, search, categoryFilter]);
+  }, [filter, search, categoryFilter, pageSize, cursor, reloadTick]);
 
-  const allSelected = contacts.length > 0 && selected.size === contacts.length;
+  // Reset to the first page whenever the result set changes (filter/search/size).
+  function resetPaging() {
+    setCursor(undefined);
+    setPrevStack([]);
+    setPageIndex(0);
+    setSelected(new Set());
+    setSelectAllMatching(false);
+  }
+  // Refetch the current page after a mutation, snapping back to page one so newly
+  // added rows (sorted newest-first) are visible and stale cursors can't linger.
+  function refreshFromStart() {
+    setCursor(undefined);
+    setPrevStack([]);
+    setPageIndex(0);
+    setSelected(new Set());
+    setSelectAllMatching(false);
+    setReloadTick((t) => t + 1);
+  }
+  function reloadCurrent() { setReloadTick((t) => t + 1); }
+
+  function changeFilter(f: string) { setFilter(f); resetPaging(); }
+  function changeCategory(v: string) { setCategoryFilter(v); resetPaging(); }
+  function changeSearch(v: string) { setSearch(v); resetPaging(); }
+  function changePageSize(n: number) { setPageSize(n); resetPaging(); }
+
+  function nextPage() {
+    if (!nextCursor || loading) return;
+    setPrevStack((s) => [...s, cursor]);
+    setCursor(nextCursor);
+    setPageIndex((i) => i + 1);
+    if (!selectAllMatching) setSelected(new Set());
+  }
+  function prevPage() {
+    if (pageIndex === 0 || loading) return;
+    setPrevStack((s) => {
+      const copy = [...s];
+      const prev = copy.pop();
+      setCursor(prev);
+      return copy;
+    });
+    setPageIndex((i) => Math.max(0, i - 1));
+    if (!selectAllMatching) setSelected(new Set());
+  }
+
+  const pageAllSelected = contacts.length > 0 && contacts.every((c) => selected.has(c.id));
+  const headerChecked = selectAllMatching || pageAllSelected;
+  const selectionCount = selectAllMatching ? filteredTotal : selected.size;
+  const totalPages = Math.max(1, Math.ceil(filteredTotal / pageSize));
+  const rangeStart = contacts.length ? pageIndex * pageSize + 1 : 0;
+  const rangeEnd = pageIndex * pageSize + contacts.length;
+  const canOfferAllMatching = pageAllSelected && !selectAllMatching && filteredTotal > contacts.length;
+
+  useEffect(() => {
+    if (headerCbRef.current) {
+      headerCbRef.current.indeterminate = !selectAllMatching && selected.size > 0 && !pageAllSelected;
+    }
+  }, [selected, pageAllSelected, selectAllMatching]);
+
+  const filterArgs = { status: filter, q: search, category: categoryFilter };
+
   function toggleAll() {
-    setSelected(allSelected ? new Set() : new Set(contacts.map((c) => c.id)));
+    if (headerChecked) {
+      setSelected(new Set());
+      setSelectAllMatching(false);
+    } else {
+      setSelected(new Set(contacts.map((c) => c.id)));
+    }
   }
   function toggle(id: string) {
-    const n = new Set(selected);
-    n.has(id) ? n.delete(id) : n.add(id);
-    setSelected(n);
+    setSelectAllMatching(false);
+    setSelected((prev) => {
+      const n = new Set(prev);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
   }
 
   async function removeSelected() {
-    if (!selected.size) return;
-    if (!confirm(`Delete ${selected.size} contact(s)?`)) return;
-    await api.deleteContacts([...selected]);
-    setSelected(new Set());
-    toast("Deleted", "success");
-    load();
+    const count = selectionCount;
+    if (!count) return;
+    if (!confirm(`Delete ${count.toLocaleString()} contact(s)? This cannot be undone.`)) return;
+    try {
+      if (selectAllMatching) await api.deleteContactsMatching(filterArgs);
+      else await api.deleteContacts([...selected]);
+      toast(`Deleted ${count.toLocaleString()} contact(s)`, "success");
+      refreshFromStart();
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  }
+
+  async function applyCategory(cat: string) {
+    const count = selectionCount;
+    if (!count) return;
+    try {
+      if (selectAllMatching) await api.setContactsCategory(cat, { all: true, ...filterArgs });
+      else await api.setContactsCategory(cat, { ids: [...selected] });
+      toast(`Set category on ${count.toLocaleString()} contact(s)`, "success");
+      setSelected(new Set());
+      setSelectAllMatching(false);
+      reloadCurrent();
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
   }
 
   async function exportCsv() {
     try {
-      const csv = await api.exportContacts({ status: filter, q: search, category: categoryFilter });
+      const csv = await api.exportContacts(filterArgs);
       if (!csv.trim() || csv.split("\n").length <= 1) return toast("Nothing to export", "info");
       downloadCsv("contacts.csv", csv);
       toast("Exported", "success");
@@ -131,7 +238,7 @@ export default function Contacts() {
           {FILTERS.map((f) => (
             <button
               key={f}
-              onClick={() => setFilter(f)}
+              onClick={() => changeFilter(f)}
               className={cn(
                 "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
                 filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
@@ -144,7 +251,7 @@ export default function Contacts() {
         {categories.length > 0 && (
           <Select
             value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
+            onChange={(e) => changeCategory(e.target.value)}
             className="h-9 w-44"
           >
             <option value="all">All categories</option>
@@ -153,32 +260,21 @@ export default function Contacts() {
           </Select>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {selected.size > 0 && (
+          {selectionCount > 0 && (
             <>
               {categories.length > 0 && (
-                <BulkCategory
-                  categories={categories}
-                  onApply={async (cat) => {
-                    await api.bulkContacts(
-                      contacts.filter((c) => selected.has(c.id)).map((c) => ({ email: c.email, category: cat })),
-                      true
-                    );
-                    toast(`Set category on ${selected.size} contact(s)`, "success");
-                    setSelected(new Set());
-                    load();
-                  }}
-                />
+                <BulkCategory categories={categories} onApply={applyCategory} />
               )}
               {/* bulk-set assigns a category; clearing is done via Edit */}
               <Button variant="danger" size="sm" onClick={removeSelected}>
-                Delete {selected.size}
+                Delete {selectionCount.toLocaleString()}
               </Button>
             </>
           )}
           <Input
             placeholder="Search email or company…"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => changeSearch(e.target.value)}
             className="h-9 w-64"
           />
         </div>
@@ -186,6 +282,33 @@ export default function Contacts() {
 
       {/* Table */}
       <Card className="overflow-hidden">
+        {/* Select-all-matching banner */}
+        {selectAllMatching ? (
+          <div className="flex flex-wrap items-center justify-center gap-1.5 border-b border-line bg-ink/[0.03] px-4 py-2 text-[13px]">
+            <span className="text-ink/70">
+              All <span className="font-semibold text-ink">{filteredTotal.toLocaleString()}</span> contacts matching your filters are selected.
+            </span>
+            <button
+              onClick={() => { setSelectAllMatching(false); setSelected(new Set()); }}
+              className="font-semibold text-ink underline underline-offset-2 hover:opacity-70"
+            >
+              Clear selection
+            </button>
+          </div>
+        ) : canOfferAllMatching ? (
+          <div className="flex flex-wrap items-center justify-center gap-1.5 border-b border-line bg-ink/[0.03] px-4 py-2 text-[13px]">
+            <span className="text-ink/70">
+              All <span className="font-semibold text-ink">{contacts.length}</span> on this page are selected.
+            </span>
+            <button
+              onClick={() => setSelectAllMatching(true)}
+              className="font-semibold text-ink underline underline-offset-2 hover:opacity-70"
+            >
+              Select all {filteredTotal.toLocaleString()} matching
+            </button>
+          </div>
+        ) : null}
+
         {loading ? (
           <div className="flex items-center justify-center gap-2 py-16 text-muted">
             <Spinner /> Loading…
@@ -193,80 +316,110 @@ export default function Contacts() {
         ) : contacts.length === 0 ? (
           <Empty onFind={() => setCrawlOpen(true)} />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-line text-left mono-label text-muted">
-                  <th className="w-10 px-4 py-3">
-                    <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-ink" />
-                  </th>
-                  <th className="px-2 py-3">Email</th>
-                  <th className="px-2 py-3">Company</th>
-                  <th className="px-2 py-3">Phone</th>
-                  <th className="px-2 py-3">Country</th>
-                  <th className="px-2 py-3">Category</th>
-                  <th className="px-2 py-3">Type</th>
-                  <th className="px-2 py-3">Status</th>
-                  <th className="w-12 px-2 py-3" />
-                </tr>
-              </thead>
-              <tbody>
-                {contacts.map((c) => (
-                  <tr key={c.id} className="group border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
-                    <td className="px-4 py-2.5">
-                      <input
-                        type="checkbox"
-                        checked={selected.has(c.id)}
-                        onChange={() => toggle(c.id)}
-                        className="accent-ink"
-                      />
-                    </td>
-                    <td className="px-2 py-2.5 font-medium">{c.email}</td>
-                    <td className="px-2 py-2.5 text-ink/70">{c.company || "—"}</td>
-                    <td className="px-2 py-2.5 text-ink/70">
-                      {c.phone ? <span className="tabular-nums">{c.phone}</span> : <span className="text-muted">—</span>}
-                    </td>
-                    <td className="px-2 py-2.5 text-ink/70">{c.country || "—"}</td>
-                    <td className="px-2 py-2.5">
-                      {c.category ? (
-                        <span className="inline-flex items-center rounded-full bg-ink/[0.06] px-2 py-0.5 text-[11px] font-medium text-ink/70">{c.category}</span>
-                      ) : (
-                        <span className="text-xs text-muted">—</span>
-                      )}
-                    </td>
-                    <td className="px-2 py-2.5">
-                      <span className="text-xs text-muted">{c.role_based ? "role" : "personal"}</span>
-                    </td>
-                    <td className="px-2 py-2.5">
-                      <StatusPill status={c.status} />
-                    </td>
-                    <td className="px-2 py-2.5 text-right">
-                      <button
-                        onClick={() => setEditing(c)}
-                        className="rounded-md px-2 py-1 text-xs font-medium text-ink/50 opacity-0 transition-opacity hover:bg-ink/[0.06] hover:text-ink group-hover:opacity-100"
-                        title="Edit contact"
-                      >
-                        Edit
-                      </button>
-                    </td>
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left mono-label text-muted">
+                    <th className="w-10 px-4 py-3">
+                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
+                    </th>
+                    <th className="px-2 py-3">Email</th>
+                    <th className="px-2 py-3">Company</th>
+                    <th className="px-2 py-3">Phone</th>
+                    <th className="px-2 py-3">Country</th>
+                    <th className="px-2 py-3">Category</th>
+                    <th className="px-2 py-3">Type</th>
+                    <th className="px-2 py-3">Status</th>
+                    <th className="w-12 px-2 py-3" />
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {contacts.map((c) => {
+                    const isSel = selectAllMatching || selected.has(c.id);
+                    return (
+                      <tr key={c.id} className="group border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
+                        <td className="px-4 py-2.5">
+                          <input
+                            type="checkbox"
+                            checked={isSel}
+                            onChange={() => toggle(c.id)}
+                            className="accent-ink"
+                          />
+                        </td>
+                        <td className="px-2 py-2.5 font-medium">{c.email}</td>
+                        <td className="px-2 py-2.5 text-ink/70">{c.company || "—"}</td>
+                        <td className="px-2 py-2.5 text-ink/70">
+                          {c.phone ? <span className="tabular-nums">{c.phone}</span> : <span className="text-muted">—</span>}
+                        </td>
+                        <td className="px-2 py-2.5 text-ink/70">{c.country || "—"}</td>
+                        <td className="px-2 py-2.5">
+                          {c.category ? (
+                            <span className="inline-flex items-center rounded-full bg-ink/[0.06] px-2 py-0.5 text-[11px] font-medium text-ink/70">{c.category}</span>
+                          ) : (
+                            <span className="text-xs text-muted">—</span>
+                          )}
+                        </td>
+                        <td className="px-2 py-2.5">
+                          <span className="text-xs text-muted">{c.role_based ? "role" : "personal"}</span>
+                        </td>
+                        <td className="px-2 py-2.5">
+                          <StatusPill status={c.status} />
+                        </td>
+                        <td className="px-2 py-2.5 text-right">
+                          <button
+                            onClick={() => setEditing(c)}
+                            className="rounded-md px-2 py-1 text-xs font-medium text-ink/50 opacity-0 transition-opacity hover:bg-ink/[0.06] hover:text-ink group-hover:opacity-100"
+                            title="Edit contact"
+                          >
+                            Edit
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination footer */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-[13px]">
+              <div className="text-muted">
+                Showing <span className="font-medium text-ink">{rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()}</span>{" "}
+                of <span className="font-medium text-ink">{filteredTotal.toLocaleString()}</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2 text-muted">
+                  <span>Per page</span>
+                  <Select value={String(pageSize)} onChange={(e) => changePageSize(Number(e.target.value))} className="h-8 w-[72px]">
+                    {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Button variant="outline" size="sm" onClick={prevPage} disabled={pageIndex === 0 || loading}>
+                    Prev
+                  </Button>
+                  <span className="min-w-[84px] text-center text-muted">Page {pageIndex + 1} / {totalPages.toLocaleString()}</span>
+                  <Button variant="outline" size="sm" onClick={nextPage} disabled={!nextCursor || loading}>
+                    Next
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </>
         )}
       </Card>
 
-      <AddModal open={addOpen} onClose={() => setAddOpen(false)} onDone={load} categories={categories} />
-      <ImportModal open={importOpen} onClose={() => setImportOpen(false)} onDone={load} />
-      <Crawler open={crawlOpen} onClose={() => setCrawlOpen(false)} onAdded={load} />
+      <AddModal open={addOpen} onClose={() => setAddOpen(false)} onDone={refreshFromStart} categories={categories} />
+      <ImportModal open={importOpen} onClose={() => setImportOpen(false)} onDone={refreshFromStart} />
+      <Crawler open={crawlOpen} onClose={() => setCrawlOpen(false)} onAdded={refreshFromStart} />
       {editing && (
         <EditModal
           key={editing.id}
           contact={editing}
           categories={categories}
           onClose={() => setEditing(null)}
-          onDone={() => { setEditing(null); load(); }}
+          onDone={() => { setEditing(null); reloadCurrent(); }}
         />
       )}
     </div>

@@ -173,16 +173,21 @@ export const api = {
   },
   logout: () => clearToken(),
 
-  // contacts
-  getContacts: (params: { status?: string; q?: string; category?: string; limit?: number } = {}) => {
+  // contacts (keyset pagination via opaque `cursor`)
+  getContacts: (params: { status?: string; q?: string; category?: string; limit?: number; cursor?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.category) qs.set("category", params.category);
     if (params.limit) qs.set("limit", String(params.limit));
-    return req<{ contacts: Contact[]; counts: { status: string; n: number }[]; total: number }>(
-      `/api/contacts?${qs.toString()}`
-    );
+    if (params.cursor) qs.set("cursor", params.cursor);
+    return req<{
+      contacts: Contact[];
+      counts: { status: string; n: number }[];
+      total: number;
+      filteredTotal: number;
+      nextCursor: string | null;
+    }>(`/api/contacts?${qs.toString()}`);
   },
   addContact: (c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
@@ -195,6 +200,21 @@ export const api = {
     }),
   deleteContacts: (ids: string[]) =>
     req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),
+  // Delete EVERY contact matching the current filter ("select all N matching").
+  deleteContactsMatching: (filter: { status?: string; q?: string; category?: string }) =>
+    req<{ deleted: number }>(`/api/contacts/delete`, {
+      method: "POST",
+      body: JSON.stringify({ all: true, ...filter }),
+    }),
+  // Set/clear category on ids, or on every row matching a filter (`all:true`).
+  setContactsCategory: (
+    value: string,
+    target: { ids?: string[]; all?: boolean; status?: string; q?: string; category?: string }
+  ) =>
+    req<{ updated: number }>(`/api/contacts/set-category`, {
+      method: "POST",
+      body: JSON.stringify({ value, ...target }),
+    }),
 
   // categories
   getCategories: () => req<{ categories: string[] }>(`/api/categories`),
@@ -219,11 +239,26 @@ export const api = {
   resetCounts: () => req(`/api/domains/reset-counts`, { method: "POST" }),
 
   // settings
-  getSettings: () => req<{ resendConfigured: boolean; appUrl: string; replyTo: string }>(`/api/settings`),
-  saveSettings: (s: { resend_api_key?: string; app_url?: string; reply_to?: string }) =>
-    req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
+  getSettings: () =>
+    req<{
+      resendConfigured: boolean;
+      appUrl: string;
+      replyTo: string;
+      scrape: { configured: boolean; provider: string; mode: "blocked" | "always"; premium: boolean };
+    }>(`/api/settings`),
+  saveSettings: (s: {
+    resend_api_key?: string;
+    app_url?: string;
+    reply_to?: string;
+    scrape_provider?: string;
+    scrape_api_key?: string;
+    scrape_mode?: "blocked" | "always";
+    scrape_premium?: boolean;
+  }) => req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
   sendTestEmail: (to: string) =>
     req<{ ok: boolean; from: string }>(`/api/settings/test-email`, { method: "POST", body: JSON.stringify({ to }) }),
+  testScrape: () =>
+    req<{ ok: boolean; provider: string; via?: string; bytes: number }>(`/api/settings/test-scrape`, { method: "POST", body: "{}" }),
 
   // crawl
   startCrawl: (body: any) => req<{ jobId: string }>(`/api/crawl`, { method: "POST", body: JSON.stringify(body) }),

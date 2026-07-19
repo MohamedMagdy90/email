@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type Domain } from "../lib/api";
-import { Button, Card, Field, Input, Modal, toast, Badge, cn } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
 
 export default function Settings() {
@@ -109,6 +109,12 @@ export default function Settings() {
             <Tip>Keep lists clean &amp; targeted — complaints are what get accounts suspended.</Tip>
           </ul>
         </Card>
+      </div>
+
+      {/* Scraping proxy */}
+      <div className="mt-8">
+        <div className="mb-3 font-clash text-lg font-semibold">Crawler — scraping proxy</div>
+        <ScrapeProxyCard />
       </div>
 
       {/* Domains */}
@@ -255,6 +261,145 @@ function CategoriesCard() {
           ))}
         </div>
       )}
+    </Card>
+  );
+}
+
+const PROVIDERS: { value: string; label: string; hint: string }[] = [
+  { value: "", label: "None (disabled)", hint: "" },
+  { value: "scrapingbee", label: "ScrapingBee", hint: "scrapingbee.com" },
+  { value: "scraperapi", label: "ScraperAPI", hint: "scraperapi.com" },
+  { value: "zenrows", label: "ZenRows", hint: "zenrows.com" },
+];
+
+function ScrapeProxyCard() {
+  const [provider, setProvider] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [mode, setMode] = useState<"blocked" | "always">("blocked");
+  const [premium, setPremium] = useState(true);
+  const [configured, setConfigured] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  async function load() {
+    try {
+      const s = await api.getSettings();
+      setProvider(s.scrape.provider || "");
+      setMode(s.scrape.mode);
+      setPremium(s.scrape.premium);
+      setConfigured(s.scrape.configured);
+    } catch { /* ignore */ }
+  }
+  useEffect(() => { load(); }, []);
+
+  const on = configured && !!provider;
+
+  async function save() {
+    if (provider && !apiKey && !configured) return toast("Enter your provider API key first", "error");
+    setSaving(true);
+    try {
+      await api.saveSettings({
+        scrape_provider: provider,
+        scrape_api_key: apiKey || undefined,
+        scrape_mode: mode,
+        scrape_premium: premium,
+      });
+      toast(provider ? "Scraping proxy saved" : "Scraping proxy disabled", "success");
+      setApiKey("");
+      load();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function test() {
+    setTesting(true);
+    try {
+      const r = await api.testScrape();
+      toast(`Proxy works — fetched ${r.bytes.toLocaleString()} bytes through ${r.provider}`, "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  const selected = PROVIDERS.find((p) => p.value === provider);
+
+  return (
+    <Card className="space-y-4 p-5">
+      <div className="flex items-center justify-between">
+        <div className="font-clash text-lg font-semibold">Scraping proxy</div>
+        <Badge className={on ? "bg-[#e7f6ec] text-[#1f8b4c]" : "bg-[#fdf6ea] text-[#8a5a12]"}>
+          {on ? "connected" : "not connected"}
+        </Badge>
+      </div>
+      <p className="text-[13px] text-muted">
+        Some directories (e.g. Cloudflare-protected sites) block plain crawlers. Connect a scraping
+        provider and the crawler will route requests through it to render JavaScript and get past
+        those walls. All three have free tiers to start.
+      </p>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Provider">
+          <Select value={provider} onChange={(e) => setProvider(e.target.value)}>
+            {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+          </Select>
+        </Field>
+        <Field
+          label="API key"
+          hint={
+            !provider
+              ? "Choose a provider to enable."
+              : configured
+              ? `A key is saved. Enter a new one to replace it.${selected?.hint ? ` Get it from ${selected.hint}.` : ""}`
+              : selected?.hint ? `Get it from ${selected.hint}.` : undefined
+          }
+        >
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={provider ? "Paste your API key" : "—"}
+            disabled={!provider}
+          />
+        </Field>
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="When to use it">
+          <Select value={mode} onChange={(e) => setMode(e.target.value as "blocked" | "always")} disabled={!provider}>
+            <option value="blocked">Only when a site blocks the crawler (recommended)</option>
+            <option value="always">Every request (slower, more credits)</option>
+          </Select>
+        </Field>
+        <div className="flex items-end">
+          <label className={cn("flex items-center gap-2 text-sm", !provider && "opacity-50")}>
+            <input
+              type="checkbox"
+              checked={premium}
+              onChange={(e) => setPremium(e.target.checked)}
+              disabled={!provider}
+              className="accent-ink"
+            />
+            Premium / stealth mode <span className="text-muted">(needed for Cloudflare)</span>
+          </label>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between border-t border-line pt-4">
+        <span className="text-xs text-muted">
+          {mode === "blocked"
+            ? "Credits are only spent on sites that actually block the crawler."
+            : "Every page is fetched through the proxy."}
+        </span>
+        <div className="flex gap-2">
+          <Button variant="outline" loading={testing} onClick={test} disabled={!on}>Test</Button>
+          <Button loading={saving} onClick={save}>Save</Button>
+        </div>
+      </div>
     </Card>
   );
 }

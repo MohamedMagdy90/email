@@ -8,7 +8,7 @@
 //      DIRECTORY's own contact, not a listing's, so it's filtered out
 // Nothing is hardcoded to any specific site.
 
-import { fetchWithRetry } from "./fetcher";
+import { fetchWithRetry, type FetchResult, type BlockReason, type ProxyConfig } from "./fetcher";
 import { extractEmails, decodeEntities } from "./extract";
 import { extractPhones, bestPhone, regionFromCountryName, type PhoneHit } from "./phones";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./validate";
@@ -45,6 +45,7 @@ export interface DirectoryOptions {
   defaultCountry?: string; // country hint (prefers local numbers, parses local formats)
   timeoutMs?: number;
   politenessMs?: number;
+  proxy?: ProxyConfig; // optional scraping proxy for JS-rendered / Cloudflare sites
 }
 
 export interface DirectoryProgress {
@@ -58,6 +59,33 @@ export interface DirectoryProgress {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Plain-language reason for a refused request, shown live in the crawl log.
+function describeBlock(res: FetchResult): string {
+  switch (res.blockReason) {
+    case "cloudflare": return "blocked by Cloudflare (JavaScript challenge)";
+    case "rate-limited": return "rate limited (HTTP 429)";
+    case "forbidden": return "access forbidden — bot protection";
+    case "blocked": return "blocked — bot protection / captcha";
+    default: return res.error === "non-html" ? "not an HTML page" : res.error === "timeout" ? "timed out" : "";
+  }
+}
+
+// One-line summary attached to the result so the UI can explain an empty harvest.
+function blockNote(reason: BlockReason | undefined): string {
+  switch (reason) {
+    case "cloudflare":
+      return "This site is protected by Cloudflare's JavaScript challenge, so it can't be read by the harvester. It needs a JS-rendering scraping proxy to crawl.";
+    case "rate-limited":
+      return "The site rate-limited the crawler (HTTP 429). Try again later or lower the concurrency.";
+    case "forbidden":
+      return "The site refused the crawler (HTTP 403 bot protection).";
+    case "blocked":
+      return "The site served a block / captcha page instead of content.";
+    default:
+      return "The site blocked the crawler.";
+  }
+}
 
 /* ----------------------------- link parsing ----------------------------- */
 
@@ -275,6 +303,7 @@ export async function crawlDirectory(
     defaultCountry,
     timeoutMs = 15000,
     politenessMs = 200,
+    proxy,
   } = opts;
 
   const origin = new URL(seed).origin;
@@ -291,6 +320,7 @@ export async function crawlDirectory(
   const detailSeen = new Set<string>();
   let listingPages = 0;
   let blocked = 0;
+  let blockReason: BlockReason | undefined;
 
   while (pageQueue.length && listingPages < maxPages && detailUrls.length < maxDetails) {
     const pageUrl = pageQueue.shift()!.split("#")[0];
@@ -300,14 +330,16 @@ export async function crawlDirectory(
     let path = "/"; try { path = new URL(pageUrl).pathname; } catch { /* ignore */ }
     if (respectRobots && !robots.allow(path)) continue;
 
-    const res = await fetchWithRetry(pageUrl, 2, timeoutMs);
+    const res = await fetchWithRetry(pageUrl, 2, timeoutMs, proxy);
     listingPages++;
     if (!res.ok) {
-      if (res.status === 403 || res.status === 429) blocked++;
-      onProgress?.({ type: "page", url: pageUrl, listingPages, msg: `page ${res.status}` });
+      if (res.blocked) { blocked++; if (!blockReason) blockReason = res.blockReason; }
+      const why = describeBlock(res);
+      onProgress?.({ type: "page", url: pageUrl, listingPages, msg: `page ${res.status || "error"}${why ? ` — ${why}` : ""}` });
       await sleep(politenessMs);
       continue;
     }
+    const viaProxy = res.via === "proxy";
 
     const links = collectLinks(res.html, res.url || pageUrl);
     const details = findDetailLinks(seed, links);
@@ -331,7 +363,7 @@ export async function crawlDirectory(
       const pn = pl.split("#")[0];
       if (!pagesSeen.has(pn) && !pageQueue.includes(pn)) pageQueue.push(pn);
     }
-    onProgress?.({ type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length, msg: `page ${listingPages}: +${added} listings` });
+    onProgress?.({ type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length, msg: `page ${listingPages}: +${added} listings${viaProxy ? " · via proxy" : ""}` });
     await sleep(politenessMs);
   }
 
@@ -344,7 +376,7 @@ export async function crawlDirectory(
       const url = detailUrls[my];
       let path = "/"; try { path = new URL(url).pathname; } catch { /* ignore */ }
       if (respectRobots && !robots.allow(path)) continue;
-      const res = await fetchWithRetry(url, 2, timeoutMs);
+      const res = await fetchWithRetry(url, 2, timeoutMs, proxy);
       detailPages++;
       if (res.ok) {
         records.push({
@@ -353,8 +385,9 @@ export async function crawlDirectory(
           emails: pickEmails(res.html),
           phones: extractPhones(res.html, { defaultCountry: region, hostname: hostOf(url) }),
         });
-      } else if (res.status === 403 || res.status === 429) {
+      } else if (res.blocked) {
         blocked++;
+        if (!blockReason) blockReason = res.blockReason;
       }
       if (detailPages % 5 === 0 || detailPages === detailUrls.length) {
         onProgress?.({ type: "detail", detailPages, detailTotal: detailUrls.length, contacts: records.length });
@@ -420,10 +453,14 @@ export async function crawlDirectory(
   const finalContacts = contacts.filter((c) => c.email || c.phone);
 
   let status: DirectoryResult["status"] = "ok";
-  if (listingPages === 0) status = "error";
-  else if (finalContacts.length === 0) status = blocked > 0 ? "blocked" : "empty";
+  let note: string | undefined;
+  if (listingPages === 0) { status = "error"; note = "Could not open the URL."; }
+  else if (finalContacts.length === 0) {
+    if (blocked > 0) { status = "blocked"; note = blockNote(blockReason); }
+    else { status = "empty"; note = "No listings or contact details were found on the pages that loaded."; }
+  }
 
-  return { seed, site: siteHost, status, listingPages, detailPages, contacts: finalContacts };
+  return { seed, site: siteHost, status, listingPages, detailPages, contacts: finalContacts, note };
 }
 
 // Fallback when a directory shows contacts inline (no detail pages): anchor on

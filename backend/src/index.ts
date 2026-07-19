@@ -9,6 +9,7 @@ import {
 import { createJob, getJob, log, type Job } from "./jobs";
 import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
+import { fetchViaProxy, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
@@ -39,6 +40,18 @@ app.use(
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const SCRAPE_PROVIDERS: ScrapeProvider[] = ["scrapingbee", "scraperapi", "zenrows"];
+
+// Assemble the scraping-proxy config from settings, or undefined when disabled.
+async function getProxyConfig(): Promise<ProxyConfig | undefined> {
+  const provider = (await getSetting("scrape_provider")) as ScrapeProvider | null;
+  const apiKey = await getSetting("scrape_api_key");
+  if (!provider || !SCRAPE_PROVIDERS.includes(provider) || !apiKey) return undefined;
+  const mode = (await getSetting("scrape_mode")) === "always" ? "always" : "blocked";
+  const premium = (await getSetting("scrape_premium")) !== "0"; // default ON (needed for Cloudflare)
+  return { provider, apiKey, mode, premium, renderJs: true };
+}
 
 app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
@@ -114,27 +127,82 @@ app.post("/api/account", async (c) => {
 
 /* ----------------------------- Contacts ----------------------------- */
 
-app.get("/api/contacts", async (c) => {
-  const status = c.req.query("status");
-  const search = c.req.query("q");
-  const category = c.req.query("category");
-  const limit = Math.min(Number(c.req.query("limit") || 500), 2000);
-  const offset = Number(c.req.query("offset") || 0);
-
+// Shared, portable WHERE builder used by list / export / bulk-by-filter so the
+// exact same filter can be re-applied server-side (e.g. "delete all matching").
+function contactWhere(opts: { status?: string | null; q?: string | null; category?: string | null }) {
   const where: string[] = [];
   const params: any[] = [];
+  const status = opts.status;
+  const search = opts.q;
+  const category = opts.category;
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
   if (category && category !== "all") {
     if (category === "__none__") where.push(`(category IS NULL OR category = '')`);
     else { where.push(`category = ?`); params.push(category); }
   }
-  if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
-  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  if (search) {
+    const like = `%${String(search).toLowerCase()}%`;
+    where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`);
+    params.push(like, like);
+  }
+  return { where, params, clause: where.length ? `WHERE ${where.join(" AND ")}` : "" };
+}
 
-  const rows = await q(`SELECT * FROM contacts ${clause} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+// Opaque keyset cursor: (created_at, id). Keyset paging stays fast at any depth,
+// unlike OFFSET which walks + discards every skipped row.
+function encodeCursor(created_at: string, id: string) {
+  return Buffer.from(`${created_at}~${id}`).toString("base64url");
+}
+function decodeCursor(s?: string | null): { created_at: string; id: string } | null {
+  if (!s) return null;
+  try {
+    const raw = Buffer.from(String(s), "base64url").toString("utf8");
+    const i = raw.indexOf("~");
+    if (i < 0) return null;
+    return { created_at: raw.slice(0, i), id: raw.slice(i + 1) };
+  } catch { return null; }
+}
+
+app.get("/api/contacts", async (c) => {
+  const status = c.req.query("status");
+  const search = c.req.query("q");
+  const category = c.req.query("category");
+  const limit = clamp(Number(c.req.query("limit") || 50), 1, 200);
+  const cursor = decodeCursor(c.req.query("cursor"));
+
+  const { where, params, clause } = contactWhere({ status, q: search, category });
+
+  // Keyset page: everything strictly "after" the cursor in (created_at DESC, id DESC).
+  const pageWhere = [...where];
+  const pageParams = [...params];
+  if (cursor) {
+    pageWhere.push(`(created_at < ? OR (created_at = ? AND id < ?))`);
+    pageParams.push(cursor.created_at, cursor.created_at, cursor.id);
+  }
+  const pageClause = pageWhere.length ? `WHERE ${pageWhere.join(" AND ")}` : "";
+
+  // Fetch one extra row to detect whether a next page exists.
+  const rows = await q(
+    `SELECT * FROM contacts ${pageClause} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    [...pageParams, limit + 1]
+  );
+  let nextCursor: string | null = null;
+  if (rows.length > limit) {
+    const last = rows[limit - 1];
+    nextCursor = encodeCursor(String(last.created_at), String(last.id));
+    rows.length = limit; // trim the probe row
+  }
+
+  const filteredTotalRow = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts ${clause}`, params);
   const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
   const total = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`);
-  return c.json({ contacts: rows, counts, total: total[0]?.n ?? 0 });
+  return c.json({
+    contacts: rows,
+    counts,
+    total: total[0]?.n ?? 0,
+    filteredTotal: filteredTotalRow[0]?.n ?? 0,
+    nextCursor,
+  });
 });
 
 app.post("/api/contacts", async (c) => {
@@ -229,8 +297,17 @@ app.post("/api/categories", async (c) => {
   return c.json({ categories: await getCategories() });
 });
 
+// Delete either an explicit set of ids, or EVERY row matching a filter
+// (`all:true` + the same status/q/category used by the list). The filter path
+// lets "select all N matching" delete thousands without shipping ids around.
 app.post("/api/contacts/delete", async (c) => {
   const b = await c.req.json().catch(() => ({}));
+  if (b.all === true) {
+    const { clause, params } = contactWhere({ status: b.status, q: b.q, category: b.category });
+    const before = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts ${clause}`, params);
+    await q(`DELETE FROM contacts ${clause}`, params);
+    return c.json({ deleted: before[0]?.n ?? 0 });
+  }
   const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
   if (!ids.length) return c.json({ deleted: 0 });
   const ph = ids.map(() => "?").join(",");
@@ -238,19 +315,30 @@ app.post("/api/contacts/delete", async (c) => {
   return c.json({ deleted: ids.length });
 });
 
-app.get("/api/contacts/export", async (c) => {
-  const status = c.req.query("status");
-  const search = c.req.query("q");
-  const category = c.req.query("category");
-  const where: string[] = [];
-  const params: any[] = [];
-  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
-  if (category && category !== "all") {
-    if (category === "__none__") where.push(`(category IS NULL OR category = '')`);
-    else { where.push(`category = ?`); params.push(category); }
+// Set (or clear) the category on a set of ids, or on EVERY row matching a
+// filter (`all:true`). An empty `value` clears the category.
+app.post("/api/contacts/set-category", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const value = String(b.value ?? "").trim() || null;
+  if (b.all === true) {
+    const { clause, params } = contactWhere({ status: b.status, q: b.q, category: b.category });
+    const before = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts ${clause}`, params);
+    await q(`UPDATE contacts SET category = ? ${clause}`, [value, ...params]);
+    return c.json({ updated: before[0]?.n ?? 0 });
   }
-  if (search) { const like = `%${search.toLowerCase()}%`; where.push(`(lower(email) LIKE ? OR lower(company) LIKE ?)`); params.push(like, like); }
-  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) return c.json({ updated: 0 });
+  const ph = ids.map(() => "?").join(",");
+  await q(`UPDATE contacts SET category = ? WHERE id IN (${ph})`, [value, ...ids]);
+  return c.json({ updated: ids.length });
+});
+
+app.get("/api/contacts/export", async (c) => {
+  const { clause, params } = contactWhere({
+    status: c.req.query("status"),
+    q: c.req.query("q"),
+    category: c.req.query("category"),
+  });
   // `email` first and `category`/`phone` early so it's easy to edit and re-import.
   const rows = await q(`SELECT email,company,country,industry,category,phone,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
   const header = ["email", "company", "country", "industry", "category", "phone", "role_based", "status", "source", "created_at"];
@@ -342,7 +430,18 @@ app.get("/api/settings", async (c) => {
   const key = await getResendKey();
   const appUrl = (await getSetting("app_url")) || process.env.APP_URL || "";
   const replyTo = (await getSetting("reply_to")) || "";
-  return c.json({ resendConfigured: !!key, appUrl, replyTo });
+  const scrapeKey = await getSetting("scrape_api_key");
+  return c.json({
+    resendConfigured: !!key,
+    appUrl,
+    replyTo,
+    scrape: {
+      configured: !!scrapeKey,
+      provider: (await getSetting("scrape_provider")) || "",
+      mode: (await getSetting("scrape_mode")) === "always" ? "always" : "blocked",
+      premium: (await getSetting("scrape_premium")) !== "0",
+    },
+  });
 });
 
 app.post("/api/settings", async (c) => {
@@ -350,7 +449,25 @@ app.post("/api/settings", async (c) => {
   if (typeof b.resend_api_key === "string" && b.resend_api_key.trim()) await setSetting("resend_api_key", b.resend_api_key.trim());
   if (typeof b.app_url === "string") await setSetting("app_url", b.app_url.trim());
   if (typeof b.reply_to === "string") await setSetting("reply_to", b.reply_to.trim());
+  // Scraping proxy
+  if (typeof b.scrape_provider === "string") await setSetting("scrape_provider", SCRAPE_PROVIDERS.includes(b.scrape_provider as ScrapeProvider) ? b.scrape_provider : "");
+  if (typeof b.scrape_api_key === "string" && b.scrape_api_key.trim()) await setSetting("scrape_api_key", b.scrape_api_key.trim());
+  if (b.scrape_api_key === "") await setSetting("scrape_api_key", ""); // explicit clear
+  if (typeof b.scrape_mode === "string") await setSetting("scrape_mode", b.scrape_mode === "always" ? "always" : "blocked");
+  if (typeof b.scrape_premium === "boolean") await setSetting("scrape_premium", b.scrape_premium ? "1" : "0");
   return c.json({ ok: true });
+});
+
+// Validate the scraping proxy by fetching a known Cloudflare-protected page
+// through it. Reports whether the challenge was solved.
+app.post("/api/settings/test-scrape", async (c) => {
+  const cfg = await getProxyConfig();
+  if (!cfg) return c.json({ error: "Save a scraping provider and API key first." }, 400);
+  const target = "https://nowsecure.nl"; // small, reliably Cloudflare-protected test page
+  const r = await fetchViaProxy(target, cfg, 75000);
+  if (r.ok) return c.json({ ok: true, provider: cfg.provider, via: r.via, bytes: r.html.length });
+  if (r.blocked) return c.json({ error: `Proxy could not solve the challenge (${r.blockReason}). Enable premium/stealth mode, then retry.` }, 502);
+  return c.json({ error: r.error || `Proxy request failed (HTTP ${r.status}).` }, 502);
 });
 
 // Send a real test email to verify Resend + domain are wired up correctly.
@@ -397,17 +514,19 @@ app.post("/api/crawl", async (c) => {
   // extract company + email + phone. Different result shape (contacts, not
   // per-domain emails), so it's handled separately from the per-company crawl.
   if (b.mode === "directory") {
+    const proxy = await getProxyConfig();
     const dirOptions: DirectoryOptions = {
       maxPages: clamp(Number(b.maxPages) || 20, 1, 100),
       maxDetails: clamp(Number(b.maxDetails) || 300, 1, 2000),
-      concurrency: clamp(Number(b.concurrency) || 5, 1, 8),
+      concurrency: proxy ? clamp(Number(b.concurrency) || 3, 1, 5) : clamp(Number(b.concurrency) || 5, 1, 8),
       respectRobots: b.respectRobots !== false,
       checkMx: b.checkMx !== false,
       defaultCountry: String(b.defaultCountry || "").trim() || undefined,
+      proxy,
     };
     const job = createJob("crawl", rawUrls.length);
     job.result = { mode: "directory", contacts: [], sites: [] };
-    log(job, { level: "info", msg: `Harvesting ${rawUrls.length} director${rawUrls.length === 1 ? "y" : "ies"}…` });
+    log(job, { level: "info", msg: `Harvesting ${rawUrls.length} director${rawUrls.length === 1 ? "y" : "ies"}…${proxy ? ` · scraping proxy: ${proxy.provider} (${proxy.mode})` : ""}` });
 
     (async () => {
       try {
@@ -422,8 +541,11 @@ app.post("/api/crawl", async (c) => {
         const seen = new Set<string>();
         const contacts: any[] = [];
         for (const r of results) {
-          job.result.sites.push({ seed: r.seed, site: r.site, status: r.status, listingPages: r.listingPages, detailPages: r.detailPages, found: r.contacts.length });
+          job.result.sites.push({ seed: r.seed, site: r.site, status: r.status, listingPages: r.listingPages, detailPages: r.detailPages, found: r.contacts.length, note: r.note });
           log(job, { level: "info", msg: `${r.site}: ${r.contacts.length} lead(s) from ${r.detailPages} page(s) [${r.status}]` });
+          if (r.note && (r.status === "blocked" || r.status === "empty" || r.status === "error")) {
+            log(job, { level: r.status === "blocked" ? "warn" : "info", msg: `↳ ${r.note}` });
+          }
           for (const co of r.contacts) {
             const dk = String(co.email || co.phone || co.detailUrl).toLowerCase();
             if (seen.has(dk)) continue;
@@ -479,6 +601,7 @@ app.post("/api/crawl", async (c) => {
     .filter(Boolean)
     .slice(0, 12);
 
+  const proxy = await getProxyConfig();
   const options: CrawlOptions = {
     maxPages: clamp(Number(b.maxPages) || 25, 1, 60),
     maxDepth: clamp(Number(b.maxDepth) || 2, 0, 3),
@@ -489,7 +612,8 @@ app.post("/api/crawl", async (c) => {
     keywords,
     requireKeyword: b.requireKeyword === true && keywords.length > 0,
     defaultCountry: String(b.defaultCountry || "").trim() || undefined,
-    concurrency: clamp(Number(b.concurrency) || 3, 1, 6),
+    concurrency: proxy ? clamp(Number(b.concurrency) || 2, 1, 4) : clamp(Number(b.concurrency) || 3, 1, 6),
+    proxy,
   };
 
   const job = createJob("crawl", urls.length);

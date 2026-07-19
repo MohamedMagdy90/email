@@ -1,4 +1,4 @@
-import { fetchWithRetry } from "./fetcher";
+import { fetchWithRetry, type ProxyConfig } from "./fetcher";
 import {
   normalizeSeed,
   hostOf,
@@ -26,6 +26,7 @@ export interface CrawlOptions {
   timeoutMs?: number;
   politenessMs?: number;
   concurrency?: number; // sites in parallel
+  proxy?: ProxyConfig; // optional scraping proxy for JS-rendered / Cloudflare sites
 }
 
 // How trustworthy an extracted address is. Drives sorting + UI badges.
@@ -106,6 +107,7 @@ export async function crawlSite(
     defaultCountry,
     timeoutMs = 15000,
     politenessMs = 250,
+    proxy,
   } = opts;
   const matchedKw = new Set<string>();
   const region = regionFromCountryName(defaultCountry);
@@ -151,11 +153,11 @@ export async function crawlSite(
     try { path = new URL(norm).pathname; } catch {}
     if (respectRobots && !robots.allow(path)) continue;
 
-    const res = await fetchWithRetry(norm, 2, timeoutMs);
+    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy);
     pagesCrawled++;
 
     if (!res.ok) {
-      if (res.status === 403 || res.status === 429) blockedHits++;
+      if (res.blocked || res.status === 403 || res.status === 429) blockedHits++;
       onPage?.({ url: norm, found: 0, status: res.status });
       await sleep(politenessMs);
       continue;

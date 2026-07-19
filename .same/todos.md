@@ -37,3 +37,40 @@
 
 ## Next (optional)
 - [ ] push to GitHub for Railway (on request)
+
+## Server-side pagination for Contacts
+
+### Backend (`backend/src/index.ts`)
+- [x] Add shared `contactWhere()` filter helper + cursor encode/decode helpers
+- [x] Rewrite `GET /api/contacts` to use keyset (cursor) pagination + return `nextCursor` & `filteredTotal`
+- [x] Extend `POST /api/contacts/delete` to support `all` + filter (delete all matching)
+- [x] Add `POST /api/contacts/set-category` (set category by ids OR all matching)
+- [x] Refactor `GET /api/contacts/export` to reuse `contactWhere()`
+
+### Frontend
+- [x] `api.ts`: update `getContacts` (cursor/limit + new return), add `bulkDeleteContacts`, `setContactsCategory`
+- [x] `Contacts.tsx`: cursor page stack, page-size selector, prev/next, "showing X–Y of Z"
+- [x] `Contacts.tsx`: "select all N matching" banner + wire bulk delete/category to all-matching
+
+### Verify
+- [x] Backend paging verified end-to-end (no overlaps; bulk-by-filter works)
+- [x] Frontend typechecks; dev server running
+- [x] Version + screenshot review (v19)
+
+## Scraping-proxy support (beat Cloudflare)
+
+### Backend
+- [x] `fetcher.ts`: `ProxyConfig` type, `buildProxyUrl()` for ScrapingBee/ScraperAPI/ZenRows, `fetchViaProxy()`, and proxy-aware `fetchWithRetry` (mode: blocked-retry vs always)
+- [x] `getProxyConfig()` helper (in `index.ts`) reading settings
+- [x] `directory.ts`: thread `proxy` through `DirectoryOptions` to all fetches
+- [x] `crawler/index.ts`: thread `proxy` through `CrawlOptions` to all fetches
+- [x] `index.ts`: load proxy config in `/api/crawl` (both modes); extend GET/POST `/api/settings`; add `POST /api/settings/test-scrape`
+
+### Frontend
+- [x] `api.ts`: extend settings types; add `testScrape`
+- [x] `Settings.tsx`: "Scraping proxy" card (provider, key, mode, premium toggle, save, test)
+
+### Verify
+- [x] Type-check clean (FE + BE)
+- [x] buildProxyUrl correct for all 3 providers (encoding + premium flags)
+- [x] Settings round-trip works; API key never exposed in GET
