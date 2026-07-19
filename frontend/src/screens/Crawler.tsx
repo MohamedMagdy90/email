@@ -80,6 +80,8 @@ export default function Crawler({
   const [dirMaxPages, setDirMaxPages] = useState(20);
   const [dirMaxListings, setDirMaxListings] = useState(200);
   const [dirSelected, setDirSelected] = useState<Set<string>>(new Set());
+  const [dirAdded, setDirAdded] = useState<Set<string>>(new Set());
+  const [dirBusy, setDirBusy] = useState(false);
 
   // options
   const [maxPages, setMaxPages] = useState(20);
@@ -110,7 +112,8 @@ export default function Crawler({
   const isDirJob = job?.result?.mode === "directory";
   const leads: Lead[] = job?.result?.contacts || [];
   const leadKey = (l: Lead) => l.email || l.phone || l.detailUrl;
-  const addableLeads = leads.filter((l) => l.email && !l.inContacts);
+  const isAdded = (l: Lead) => !!l.inContacts || dirAdded.has(leadKey(l));
+  const addableLeads = leads.filter((l) => l.email && !isAdded(l));
   const leadsWithPhone = leads.filter((l) => l.phone).length;
 
   useEffect(() => {
@@ -291,6 +294,7 @@ export default function Crawler({
   async function addDirectorySelected() {
     const chosen = leads.filter((l) => dirSelected.has(leadKey(l)) && l.email);
     if (!chosen.length) return toast("Select leads that have an email to add", "info");
+    setDirBusy(true);
     try {
       const r = await api.bulkContacts(
         chosen.map((l) => ({
@@ -304,13 +308,18 @@ export default function Crawler({
         })),
         true
       );
+      // Flip the added rows to "added" and clear the selection so it's obvious.
+      setDirAdded((prev) => new Set([...prev, ...chosen.map(leadKey)]));
+      setDirSelected(new Set());
       const parts = [`Added ${r.added}`];
       if (r.updated) parts.push(`updated ${r.updated}`);
       if (r.skipped) parts.push(`skipped ${r.skipped}`);
-      toast(parts.join(" · "), "success");
+      toast(`${parts.join(" · ")} — saved to Contacts`, "success");
       onAdded();
     } catch (e: any) {
-      toast(e.message, "error");
+      toast(e.message || "Could not add contacts", "error");
+    } finally {
+      setDirBusy(false);
     }
   }
 
@@ -379,6 +388,7 @@ export default function Crawler({
     setJob(null);
     setSelected(new Set());
     setDirSelected(new Set());
+    setDirAdded(new Set());
     setStage("input");
   }
   function close() {
@@ -652,6 +662,7 @@ export default function Crawler({
                 <label className="flex items-center gap-2 text-[13px] font-medium">
                   <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="accent-ink" />
                   {leads.length} lead(s) · <span className="text-muted">{leadsWithPhone} with phone</span>
+                  {dirAdded.size > 0 && <span className="text-good">· {dirAdded.size} added</span>}
                 </label>
                 <div className="flex items-center gap-3">
                   <span className="text-xs text-muted">{dirSelected.size} selected</span>
@@ -663,10 +674,11 @@ export default function Crawler({
                   <tbody>
                     {leads.map((l) => {
                       const k = leadKey(l);
+                      const added = isAdded(l);
                       return (
-                        <tr key={k} className={cn("border-b border-line-soft last:border-0", l.inContacts && "opacity-60")}>
+                        <tr key={k} className={cn("border-b border-line-soft last:border-0", added && "opacity-60")}>
                           <td className="w-8 px-3 py-2">
-                            <input type="checkbox" disabled={!l.email || l.inContacts} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-ink disabled:opacity-30" />
+                            <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-ink disabled:opacity-30" />
                           </td>
                           <td className="px-1 py-2">
                             <div className="font-medium leading-tight">{l.name || l.domain}</div>
@@ -681,7 +693,8 @@ export default function Crawler({
                           </td>
                           <td className="px-1 py-2 text-right">
                             {l.inContacts && <Tag tone="blue">in contacts</Tag>}
-                            {!l.inContacts && !l.email && l.phone && <Tag tone="gray">phone only</Tag>}
+                            {!l.inContacts && dirAdded.has(k) && <Tag tone="green">added</Tag>}
+                            {!added && !l.email && l.phone && <Tag tone="gray">phone only</Tag>}
                           </td>
                         </tr>
                       );
@@ -748,7 +761,7 @@ export default function Crawler({
               )}
               <Button variant="outline" onClick={close}>Close</Button>
               {isDirJob ? (
-                <Button onClick={addDirectorySelected} disabled={!dirSelected.size}>Add {dirSelected.size || ""} to contacts</Button>
+                <Button onClick={addDirectorySelected} loading={dirBusy} disabled={!dirSelected.size || dirBusy}>Add {dirSelected.size || ""} to contacts</Button>
               ) : (
                 <Button onClick={addSelected} disabled={!selected.size}>Add {selected.size || ""} to contacts</Button>
               )}
