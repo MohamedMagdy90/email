@@ -91,9 +91,25 @@ export async function ensureSchema() {
     status TEXT NOT NULL DEFAULT 'queued',
     error TEXT,
     opened INTEGER NOT NULL DEFAULT 0,
+    open_count INTEGER NOT NULL DEFAULT 0,
+    first_opened_at TEXT,
+    last_opened_at TEXT,
+    click_count INTEGER NOT NULL DEFAULT 0,
+    first_clicked_at TEXT,
+    last_clicked_at TEXT,
     sent_at TEXT,
     created_at TEXT NOT NULL
   )`);
+
+  // Engagement tracking migrations (idempotent — duplicate-column errors swallowed).
+  try { await q(`ALTER TABLE sends ADD COLUMN open_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN first_opened_at TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN last_opened_at TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN click_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN first_clicked_at TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN last_clicked_at TEXT`); } catch { /* exists */ }
+  // Backfill: legacy opened rows had no counter — treat as one open.
+  try { await q(`UPDATE sends SET open_count = 1 WHERE opened = 1 AND open_count = 0`); } catch { /* ignore */ }
 
   await q(`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,

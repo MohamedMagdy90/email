@@ -7,6 +7,19 @@ import Crawler from "./Crawler";
 const FILTERS = ["all", "new", "sent", "unsubscribed", "bounced"];
 const PAGE_SIZES = [25, 50, 100];
 
+// Compact relative time for the "Last opened" column.
+function timeAgo(iso?: string | null) {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return null;
+  const s = Math.floor((Date.now() - t) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 2592000) return `${Math.floor(s / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
 export default function Contacts() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
@@ -331,6 +344,7 @@ export default function Contacts() {
                     <th className="px-2 py-3">Category</th>
                     <th className="px-2 py-3">Type</th>
                     <th className="px-2 py-3">Status</th>
+                    <th className="px-2 py-3">Last opened</th>
                     <th className="w-12 px-2 py-3" />
                   </tr>
                 </thead>
@@ -365,6 +379,29 @@ export default function Contacts() {
                         </td>
                         <td className="px-2 py-2.5">
                           <StatusPill status={c.status} />
+                        </td>
+                        <td className="px-2 py-2.5">
+                          {c.last_opened_at ? (
+                            <span className="inline-flex items-center gap-1.5 text-xs">
+                              <span className="h-1.5 w-1.5 rounded-full bg-good" />
+                              <span className="text-ink/70" title={new Date(c.last_opened_at).toLocaleString()}>
+                                {timeAgo(c.last_opened_at)}
+                              </span>
+                              {(c.open_count || 0) > 1 && (
+                                <span className="text-muted tabular-nums">·{c.open_count}×</span>
+                              )}
+                              {(c.click_count || 0) > 0 && (
+                                <span
+                                  className="rounded bg-good/10 px-1 text-[10px] font-medium text-good"
+                                  title={c.last_clicked_at ? `Last clicked ${timeAgo(c.last_clicked_at)}` : "Clicked"}
+                                >
+                                  click
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-muted">—</span>
+                          )}
                         </td>
                         <td className="px-2 py-2.5 text-right">
                           <button

@@ -82,3 +82,35 @@
 - [x] "Select all N matching" (default) so a send targets the whole filtered set, not just the loaded page
 - [x] Fixed the 200-cap symptom (list endpoint clamp) by making sends filter-driven
 - [x] Verified: send-all resolved total=2 of 3 (unsubscribed excluded); throwaway data cleaned up; real data untouched
+
+## Engagement tracking: open timestamps/counts + click tracking
+
+### Backend
+- [x] db.ts: add sends columns (first/last_opened_at, open_count, first/last_clicked_at, click_count) + migrations + backfill
+- [x] index.ts: add /api/click to PUBLIC_API allowlist
+- [x] index.ts: enhance /api/open (count + first/last timestamps)
+- [x] index.ts: add /api/click endpoint (record + 302 redirect, safe URL only)
+- [x] index.ts: /api/contacts LEFT JOIN engagement (last_opened_at, open_count, clicks)
+- [x] index.ts: /api/history/export add engagement columns
+- [x] index.ts: /api/stats + /api/overview add `clicks`
+- [x] index.ts: send job builds clickBase, passes to wrapHtml
+- [x] template.ts: wrapLinks() + wrapHtml clickBase param
+
+### Frontend
+- [x] api.ts: extend Contact + SendRow types; add clicks to stats/overview
+- [x] Overview.tsx: show Clicks metric + Click rate card
+- [x] History.tsx: Clicks card + column + "clicked" filter + open counts
+- [x] Contacts.tsx: "Last opened" column
+
+### Verify
+- [x] FE builds clean (vite build OK)
+- [x] End-to-end test PASS: open_count=2, first/last set, click 302, js: guard 400, rollup + stats delta all correct
+- [x] Recovered from corrupt local SQLite (test-only data; prod Postgres unaffected)
+- [ ] Version
+
+### Notes
+- open tracking now: open_count + first_opened_at + last_opened_at (was boolean)
+- click tracking: /api/click?s=<sendId>&u=<url> records + 302 redirects; only http(s) counted
+- links auto-wrapped in wrapHtml (skips unsub, mailto:, tel:, anchors, our own endpoints)
+- a click also marks opened (covers image-blocked clients)
+- REMINDER: not committed/pushed to GitHub yet (Railway won't have it until pushed)

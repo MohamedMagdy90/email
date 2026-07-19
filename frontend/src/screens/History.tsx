@@ -4,7 +4,7 @@ import { Button, Card, Input, Spinner, StatusPill, cn, toast } from "../lib/ui";
 import { downloadCsv } from "../lib/csv";
 import { Header } from "./Contacts";
 
-const FILTERS = ["all", "sent", "failed", "opened"];
+const FILTERS = ["all", "sent", "failed", "opened", "clicked"];
 
 function timeAgo(iso?: string) {
   if (!iso) return "—";
@@ -39,6 +39,7 @@ export default function History() {
   const cards = [
     { label: "Emails sent", value: sentCount },
     { label: "Opens", value: stats?.opens || 0 },
+    { label: "Clicks", value: stats?.clicks || 0 },
     { label: "Failed", value: failedCount },
     { label: "Unsubscribed", value: unsub },
   ];
@@ -49,7 +50,8 @@ export default function History() {
         filter === "all" ||
         (filter === "sent" && s.status.startsWith("sent")) ||
         (filter === "failed" && s.status === "failed") ||
-        (filter === "opened" && s.opened);
+        (filter === "opened" && (s.open_count || 0) > 0) ||
+        (filter === "clicked" && (s.click_count || 0) > 0);
       const q = search.trim().toLowerCase();
       const matchSearch = !q || s.contact_email.toLowerCase().includes(q) || (s.subject || "").toLowerCase().includes(q);
       return matchFilter && matchSearch;
@@ -80,7 +82,7 @@ export default function History() {
         }
       />
 
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-5">
         {cards.map((c) => (
           <Card key={c.label} className="px-4 py-3.5">
             <div className="font-clash text-2xl font-semibold">{Number(c.value).toLocaleString()}</div>
@@ -127,7 +129,8 @@ export default function History() {
                   <th className="px-4 py-3">Recipient</th>
                   <th className="px-2 py-3">Subject</th>
                   <th className="px-2 py-3">Status</th>
-                  <th className="px-2 py-3">Open</th>
+                  <th className="px-2 py-3">Opens</th>
+                  <th className="px-2 py-3">Clicks</th>
                   <th className="px-2 py-3">When</th>
                 </tr>
               </thead>
@@ -137,7 +140,30 @@ export default function History() {
                     <td className="px-4 py-2.5 font-medium">{s.contact_email}</td>
                     <td className="max-w-[280px] truncate px-2 py-2.5 text-ink/70" title={s.subject}>{s.subject}</td>
                     <td className="px-2 py-2.5"><StatusPill status={s.status} /></td>
-                    <td className="px-2 py-2.5">{s.opened ? <span className="text-good">●</span> : <span className="text-ink/20">○</span>}</td>
+                    <td className="px-2 py-2.5">
+                      {(s.open_count || 0) > 0 ? (
+                        <span
+                          className="tabular-nums font-medium text-good"
+                          title={s.last_opened_at ? `Last opened ${timeAgo(s.last_opened_at)}` : "Opened"}
+                        >
+                          {s.open_count}×
+                        </span>
+                      ) : (
+                        <span className="text-ink/20">○</span>
+                      )}
+                    </td>
+                    <td className="px-2 py-2.5">
+                      {(s.click_count || 0) > 0 ? (
+                        <span
+                          className="tabular-nums font-medium text-good"
+                          title={s.last_clicked_at ? `Last clicked ${timeAgo(s.last_clicked_at)}` : "Clicked"}
+                        >
+                          {s.click_count}×
+                        </span>
+                      ) : (
+                        <span className="text-ink/20">○</span>
+                      )}
+                    </td>
                     <td className="px-2 py-2.5 text-xs text-muted">{timeAgo(s.created_at)}</td>
                   </tr>
                 ))}

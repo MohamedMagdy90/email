@@ -28,6 +28,12 @@ export interface Contact {
   source?: string;
   status: string;
   created_at: string;
+  // Engagement (rolled up across all sends to this contact)
+  open_count?: number;
+  first_opened_at?: string | null;
+  last_opened_at?: string | null;
+  click_count?: number;
+  last_clicked_at?: string | null;
 }
 
 export interface Template {
@@ -57,6 +63,12 @@ export interface SendRow {
   status: string;
   error?: string;
   opened: boolean;
+  open_count?: number;
+  first_opened_at?: string | null;
+  last_opened_at?: string | null;
+  click_count?: number;
+  first_clicked_at?: string | null;
+  last_clicked_at?: string | null;
   sent_at?: string;
   created_at: string;
 }
@@ -320,6 +332,7 @@ export const api = {
       contacts: { status: string; n: number }[];
       sends: { status: string; n: number }[];
       opens: number;
+      clicks: number;
       totalContacts: number;
       totalSends: number;
       daily: { d: string; n: number }[];
@@ -332,6 +345,7 @@ export const api = {
       contacts: { status: string; n: number }[];
       sends: { status: string; n: number }[];
       opens: number;
+      clicks: number;
       totalContacts: number;
       totalSends: number;
     }>(`/api/stats`),

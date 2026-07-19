@@ -63,6 +63,7 @@ const PUBLIC_API = new Set([
   "/api/auth/status",
   "/api/auth/setup",
   "/api/open",
+  "/api/click",
   "/api/unsubscribe",
 ]);
 
@@ -181,9 +182,32 @@ app.get("/api/contacts", async (c) => {
   }
   const pageClause = pageWhere.length ? `WHERE ${pageWhere.join(" AND ")}` : "";
 
-  // Fetch one extra row to detect whether a next page exists.
+  // Fetch one extra row to detect whether a next page exists. Engagement
+  // (opens/clicks) is rolled up per-contact from `sends` via a LEFT JOIN — the
+  // aggregate's column names don't clash with `contacts`, so the shared filter
+  // (bare column names) still resolves correctly.
   const rows = await q(
-    `SELECT * FROM contacts ${pageClause} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    `SELECT c.*,
+            e.open_count AS open_count,
+            e.first_opened_at AS first_opened_at,
+            e.last_opened_at AS last_opened_at,
+            e.click_count AS click_count,
+            e.last_clicked_at AS last_clicked_at
+       FROM contacts c
+       LEFT JOIN (
+         SELECT contact_id,
+                CAST(SUM(open_count) AS INTEGER)  AS open_count,
+                MIN(first_opened_at)              AS first_opened_at,
+                MAX(last_opened_at)               AS last_opened_at,
+                CAST(SUM(click_count) AS INTEGER) AS click_count,
+                MAX(last_clicked_at)              AS last_clicked_at
+           FROM sends
+          WHERE contact_id IS NOT NULL
+          GROUP BY contact_id
+       ) e ON e.contact_id = c.id
+       ${pageClause}
+       ORDER BY c.created_at DESC, c.id DESC
+       LIMIT ?`,
     [...pageParams, limit + 1]
   );
   let nextCursor: string | null = null;
@@ -770,7 +794,8 @@ async function runSendJob(job: Job, templateId: string, contactIds: string[], pe
     const sendId = uid();
     const unsub = appUrl ? `${appUrl}/api/unsubscribe?c=${contact.id}` : "";
     const pixel = appUrl ? `${appUrl}/api/open?s=${sendId}` : "";
-    const html = wrapHtml(renderTemplate(tpl.body, contact), unsub, pixel);
+    const clickBase = appUrl ? `${appUrl}/api/click?s=${sendId}` : "";
+    const html = wrapHtml(renderTemplate(tpl.body, contact), unsub, pixel, clickBase);
 
     const result = await sendEmail({
       from, to: contact.email, subject, html,
@@ -809,8 +834,50 @@ const PIXEL = Uint8Array.from(atob("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAAB
 
 app.get("/api/open", async (c) => {
   const s = c.req.query("s");
-  if (s) await q(`UPDATE sends SET opened=1 WHERE id=?`, [s]).catch(() => {});
+  if (s) {
+    const now = nowIso();
+    await q(
+      `UPDATE sends
+         SET opened = 1,
+             open_count = open_count + 1,
+             first_opened_at = COALESCE(first_opened_at, ?),
+             last_opened_at = ?
+       WHERE id = ?`,
+      [now, now, s]
+    ).catch(() => {});
+  }
   return new Response(PIXEL, { headers: { "Content-Type": "image/gif", "Cache-Control": "no-store, max-age=0" } });
+});
+
+// Click tracker: records the click (a click also proves an open), then 302s to
+// the real URL. Only http(s) targets are honoured to avoid open-redirect abuse.
+app.get("/api/click", async (c) => {
+  const s = c.req.query("s");
+  const raw = c.req.query("u") || "";
+  let target = "";
+  try { target = decodeURIComponent(raw); } catch { target = raw; }
+  const safe = /^https?:\/\//i.test(target) ? target : "";
+
+  // Only record a click when we're actually redirecting to a legitimate target,
+  // so tampered/unsafe links (e.g. javascript:) don't inflate the metric.
+  if (s && safe) {
+    const now = nowIso();
+    await q(
+      `UPDATE sends
+         SET click_count = click_count + 1,
+             first_clicked_at = COALESCE(first_clicked_at, ?),
+             last_clicked_at = ?,
+             opened = 1,
+             open_count = CASE WHEN open_count = 0 THEN 1 ELSE open_count END,
+             first_opened_at = COALESCE(first_opened_at, ?),
+             last_opened_at = COALESCE(last_opened_at, ?)
+       WHERE id = ?`,
+      [now, now, now, now, s]
+    ).catch(() => {});
+  }
+
+  if (safe) return c.redirect(safe, 302);
+  return c.text("This link is no longer available.", 400);
 });
 
 app.get("/api/unsubscribe", async (c) => {
@@ -937,11 +1004,19 @@ app.get("/api/history", async (c) => {
 
 app.get("/api/history/export", async (c) => {
   const rows = await q(
-    `SELECT s.contact_email, c.company AS company, s.subject, s.status, s.opened, s.error, s.created_at
+    `SELECT s.contact_email, c.company AS company, s.subject, s.status, s.opened,
+            s.open_count, s.first_opened_at, s.last_opened_at,
+            s.click_count, s.first_clicked_at, s.last_clicked_at,
+            s.error, s.created_at
      FROM sends s LEFT JOIN contacts c ON c.id = s.contact_id
      ORDER BY s.created_at DESC`
   );
-  const header = ["contact_email", "company", "subject", "status", "opened", "error", "created_at"];
+  const header = [
+    "contact_email", "company", "subject", "status", "opened",
+    "open_count", "first_opened_at", "last_opened_at",
+    "click_count", "first_clicked_at", "last_clicked_at",
+    "error", "created_at",
+  ];
   const csv = [header.join(",")]
     .concat(rows.map((r) => header.map((h) => csvCell(h === "opened" ? (r[h] ? "yes" : "no") : r[h])).join(",")))
     .join("\n");
@@ -954,15 +1029,17 @@ app.get("/api/stats", async (c) => {
   const contacts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
   const sends = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM sends GROUP BY status`);
   const opens = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE opened=1`))[0]?.n ?? 0;
+  const clicks = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE click_count>0`))[0]?.n ?? 0;
   const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
   const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
-  return c.json({ contacts, sends, opens, totalContacts, totalSends });
+  return c.json({ contacts, sends, opens, clicks, totalContacts, totalSends });
 });
 
 app.get("/api/overview", async (c) => {
   const contacts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM contacts GROUP BY status`);
   const sends = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM sends GROUP BY status`);
   const opens = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE opened=1`))[0]?.n ?? 0;
+  const clicks = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends WHERE click_count>0`))[0]?.n ?? 0;
   const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
   const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
 
@@ -972,7 +1049,7 @@ app.get("/api/overview", async (c) => {
   for (const r of recent) { const d = String(r.created_at).slice(0, 10); bucket[d] = (bucket[d] || 0) + 1; }
   const daily = Object.entries(bucket).map(([d, n]) => ({ d, n })).sort((a, b) => (a.d < b.d ? -1 : 1));
 
-  return c.json({ contacts, sends, opens, totalContacts, totalSends, daily });
+  return c.json({ contacts, sends, opens, clicks, totalContacts, totalSends, daily });
 });
 
 /* ------------------------------ Helpers ----------------------------- */

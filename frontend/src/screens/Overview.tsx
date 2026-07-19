@@ -34,8 +34,9 @@ export default function Overview() {
   const sentCount = (data?.sends || []).reduce((a: number, r: any) => a + (String(r.status).startsWith("sent") ? r.n : 0), 0);
   const failed = (data?.sends || []).find((r: any) => r.status === "failed")?.n || 0;
   const unsub = (data?.contacts || []).find((r: any) => r.status === "unsubscribed")?.n || 0;
+  const clicks = data?.clicks || 0;
   const openRate = sentCount ? Math.round((data.opens / sentCount) * 100) : 0;
-  const unsubRate = sentCount ? Math.round((unsub / sentCount) * 100) : 0;
+  const clickRate = sentCount ? Math.round((clicks / sentCount) * 100) : 0;
 
   const daily = buildDailySeries(data?.daily || []);
 
@@ -43,7 +44,7 @@ export default function Overview() {
     { label: "Contacts", value: data?.totalContacts || 0 },
     { label: "Emails sent", value: sentCount },
     { label: "Open rate", value: `${openRate}%` },
-    { label: "Unsub rate", value: `${unsubRate}%` },
+    { label: "Click rate", value: `${clickRate}%` },
   ];
 
   return (
@@ -93,9 +94,10 @@ export default function Overview() {
       </div>
 
       {/* Engagement strip */}
-      <Card className="mt-5 grid grid-cols-2 gap-6 p-5 sm:grid-cols-4">
+      <Card className="mt-5 grid grid-cols-2 gap-6 p-5 sm:grid-cols-5">
         <Metric label="Delivered / dry-run" value={sentCount} tone="ink" />
         <Metric label="Opens" value={data?.opens || 0} tone="good" />
+        <Metric label="Clicks" value={clicks} tone="good" />
         <Metric label="Failed" value={failed} tone={failed ? "bad" : "ink"} />
         <Metric label="Unsubscribed" value={unsub} tone="muted" />
       </Card>
