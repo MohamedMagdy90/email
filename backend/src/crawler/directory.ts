@@ -134,6 +134,31 @@ function stripPageParams(u: URL): string {
   return c.search;
 }
 
+// The next sequential page URL (?page=N → ?page=N+1, or /page/N → /page/N+1).
+// Used to keep walking deep directories whose pager only shows a small window
+// ("1 2 3 … next") and never links the far pages directly.
+function nextPageUrl(u: URL): string | null {
+  const k = pageParamOf(u);
+  if (k) {
+    const n = Number(u.searchParams.get(k));
+    if (Number.isInteger(n) && n > 0) {
+      const c = new URL(u.toString());
+      c.searchParams.set(k, String(n + 1));
+      return c.toString();
+    }
+  }
+  const pm = u.pathname.match(PATH_PAGE_RE);
+  if (pm) {
+    const n = Number(pm[2]);
+    if (Number.isInteger(n) && n > 0) {
+      const c = new URL(u.toString());
+      c.pathname = u.pathname.replace(/(\d+)(\/?)$/, `${n + 1}$2`);
+      return c.toString();
+    }
+  }
+  return null;
+}
+
 // Reduce a path to a template where slug/id segments become "*".
 function pathTemplate(pathname: string): { key: string; placeholders: number; literals: string[] } {
   const segs = pathname.split("/").filter(Boolean).map(decode);
@@ -240,13 +265,28 @@ function findDetailLinks(seed: string, links: string[]): string[] {
     }
   }
 
-  let best: Set<string> | null = null;
-  for (const set of byTpl.values()) if (!best || set.size > best.size) best = set;
-  if (best && best.size >= 2) return [...best];
+  // Winning wildcard template (e.g. "/listing/*").
+  let bestTplKey = "";
+  let bestTpl: Set<string> | null = null;
+  for (const [key, set] of byTpl) if (!bestTpl || set.size > bestTpl.size) { bestTpl = set; bestTplKey = key; }
 
-  best = null;
-  for (const set of bySeg.values()) if (!best || set.size > best.size) best = set;
-  return best && best.size >= 3 ? [...best] : [];
+  // Winning first-path-segment bucket (e.g. every "/listing/…" link).
+  let bestSegKey = "";
+  let bestSeg: Set<string> | null = null;
+  for (const [key, set] of bySeg) if (!bestSeg || set.size > bestSeg.size) { bestSeg = set; bestSegKey = key; }
+
+  // Prefer the first-segment bucket when it shares the winning template's lead
+  // segment and is at least as large. The wildcard template alone skips clean
+  // one-word slugs like /listing/shark or /listing/kreston-svp (no digit, <2
+  // hyphens), so those listings would be silently lost. Unioning by the shared
+  // "/listing/" segment recovers every sibling detail page in the same bucket.
+  const tplLead = bestTplKey.split("/").filter(Boolean)[0] || "";
+  if (bestTpl && bestSeg && bestSegKey && bestSegKey === tplLead && bestSeg.size >= bestTpl.size) {
+    return [...bestSeg];
+  }
+  if (bestTpl && bestTpl.size >= 2) return [...bestTpl];
+  if (bestSeg && bestSeg.size >= 3) return [...bestSeg];
+  return [];
 }
 
 /* ----------------------------- extraction ------------------------------- */
@@ -367,9 +407,21 @@ export async function crawlDirectory(
       for (const rec of harvestInline(res.html, res.url || pageUrl, region)) records.push(rec);
     }
 
+    // Follow linked pagination…
     for (const pl of findPageLinks(seed, links, res.html, res.url || pageUrl)) {
       const pn = pl.split("#")[0];
       if (!pagesSeen.has(pn) && !pageQueue.includes(pn)) pageQueue.push(pn);
+    }
+    // …and, when this page yielded new listings, also probe the next sequential
+    // page. Narrow pagers ("1 2 3 … next") never link the far pages, so
+    // linked-only discovery stalls early on big directories. Gating on *new
+    // detail links* (not inline footer emails) means the first empty page
+    // enqueues nothing and the walk stops cleanly at the end of the list.
+    if (added > 0) {
+      try {
+        const np = nextPageUrl(new URL(pageUrl));
+        if (np) { const nn = np.split("#")[0]; if (!pagesSeen.has(nn) && !pageQueue.includes(nn)) pageQueue.push(nn); }
+      } catch { /* ignore */ }
     }
     onProgress?.({ type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length, msg: `page ${listingPages}: +${added} listings${viaProxy ? " · via proxy" : ""}` });
     await sleep(politenessMs);
