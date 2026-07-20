@@ -115,7 +115,9 @@ export async function extractPdfLines(buf: Uint8Array): Promise<{ lines: string[
 
 function cleanName(raw: string): string {
   return raw
-    .replace(/^[\d).\-–—•*\s]+/, "")
+    // strip leading bullets and "1." / "2)" list markers — but NOT bare leading
+    // numbers, which are part of names like "21 Century" or "360 Solutions".
+    .replace(/^\s*(?:[•*·\-–—]+\s*)?(?:\d{1,3}[.)]\s+)?/, "")
     .replace(/[\s|·•,;:-]+$/, "")
     .replace(/\s{2,}/g, " ")
     .trim()
@@ -313,10 +315,25 @@ function isMobile(digits: string, region?: CountryCode): boolean {
 
 // Turn the text sitting before a P.O.Box block into a clean company name (and,
 // when present, a leading ALL-CAPS activity section → category).
+const ARABIC_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g;
+const ENG_HEADER_RE = /(commercial and industrial directory|companies and institutions by activity|alphabetical list of commercial|list of commercial and industrial)/i;
+
 function nameFromBetween(raw: string): { name: string; category?: string } {
-  let s = raw.replace(HEADER_NOISE_RE, " ");
-  s = s.replace(FAX_TAIL_RE, " ");            // stray leading "(Fax …)"
-  s = s.replace(/^\s*\d{1,4}\s+/, " ");       // leading page number
+  // A page-boundary chunk carries the bilingual page header + page no. + index letter.
+  const hadHeader = ARABIC_RE.test(raw) || ENG_HEADER_RE.test(raw);
+  ARABIC_RE.lastIndex = 0; // reset (global regex used with .test above)
+
+  let s = raw
+    .replace(ARABIC_RE, " ")                                   // drop Arabic header text
+    .replace(HEADER_NOISE_RE, " ")                             // drop English header / ads
+    .replace(FAX_TAIL_RE, " ")                                 // stray leading "(Fax …)"
+    .replace(/\b(19|20)\d{2}\s*[-–]\s*(19|20)\d{2}\b/g, " ");  // year range e.g. 2025 - 2026
+
+  if (hadHeader) {
+    // Only for page-boundary chunks: strip a leading page number + index letter
+    // (mid-page names never carry these, so real names like "21 Century" are safe).
+    s = s.replace(/^\s*\d{1,4}\s+/, " ").replace(/^\s*[A-Z]\s+/, " ");
+  }
   s = s.replace(/\s+/g, " ").trim();
 
   let category: string | undefined;
@@ -327,6 +344,13 @@ function nameFromBetween(raw: string): { name: string; category?: string } {
     s = sec[2];
   }
   return { name: cleanName(s), category };
+}
+
+// A leftover fragment (e.g. a lone lowercase word like "point") — not a company.
+function isFragmentName(name: string): boolean {
+  if (/^[a-z]/.test(name) && !name.includes(" ")) return true; // single lowercase word
+  if (name.replace(/[^a-z]/gi, "").length < 2) return true;    // barely any letters
+  return false;
 }
 
 export function parseDirectoryFlat(text: string, country?: string): ParsedRow[] {
@@ -356,6 +380,7 @@ export function parseDirectoryFlat(text: string, country?: string): ParsedRow[] 
     const { name, category } = nameFromBetween(between);
     if (category) currentCategory = category;
     if (!name || name.length < 2 || !/[a-z]/i.test(name)) continue;
+    if (isFragmentName(name)) continue;
 
     const phone = formatPhone(phoneDigits, region, cc);
     const key = `${name.toLowerCase()}|${phoneDigits}`;
