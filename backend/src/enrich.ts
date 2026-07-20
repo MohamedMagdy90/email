@@ -13,9 +13,18 @@
 import { searchCompanies, searchRaw, type RawHit } from "./search";
 import { crawlSite, type CrawlOptions } from "./crawler";
 import { fetchPage, fetchViaProxy, fetchViaReader, type ProxyConfig } from "./crawler/fetcher";
-import { extractContactFromProfile } from "./crawler/profiles";
+import { extractContactFromProfile, isProfileHost, isJunkHost } from "./crawler/profiles";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./crawler/validate";
 import { registrableDomain, hostOf } from "./crawler/urls";
+
+// An email that belongs to the COMPANY, not to a platform it's listed on. A
+// directory's / social network's own inbox (info@oilandgasdirectory.qa,
+// info@yellowpages.qa, …) must never be attributed to a company we found there.
+function isCompanyEmail(email: string): boolean {
+  const domain = registrableDomain((email.split("@")[1] || ""));
+  if (!domain) return false;
+  return !isProfileHost(domain) && !isJunkHost(domain);
+}
 
 // Legal suffixes / generic words that shouldn't count toward a name match.
 const STOP = new Set([
@@ -121,6 +130,7 @@ export interface EnrichOutput {
 export interface EnrichConfig {
   crawlOpts: CrawlOptions;
   proxy?: ProxyConfig;
+  readerKey?: string; // optional (free) Jina Reader key for higher rate limits
   useProfiles?: boolean; // read Facebook/Instagram/directory pages (default true)
   guessDomains?: boolean; // guess the domain from the name (default true)
 }
@@ -142,7 +152,7 @@ function pickEmail(emails: string[]): { email: string; role: boolean } | null {
   const good: string[] = [];
   for (const raw of emails) {
     const e = cleanEmail(raw);
-    if (e && isValidEmail(e) && !isJunk(e)) good.push(e);
+    if (e && isValidEmail(e) && !isJunk(e) && isCompanyEmail(e)) good.push(e);
   }
   if (!good.length) return null;
   good.sort((a, b) => Number(isRole(b)) - Number(isRole(a)) || a.localeCompare(b));
@@ -169,12 +179,12 @@ function guessCandidates(company: string, country: string): string[] {
   return [...new Set(out)].slice(0, 10);
 }
 
-async function fetchProfileHtml(url: string, proxy?: ProxyConfig): Promise<string | null> {
+async function fetchProfileHtml(url: string, proxy?: ProxyConfig, readerKey?: string): Promise<string | null> {
   // 1) Plain direct fetch — free, works for most directory pages.
   const d = await fetchPage(url, 15000).catch(() => null);
   if (d?.ok && d.html && !d.blocked) return d.html;
   // 2) FREE reader (renders JS) — good for JS-heavy directories/listings.
-  const rd = await fetchViaReader(url).catch(() => null);
+  const rd = await fetchViaReader(url, undefined, readerKey).catch(() => null);
   if (rd?.ok && rd.html) return rd.html;
   // 3) Paid scraping proxy, only if the user configured one.
   if (proxy) {
@@ -215,13 +225,17 @@ export async function enrichCompany(
     if (!out.phone && site.phone) { out.phone = site.phone; out.phoneMobile = !!site.phoneMobile; }
     if (input.phone && site.phone && phonesMatch(input.phone, site.phone)) phoneVerified = true;
     if (site.emails.length && !out.email) {
-      const best = site.emails[0];
-      out.email = best.email;
-      out.role_based = best.role_based;
-      out.domain = best.domain || out.domain;
-      out.source = source;
-      out.via = via;
-      return true;
+      // Take the first address that actually belongs to the company (skip a
+      // directory/platform's own inbox that may have been crawled).
+      const best = site.emails.find((e) => isCompanyEmail(e.email));
+      if (best) {
+        out.email = best.email;
+        out.role_based = best.role_based;
+        out.domain = best.domain || out.domain;
+        out.source = source;
+        out.via = via;
+        return true;
+      }
     }
     return false;
   }
@@ -257,7 +271,7 @@ export async function enrichCompany(
   //    Instagram / directory page (exactly like looking it up by hand).
   if (cfg.useProfiles !== false) {
     for (const p of res.profiles.slice(0, 2)) {
-      const html = await fetchProfileHtml(p.url, cfg.proxy);
+      const html = await fetchProfileHtml(p.url, cfg.proxy, cfg.readerKey);
       if (!html) continue;
       const contact = extractContactFromProfile(html, p.url);
       if (contact.website) {

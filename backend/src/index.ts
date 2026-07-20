@@ -11,7 +11,7 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import { fetchViaProxy, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
+import { fetchViaProxy, fetchViaReader, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
@@ -53,6 +53,12 @@ async function getProxyConfig(): Promise<ProxyConfig | undefined> {
   const mode = (await getSetting("scrape_mode")) === "always" ? "always" : "blocked";
   const premium = (await getSetting("scrape_premium")) !== "0"; // default ON (needed for Cloudflare)
   return { provider, apiKey, mode, premium, renderJs: true };
+}
+
+// Optional (free) Jina Reader key: raises the free rate limit for large PDF
+// runs. Prefer the value saved in Settings, then the Railway env var.
+async function getReaderKey(): Promise<string> {
+  return ((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").trim();
 }
 
 app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
@@ -467,6 +473,11 @@ app.get("/api/settings", async (c) => {
       mode: (await getSetting("scrape_mode")) === "always" ? "always" : "blocked",
       premium: (await getSetting("scrape_premium")) !== "0",
     },
+    reader: {
+      // Free crawler is always on; a key just raises the free rate limit.
+      configured: !!(await getSetting("jina_api_key")),
+      fromEnv: !!process.env.JINA_API_KEY,
+    },
   });
 });
 
@@ -481,6 +492,9 @@ app.post("/api/settings", async (c) => {
   if (b.scrape_api_key === "") await setSetting("scrape_api_key", ""); // explicit clear
   if (typeof b.scrape_mode === "string") await setSetting("scrape_mode", b.scrape_mode === "always" ? "always" : "blocked");
   if (typeof b.scrape_premium === "boolean") await setSetting("scrape_premium", b.scrape_premium ? "1" : "0");
+  // Free reader (Jina) — optional key raises the free rate limit.
+  if (typeof b.jina_api_key === "string" && b.jina_api_key.trim()) await setSetting("jina_api_key", b.jina_api_key.trim());
+  if (b.jina_api_key === "") await setSetting("jina_api_key", ""); // explicit clear
   return c.json({ ok: true });
 });
 
@@ -494,6 +508,14 @@ app.post("/api/settings/test-scrape", async (c) => {
   if (r.ok) return c.json({ ok: true, provider: cfg.provider, via: r.via, bytes: r.html.length });
   if (r.blocked) return c.json({ error: `Proxy could not solve the challenge (${r.blockReason}). Enable premium/stealth mode, then retry.` }, 502);
   return c.json({ error: r.error || `Proxy request failed (HTTP ${r.status}).` }, 502);
+});
+
+// Validate the FREE Jina Reader (and any saved key) by rendering a JS-heavy page.
+app.post("/api/settings/test-reader", async (c) => {
+  const key = await getReaderKey();
+  const r = await fetchViaReader("https://example.com", 45000, key).catch((e) => ({ ok: false, status: 0, html: "", error: String(e?.message || e) } as any));
+  if (r.ok && r.html) return c.json({ ok: true, keyed: !!key, bytes: r.html.length });
+  return c.json({ error: r.error || `Reader request failed (HTTP ${r.status}).`, keyed: !!key }, 502);
 });
 
 // Send a real test email to verify Resend + domain are wired up correctly.
@@ -600,6 +622,7 @@ app.post("/api/crawl", async (c) => {
   // shape as the directory harvest so the frontend reuses the leads table.
   if (b.mode === "enrich") {
     const proxy = await getProxyConfig();
+    const readerKey = await getReaderKey();
     const rawRows: any[] = Array.isArray(b.rows) ? b.rows : [];
     const list = rawRows
       .map((r) => ({
@@ -625,6 +648,7 @@ app.post("/api/crawl", async (c) => {
       defaultCountry: country,
       concurrency: 1,
       proxy,
+      readerKey,
     };
 
     const job = createJob("crawl", list.length);
@@ -657,7 +681,7 @@ app.post("/api/crawl", async (c) => {
                 website: row.website,
               },
               country || "",
-              { crawlOpts, proxy, useProfiles: b.useProfiles !== false, guessDomains: b.guessDomains !== false }
+              { crawlOpts, proxy, readerKey, useProfiles: b.useProfiles !== false, guessDomains: b.guessDomains !== false }
             ).catch(() => null);
 
             const email = r?.email || null;
@@ -751,6 +775,7 @@ app.post("/api/crawl", async (c) => {
     .slice(0, 12);
 
   const proxy = await getProxyConfig();
+  const readerKey = await getReaderKey();
   const options: CrawlOptions = {
     maxPages: clamp(Number(b.maxPages) || 25, 1, 60),
     maxDepth: clamp(Number(b.maxDepth) || 2, 0, 3),
@@ -763,6 +788,7 @@ app.post("/api/crawl", async (c) => {
     defaultCountry: String(b.defaultCountry || "").trim() || undefined,
     concurrency: proxy ? clamp(Number(b.concurrency) || 2, 1, 4) : clamp(Number(b.concurrency) || 3, 1, 6),
     proxy,
+    readerKey,
   };
 
   const job = createJob("crawl", urls.length);

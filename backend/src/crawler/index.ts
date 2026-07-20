@@ -27,6 +27,7 @@ export interface CrawlOptions {
   politenessMs?: number;
   concurrency?: number; // sites in parallel
   proxy?: ProxyConfig; // optional scraping proxy for JS-rendered / Cloudflare sites
+  readerKey?: string; // optional (free) Jina Reader API key for higher rate limits
 }
 
 // How trustworthy an extracted address is. Drives sorting + UI badges.
@@ -108,6 +109,7 @@ export async function crawlSite(
     timeoutMs = 15000,
     politenessMs = 250,
     proxy,
+    readerKey,
   } = opts;
   const matchedKw = new Set<string>();
   const region = regionFromCountryName(defaultCountry);
@@ -153,7 +155,7 @@ export async function crawlSite(
     try { path = new URL(norm).pathname; } catch {}
     if (respectRobots && !robots.allow(path)) continue;
 
-    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy);
+    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy, readerKey);
     pagesCrawled++;
 
     if (!res.ok) {

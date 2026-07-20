@@ -267,6 +267,7 @@ export const api = {
       appUrl: string;
       replyTo: string;
       scrape: { configured: boolean; provider: string; mode: "blocked" | "always"; premium: boolean };
+      reader: { configured: boolean; fromEnv: boolean };
     }>(`/api/settings`),
   saveSettings: (s: {
     resend_api_key?: string;
@@ -276,11 +277,14 @@ export const api = {
     scrape_api_key?: string;
     scrape_mode?: "blocked" | "always";
     scrape_premium?: boolean;
+    jina_api_key?: string;
   }) => req(`/api/settings`, { method: "POST", body: JSON.stringify(s) }),
   sendTestEmail: (to: string) =>
     req<{ ok: boolean; from: string }>(`/api/settings/test-email`, { method: "POST", body: JSON.stringify({ to }) }),
   testScrape: () =>
     req<{ ok: boolean; provider: string; via?: string; bytes: number }>(`/api/settings/test-scrape`, { method: "POST", body: "{}" }),
+  testReader: () =>
+    req<{ ok: boolean; keyed: boolean; bytes: number }>(`/api/settings/test-reader`, { method: "POST", body: "{}" }),
 
   // crawl
   startCrawl: (body: any) => req<{ jobId: string }>(`/api/crawl`, { method: "POST", body: JSON.stringify(body) }),

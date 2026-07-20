@@ -111,9 +111,10 @@ export default function Settings() {
         </Card>
       </div>
 
-      {/* Scraping proxy */}
-      <div className="mt-8">
-        <div className="mb-3 font-clash text-lg font-semibold">Crawler — scraping proxy</div>
+      {/* Crawler — free reader + optional paid proxy */}
+      <div className="mt-8 space-y-3">
+        <div className="mb-3 font-clash text-lg font-semibold">Crawler — page fetching</div>
+        <ReaderCard />
         <ScrapeProxyCard />
       </div>
 
@@ -272,6 +273,80 @@ const PROVIDERS: { value: string; label: string; hint: string }[] = [
   { value: "zenrows", label: "ZenRows", hint: "zenrows.com" },
 ];
 
+function ReaderCard() {
+  const [apiKey, setApiKey] = useState("");
+  const [configured, setConfigured] = useState(false);
+  const [fromEnv, setFromEnv] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  async function load() {
+    try {
+      const s = await api.getSettings();
+      setConfigured(s.reader.configured);
+      setFromEnv(s.reader.fromEnv);
+    } catch { /* ignore */ }
+  }
+  useEffect(() => { load(); }, []);
+  const keyed = configured || fromEnv;
+  async function save() {
+    setSaving(true);
+    try {
+      await api.saveSettings({ jina_api_key: apiKey });
+      toast(apiKey ? "Reader key saved" : "Reader key cleared", "success");
+      setApiKey("");
+      load();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function test() {
+    setTesting(true);
+    try {
+      const r = await api.testReader();
+      toast(`Free reader works — rendered ${r.bytes.toLocaleString()} bytes${r.keyed ? " (with your key)" : ""}`, "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setTesting(false);
+    }
+  }
+  return (
+    <Card className="space-y-4 p-5">
+      <div className="flex items-center justify-between">
+        <div className="font-clash text-lg font-semibold">Free reader <span className="text-muted">(no payment)</span></div>
+        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">{keyed ? "on · keyed" : "on · free"}</Badge>
+      </div>
+      <p className="text-[13px] text-muted">
+        The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
+        built-in reader — <b>no scraping proxy needed</b>. Adding a free API key from{" "}
+        <a href="https://jina.ai/reader" target="_blank" rel="noreferrer" className="underline">jina.ai/reader</a>{" "}
+        just raises the rate limit for large PDF imports. It works fine without one.
+        {fromEnv && <span className="text-good"> A key is set via the server environment.</span>}
+      </p>
+      <Field
+        label="Jina Reader API key (optional)"
+        hint={configured ? "A key is saved. Enter a new one to replace it, or clear the box and save to remove." : "Leave empty to use the free tier."}
+      >
+        <Input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder={configured ? "•••••••• (saved)" : "jina_… (optional)"}
+        />
+      </Field>
+      <div className="flex items-center justify-between border-t border-line pt-4">
+        <span className="text-xs text-muted">Used automatically before any paid proxy.</span>
+        <div className="flex gap-2">
+          <Button variant="outline" loading={testing} onClick={test}>Test</Button>
+          <Button loading={saving} onClick={save}>Save</Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function ScrapeProxyCard() {
   const [provider, setProvider] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -337,9 +412,9 @@ function ScrapeProxyCard() {
         </Badge>
       </div>
       <p className="text-[13px] text-muted">
-        Some directories (e.g. Cloudflare-protected sites) block plain crawlers. Connect a scraping
-        provider and the crawler will route requests through it to render JavaScript and get past
-        those walls. All three have free tiers to start.
+        <b>Optional.</b> The free reader above already handles most JavaScript / Cloudflare-blocked
+        sites, so you usually don't need this. Connect a paid provider only if you want an extra
+        fallback for the hardest sites. (Note: none of these can read login-walled Facebook/Instagram.)
       </p>
 
       <div className="grid gap-4 sm:grid-cols-2">

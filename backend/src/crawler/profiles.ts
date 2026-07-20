@@ -17,17 +17,28 @@ export const PROFILE_HOST_RE =
 export const JUNK_HOST_RE =
   /(^|\.)(google|goo\.gl|bing|duckduckgo|yahoo|baidu|youtube|pinterest|tiktok|snapchat|whatsapp|telegram|t\.co|bit\.ly|tinyurl|wikipedia|wikimedia|amazon|ebay|aliexpress|alibaba|made-in-china|indiamart|exportersindia|tradeindia|indeed|glassdoor|naukri|apple|microsoft|reddit|quora|medium|blogspot|wordpress|wixsite|weebly|godaddy|booking|expedia|craigslist|dnb|zoominfo|crunchbase|opencorporates|bloomberg)\.[a-z.]+$/i;
 
+// Business directories / listing platforms. A company is only LISTED on these,
+// so the platform's OWN email (e.g. info@oilandgasdirectory.qa) must never be
+// attributed to the company. Matched by strong keywords + a few explicit hosts.
+export const DIRECTORY_HOST_RE =
+  /(^|\.)([a-z0-9-]*(?:directory|yellowpages?|businesslist|business-directory|companieslist|kompass|tradekey|europages|b2bmap)[a-z0-9-]*)\.[a-z.]+$/i;
+const DIRECTORY_KNOWN_RE =
+  /(^|\.)(oilandgasdirectory|fadiahmad|qatarindex|qadcat|qataryellow|gulfyellowpages|yellowpagesqatar)\.[a-z.]+$/i;
+
+export function isDirectoryHost(host: string): boolean {
+  return DIRECTORY_HOST_RE.test(host) || DIRECTORY_KNOWN_RE.test(host);
+}
 export function isProfileHost(host: string): boolean {
-  return PROFILE_HOST_RE.test(host);
+  return PROFILE_HOST_RE.test(host) || isDirectoryHost(host);
 }
 export function isJunkHost(host: string): boolean {
   return JUNK_HOST_RE.test(host);
 }
 
-// A host we consider a *real* company website: not a profile, not junk.
+// A host we consider a *real* company website: not a profile/directory, not junk.
 function isRealSiteHost(host: string): boolean {
   if (!host) return false;
-  return !PROFILE_HOST_RE.test(host) && !JUNK_HOST_RE.test(host);
+  return !isProfileHost(host) && !JUNK_HOST_RE.test(host);
 }
 
 // Facebook wraps every outbound link in l.facebook.com/l.php?u=<encoded-url>.
@@ -89,8 +100,14 @@ export function extractContactFromProfile(html: string, pageUrl: string): Profil
   }
   const domain = website ? registrableDomain(hostOf(website)) : null;
 
-  // Emails present directly on the profile page (mailto / text / obfuscated).
-  const emails = [...new Set(extractEmails(html).map((h) => h.email))];
+  // Emails present directly on the profile page (mailto / text / obfuscated),
+  // EXCLUDING the directory/platform's own address (info@thisdirectory) — that
+  // belongs to the site we're reading, not to the company listed on it.
+  const pageDomain = registrableDomain(pageHost);
+  const emails = [...new Set(extractEmails(html).map((h) => h.email))].filter((e) => {
+    const d = registrableDomain((e.split("@")[1] || ""));
+    return d && d !== pageDomain && !isProfileHost(d) && !isJunkHost(d);
+  });
 
   return { website, domain, emails };
 }

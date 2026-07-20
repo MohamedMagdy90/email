@@ -189,13 +189,14 @@ const READER_TIMEOUT_MS = 45_000;
 const READER_ENABLED = process.env.DISABLE_READER !== "1";
 const READER_KEY = process.env.JINA_API_KEY || "";
 
-export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS): Promise<FetchResult> {
+export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS, apiKey?: string): Promise<FetchResult> {
+  const key = (apiKey || READER_KEY || "").trim();
   const headers: Record<string, string> = {
     "X-Return-Format": "html", // give us HTML so the existing extractors work
     "X-Timeout": "30", // tell Jina to cap its own render time
     Accept: "text/html,*/*;q=0.8",
   };
-  if (READER_KEY) headers.Authorization = `Bearer ${READER_KEY}`;
+  if (key) headers.Authorization = `Bearer ${key}`;
   const r = await rawFetch(`https://r.jina.ai/${target}`, {
     timeoutMs,
     headers,
@@ -208,7 +209,7 @@ export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_
   return r;
 }
 
-export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig): Promise<FetchResult> {
+export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig, readerKey?: string): Promise<FetchResult> {
   // "always" mode: route every request through the proxy (with one transient retry).
   if (proxy && proxy.mode === "always") {
     let p = await fetchViaProxy(url, proxy);
@@ -234,7 +235,7 @@ export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, 
   // proxy only if one is configured (so most sites cost nothing to crawl).
   if (last && last.blocked) {
     if (READER_ENABLED) {
-      const rd = await fetchViaReader(url).catch(() => null);
+      const rd = await fetchViaReader(url, READER_TIMEOUT_MS, readerKey).catch(() => null);
       if (rd?.ok && rd.html) return rd;
     }
     if (proxy) {
