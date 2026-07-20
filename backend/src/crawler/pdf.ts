@@ -1,16 +1,19 @@
 // Parse a business-directory PDF into structured rows: { company, category,
 // phone, email?, website? }.
 //
-// Directory listings follow a repeating shape: a company NAME line, then
-// address lines, then one or more phone/fax lines, then an activity/category.
-// We walk the text line-by-line as a small state machine: a non-contact,
-// non-address line starts a new company; contact lines (phone/email/site) and
-// "Activity:" lines attach to the company currently being built. A company that
-// never gathers a phone or email (e.g. the cover title / section headers) is
-// dropped. Text extraction uses `unpdf`, a runtime-agnostic pdf.js build that
-// runs cleanly under Bun.
+// Real directories (e.g. the Qatar Commercial & Industrial Directory) are
+// multi-COLUMN, and each listing looks like:
+//     Abdul Aziz Al-Baker Trading &        <- name (may wrap 1-2 lines)
+//     Contracting Est.
+//     (P.O.Box 00001334) ........ 44416243 <- phone at end of the P.O.Box line
+//     (Fax 44423546)
+// So we (1) reconstruct COLUMNS from pdf.js text-item coordinates (detecting the
+// vertical gutters between columns), then (2) parse each column top-to-bottom:
+// name lines accumulate until a line carries a phone/email, which closes the
+// record. Page headers, page numbers, index letters and ads are dropped;
+// ALL-CAPS section titles (MEDICAL, METAL, …) become the running category.
 
-import { parsePhoneNumberFromString, type CountryCode } from "libphonenumber-js";
+import { parsePhoneNumberFromString, getCountryCallingCode, type CountryCode } from "libphonenumber-js";
 import { regionFromCountryName } from "./phones";
 
 export interface ParsedRow {
@@ -23,15 +26,16 @@ export interface ParsedRow {
 }
 
 const EMAIL_RE = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/i;
-// A bare domain or full URL (kept loose; validated/normalised before use).
 const URL_RE = /\b((?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+){1,3})\b/i;
 const CATEGORY_RE = /(?:activity|business activity|category|classification|line of business)\s*[:\-]\s*([^\n]{2,60})/i;
-// A line that STARTS with one of these labels isn't a company name.
 const LABEL_START_RE =
-  /^(p\.?\s*o\.?\s*box|tel\b|tel\s*[:.]|telephone|tele\b|fax\b|fax\s*[:.]|mob(ile)?\b|cell\b|phone\b|e-?mail\b|email\s*[:.]|www\.|https?:|activity\b|category\b|classification\b|business\s+activity|line of business|contact\b)/i;
-// A line that STARTS with one of these is an address fragment, not a name.
+  /^\(?\s*(p\.?\s*o\.?\s*box|tel\b|tel\s*[:.]|telephone|fax\b|fax\s*[:.]|mob(ile)?\b|cell\b|phone\b|e-?mail\b|email\s*[:.]|www\.|https?:|activity\b|category\b)/i;
 const ADDRESS_START_RE =
   /^(building|bldg|zone|street|st\.|road|rd\.|floor|flat|unit|office\s*(no|#)|shop\s*(no|#)|gate|area|district|block)\b/i;
+
+// Running page headers / footers / ads to ignore (directory-specific + generic).
+const NOISE_RE =
+  /(commercial and industrial directory|alphabetical list of commercial|industrial companies and institutions|list of commercial and industrial|ahlibank|alikhtyar|www\.[a-z]|\.com\.qa\b)/i;
 
 // ------------------------------- text extract -------------------------------
 
@@ -44,10 +48,7 @@ export async function extractPdfText(buf: Uint8Array): Promise<{ text: string; p
   return { text: merged, pages: totalPages || 0 };
 }
 
-// Reconstruct real visual LINES from pdf.js text-item coordinates. Items sharing
-// (roughly) the same Y are one line; we sort them left-to-right. This recovers
-// the "one entry per line" structure that flat extraction loses — and, by
-// splitting on wide horizontal gaps, keeps side-by-side columns apart.
+// Reconstruct real LINES from pdf.js text-item coordinates, column by column.
 export async function extractPdfLines(buf: Uint8Array): Promise<{ lines: string[]; pages: number }> {
   const { getDocumentProxy } = await import("unpdf");
   const pdf: any = await getDocumentProxy(new Uint8Array(buf)); // copy: pdf.js detaches the buffer
@@ -56,31 +57,55 @@ export async function extractPdfLines(buf: Uint8Array): Promise<{ lines: string[
 
   for (let p = 1; p <= pages; p++) {
     const page = await pdf.getPage(p);
+    const W = page.getViewport({ scale: 1 }).width || 612;
     const content = await page.getTextContent();
-    const buckets = new Map<number, { x: number; str: string }[]>();
+
+    const items: { x: number; y: number; w: number; str: string }[] = [];
     for (const it of content.items as any[]) {
       const str = it?.str;
-      if (typeof str !== "string" || !str.length) continue;
+      if (typeof str !== "string" || !str.trim()) continue;
       const tr = it.transform || [1, 0, 0, 1, 0, 0];
-      const y = Math.round(tr[5] / 2) * 2; // 2pt tolerance so the same row groups
-      const x = tr[4];
-      if (!buckets.has(y)) buckets.set(y, []);
-      buckets.get(y)!.push({ x, str });
+      items.push({ x: tr[4], y: tr[5], w: it.width || str.length * 4, str });
     }
-    // Top of page first (higher Y first).
-    for (const y of [...buckets.keys()].sort((a, b) => b - a)) {
-      const parts = buckets.get(y)!.sort((a, b) => a.x - b.x);
-      // Break a visual line into segments where there's a big horizontal gap
-      // (two columns on the same row shouldn't merge into one company).
-      let seg = "";
-      let lastX: number | null = null;
-      const flushSeg = () => { const s = seg.replace(/\s+/g, " ").trim(); if (s) lines.push(s); seg = ""; };
-      for (const part of parts) {
-        if (lastX !== null && part.x - lastX > 90) flushSeg();
-        seg += (seg ? " " : "") + part.str;
-        lastX = part.x + part.str.length * 4; // rough end-x estimate
+    if (!items.length) continue;
+
+    // --- detect column bands via vertical gutters (uncovered x-ranges) ---
+    const BIN = 4;
+    const nbins = Math.ceil(W / BIN) + 1;
+    const covered = new Array(nbins).fill(false);
+    for (const it of items) {
+      const a = Math.max(0, Math.floor(it.x / BIN));
+      const b = Math.min(nbins - 1, Math.floor((it.x + it.w) / BIN));
+      for (let i = a; i <= b; i++) covered[i] = true;
+    }
+    const first = Math.max(0, covered.indexOf(true));
+    const last = covered.lastIndexOf(true);
+    const edges: number[] = [first * BIN];
+    for (let i = first; i <= last; ) {
+      if (!covered[i]) {
+        let j = i;
+        while (j <= last && !covered[j]) j++;
+        if (j - i >= 3) edges.push(((i + j) / 2) * BIN); // gutter ≥ ~12pt → column break
+        i = j;
+      } else i++;
+    }
+    edges.push((last + 1) * BIN);
+
+    // --- within each column, group items into lines by Y (top→bottom) ---
+    for (let k = 0; k + 1 < edges.length; k++) {
+      const lo = edges[k], hi = edges[k + 1];
+      const colItems = items.filter((it) => { const cx = it.x + it.w / 2; return cx >= lo && cx < hi; });
+      if (!colItems.length) continue;
+      const rows = new Map<number, { x: number; str: string }[]>();
+      for (const it of colItems) {
+        const y = Math.round(it.y / 2) * 2; // 2pt tolerance groups a visual row
+        if (!rows.has(y)) rows.set(y, []);
+        rows.get(y)!.push({ x: it.x, str: it.str });
       }
-      flushSeg();
+      for (const y of [...rows.keys()].sort((a, b) => b - a)) {
+        const line = rows.get(y)!.sort((a, b) => a.x - b.x).map((r) => r.str).join(" ").replace(/\s+/g, " ").trim();
+        if (line) lines.push(line);
+      }
     }
   }
   return { lines, pages };
@@ -90,11 +115,11 @@ export async function extractPdfLines(buf: Uint8Array): Promise<{ lines: string[
 
 function cleanName(raw: string): string {
   return raw
-    .replace(/^[\d).\-–—•*\s]+/, "") // leading numbering / bullets
+    .replace(/^[\d).\-–—•*\s]+/, "")
     .replace(/[\s|·•,;:-]+$/, "")
     .replace(/\s{2,}/g, " ")
     .trim()
-    .slice(0, 90);
+    .slice(0, 120);
 }
 
 function normDomain(raw: string): string | null {
@@ -102,23 +127,45 @@ function normDomain(raw: string): string | null {
   if (!d.includes(".")) return null;
   if (EMAIL_RE.test(d)) return null;
   if (/\.(png|jpe?g|gif|svg|pdf|css|js)$/i.test(d)) return null;
-  // TLD must be real letters (rejects "p.o" from "P.O. Box", "w.l.l", numerics).
   const tld = d.split(".").pop() || "";
   if (!/^[a-z]{2,}$/.test(tld)) return null;
   return d;
 }
 
-// Does this line read like a company name (vs. an address / contact / label)?
+function titleCase(s: string): string {
+  return s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase()).trim();
+}
+
+function isNoise(line: string): boolean {
+  const l = line.trim();
+  if (!l) return true;
+  if (/^\d{1,4}$/.test(l)) return true; // page number
+  if (/^[A-Za-z]$/.test(l)) return true; // index letter (A, B, …)
+  if (/^\(?\s*fax\b/i.test(l)) return true; // fax-only line
+  if (NOISE_RE.test(l)) return true;
+  return false;
+}
+
+// ALL-CAPS short standalone line ⇒ an activity/section title (MEDICAL, METAL…).
+function sectionHeader(line: string): string | null {
+  const s = line.trim();
+  if (s.length < 3 || s.length > 26) return null;
+  if (!/^[A-Z][A-Z0-9 &/\-]+$/.test(s)) return null;
+  if (/\b(WLL|W\.?L\.?L|LLC)\b/.test(s)) return null; // legal-suffix fragments
+  if (/\d/.test(s)) return null;
+  return s.replace(/\s+/g, " ").trim();
+}
+
 function looksLikeName(line: string): boolean {
   const l = line.trim();
-  if (l.length < 2 || l.length > 90) return false;
+  if (l.length < 2 || l.length > 120) return false;
   if (!/[a-z]/i.test(l)) return false;
   if (l.includes("@")) return false;
   if (LABEL_START_RE.test(l)) return false;
   if (ADDRESS_START_RE.test(l)) return false;
   if (/^(doha|qatar|state of qatar)$/i.test(l)) return false;
   const digits = (l.match(/\d/g) || []).length;
-  if (digits > l.length * 0.4) return false; // too numeric to be a name
+  if (digits > l.length * 0.4) return false;
   return true;
 }
 
@@ -131,10 +178,10 @@ function phonesInLine(line: string, region?: CountryCode): LinePhone[] {
     const raw = m[1];
     const digits = raw.replace(/\D/g, "");
     if (digits.length < 7 || digits.length > 15) continue;
+    const pre = line.slice(Math.max(0, m.index - 16), m.index).toLowerCase();
+    if (/box|p\.?\s*o\b/.test(pre)) continue; // P.O. Box number, not a phone
     const p = parsePhoneNumberFromString(raw, region);
     if (!p || !p.isValid()) continue;
-    const pre = line.slice(Math.max(0, m.index - 16), m.index).toLowerCase();
-    // A number is "mobile" if its type says so OR it sits behind a mobile label.
     const mobile = p.getType() === "MOBILE" || /(mob|cell|gsm|whats)/.test(pre);
     out.push({ e164: p.number, mobile, isFax: /fax/.test(pre) });
   }
@@ -151,45 +198,57 @@ export function parseDirectoryText(text: string, country?: string): ParsedRow[] 
 // The core parser, working on an array of text lines (from coordinates or \n).
 export function parseDirectoryLines(rawLines: string[], country?: string): ParsedRow[] {
   const region = regionFromCountryName(country);
-  const lines = rawLines.map((l) => l.replace(/\s{2,}/g, " ").trim());
+  const lines = rawLines.map((l) => l.replace(/\s{2,}/g, " ").trim()).filter(Boolean);
 
-  interface Rec { company: string; category?: string; phone?: string; phoneMobile?: boolean; email?: string; website?: string }
-  const records: Rec[] = [];
-  let cur: Rec | null = null;
-  const hasContact = (r: Rec | null) => !!(r && (r.phone || r.email));
-  const flush = () => { if (cur && cur.company && (cur.phone || cur.email)) records.push(cur); };
+  const records: ParsedRow[] = [];
+  let nameBuf: string[] = [];
+  let currentCategory: string | undefined;
+
+  const flush = (phone?: string, phoneMobile?: boolean, email?: string, website?: string) => {
+    const company = cleanName(nameBuf.join(" "));
+    nameBuf = [];
+    if (!company || company.length < 2 || !/[a-z]/i.test(company)) return;
+    if (!phone && !email) return; // need at least one contact anchor
+    records.push({ company, category: currentCategory, phone, phoneMobile, email, website });
+  };
 
   for (const line of lines) {
-    if (!line) continue;
+    if (isNoise(line)) { nameBuf = []; continue; }
 
-    const phones = phonesInLine(line, region);
+    const sec = sectionHeader(line);
+    if (sec) { currentCategory = titleCase(sec); nameBuf = []; continue; }
+
+    const phones = phonesInLine(line, region).filter((p) => !p.isFax);
     const emailM = line.match(EMAIL_RE);
-    const urlM = line.match(URL_RE);
     const catM = line.match(CATEGORY_RE);
 
-    // A clean name line (no contact data on it) starts / renames a record.
-    if (!phones.length && !emailM && !catM && looksLikeName(line)) {
-      if (hasContact(cur)) { flush(); cur = { company: cleanName(line) }; }
-      else if (cur) cur.company = cleanName(line); // replace a contact-less false start (title/header)
-      else cur = { company: cleanName(line) };
+    // A line carrying a phone or email closes the current listing.
+    if (phones.length || emailM) {
+      let phone: string | undefined;
+      let phoneMobile = false;
+      for (const p of phones) {
+        if (!phone) { phone = p.e164; phoneMobile = p.mobile; }
+        else if (p.mobile && !phoneMobile) { phone = p.e164; phoneMobile = true; }
+      }
+      const email = emailM ? emailM[0].toLowerCase() : undefined;
+      let website: string | undefined;
+      const urlM = line.match(URL_RE);
+      if (urlM) { const d = normDomain(urlM[1]); if (d) website = d; }
+      flush(phone, phoneMobile, email, website);
       continue;
     }
 
-    if (!cur) cur = { company: "" };
+    if (catM) { currentCategory = catM[1].trim(); continue; }
 
-    // Phone: prefer the current one, but upgrade to a mobile if we find one.
-    for (const p of phones) {
-      if (p.isFax) continue;
-      if (!cur.phone) { cur.phone = p.e164; cur.phoneMobile = p.mobile; }
-      else if (p.mobile && !cur.phoneMobile) { cur.phone = p.e164; cur.phoneMobile = true; }
+    // Otherwise it's (part of) a company name — accumulate wrapped lines.
+    if (looksLikeName(line)) {
+      nameBuf.push(line);
+      if (nameBuf.length > 4) nameBuf.shift();
     }
-    if (emailM && !cur.email) cur.email = emailM[0].toLowerCase();
-    if (urlM && !cur.website) { const d = normDomain(urlM[1]); if (d) cur.website = d; }
-    if (catM && !cur.category) cur.category = catM[1].trim();
+    // address-only / unknown lines are ignored (buffer preserved).
   }
-  flush();
 
-  // Fallback: nothing had a phone/email — salvage any inline email/website lines.
+  // Fallback: nothing anchored — salvage any inline email/website lines.
   if (records.length === 0) {
     for (const line of lines) {
       const email = line.match(EMAIL_RE)?.[0]?.toLowerCase();
@@ -201,7 +260,7 @@ export function parseDirectoryLines(rawLines: string[], country?: string): Parse
     }
   }
 
-  // Dedupe.
+  // Dedupe by company + anchor.
   const seen = new Set<string>();
   const rows: ParsedRow[] = [];
   for (const r of records) {
@@ -213,14 +272,126 @@ export function parseDirectoryLines(rawLines: string[], country?: string): Parse
   return rows;
 }
 
-export async function parsePdf(buf: Uint8Array, country?: string): Promise<{ rows: ParsedRow[]; pages: number }> {
-  // Primary: reconstruct real lines from item coordinates.
-  const { lines, pages } = await extractPdfLines(buf);
-  let rows = parseDirectoryLines(lines, country);
-  // Fallback: if coordinate lines produced nothing, try flat text.
-  if (!rows.length) {
-    const { text } = await extractPdfText(buf);
-    rows = parseDirectoryText(text, country);
+// ------------------------- flat-stream directory parser ---------------------
+// The reliable path for multi-column directories: pdf.js flattens each page to
+// text in correct READING order (column 1 fully, then 2, then 3), just
+// space-joined. Every listing ends with "(P.O.Box <n>) …… <phone>", so we anchor
+// on that pattern and take the text BEFORE each block as the company name. This
+// sidesteps fragile column-geometry detection entirely.
+
+const HEADER_NOISE_RE =
+  /(Qatar Commercial and Industrial Directory\s*\d{4}\s*[-–]\s*\d{4}|(?:Commercial|Industrial) companies and institutions by activity|Alphabetical List of Commercial and Industrial|Al Ikhtyaar German Group|www\.[a-z0-9.\-]+|UPVC[^]*?Coating)/gi;
+
+const POBOX_ANCHOR_RE = /\(?\s*p\.?\s*o\.?\s*box\s*([0-9]+)\s*\)?[.\s]*([0-9]{6,9})/gi;
+const FAX_TAIL_RE = /^\s*\(\s*fax[^)]*\)/i;
+
+function safeCallingCode(region?: CountryCode): string {
+  if (!region) return "";
+  try { return getCountryCallingCode(region); } catch { return ""; }
+}
+
+function formatPhone(digits: string, region?: CountryCode, cc?: string): string {
+  if (region) {
+    const p = parsePhoneNumberFromString(digits, region);
+    if (p && p.isValid()) return p.formatInternational();
   }
-  return { rows, pages };
+  return cc ? `+${cc} ${digits}` : digits;
+}
+
+function isMobile(digits: string, region?: CountryCode): boolean {
+  if (region) {
+    const p = parsePhoneNumberFromString(digits, region);
+    if (p && p.isValid()) {
+      if (p.getType() === "MOBILE") return true;
+      if (region === "QA") return /^[3567]/.test(digits) && digits.length === 8;
+      return false;
+    }
+  }
+  if (region === "QA") return /^[3567]/.test(digits) && digits.length === 8;
+  return false;
+}
+
+// Turn the text sitting before a P.O.Box block into a clean company name (and,
+// when present, a leading ALL-CAPS activity section → category).
+function nameFromBetween(raw: string): { name: string; category?: string } {
+  let s = raw.replace(HEADER_NOISE_RE, " ");
+  s = s.replace(FAX_TAIL_RE, " ");            // stray leading "(Fax …)"
+  s = s.replace(/^\s*\d{1,4}\s+/, " ");       // leading page number
+  s = s.replace(/\s+/g, " ").trim();
+
+  let category: string | undefined;
+  // Leading ALL-CAPS run followed by a Title-Case name ⇒ activity header.
+  const sec = s.match(/^([A-Z][A-Z &/\-]{2,})\s+([A-Z].*)$/);
+  if (sec && !/\b(WLL|LLC|W\.?L\.?L)\b/.test(sec[1]) && sec[1] === sec[1].toUpperCase()) {
+    category = titleCase(sec[1]);
+    s = sec[2];
+  }
+  return { name: cleanName(s), category };
+}
+
+export function parseDirectoryFlat(text: string, country?: string): ParsedRow[] {
+  const region = regionFromCountryName(country);
+  const cc = safeCallingCode(region);
+  if (!text) return [];
+  const s = text.replace(/\s+/g, " ");
+
+  const rows: ParsedRow[] = [];
+  const seen = new Set<string>();
+  let lastEnd = 0;
+  let currentCategory: string | undefined;
+  POBOX_ANCHOR_RE.lastIndex = 0;
+
+  let m: RegExpExecArray | null;
+  while ((m = POBOX_ANCHOR_RE.exec(s))) {
+    const between = s.slice(lastEnd, m.index);
+    const phoneDigits = m[2];
+
+    // Consume a trailing "(Fax …)" so it doesn't bleed into the next name.
+    let end = POBOX_ANCHOR_RE.lastIndex;
+    const fax = FAX_TAIL_RE.exec(s.slice(end));
+    if (fax) end += fax[0].length;
+    lastEnd = end;
+    POBOX_ANCHOR_RE.lastIndex = end;
+
+    const { name, category } = nameFromBetween(between);
+    if (category) currentCategory = category;
+    if (!name || name.length < 2 || !/[a-z]/i.test(name)) continue;
+
+    const phone = formatPhone(phoneDigits, region, cc);
+    const key = `${name.toLowerCase()}|${phoneDigits}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ company: name, category: currentCategory, phone, phoneMobile: isMobile(phoneDigits, region) });
+  }
+  return rows;
+}
+
+export interface ParseResult {
+  rows: ParsedRow[];
+  pages: number;
+  textChars: number;
+  lineCount: number;
+  sampleLines: string[];
+}
+
+export async function parsePdf(buf: Uint8Array, country?: string): Promise<ParseResult> {
+  // Primary: flat text in reading order, parsed by P.O.Box anchor.
+  const { text, pages } = await extractPdfText(buf);
+  let rows = parseDirectoryFlat(text, country);
+
+  // Fallback: line-based parser (for non-P.O.Box layouts / true multi-line PDFs).
+  if (rows.length < 3) {
+    const alt = parseDirectoryText(text, country);
+    if (alt.length > rows.length) rows = alt;
+  }
+
+  // A readable sample for diagnostics (split the stream before each P.O.Box).
+  const sampleLines = text
+    .replace(/\s+/g, " ")
+    .split(/(?=\(?\s*p\.?\s*o\.?\s*box)/i)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .slice(0, 60);
+
+  return { rows, pages, textChars: text.length, lineCount: sampleLines.length, sampleLines };
 }

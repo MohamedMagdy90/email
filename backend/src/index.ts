@@ -610,7 +610,7 @@ app.post("/api/crawl", async (c) => {
         website: r.website ? String(r.website).trim() : undefined,
       }))
       .filter((r) => r.company)
-      .slice(0, clamp(Number(b.maxRows) || 100, 1, 1000));
+      .slice(0, clamp(Number(b.maxRows) || 100, 1, 20000));
     if (!list.length) return c.json({ error: "No companies to enrich" }, 400);
 
     const country = String(b.defaultCountry || "").trim() || undefined;
@@ -826,8 +826,16 @@ app.post("/api/import/pdf", async (c) => {
 
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
-    const { rows, pages } = await parsePdf(buf, country || undefined);
-    return c.json({ rows, pages, count: rows.length });
+    const { rows, pages, textChars, lineCount, sampleLines } = await parsePdf(buf, country || undefined);
+    let reason: string | undefined;
+    if (!rows.length) {
+      // near-empty text layer ⇒ the PDF is scanned images (needs OCR);
+      // otherwise we read text but couldn't recognise the listing layout.
+      reason = textChars < 200 ? "scanned" : "no_listings";
+      console.log(`[import/pdf] 0 rows · pages=${pages} chars=${textChars} lines=${lineCount} · sample:`);
+      for (const l of sampleLines.slice(0, 30)) console.log("   | " + l);
+    }
+    return c.json({ rows, pages, count: rows.length, textChars, lineCount, reason, sample: sampleLines });
   } catch (e: any) {
     return c.json({ error: "Could not read this PDF — " + String(e?.message || e) }, 400);
   }

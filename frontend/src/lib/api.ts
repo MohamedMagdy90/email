@@ -294,7 +294,15 @@ export const api = {
     const res = await fetch(`${BASE}/api/import/pdf`, { method: "POST", headers: { ...authHeaders() }, body: fd });
     if (res.status === 401) { onUnauthorized(); throw new Error("Unauthorized"); }
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
-    return res.json() as Promise<{ rows: ParsedRow[]; pages: number; count: number }>;
+    return res.json() as Promise<{
+      rows: ParsedRow[];
+      pages: number;
+      count: number;
+      textChars: number;
+      lineCount: number;
+      reason?: "scanned" | "no_listings";
+      sample: string[];
+    }>;
   },
 
   // send

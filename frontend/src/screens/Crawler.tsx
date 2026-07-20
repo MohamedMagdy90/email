@@ -89,8 +89,9 @@ export default function Crawler({
   const [pdfRows, setPdfRows] = useState<ParsedRow[]>([]);
   const [pdfParsing, setPdfParsing] = useState(false);
   const [pdfCountry, setPdfCountry] = useState("");
-  const [pdfMax, setPdfMax] = useState(50);
+  const [pdfMax, setPdfMax] = useState(100);
   const [pdfGuessInbox, setPdfGuessInbox] = useState(true);
+  const [pdfDiag, setPdfDiag] = useState<{ reason?: "scanned" | "no_listings"; sample: string[]; pages: number } | null>(null);
 
   // options
   const [maxPages, setMaxPages] = useState(20);
@@ -300,14 +301,16 @@ export default function Crawler({
   async function onPdfFile(file: File | null) {
     setPdfFile(file);
     setPdfRows([]);
+    setPdfDiag(null);
     if (!file) return;
     if (!/\.pdf$/i.test(file.name)) return toast("Please choose a PDF file", "error");
     setPdfParsing(true);
     try {
       const r = await api.parsePdf(file, pdfCountry.trim() || undefined);
       setPdfRows(r.rows || []);
-      if (!r.rows?.length) toast("Couldn't find company rows in this PDF — try another file", "info");
-      else toast(`Parsed ${r.count} compan${r.count === 1 ? "y" : "ies"} from ${r.pages} page(s)`, "success");
+      setPdfDiag({ reason: r.reason, sample: r.sample || [], pages: r.pages });
+      if (!r.rows?.length) toast("Couldn't detect listings — see the note below", "info");
+      else toast(`Parsed ${r.count.toLocaleString()} compan${r.count === 1 ? "y" : "ies"} from ${r.pages} page(s)`, "success");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
@@ -454,6 +457,7 @@ export default function Crawler({
     setUrlCheck(null);
     setPdfFile(null);
     setPdfRows([]);
+    setPdfDiag(null);
     onClose();
   }
 
@@ -673,10 +677,28 @@ export default function Crawler({
                 )}
               </label>
 
+              {pdfFile && !pdfParsing && pdfRows.length === 0 && pdfDiag && (
+                <div className="rounded-xl border border-[#f0c98a] bg-[#fff6e8] p-3 text-xs text-[#8a5a12]">
+                  <div className="font-semibold">
+                    {pdfDiag.reason === "scanned" ? "This PDF looks scanned (no selectable text)" : "Couldn't detect company listings"}
+                  </div>
+                  <div className="mt-1 leading-relaxed">
+                    {pdfDiag.reason === "scanned"
+                      ? `We read ${pdfDiag.pages} page(s) but found almost no text — it's likely scanned images, which need OCR to read.`
+                      : "We read the text but its layout didn't match. Make sure the Country above is filled in, then re-upload. If it still fails, copy the sample below and send it to me so I can tune the parser to this file."}
+                  </div>
+                  {pdfDiag.sample.length > 0 && (
+                    <div className="mt-2 max-h-32 overflow-y-auto rounded-lg bg-white/70 p-2 font-mono text-[10px] leading-relaxed text-ink/70">
+                      {pdfDiag.sample.slice(0, 25).map((l, i) => <div key={i} className="truncate">{l || "\u00a0"}</div>)}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {pdfRows.length > 0 && (
                 <div className="rounded-xl border border-line">
                   <div className="flex items-center justify-between border-b border-line px-3 py-2 text-[13px] font-medium">
-                    <span>{pdfRows.length} companies parsed · <span className="text-muted">{pdfRows.filter((r) => r.phone).length} with phone</span></span>
+                    <span>{pdfRows.length.toLocaleString()} companies parsed · <span className="text-muted">{pdfRows.filter((r) => r.phone).length.toLocaleString()} with phone</span></span>
                     <span className="text-xs text-muted">preview</span>
                   </div>
                   <div className="max-h-40 overflow-y-auto">
@@ -699,8 +721,9 @@ export default function Crawler({
 
               <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-ink/[0.03] p-3">
                 <Field label="Companies to process">
-                  <Select value={pdfMax} onChange={(e) => setPdfMax(Number(e.target.value))} className="h-9 w-28">
-                    {[10, 25, 50, 100, 200, 500].map((n) => <option key={n} value={n}>{n}</option>)}
+                  <Select value={pdfMax} onChange={(e) => setPdfMax(Number(e.target.value))} className="h-9 w-36">
+                    {[25, 50, 100, 250, 500, 1000, 2000, 5000, 10000].filter((n) => !pdfRows.length || n < pdfRows.length).map((n) => <option key={n} value={n}>{n.toLocaleString()}</option>)}
+                    {pdfRows.length > 0 && <option value={pdfRows.length}>All ({pdfRows.length.toLocaleString()})</option>}
                   </Select>
                 </Field>
                 <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
