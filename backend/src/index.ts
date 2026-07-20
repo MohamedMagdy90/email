@@ -533,7 +533,8 @@ app.post("/api/crawl", async (c) => {
   const rawUrls: string[] = (Array.isArray(b.urls) ? b.urls : String(b.urls || "").split(/[\n,]/))
     .map((u: string) => u.trim())
     .filter(Boolean);
-  if (!rawUrls.length) return c.json({ error: "provide at least one URL" }, 400);
+  // The PDF enrichment mode carries `rows`, not `urls`, so it's exempt here.
+  if (b.mode !== "enrich" && !rawUrls.length) return c.json({ error: "provide at least one URL" }, 400);
 
   // ---- Directory harvest mode ------------------------------------------
   // Paste a business-directory URL; walk its pages, open every listing, and
