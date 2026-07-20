@@ -26,6 +26,9 @@ interface Lead {
   detailUrl: string;
   domain: string;
   inContacts?: boolean;
+  source?: "pdf" | "site" | "social" | "guess" | null; // where the contact came from
+  via?: string | null; // profile host (e.g. "facebook.com") when recovered from social
+  confidence?: "verified" | "likely" | "guess" | null;
 }
 type Company = LeadCompany;
 
@@ -864,7 +867,10 @@ export default function Crawler({
                           </td>
                           <td className="px-1 py-2">
                             <div className="font-medium leading-tight">{l.name || l.domain}</div>
-                            <div className="truncate text-xs text-muted">{l.email || <span className="italic">no email</span>}</div>
+                            <div className="flex items-center gap-1.5 truncate text-xs text-muted">
+                              <span className="truncate">{l.email || <span className="italic">no email</span>}</span>
+                              <SourceTag source={l.source} via={l.via} confidence={l.confidence} />
+                            </div>
                           </td>
                           <td className="px-1 py-2 text-xs">
                             {l.phone ? (
@@ -1050,6 +1056,23 @@ function Tag({ children, tone }: { children: React.ReactNode; tone: "green" | "b
     gray: "bg-ink/[0.06] text-ink/50",
   };
   return <span className={cn("inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium", tones[tone])}>{children}</span>;
+}
+
+// Shows where a PDF-enriched contact came from: verified (phone matched or on
+// the PDF), via a social page (Facebook/Instagram/directory), or a guessed domain.
+function SourceTag({
+  source,
+  via,
+  confidence,
+}: {
+  source?: "pdf" | "site" | "social" | "guess" | null;
+  via?: string | null;
+  confidence?: "verified" | "likely" | "guess" | null;
+}) {
+  if (confidence === "verified") return <Tag tone="green">verified</Tag>;
+  if (source === "social") return <Tag tone="amber">via {via?.replace(/\.com$/, "") || "social"}</Tag>;
+  if (source === "guess") return <Tag tone="gray">guessed</Tag>;
+  return null;
 }
 
 function ConfidenceTag({ c }: { c?: "high" | "medium" | "low" | "guessed" }) {

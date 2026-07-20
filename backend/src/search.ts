@@ -10,6 +10,7 @@
 // cache results briefly so repeat searches don't re-hit the engine.
 
 import { registrableDomain, hostOf } from "./crawler/urls";
+import { isProfileHost, isJunkHost } from "./crawler/profiles";
 import type { Company } from "./leads";
 
 const UAS = [
@@ -146,4 +147,69 @@ export async function searchCompanies(keywords: string, location: string, limit:
   }
   if (results.length) cache.set(cacheKey, { at: Date.now(), data: results });
   return results;
+}
+
+// A single search result, categorized. `sites` are candidate company websites;
+// `profiles` are social/directory pages (Facebook, Talabat, …) that we keep as a
+// fallback because they usually list the company's real website + email.
+export interface RawHit {
+  url: string; // homepage-normalized URL
+  title: string;
+  host: string;
+  domain: string;
+}
+
+const rawCache = new Map<string, { at: number; data: { sites: RawHit[]; profiles: RawHit[] } }>();
+
+// Like searchCompanies, but returns BOTH real sites and profile pages (instead
+// of throwing profiles away). Used by the PDF enrichment pipeline so companies
+// that only have a Facebook/Instagram/directory presence are still resolvable.
+export async function searchRaw(
+  keywords: string,
+  location: string,
+  limit = 8
+): Promise<{ sites: RawHit[]; profiles: RawHit[] }> {
+  const q = keywords.trim();
+  if (!q) return { sites: [], profiles: [] };
+
+  const cacheKey = `raw|${q.toLowerCase()}|${location.toLowerCase().trim()}|${limit}`;
+  const cached = rawCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < CACHE_MS) return cached.data;
+
+  const base = location.trim() ? `${q} ${location.trim()}` : q;
+  const sites: RawHit[] = [];
+  const profiles: RawHit[] = [];
+  const seenSite = new Set<string>();
+  const seenProfile = new Set<string>();
+
+  for (const offset of [0, 30]) {
+    const hits = await fetchResultsPage(base, offset);
+    for (const h of hits) {
+      let host = "";
+      try { host = hostOf(h.url); } catch { continue; }
+      if (!host || isJunkHost(host)) continue;
+      const domain = registrableDomain(host);
+      if (!domain) continue;
+      let url = h.url;
+      try { const u = new URL(h.url); url = `${u.protocol}//${u.host}${u.pathname}`; } catch {}
+      const rec: RawHit = { url, title: (h.title || "").slice(0, 120), host, domain };
+
+      if (isProfileHost(host)) {
+        // Keep the full path for profiles (we need the exact page to scrape).
+        if (!seenProfile.has(url)) { seenProfile.add(url); profiles.push(rec); }
+      } else {
+        if (!seenSite.has(domain)) {
+          seenSite.add(domain);
+          try { const u = new URL(h.url); rec.url = `${u.protocol}//${u.host}/`; } catch {}
+          sites.push(rec);
+        }
+      }
+    }
+    if (sites.length >= limit && profiles.length >= 3) break;
+    await sleep(700);
+  }
+
+  const data = { sites: sites.slice(0, limit), profiles: profiles.slice(0, 5) };
+  if (data.sites.length || data.profiles.length) rawCache.set(cacheKey, { at: Date.now(), data });
+  return data;
 }

@@ -7,10 +7,10 @@ import {
   getCategories, setCategories,
 } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
-import { crawlMany, crawlSite, type CrawlOptions } from "./crawler";
+import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
-import { resolveWebsite } from "./enrich";
+import { enrichCompany } from "./enrich";
 import { fetchViaProxy, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
@@ -643,52 +643,59 @@ app.post("/api/crawl", async (c) => {
           while (idx < list.length) {
             const my = idx++;
             const row = list[my];
-            let website = row.website
-              ? (/^https?:\/\//i.test(row.website) ? row.website : "https://" + row.website)
-              : "";
-            let domain = website ? registrableDomain(hostOf(website)) || "" : "";
-            let email = row.email;
-            let phone = row.phone;
-            let phoneMobile = row.phoneMobile;
-            let role_based = email ? /^(info|sales|contact|support|admin|office|enquir|inquir|general|mail|hello)/i.test(email) : false;
 
-            // 1) Find the website if the PDF didn't already have one.
-            if (!website) {
-              const r = await resolveWebsite(row.company, country || "").catch(() => null);
-              if (r) { website = /^https?:\/\//i.test(r.website) ? r.website : "https://" + r.website; domain = r.domain; }
-            }
+            // Full pipeline: search "<name> <country>" → best site → crawl for
+            // email; fall back to social/directory profiles (Facebook, Talabat…)
+            // to recover the real website + email; then domain-guessing.
+            const r = await enrichCompany(
+              {
+                company: row.company,
+                category: row.category,
+                phone: row.phone,
+                phoneMobile: row.phoneMobile,
+                email: row.email,
+                website: row.website,
+              },
+              country || "",
+              { crawlOpts, proxy, useProfiles: b.useProfiles !== false, guessDomains: b.guessDomains !== false }
+            ).catch(() => null);
 
-            // 2) Crawl the site for an email (unless the PDF already had one).
-            if (!email && website) {
-              const site = await crawlSite(website, crawlOpts).catch(() => null);
-              if (site && site.emails.length) {
-                const best = site.emails[0];
-                email = best.email;
-                role_based = best.role_based;
-                domain = best.domain || domain;
-                if (!phone && site.phone) { phone = site.phone; phoneMobile = !!site.phoneMobile; }
-              }
-            }
-            if (website && !domain) domain = registrableDomain(hostOf(website)) || "";
+            const email = r?.email || null;
+            const website = r?.website || "";
+            const domain = r?.domain || (website ? registrableDomain(hostOf(website)) || "" : "");
 
             out[my] = {
               name: row.company,
-              email: email || null,
-              phone: phone || null,
-              phoneMobile: !!phoneMobile,
-              role_based,
+              email,
+              phone: r?.phone || null,
+              phoneMobile: !!r?.phoneMobile,
+              role_based: !!r?.role_based,
               category: row.category || null,
-              detailUrl: website || "",
+              detailUrl: website,
               domain,
+              source: r?.source || null, // pdf | site | social | guess
+              via: r?.via || null, // e.g. "facebook.com" when recovered from a profile
+              confidence: r?.confidence || null, // verified | likely | guess
               inContacts: !!(email && known.has(email.toLowerCase())),
             };
             done++;
             job.processed = done;
             job.progress = Math.min(0.99, done / list.length);
-            log(job, {
-              level: email ? "hit" : "info",
-              msg: `${row.company}: ${email ? email : website ? "site found, no email" : "no website found"}`,
-            });
+
+            // Human-readable status: where the email/website came from.
+            let msg: string;
+            if (email) {
+              const tag =
+                r?.source === "social" ? ` (via ${r.via})` :
+                r?.source === "guess" ? " (guessed domain)" :
+                r?.source === "pdf" ? " (from PDF)" : "";
+              msg = `${row.company}: ${email}${tag}`;
+            } else if (website) {
+              msg = `${row.company}: site found (${domain}), no email`;
+            } else {
+              msg = `${row.company}: no website found`;
+            }
+            log(job, { level: email ? "hit" : "info", msg });
           }
         }
 
