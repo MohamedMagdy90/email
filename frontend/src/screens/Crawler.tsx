@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type Job, type Place, type LeadCompany } from "../lib/api";
+import { api, type Job, type Place, type LeadCompany, type ParsedRow } from "../lib/api";
 import { Button, Field, Input, Modal, Select, Spinner, Textarea, toast, cn } from "../lib/ui";
 import { toCsv, downloadCsv } from "../lib/csv";
 
@@ -22,6 +22,7 @@ interface Lead {
   phone: string | null;
   phoneMobile?: boolean;
   role_based?: boolean;
+  category?: string | null;
   detailUrl: string;
   domain: string;
   inContacts?: boolean;
@@ -34,7 +35,7 @@ const FALLBACK_CATS = [
   "Advertising & Marketing", "Insurance", "Trading & Retail", "Companies (general)",
 ];
 
-type Mode = "discover" | "keyword" | "urls" | "directory";
+type Mode = "discover" | "keyword" | "urls" | "directory" | "pdf";
 
 export default function Crawler({
   open,
@@ -83,6 +84,14 @@ export default function Crawler({
   const [dirAdded, setDirAdded] = useState<Set<string>>(new Set());
   const [dirBusy, setDirBusy] = useState(false);
 
+  // pdf import
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [pdfRows, setPdfRows] = useState<ParsedRow[]>([]);
+  const [pdfParsing, setPdfParsing] = useState(false);
+  const [pdfCountry, setPdfCountry] = useState("");
+  const [pdfMax, setPdfMax] = useState(50);
+  const [pdfGuessInbox, setPdfGuessInbox] = useState(true);
+
   // options
   const [maxPages, setMaxPages] = useState(20);
   const [maxDepth, setMaxDepth] = useState(2);
@@ -108,8 +117,9 @@ export default function Crawler({
   const results: Found[] = job?.result?.emails || [];
   const skippedList: any[] = job?.result?.skipped || [];
 
-  // directory job
-  const isDirJob = job?.result?.mode === "directory";
+  // directory job (also covers PDF enrichment — same result shape)
+  const isEnrichJob = job?.result?.mode === "enrich";
+  const isDirJob = job?.result?.mode === "directory" || isEnrichJob;
   const leads: Lead[] = job?.result?.contacts || [];
   const leadKey = (l: Lead) => l.email || l.phone || l.detailUrl;
   const isAdded = (l: Lead) => !!l.inContacts || dirAdded.has(leadKey(l));
@@ -286,6 +296,48 @@ export default function Crawler({
     }
   }
 
+  /* ------------------------------ pdf import ------------------------------ */
+  async function onPdfFile(file: File | null) {
+    setPdfFile(file);
+    setPdfRows([]);
+    if (!file) return;
+    if (!/\.pdf$/i.test(file.name)) return toast("Please choose a PDF file", "error");
+    setPdfParsing(true);
+    try {
+      const r = await api.parsePdf(file, pdfCountry.trim() || undefined);
+      setPdfRows(r.rows || []);
+      if (!r.rows?.length) toast("Couldn't find company rows in this PDF — try another file", "info");
+      else toast(`Parsed ${r.count} compan${r.count === 1 ? "y" : "ies"} from ${r.pages} page(s)`, "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setPdfParsing(false);
+    }
+  }
+
+  async function startPdfEnrich() {
+    if (!pdfRows.length) return toast("Upload a PDF first", "error");
+    setDirSelected(new Set());
+    setStage("job");
+    setJob(null);
+    try {
+      const { jobId } = await api.startCrawl({
+        mode: "enrich",
+        rows: pdfRows,
+        maxRows: pdfMax,
+        defaultCountry: pdfCountry || undefined,
+        respectRobots,
+        checkMx,
+        guessInbox: pdfGuessInbox,
+      });
+      beginPoll(jobId);
+      setJob(await api.getCrawl(jobId));
+    } catch (e: any) {
+      toast(e.message, "error");
+      setStage("input");
+    }
+  }
+
   function toggleLead(k: string) {
     const n = new Set(dirSelected);
     n.has(k) ? n.delete(k) : n.add(k);
@@ -306,10 +358,10 @@ export default function Crawler({
           email: l.email!,
           company: l.name,
           phone: l.phone || undefined,
-          country: dirCountry || undefined,
-          category: saveCategory || undefined,
+          country: (mode === "pdf" ? pdfCountry : dirCountry) || undefined,
+          category: saveCategory || l.category || undefined,
           role_based: l.role_based,
-          source: "directory",
+          source: mode === "pdf" ? "pdf-import" : "directory",
         })),
         true
       );
@@ -400,6 +452,8 @@ export default function Crawler({
     reset();
     setCompanies([]);
     setUrlCheck(null);
+    setPdfFile(null);
+    setPdfRows([]);
     onClose();
   }
 
@@ -411,7 +465,7 @@ export default function Crawler({
         <div className="space-y-5">
           {/* mode switch */}
           <div className="flex rounded-full border border-line bg-cream p-1 w-fit">
-            {([["discover", "Discover companies"], ["keyword", "Keyword search"], ["directory", "Directory"], ["urls", "Paste websites"]] as const).map(([m, label]) => (
+            {([["discover", "Discover companies"], ["keyword", "Keyword search"], ["directory", "Directory"], ["pdf", "Import PDF"], ["urls", "Paste websites"]] as const).map(([m, label]) => (
               <button
                 key={m}
                 onClick={() => { setMode(m); setCompanies([]); }}
@@ -586,8 +640,90 @@ export default function Crawler({
             </div>
           )}
 
-          {/* shared crawl options (not needed for directory mode) */}
-          {mode !== "directory" && (
+          {mode === "pdf" && (
+            <div className="space-y-4">
+              <Field label="Country" hint="Helps read local phone numbers and find the right websites">
+                <Input value={pdfCountry} onChange={(e) => setPdfCountry(e.target.value)} placeholder="Qatar" />
+              </Field>
+
+              <label
+                className={cn(
+                  "flex cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed border-line bg-cream px-4 py-8 text-center transition-colors hover:border-ink/30",
+                  pdfParsing && "pointer-events-none opacity-70"
+                )}
+              >
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  className="hidden"
+                  onChange={(e) => onPdfFile(e.target.files?.[0] || null)}
+                />
+                {pdfParsing ? (
+                  <span className="inline-flex items-center gap-2 text-sm font-medium text-ink/70"><Spinner className="h-4 w-4" /> Reading PDF…</span>
+                ) : pdfFile ? (
+                  <>
+                    <span className="text-sm font-medium">{pdfFile.name}</span>
+                    <span className="text-xs text-muted">{pdfRows.length ? `${pdfRows.length} companies parsed` : "No rows found"} · click to choose another</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm font-medium">Drop or choose a directory PDF</span>
+                    <span className="text-xs text-muted">e.g. the QCCI Directory. Company + phone are read from each listing.</span>
+                  </>
+                )}
+              </label>
+
+              {pdfRows.length > 0 && (
+                <div className="rounded-xl border border-line">
+                  <div className="flex items-center justify-between border-b border-line px-3 py-2 text-[13px] font-medium">
+                    <span>{pdfRows.length} companies parsed · <span className="text-muted">{pdfRows.filter((r) => r.phone).length} with phone</span></span>
+                    <span className="text-xs text-muted">preview</span>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <tbody>
+                        {pdfRows.slice(0, 100).map((r, i) => (
+                          <tr key={i} className="border-b border-line-soft last:border-0">
+                            <td className="px-3 py-1.5">
+                              <div className="font-medium leading-tight">{r.company}</div>
+                              {r.category && <div className="truncate text-xs text-muted">{r.category}</div>}
+                            </td>
+                            <td className="px-3 py-1.5 text-right text-xs tabular-nums text-ink/70">{r.phone || "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-ink/[0.03] p-3">
+                <Field label="Companies to process">
+                  <Select value={pdfMax} onChange={(e) => setPdfMax(Number(e.target.value))} className="h-9 w-28">
+                    {[10, 25, 50, 100, 200, 500].map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                </Field>
+                <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
+                <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
+                <Toggle label="Guess info@ if hidden" checked={pdfGuessInbox} onChange={setPdfGuessInbox} />
+                {categories.length > 0 && (
+                  <div className="ml-auto flex items-center gap-2">
+                    <span className="text-[13px] text-muted">Save under</span>
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                      <option value="">No category</option>
+                      {categories.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
+                    </Select>
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-muted">
+                For each company we find its website, then read the site for a real email &amp; phone. You review everything before it's added to Contacts.
+              </p>
+            </div>
+          )}
+
+          {/* shared crawl options (not needed for directory / pdf modes) */}
+          {mode !== "directory" && mode !== "pdf" && (
           <div className="rounded-xl bg-ink/[0.03] p-3">
             <div className="mb-2 grid grid-cols-2 gap-3">
               <Field label="Max pages / site">
@@ -622,6 +758,8 @@ export default function Crawler({
               <Button onClick={crawlDiscovered} disabled={!pickedCrawlable.length}>Find emails on {pickedCrawlable.length || ""} site(s)</Button>
             ) : mode === "directory" ? (
               <Button onClick={startDirectory} disabled={!dirUrls.trim()}>Harvest directory</Button>
+            ) : mode === "pdf" ? (
+              <Button onClick={startPdfEnrich} disabled={!pdfRows.length}>Find emails for {pdfRows.length ? Math.min(pdfRows.length, pdfMax) : ""} companies</Button>
             ) : (
               <Button onClick={crawlUrls} disabled={!urls.trim()}>Start crawl</Button>
             )}
@@ -638,10 +776,10 @@ export default function Crawler({
                 ) : job?.status === "error" ? (
                   <span className="text-bad">Error: {job.error}</span>
                 ) : (
-                  <span className="text-good">Done — {isDirJob ? `${leads.length} lead(s) harvested` : `${results.length} unique email(s) found`}</span>
+                  <span className="text-good">Done — {isEnrichJob ? `${leads.filter((l) => l.email).length} email(s) found` : isDirJob ? `${leads.length} lead(s) harvested` : `${results.length} unique email(s) found`}</span>
                 )}
               </span>
-              <span className="text-muted">{isDirJob ? (running ? "walking…" : `${job?.result?.sites?.[0]?.detailPages ?? 0} pages`) : `${job?.processed ?? 0}/${job?.total ?? 0} sites`}</span>
+              <span className="text-muted">{isEnrichJob ? `${job?.processed ?? 0}/${job?.total ?? 0} companies` : isDirJob ? (running ? "walking…" : `${job?.result?.sites?.[0]?.detailPages ?? 0} pages`) : `${job?.processed ?? 0}/${job?.total ?? 0} sites`}</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-ink/[0.07]">
               <div className="prism-bar h-full rounded-full transition-all duration-300" style={{ width: `${Math.round((job?.progress || 0) * 100)}%` }} />

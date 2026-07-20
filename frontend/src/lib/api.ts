@@ -111,6 +111,16 @@ export interface LeadResult {
   summary: { total: number; new: number };
 }
 
+// A row parsed from an uploaded directory PDF.
+export interface ParsedRow {
+  company: string;
+  category?: string;
+  phone?: string;
+  phoneMobile?: boolean;
+  email?: string;
+  website?: string;
+}
+
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
@@ -275,6 +285,17 @@ export const api = {
   // crawl
   startCrawl: (body: any) => req<{ jobId: string }>(`/api/crawl`, { method: "POST", body: JSON.stringify(body) }),
   getCrawl: (id: string) => req<Job>(`/api/crawl/${id}`),
+
+  // PDF import: upload a directory PDF, get back parsed rows to enrich
+  parsePdf: async (file: File, country?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (country) fd.append("country", country);
+    const res = await fetch(`${BASE}/api/import/pdf`, { method: "POST", headers: { ...authHeaders() }, body: fd });
+    if (res.status === 401) { onUnauthorized(); throw new Error("Unauthorized"); }
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
+    return res.json() as Promise<{ rows: ParsedRow[]; pages: number; count: number }>;
+  },
 
   // send
   startSend: (body: any) => req<{ jobId: string }>(`/api/send`, { method: "POST", body: JSON.stringify(body) }),

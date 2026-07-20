@@ -106,11 +106,20 @@
 - [x] FE builds clean (vite build OK)
 - [x] End-to-end test PASS: open_count=2, first/last set, click 302, js: guard 400, rollup + stats delta all correct
 - [x] Recovered from corrupt local SQLite (test-only data; prod Postgres unaffected)
-- [ ] Version
+- [x] Version 24
+- [x] Committed d10bc04 + pushed to origin/main (Railway auto-deploy triggered)
+
+## Feature: Import PDF → find websites + emails → review → add to contacts
+
+- [x] Install `unpdf` in backend for PDF text extraction
+- [x] `backend/src/crawler/pdf.ts` — coordinate-based line extraction + row parser (company, category, phone, email?, website?)
+- [x] `backend/src/enrich.ts` — resolveWebsite(company, country) via web search
+- [x] `backend/src/index.ts` — POST /api/import/pdf (upload+parse) + `mode:"enrich"` branch in /api/crawl
+- [x] `frontend/src/lib/api.ts` — parsePdf(file) + ParsedRow type
+- [x] `frontend/src/screens/Crawler.tsx` — "Import PDF" tab (upload, preview rows, Find emails) reusing leads table
+- [x] Tested parser + /api/import/pdf end-to-end (4 clean rows from a real PDF)
 
 ### Notes
-- open tracking now: open_count + first_opened_at + last_opened_at (was boolean)
-- click tracking: /api/click?s=<sendId>&u=<url> records + 302 redirects; only http(s) counted
-- links auto-wrapped in wrapHtml (skips unsub, mailto:, tel:, anchors, our own endpoints)
-- a click also marks opened (covers image-blocked clients)
-- REMINDER: not committed/pushed to GitHub yet (Railway won't have it until pushed)
+- unpdf flat extraction loses line breaks → we reconstruct lines from pdf.js item Y-coordinates (extractPdfLines), splitting columns on wide X gaps.
+- Must copy the buffer (`new Uint8Array(buf)`) before each getDocumentProxy — pdf.js detaches it.
+- Enrichment (name→website→email) reuses searchCompanies + crawlSite + MX verify; results reuse the directory leads table + add flow.

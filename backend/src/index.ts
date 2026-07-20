@@ -7,8 +7,10 @@ import {
   getCategories, setCategories,
 } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
-import { crawlMany, type CrawlOptions } from "./crawler";
+import { crawlMany, crawlSite, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
+import { parsePdf } from "./crawler/pdf";
+import { resolveWebsite } from "./enrich";
 import { fetchViaProxy, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
@@ -591,6 +593,121 @@ app.post("/api/crawl", async (c) => {
     return c.json({ jobId: job.id });
   }
 
+  // ---- PDF enrichment mode ---------------------------------------------
+  // Take rows parsed from a directory PDF ({ company, phone, category, … }),
+  // resolve each company's website, then crawl it for an email. Same result
+  // shape as the directory harvest so the frontend reuses the leads table.
+  if (b.mode === "enrich") {
+    const proxy = await getProxyConfig();
+    const rawRows: any[] = Array.isArray(b.rows) ? b.rows : [];
+    const list = rawRows
+      .map((r) => ({
+        company: String(r.company || "").trim(),
+        category: r.category ? String(r.category).trim() : undefined,
+        phone: r.phone ? String(r.phone).trim() : undefined,
+        phoneMobile: !!r.phoneMobile,
+        email: r.email ? String(r.email).trim().toLowerCase() : undefined,
+        website: r.website ? String(r.website).trim() : undefined,
+      }))
+      .filter((r) => r.company)
+      .slice(0, clamp(Number(b.maxRows) || 100, 1, 1000));
+    if (!list.length) return c.json({ error: "No companies to enrich" }, 400);
+
+    const country = String(b.defaultCountry || "").trim() || undefined;
+    const crawlOpts: CrawlOptions = {
+      maxPages: 8,
+      maxDepth: 1,
+      respectRobots: b.respectRobots !== false,
+      checkMx: b.checkMx !== false,
+      guessInbox: b.guessInbox !== false, // default ON — the whole point is to get an email
+      useSitemap: true,
+      defaultCountry: country,
+      concurrency: 1,
+      proxy,
+    };
+
+    const job = createJob("crawl", list.length);
+    job.result = { mode: "enrich", contacts: [], sites: [] };
+    log(job, { level: "info", msg: `Enriching ${list.length} compan${list.length === 1 ? "y" : "ies"} from PDF…${proxy ? ` · scraping proxy: ${proxy.provider}` : ""}` });
+
+    (async () => {
+      try {
+        const known = new Set(await getContactEmails());
+        const out: any[] = new Array(list.length);
+        let done = 0;
+        let idx = 0;
+        const concurrency = proxy ? 2 : 3;
+
+        async function worker() {
+          while (idx < list.length) {
+            const my = idx++;
+            const row = list[my];
+            let website = row.website
+              ? (/^https?:\/\//i.test(row.website) ? row.website : "https://" + row.website)
+              : "";
+            let domain = website ? registrableDomain(hostOf(website)) || "" : "";
+            let email = row.email;
+            let phone = row.phone;
+            let phoneMobile = row.phoneMobile;
+            let role_based = email ? /^(info|sales|contact|support|admin|office|enquir|inquir|general|mail|hello)/i.test(email) : false;
+
+            // 1) Find the website if the PDF didn't already have one.
+            if (!website) {
+              const r = await resolveWebsite(row.company, country || "").catch(() => null);
+              if (r) { website = /^https?:\/\//i.test(r.website) ? r.website : "https://" + r.website; domain = r.domain; }
+            }
+
+            // 2) Crawl the site for an email (unless the PDF already had one).
+            if (!email && website) {
+              const site = await crawlSite(website, crawlOpts).catch(() => null);
+              if (site && site.emails.length) {
+                const best = site.emails[0];
+                email = best.email;
+                role_based = best.role_based;
+                domain = best.domain || domain;
+                if (!phone && site.phone) { phone = site.phone; phoneMobile = !!site.phoneMobile; }
+              }
+            }
+            if (website && !domain) domain = registrableDomain(hostOf(website)) || "";
+
+            out[my] = {
+              name: row.company,
+              email: email || null,
+              phone: phone || null,
+              phoneMobile: !!phoneMobile,
+              role_based,
+              category: row.category || null,
+              detailUrl: website || "",
+              domain,
+              inContacts: !!(email && known.has(email.toLowerCase())),
+            };
+            done++;
+            job.processed = done;
+            job.progress = Math.min(0.99, done / list.length);
+            log(job, {
+              level: email ? "hit" : "info",
+              msg: `${row.company}: ${email ? email : website ? "site found, no email" : "no website found"}`,
+            });
+          }
+        }
+
+        await Promise.all(Array.from({ length: concurrency }, worker));
+        const contacts = out.filter(Boolean);
+        job.result.contacts = contacts;
+        job.status = "done";
+        job.progress = 1;
+        job.processed = list.length;
+        const withEmail = contacts.filter((x) => x.email).length;
+        log(job, { level: "info", msg: `Done — ${withEmail}/${contacts.length} compan${contacts.length === 1 ? "y" : "ies"} got an email.` });
+      } catch (e: any) {
+        job.status = "error";
+        job.error = String(e?.message || e);
+      }
+    })();
+
+    return c.json({ jobId: job.id });
+  }
+
   const skipKnown = b.skipKnown !== false; // default ON
   const recrawlDays = clamp(Number(b.recrawlDays) || 60, 1, 365);
 
@@ -689,6 +806,31 @@ app.get("/api/crawl/:id", (c) => {
   const job = getJob(c.req.param("id"));
   if (!job) return c.json({ error: "job not found" }, 404);
   return c.json(serializeJob(job));
+});
+
+/* ----------------------------- PDF import --------------------------- */
+// Upload a business-directory PDF; extract structured rows (company, category,
+// phone, and any inline email/website). The rows are then handed to /api/crawl
+// with mode:"enrich" to find the missing websites + emails.
+app.post("/api/import/pdf", async (c) => {
+  let form: FormData;
+  try {
+    form = await c.req.formData();
+  } catch {
+    return c.json({ error: "Upload a PDF file." }, 400);
+  }
+  const file = form.get("file");
+  const country = String(form.get("country") || "").trim();
+  if (!(file instanceof File)) return c.json({ error: "Attach a PDF file (field \"file\")." }, 400);
+  if (file.size > 40 * 1024 * 1024) return c.json({ error: "PDF is too large (max 40 MB)." }, 413);
+
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const { rows, pages } = await parsePdf(buf, country || undefined);
+    return c.json({ rows, pages, count: rows.length });
+  } catch (e: any) {
+    return c.json({ error: "Could not read this PDF — " + String(e?.message || e) }, 400);
+  }
 });
 
 /* -------------------------------- Send ------------------------------ */
