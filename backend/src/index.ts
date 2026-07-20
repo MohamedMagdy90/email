@@ -822,7 +822,16 @@ app.post("/api/import/pdf", async (c) => {
   const file = form.get("file");
   const country = String(form.get("country") || "").trim();
   if (!(file instanceof File)) return c.json({ error: "Attach a PDF file (field \"file\")." }, 400);
-  if (file.size > 200 * 1024 * 1024) return c.json({ error: "PDF is too large (max 200 MB). Split it into smaller parts and upload each." }, 413);
+  if (file.size > 50 * 1024 * 1024) {
+    return c.json(
+      {
+        error:
+          "PDF is too large (max 50 MB). A text directory is usually small — a 170 MB+ file is image-heavy and will overload the server. " +
+          "Please split it into smaller parts (or use \"Reduce File Size\" / export as text) and upload each part.",
+      },
+      413
+    );
+  }
 
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
