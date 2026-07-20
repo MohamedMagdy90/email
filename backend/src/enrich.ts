@@ -12,7 +12,7 @@
 
 import { searchCompanies, searchRaw, type RawHit } from "./search";
 import { crawlSite, type CrawlOptions } from "./crawler";
-import { fetchPage, fetchViaProxy, type ProxyConfig } from "./crawler/fetcher";
+import { fetchPage, fetchViaProxy, fetchViaReader, type ProxyConfig } from "./crawler/fetcher";
 import { extractContactFromProfile } from "./crawler/profiles";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./crawler/validate";
 import { registrableDomain, hostOf } from "./crawler/urls";
@@ -170,12 +170,17 @@ function guessCandidates(company: string, country: string): string[] {
 }
 
 async function fetchProfileHtml(url: string, proxy?: ProxyConfig): Promise<string | null> {
-  // Facebook/Instagram need JS + antibot, so prefer the scraping proxy.
-  if (proxy) {
-    const r = await fetchViaProxy(url, proxy).catch(() => null);
-    if (r?.ok && r.html) return r.html;
-  }
+  // 1) Plain direct fetch — free, works for most directory pages.
   const d = await fetchPage(url, 15000).catch(() => null);
+  if (d?.ok && d.html && !d.blocked) return d.html;
+  // 2) FREE reader (renders JS) — good for JS-heavy directories/listings.
+  const rd = await fetchViaReader(url).catch(() => null);
+  if (rd?.ok && rd.html) return rd.html;
+  // 3) Paid scraping proxy, only if the user configured one.
+  if (proxy) {
+    const p = await fetchViaProxy(url, proxy).catch(() => null);
+    if (p?.ok && p.html) return p.html;
+  }
   return d?.ok && d.html ? d.html : null;
 }
 

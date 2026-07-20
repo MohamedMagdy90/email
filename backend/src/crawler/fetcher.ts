@@ -22,7 +22,7 @@ export interface FetchResult {
   error?: string;
   blocked?: boolean; // request was refused by bot protection (not a normal 404/5xx)
   blockReason?: BlockReason;
-  via?: "direct" | "proxy"; // how the page was fetched
+  via?: "direct" | "proxy" | "reader"; // how the page was fetched
 }
 
 export type ScrapeProvider = "scrapingbee" | "scraperapi" | "zenrows";
@@ -87,7 +87,7 @@ export function buildProxyUrl(cfg: ProxyConfig, target: string): string {
 // URL reported in the result (proxy fetches report the TARGET, not the proxy).
 async function rawFetch(
   fetchUrl: string,
-  opts: { timeoutMs: number; headers: Record<string, string>; reportUrl?: string; via?: "direct" | "proxy" }
+  opts: { timeoutMs: number; headers: Record<string, string>; reportUrl?: string; via?: "direct" | "proxy" | "reader" }
 ): Promise<FetchResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
@@ -179,6 +179,35 @@ export async function fetchViaProxy(target: string, cfg: ProxyConfig, timeoutMs 
   return r;
 }
 
+// ── Free reader fallback (Jina Reader, https://r.jina.ai) ──────────────────
+// A no-key, free service that fetches a URL, RENDERS JavaScript, and returns
+// clean HTML — so JS-heavy / Cloudflare-"soft"-blocked sites become crawlable
+// WITHOUT a paid scraping proxy. An optional JINA_API_KEY (also free) raises the
+// rate limit. It can't defeat hard LOGIN walls (Facebook/Instagram), but those
+// are unreachable by paid proxies too.
+const READER_TIMEOUT_MS = 45_000;
+const READER_ENABLED = process.env.DISABLE_READER !== "1";
+const READER_KEY = process.env.JINA_API_KEY || "";
+
+export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS): Promise<FetchResult> {
+  const headers: Record<string, string> = {
+    "X-Return-Format": "html", // give us HTML so the existing extractors work
+    "X-Timeout": "30", // tell Jina to cap its own render time
+    Accept: "text/html,*/*;q=0.8",
+  };
+  if (READER_KEY) headers.Authorization = `Bearer ${READER_KEY}`;
+  const r = await rawFetch(`https://r.jina.ai/${target}`, {
+    timeoutMs,
+    headers,
+    reportUrl: target,
+    via: "reader",
+  });
+  if (!r.ok && (r.status === 401 || r.status === 402 || r.status === 429)) {
+    r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit — add a free JINA_API_KEY)" : "");
+  }
+  return r;
+}
+
 export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig): Promise<FetchResult> {
   // "always" mode: route every request through the proxy (with one transient retry).
   if (proxy && proxy.mode === "always") {
@@ -201,12 +230,18 @@ export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, 
     await sleep(400 * (i + 1));
   }
 
-  // …and if a bot-wall blocked us and a proxy is configured, retry through it.
-  if (proxy && last && last.blocked) {
-    const p = await fetchViaProxy(url, proxy);
-    if (p.ok) return p;
-    // Keep the original block info if the proxy also couldn't get through.
-    return last.blocked ? last : p;
+  // …and if a bot-wall blocked us, escalate: FREE reader first, then the paid
+  // proxy only if one is configured (so most sites cost nothing to crawl).
+  if (last && last.blocked) {
+    if (READER_ENABLED) {
+      const rd = await fetchViaReader(url).catch(() => null);
+      if (rd?.ok && rd.html) return rd;
+    }
+    if (proxy) {
+      const p = await fetchViaProxy(url, proxy);
+      if (p.ok) return p;
+      return last.blocked ? last : p; // keep original block info if proxy also failed
+    }
   }
   return last as FetchResult;
 }

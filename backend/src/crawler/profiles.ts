@@ -10,7 +10,7 @@ import { extractLinks, hostOf, registrableDomain } from "./urls";
 // Hosts that are social profiles or business directories worth reading for
 // contact info (they frequently expose an outbound website + email).
 export const PROFILE_HOST_RE =
-  /(^|\.)(facebook|fb|instagram|linkedin|twitter|x|talabat|snoonu|rafeeq|deliveroo|zomato|tripadvisor|foursquare|yelp|justdial|yellowpages|yalwa|yello|bayt|gulftalent|qatarliving|marhaba|companiesqatar|qatar-companies|daleeli|connectqatar|qatardirectory|hukoomi|qbdc)\.[a-z.]+$/i;
+  /(^|\.)(facebook|fb|instagram|linkedin|twitter|x|talabat|snoonu|rafeeq|deliveroo|zomato|tripadvisor|foursquare|yelp|justdial|yellowpages|yalwa|yello|bayt|gulftalent|qatarliving|marhaba|companiesqatar|qatar-companies|daleeli|connectqatar|qatardirectory|hukoomi|qbdc|evendo|clickdoha|qataryellowpages|qatarbusinessdirectory|dohaguide|qatarofw|explore-qatar|ilovqatar|iloveqatar|businesslist|yellowpages-qatar|linktr\.ee|linktree|beacons|carrd)\.[a-z.]+$/i;
 
 // Hosts that are pure noise — search infra, marketplaces, encyclopaediae, link
 // shorteners — never the company and never a useful contact source.
