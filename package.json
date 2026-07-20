@@ -10,7 +10,8 @@
   "dependencies": {
     "hono": "^4.6.15",
     "libphonenumber-js": "^1.13.9",
-    "postgres": "^3.4.5"
+    "postgres": "^3.4.5",
+    "unpdf": "^1.6.2"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
