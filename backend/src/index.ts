@@ -1344,16 +1344,22 @@ app.post("/api/discovery/leads/approve", async (c) => {
 
   let added = 0, skipped = 0;
   const approvedIds: string[] = [];
+  const seenEmails = new Set<string>(); // guards against the same email twice in one batch
   for (const l of leads) {
     const email = String(l.email || "").trim().toLowerCase();
     approvedIds.push(l.id); // approving marks it handled even if it has no email
     if (!email || !email.includes("@")) { skipped++; continue; }
+    // Never attempt the same email twice in one request. The contacts.email
+    // UNIQUE constraint (ON CONFLICT DO NOTHING) is the hard guarantee; this just
+    // keeps the counts honest and avoids redundant inserts.
+    if (seenEmails.has(email)) { skipped++; continue; }
+    seenEmails.add(email);
     const ins = await q(
       `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
        VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
       [uid(), email, l.name || l.domain || null, l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
     );
-    if (ins.length) added++; else skipped++;
+    if (ins.length) added++; else skipped++; // skipped = already an existing Contact
   }
   if (approvedIds.length) {
     const ph = approvedIds.map(() => "?").join(",");

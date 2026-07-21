@@ -37,3 +37,15 @@
       fallback for non-numeric pagers, and then forward-only + ascending.
 - [x] Verified: ?page=93 -> 93→94→95→96 (38 contacts); /listings -> 1→2→3→4 (39).
 - [ ] Note for user: Restart the source after deploy to re-cover skipped low pages.
+
+## No duplicate emails (pool + contacts) — DONE
+- Contacts: already hard-guaranteed by `contacts.email UNIQUE` + ON CONFLICT DO NOTHING
+  on every insert path (approve, manual, bulk). Added within-batch dedup on approve.
+- Pool: `dedup_key` is `e:<email>` when present (UNIQUE) — blocks direct duplicates.
+  Closed the enrichment gap:
+  - insertDiscovered now also checks the pool's `email` column before inserting.
+  - enrichTick: if a found email is already a Contact or another pool row, the
+    redundant lead is deleted; otherwise its dedup_key is promoted to `e:<email>`.
+  - Added index `idx_discovered_leads_email` for fast lookups.
+- [x] Verified with a temp-DB test: contacts UNIQUE, pool dedup_key, enrichment
+      guard, and the index — all pass.

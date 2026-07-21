@@ -179,10 +179,17 @@ interface LeadRow {
 // Insert one lead if it's genuinely new (not an existing contact, not already in
 // the pool). Returns true when a row was added.
 async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; domains: Set<string> }): Promise<boolean> {
-  const email = (row.email || "").toLowerCase();
-  const domain = (row.domain || "").toLowerCase();
-  if (email && dedup.emails.has(email)) return false;
-  if (domain && dedup.domains.has(domain)) return false;
+  const email = (row.email || "").trim().toLowerCase();
+  const domain = (row.domain || "").trim().toLowerCase();
+  if (email && dedup.emails.has(email)) return false;   // already a saved Contact
+  if (domain && dedup.domains.has(domain)) return false; // already a Contact's domain
+  // Never allow the same email twice in the pool. The dedup_key ("e:<email>")
+  // already blocks two directly-listed emails, but a lead that was ENRICHED to
+  // this email carries a domain/phone key — so check the email column too.
+  if (email) {
+    const dupe = (await q(`SELECT 1 FROM discovered_leads WHERE email=? LIMIT 1`, [email]))[0];
+    if (dupe) return false;
+  }
   const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
   const rows = await q(
     `INSERT INTO discovered_leads
@@ -525,17 +532,34 @@ async function enrichTick(): Promise<void> {
       const site = await crawlSite(lead.website, opts);
       if (site.phone && !phone) phone = site.phone;
       const best = pickSiteEmail(site.emails, lead.domain);
-      if (best) { email = best.email; confidence = "likely"; }
+      if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; }
     } catch (e: any) {
       dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${String(e?.message || e)}`);
     }
 
-    // enriched=1 always, so we never spin on the same lead twice.
-    await q(
-      `UPDATE discovered_leads SET enriched=1, email=?, phone=?, confidence=? WHERE id=?`,
-      [email, phone, email ? confidence : null, lead.id]
-    );
-    dlog("enrich", `  ${email ? "✓ found " + email : "✗ no email found"} for "${lead.name || lead.domain}"`);
+    if (email) {
+      // Guard against duplicates: if this email is already a saved Contact, or
+      // already sits on another pool row, this lead is now redundant — remove it
+      // so the same email is never listed twice.
+      const asContact = (await q(`SELECT 1 FROM contacts WHERE email=? LIMIT 1`, [email]))[0];
+      const inPool = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [email, lead.id]))[0];
+      if (asContact || inPool) {
+        await q(`DELETE FROM discovered_leads WHERE id=?`, [lead.id]);
+        dlog("enrich", `  ✓ ${email} already known — removed duplicate "${lead.name || lead.domain}"`);
+        return;
+      }
+      // Promote the dedup_key to the email so any FUTURE lead carrying it collides
+      // on the unique key and is skipped. enriched=1 so we never re-crawl it.
+      await q(
+        `UPDATE discovered_leads SET enriched=1, email=?, phone=?, confidence=?, dedup_key=? WHERE id=?`,
+        [email, phone, confidence, "e:" + email, lead.id]
+      );
+      dlog("enrich", `  ✓ found ${email} for "${lead.name || lead.domain}"`);
+    } else {
+      // enriched=1 always, so we never spin on the same lead twice.
+      await q(`UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL WHERE id=?`, [phone, lead.id]);
+      dlog("enrich", `  ✗ no email found for "${lead.name || lead.domain}"`);
+    }
   } finally {
     enriching = false;
   }

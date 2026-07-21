@@ -179,6 +179,10 @@ export async function ensureSchema() {
     via TEXT,
     created_at TEXT NOT NULL
   )`);
+
+  // Fast lookups for email de-duplication in the pool (never unique — many leads
+  // legitimately have no email/NULL — the app guarantees email-uniqueness itself).
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_email ON discovered_leads(email)`); } catch { /* ignore */ }
 }
 
 /* ---------------------------- Crawl ledger ---------------------------- */
