@@ -65,4 +65,16 @@
 - [x] Add clearer worker log when an area is fully harvested from OSM
 - [x] Update modal copy to explain OSM limits + steer to Directory for thousands
 - [x] Verified live: Qatar · Companies (general) 24 -> 178 (147 w/ site, 84 w/ email)
+- [x] Version 43 + committed 32b6552 + pushed to origin/main (Railway auto-deploy)
+- Note: restored local .git (was empty) → re-linked to MohamedMagdy90/email
+
+## Fix: qatarcontact.com directory crawler (path to thousands)
+- [x] Diagnosed: crawler DOES read /listing/ cards (proved: 39/40 w/ contact info)
+- [x] Root cause: "+0" logs were page 426 (past the 412-page end), not broken cards
+- [x] Fix premature-finish: end-of-directory now = "no listing cards seen",
+      not "no NEW leads" — so re-scans of known directories walk to the true end
+- [x] Safety: maxDetails >= pages*40 so dense pages aren't truncated by the cursor
+- [x] "Run now" on a FINISHED directory restarts from page 1 (manual re-scan)
+- [x] Clearer logs: "already known — still walking to the end"
+- [x] Integration test PASSED: duplicate re-scan no longer trips the empty streak
 - [ ] Version + push

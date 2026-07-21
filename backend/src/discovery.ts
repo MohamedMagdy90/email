@@ -297,7 +297,12 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
 
 /* -------------------------- Directory source -------------------------- */
 
-interface DirRunResult { found: number; error?: string; okish: boolean; nextCursor: number; pages: number; }
+interface DirRunResult {
+  found: number;       // NEW leads inserted into the pool this batch
+  extracted: number;   // listings actually read this batch (new OR already-known)
+  detailPages: number; // detail/card pages opened this batch
+  error?: string; okish: boolean; nextCursor: number; pages: number;
+}
 
 // Walk ONE batch of a business directory (a few pages), starting at the saved
 // page cursor, and insert every new company. This is what scales to tens of
@@ -312,7 +317,10 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   const seed = withPage(base, cursor);
   const opts: DirectoryOptions = {
     maxPages: DIRECTORY_PAGES_PER_RUN,
-    maxDetails: clamp(src.limit_n, 20, 300),
+    // Open EVERY listing on the pages we walk — the cursor advances by whole
+    // pages, so a maxDetails smaller than (pages × listings-per-page) would
+    // silently skip listings. 40/page is a generous ceiling for dense directories.
+    maxDetails: Math.max(clamp(src.limit_n, 20, 300), DIRECTORY_PAGES_PER_RUN * 40),
     concurrency: proxy ? 3 : 5,
     respectRobots: true,
     checkMx: true,
@@ -382,7 +390,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   // switched to a freshly-resolved index), never past a block.
   const nextCursor = okish ? resolvedFromCursor + Math.max(1, pages) : resolvedFromCursor;
   const error = blocked ? (result.note || result.status) : undefined;
-  return { found, error, okish, nextCursor, pages };
+  return { found, extracted: result.contacts.length, detailPages: result.detailPages, error, okish, nextCursor, pages };
 }
 
 /* ------------------------------ scheduling ---------------------------- */
@@ -399,18 +407,23 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     try {
       r = await runDirectorySource(src);
     } catch (e: any) {
-      r = { found: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
+      r = { found: 0, extracted: 0, detailPages: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
     }
 
-    // Tolerate a few consecutive empty batches (thin pages between rich ones)
-    // before declaring the directory finished — but always advance past them.
+    // Decide "end of directory" by whether this batch actually READ listing cards,
+    // NOT by whether they were new. A page full of businesses we already have
+    // (found=0 but extracted>0) is NOT the end — otherwise re-scanning a directory
+    // we've already harvested would die after 3 duplicate pages and never re-walk
+    // the whole thing. Only a batch that opened no detail pages and pulled nothing
+    // real (a lone footer email leaks 1) counts toward the empty streak.
+    const productive = r.detailPages > 0 || r.extracted >= 2;
     let streak = Number(src.empty_streak) || 0;
     let exhausted = false;
     let cursor = Number(src.cursor) || 1;
     if (!r.error && r.okish) {
       cursor = r.nextCursor;                       // move on, even through thin pages
-      streak = r.found > 0 ? 0 : streak + 1;
-      exhausted = streak >= EMPTY_STREAK_LIMIT;    // truly out of listings
+      streak = productive ? 0 : streak + 1;
+      exhausted = streak >= EMPTY_STREAK_LIMIT;    // genuinely off the end of the list
     }
     const cont = !r.error && !exhausted;           // keep streaming while there's more
     const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
@@ -423,8 +436,8 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
       [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
     );
     if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
-    else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — no more listings (${EMPTY_STREAK_LIMIT} empty batches in a row); re-checking in ${interval}m`);
-    else if (cont) dlog("dir", `${srcLabel(src)}: continuing — next batch starts at page ${cursor} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
+    else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${EMPTY_STREAK_LIMIT} pages with no more listings); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
+    else if (cont) dlog("dir", `${srcLabel(src)}: continuing to page ${cursor} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s${r.extracted > 0 && r.found === 0 ? ` (page's ${r.extracted} listing(s) already known — still walking to the end)` : ""}`);
     return { found: r.found, error: r.error, continue: cont };
   }
 
@@ -453,7 +466,16 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
   const src = (await q(`SELECT * FROM discovery_sources WHERE id=?`, [id]))[0];
   if (!src) { dwarn("", `manual "run now": source ${id} not found`); return { found: 0, error: "Source not found" }; }
   dlog("", `manual "run now" requested for ${srcLabel(src)}`);
-  if (src.type === "directory") { await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0 WHERE id=?`, [id]); src.exhausted = 0; src.empty_streak = 0; }
+  if (src.type === "directory") {
+    // A kick on a FINISHED directory re-scans it from the top, so listings added
+    // anywhere in it get picked up (dedup skips the ones we already hold). A kick
+    // on a mid-walk directory just resumes from where it left off.
+    const restart = Number(src.exhausted) === 1;
+    const cursor = restart ? initialCursor(String(src.base_url || "")) : (Number(src.cursor) || 1);
+    await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
+    src.exhausted = 0; src.empty_streak = 0; src.cursor = cursor;
+    if (restart) dlog("dir", `re-scanning ${srcLabel(src)} from page ${cursor} — re-checking every listing for anything new`);
+  }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.
   if (r.continue) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
