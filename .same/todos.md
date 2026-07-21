@@ -57,3 +57,12 @@
   next to the category select, passed in approve + approve-all, confirm text updated.
 - [x] Verified live: lead country "Qatar" -> approved with override "Testland" ->
       contact saved with country "Testland". Test data cleaned up.
+
+## Fix: OSM "Companies (general)" finds almost nothing (Qatar)
+- [x] Broaden category tag matching — support "any value of a key" (key-only) filters
+- [x] Make "Companies (general)"/"Trading & Retail"/"Manufacturing" match any office/shop/craft
+- [x] Raise per-scan cap (120 -> 500) so a whole country can stream in one scan
+- [x] Add clearer worker log when an area is fully harvested from OSM
+- [x] Update modal copy to explain OSM limits + steer to Directory for thousands
+- [x] Verified live: Qatar · Companies (general) 24 -> 178 (147 w/ site, 84 w/ email)
+- [ ] Version + push

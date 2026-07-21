@@ -59,19 +59,20 @@ export const LEAD_CATEGORIES: Record<string, { k: string; v?: string }[]> = {
   ],
   "Manufacturing & Industrial": [
     { k: "office", v: "company" }, { k: "man_made", v: "works" },
+    { k: "craft" }, // any craft = workshops, fabricators, manufacturers
   ],
   "Education & Training": [
     { k: "amenity", v: "school" }, { k: "amenity", v: "college" },
     { k: "office", v: "educational_institution" },
   ],
   "Trading & Retail": [
-    { k: "shop", v: "trade" }, { k: "shop", v: "wholesale" },
-    { k: "shop", v: "car" }, { k: "office", v: "company" },
+    { k: "shop" },                 // any retail/wholesale shop
+    { k: "office", v: "company" },
   ],
+  // Umbrella category: match ANY value of the core "business" keys so the whole
+  // long tail of companies OSM knows about is captured — not a hand-picked few.
   "Companies (general)": [
-    { k: "office", v: "company" }, { k: "office", v: "consulting" },
-    { k: "office", v: "it" }, { k: "office", v: "financial" },
-    { k: "shop", v: "trade" }, { k: "shop", v: "wholesale" },
+    { k: "office" }, { k: "shop" }, { k: "craft" }, { k: "company" },
   ],
 };
 
@@ -90,7 +91,7 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass.osm.jp/api/interpreter",
 ];
 const UA = "DNA-Outreach/1.0 (dna.systems outreach tool)";
-const OVERPASS_TIMEOUT_MS = 30000; // abort a slow endpoint and fall through
+const OVERPASS_TIMEOUT_MS = 55000; // abort a slow endpoint and fall through (broad "any office/shop" queries need room)
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface Company {
@@ -204,26 +205,39 @@ export async function geocodeSuggest(qStr: string, limit = 6): Promise<Place[]> 
 }
 
 function buildQuery(filters: { k: string; v?: string }[], areaClause: string, limit: number) {
-  // Group category values by their OSM key so we can match them with a single
-  // fast value-regex (e.g. office~"^(it|software|telecommunication)$") instead
-  // of one statement per value. `nw` (node+way) skips slow relation processing.
+  // Two kinds of filter:
+  //  • value filters      → specific values of a key (office~"^(it|software)$")
+  //  • key-only filters    → ANY value of a key (any office/shop/craft). This is
+  //    how umbrella categories capture the long tail of businesses OSM knows,
+  //    instead of a hand-picked handful of tag values.
+  // Grouping keeps each key to a single fast regex. `nw` (node+way) skips slow
+  // relation processing.
   const groups = new Map<string, string[]>();
+  const anyKey = new Set<string>();
   for (const f of filters) {
-    if (!f.v) continue;
-    const arr = groups.get(f.k) || [];
-    arr.push(f.v.replace(/[^a-z0-9_]/gi, ""));
-    groups.set(f.k, arr);
-  }
-
-  const parts: string[] = [];
-  for (const [k, vals] of groups) {
-    const vre = `^(${[...new Set(vals)].join("|")})$`;
-    for (const ck of CONTACT_KEYS) {
-      parts.push(`nw["${k}"~"${vre}"]["${ck}"]${areaClause};`);
+    if (f.v) {
+      const arr = groups.get(f.k) || [];
+      arr.push(f.v.replace(/[^a-z0-9_]/gi, ""));
+      groups.set(f.k, arr);
+    } else {
+      anyKey.add(f.k);
     }
   }
-  // Ask for a healthy multiple of `limit` since we de-dupe aggressively after.
-  return `[out:json][timeout:25];(${parts.join("")});out tags center ${limit * 3};`;
+  // A key matched "any value" is a superset of its own value list — drop the list.
+  for (const k of anyKey) groups.delete(k);
+
+  const selectors: string[] = [];
+  for (const [k, vals] of groups) selectors.push(`["${k}"~"^(${[...new Set(vals)].join("|")})$"]`);
+  for (const k of anyKey) selectors.push(`["${k}"]`);
+
+  const parts: string[] = [];
+  for (const sel of selectors) {
+    for (const ck of CONTACT_KEYS) parts.push(`nw${sel}["${ck}"]${areaClause};`);
+  }
+  // Pull a generous slice — we de-dupe hard by domain afterwards, and a whole
+  // country of "any office/shop/craft" can legitimately be several hundred rows.
+  const cap = Math.min(Math.max(limit * 3, 900), 3000);
+  return `[out:json][timeout:50];(${parts.join("")});out tags center ${cap};`;
 }
 
 async function fetchOverpass(endpoint: string, query: string): Promise<any> {

@@ -263,7 +263,7 @@ export function initialCursor(base: string): number {
 // Run one OSM source: discover companies, dedupe, insert new. Returns count.
 async function runSource(src: any): Promise<{ found: number; error?: string }> {
   const place = safeParse(src.place_json);
-  const limit = clamp(src.limit_n, 5, 120);
+  const limit = clamp(src.limit_n, 5, 500);
   dlog("osm", `searching "${src.location}" · ${src.category} (up to ${limit}) via OpenStreetMap`);
   const companies: Company[] = await findLeads(src.location, src.category, limit, place);
   dlog("osm", `OpenStreetMap returned ${companies.length} candidate(s) for "${src.location}"`);
@@ -284,6 +284,14 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
     else skipped++;
   }
   dlog("osm", `"${src.location}" done: +${found} new, ${skipped} already-known/duplicate`);
+  // When OSM returned rows but they're ALL already in the pool/contacts, the area
+  // is fully harvested — re-scanning can't surface more. Say so, and point at the
+  // one thing that actually scales beyond OSM's tagged set: a Directory source.
+  if (found === 0 && companies.length > 0) {
+    dlog("osm", `↳ "${src.location}" · ${src.category} is fully harvested from OpenStreetMap (all ${companies.length} known already). OSM is a map, not a company registry — add a Directory (bulk) source to go beyond it.`);
+  } else if (companies.length === 0) {
+    dlog("osm", `↳ OpenStreetMap has no ${src.category} tagged with a website/email in "${src.location}". Try a broader Industry, a bigger area, or a Directory (bulk) source.`);
+  }
   return { found };
 }
 

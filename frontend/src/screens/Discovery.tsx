@@ -516,8 +516,9 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
     }
   }, [open, editing, cats]);
 
-  // Directory sources default to a bigger batch size.
-  useEffect(() => { if (!editing) setLimit(type === "directory" ? 100 : 40); }, [type, editing]);
+  // Directory sources default to a bigger batch size; a map source should pull a
+  // whole area's worth in one pass (OSM returns it all in a single request).
+  useEffect(() => { if (!editing) setLimit(type === "directory" ? 100 : 120); }, [type, editing]);
 
   async function save() {
     if (type === "osm" && !location.trim()) return toast("Choose a country or city", "error");
@@ -575,12 +576,12 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               </Field>
               <Field label="Max per scan">
                 <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
-                  {[20, 40, 60, 100, 120].map((n) => <option key={n} value={n}>{n}</option>)}
+                  {[40, 60, 120, 250, 500].map((n) => <option key={n} value={n}>{n}</option>)}
                 </Select>
               </Field>
             </div>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              Map data (OpenStreetMap) is precise but limited — good for a few hundred well-tagged businesses. For <span className="font-medium text-ink/70">thousands</span> of companies, use a <span className="font-medium text-ink/70">Directory</span> source.
+              OpenStreetMap is a <span className="font-medium text-ink/70">map, not a company registry</span> — it only knows businesses a mapper tagged with a website or email. That's typically a few hundred per country, and once you've pulled them a re-scan won't surface more. To reach <span className="font-medium text-ink/70">thousands</span>, add a <span className="font-medium text-ink/70">Directory (bulk)</span> source.
             </p>
           </>
         ) : (

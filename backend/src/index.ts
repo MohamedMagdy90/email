@@ -1121,7 +1121,7 @@ app.post("/api/leads/find", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const location = String(b.location || "").trim();
   const category = String(b.category || "Companies (general)");
-  const limit = clamp(Number(b.limit) || 40, 5, 120);
+  const limit = clamp(Number(b.limit) || 40, 5, 500);
   const place = b.place && typeof b.place === "object" ? b.place : undefined;
   if (!location && !place) return c.json({ error: "location required" }, 400);
   try {
@@ -1223,7 +1223,7 @@ app.post("/api/discovery/sources", async (c) => {
   // OSM area source.
   const location = String(b.location || "").trim();
   if (!location) return c.json({ error: "Location is required" }, 400);
-  const limit = clamp(Number(b.limit) || 40, 5, 120);
+  const limit = clamp(Number(b.limit) || 40, 5, 500);
   const placeJson = b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null;
   const rows = await q(
     `INSERT INTO discovery_sources
@@ -1241,7 +1241,7 @@ app.put("/api/discovery/sources/:id", async (c) => {
   if (!existing) return c.json({ error: "not found" }, 404);
   const location = b.location != null ? String(b.location).trim() : existing.location;
   const category = b.category != null ? String(b.category).trim() : existing.category;
-  const limit = b.limit != null ? clamp(Number(b.limit), 5, 300) : existing.limit_n;
+  const limit = b.limit != null ? clamp(Number(b.limit), 5, 500) : existing.limit_n;
   const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
   const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
   const placeJson =
