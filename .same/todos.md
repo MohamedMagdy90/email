@@ -49,3 +49,11 @@
   - Added index `idx_discovered_leads_email` for fast lookups.
 - [x] Verified with a temp-DB test: contacts UNIQUE, pool dedup_key, enrichment
       guard, and the index — all pass.
+
+## Approve: choose a country (like category) — DONE
+- Backend approve endpoint accepts `country`; applied as country || lead.country.
+- api.ts: approveDiscoveryLeads accepts `country`.
+- Discovery.tsx: `saveCountry` state, country input (w/ datalist of pool countries)
+  next to the category select, passed in approve + approve-all, confirm text updated.
+- [x] Verified live: lead country "Qatar" -> approved with override "Testland" ->
+      contact saved with country "Testland". Test data cleaned up.

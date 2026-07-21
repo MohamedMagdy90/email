@@ -417,7 +417,7 @@ export const api = {
       `/api/discovery/leads?${qs.toString()}`
     );
   },
-  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string }) =>
+  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string }) =>
     req<{ added: number; skipped: number }>(`/api/discovery/leads/approve`, { method: "POST", body: JSON.stringify(body) }),
   rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string }) =>
     req<{ rejected: number }>(`/api/discovery/leads/reject`, { method: "POST", body: JSON.stringify(body) }),

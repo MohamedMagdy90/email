@@ -1330,6 +1330,9 @@ const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|m
 app.post("/api/discovery/leads/approve", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const category = String(b.category ?? "").trim() || null;
+  // Optional country override applied to every approved contact (blank = keep
+  // each lead's own country from its source).
+  const country = String(b.country ?? "").trim() || null;
 
   let leads: any[];
   if (b.all === true) {
@@ -1357,7 +1360,7 @@ app.post("/api/discovery/leads/approve", async (c) => {
     const ins = await q(
       `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
        VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, l.name || l.domain || null, l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
+      [uid(), email, l.name || l.domain || null, country || l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
     );
     if (ins.length) added++; else skipped++; // skipped = already an existing Contact
   }

@@ -43,6 +43,7 @@ export default function Discovery() {
   const [approvableTotal, setApprovableTotal] = useState(0);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [saveCategory, setSaveCategory] = useState("");
+  const [saveCountry, setSaveCountry] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
 
@@ -136,7 +137,7 @@ export default function Discovery() {
     if (!ids.length) return;
     setBusy(true);
     try {
-      const r = await api.approveDiscoveryLeads({ ids, category: saveCategory || undefined });
+      const r = await api.approveDiscoveryLeads({ ids, category: saveCategory || undefined, country: saveCountry.trim() || undefined });
       toast(`Approved ${r.added} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
@@ -145,10 +146,12 @@ export default function Discovery() {
   // not just the loaded page. Drains a large pool in one action.
   async function approveAll() {
     if (!approvableTotal) return;
-    if (!confirm(`Approve all ${approvableTotal.toLocaleString()} matching lead${approvableTotal === 1 ? "" : "s"} into Contacts?${saveCategory ? `\nThey'll be saved under "${saveCategory}".` : ""}`)) return;
+    const tags = [saveCategory && `category "${saveCategory}"`, saveCountry.trim() && `country "${saveCountry.trim()}"`].filter(Boolean);
+    const suffix = tags.length ? `\nThey'll be saved under ${tags.join(" and ")}.` : "";
+    if (!confirm(`Approve all ${approvableTotal.toLocaleString()} matching lead${approvableTotal === 1 ? "" : "s"} into Contacts?${suffix}`)) return;
     setBusy(true);
     try {
-      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined });
+      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined });
       toast(`Approved ${r.added.toLocaleString()} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
@@ -167,6 +170,9 @@ export default function Discovery() {
   }
 
   const pickedWithEmail = leads.filter((l) => picked.has(l.id) && l.email);
+  // Countries already present in the loaded pool — offered as quick-picks when
+  // choosing a country to save approved contacts under.
+  const poolCountries = [...new Set(leads.map((l) => (l.country || "").trim()).filter(Boolean))].sort();
   const running = !!status?.enabled;
   const counts = { pending: status?.leads.pending ?? 0, approved: status?.leads.approved ?? 0, rejected: status?.leads.rejected ?? 0 };
 
@@ -278,12 +284,29 @@ export default function Discovery() {
               )}
             </label>
 
-            <div className="flex items-center gap-2">
-              {tab === "pending" && contactCats.length > 0 && (
-                <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-40 text-[13px]" title="Save approved under category">
-                  <option value="">No category</option>
-                  {contactCats.map((c) => <option key={c} value={c}>{c}</option>)}
-                </Select>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {tab === "pending" && (
+                <>
+                  {contactCats.length > 0 && (
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-36 text-[13px]" title="Save approved contacts under this category">
+                      <option value="">No category</option>
+                      {contactCats.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </Select>
+                  )}
+                  <Input
+                    value={saveCountry}
+                    onChange={(e) => setSaveCountry(e.target.value)}
+                    placeholder="Country (optional)"
+                    list="pool-countries"
+                    className="h-8 w-36 text-[13px]"
+                    title="Save approved contacts under this country (blank = keep each lead's own)"
+                  />
+                  {poolCountries.length > 0 && (
+                    <datalist id="pool-countries">
+                      {poolCountries.map((c) => <option key={c} value={c} />)}
+                    </datalist>
+                  )}
+                </>
               )}
               {tab === "pending" ? (
                 <>
