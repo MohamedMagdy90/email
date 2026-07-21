@@ -16,4 +16,13 @@
 - [x] Worker: persist resolved index as base_url, walk from page 1 of it.
 - [x] UI: paused-with-sources banner + "homepage works" guidance + show resolved path.
 - [x] Verify live: homepage seed → auto-resolved to /listings → streamed 39→106+ continuously.
-- [ ] Commit & push (Railway auto-deploy).
+- [x] Commit & push (Railway auto-deploy).
+
+## Worker logging (for Railway debugging) — DONE
+- [x] `[discovery]` structured logs: boot state, bot on/off, per-source start.
+- [x] `[discovery:dir]` per-page crawl (URL), detail progress, auto-index switch,
+      batch summary, every new lead (name · email · phone), pool +new/skipped, schedule.
+- [x] `[discovery:osm]` search target, candidate count, each new lead, summary.
+- [x] `[discovery:enrich]` which site is crawled + ✓/✗ email result.
+- [x] Surface previously-swallowed tick errors via `console.error`.
+- [x] Verified log output live against qatarcontact.com (fresh temp DB).

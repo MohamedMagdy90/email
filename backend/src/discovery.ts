@@ -23,6 +23,32 @@ function safeParse(s?: string | null): any {
   try { return JSON.parse(s); } catch { return undefined; }
 }
 
+/* ------------------------------- logging ------------------------------- */
+// Verbose, greppable worker logs so Railway shows exactly what the bot is doing:
+// which source it's searching, every company it finds, and why anything stalls.
+// Filter in Railway with "[discovery" (all), "[discovery:dir]" (directories),
+// "[discovery:osm]" (map areas), or "[discovery:enrich]" (email finding).
+function dlog(scope: string, msg: string) { console.log(`[discovery${scope ? ":" + scope : ""}] ${msg}`); }
+function dwarn(scope: string, msg: string) { console.warn(`[discovery${scope ? ":" + scope : ""}] ${msg}`); }
+function derr(scope: string, msg: string) { console.error(`[discovery${scope ? ":" + scope : ""}] ${msg}`); }
+
+// host + path (+ query) — compact URL for logs, drops the noisy protocol/www.
+function shortUrl(u?: string | null): string {
+  if (!u) return "";
+  try { const x = new URL(u); return x.host.replace(/^www\./, "") + x.pathname + (x.search || ""); } catch { return String(u); }
+}
+function srcLabel(src: any): string {
+  if (src?.type === "directory") return shortUrl(src.base_url) || "directory";
+  return `${src?.location || "?"} · ${src?.category || "?"}`;
+}
+// One-line "what we found": name · email · phone (email/phone omitted if absent).
+function leadLine(name?: string | null, email?: string | null, phone?: string | null): string {
+  const bits = [String(name || "(unnamed)").slice(0, 60)];
+  bits.push(email ? email : "no-email");
+  if (phone) bits.push(phone);
+  return bits.join("  ·  ");
+}
+
 // One source (or one enrichment) per tick keeps us gentle on the free OSM
 // mirrors and on the sites we crawl — no bans, no hammering.
 const DISCOVERY_TICK_MS = 45_000;
@@ -45,12 +71,14 @@ export async function isBotEnabled(): Promise<boolean> {
 }
 export async function setBotEnabled(on: boolean): Promise<void> {
   await setSetting("discovery_enabled", on ? "1" : "0");
+  dlog("", `bot switched ${on ? "ON — will start scanning enabled sources" : "OFF — scanning paused"}`);
 }
 async function autoEnrichOn(): Promise<boolean> {
   return (await getSetting("discovery_auto_enrich")) !== "0"; // default ON
 }
 export async function setAutoEnrich(on: boolean): Promise<void> {
   await setSetting("discovery_auto_enrich", on ? "1" : "0");
+  dlog("", `auto-find-emails switched ${on ? "ON" : "OFF"}`);
 }
 
 /* ------------------------------- status -------------------------------- */
@@ -228,15 +256,13 @@ export function initialCursor(base: string): number {
 // Run one OSM source: discover companies, dedupe, insert new. Returns count.
 async function runSource(src: any): Promise<{ found: number; error?: string }> {
   const place = safeParse(src.place_json);
-  const companies: Company[] = await findLeads(
-    src.location,
-    src.category,
-    clamp(src.limit_n, 5, 120),
-    place
-  );
+  const limit = clamp(src.limit_n, 5, 120);
+  dlog("osm", `searching "${src.location}" · ${src.category} (up to ${limit}) via OpenStreetMap`);
+  const companies: Company[] = await findLeads(src.location, src.category, limit, place);
+  dlog("osm", `OpenStreetMap returned ${companies.length} candidate(s) for "${src.location}"`);
   const dedup = await loadContactDedup();
   const label = `${src.location} · ${src.category}`;
-  let found = 0;
+  let found = 0, skipped = 0;
   for (const co of companies) {
     const domain = co.website ? (registrableDomain(hostOf(co.website)) || "") : "";
     const email = (co.email || "").toLowerCase();
@@ -247,8 +273,10 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
       enriched: email ? 1 : 0,          // listed email → no enrichment needed
       confidence: email ? "listed" : null,
     }, dedup);
-    if (added) found++;
+    if (added) { found++; dlog("osm", `  + ${leadLine(co.name, email, co.phone)}`); }
+    else skipped++;
   }
+  dlog("osm", `"${src.location}" done: +${found} new, ${skipped} already-known/duplicate`);
   return { found };
 }
 
@@ -262,7 +290,7 @@ interface DirRunResult { found: number; error?: string; okish: boolean; nextCurs
 async function runDirectorySource(src: any): Promise<DirRunResult> {
   const base = String(src.base_url || "").trim();
   const cursor = Math.max(1, Number(src.cursor) || 1);
-  if (!base) return { found: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 };
+  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
 
   const proxy = await getProxyConfig();
   const readerKey = await getReaderKey();
@@ -278,7 +306,18 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     readerKey,
   };
 
-  const result = await crawlDirectory(seed, opts);
+  const how = proxy ? `scraping proxy (${proxy.provider})` : readerKey ? "free reader (keyed)" : "direct fetch + free reader fallback";
+  dlog("dir", `crawling ${shortUrl(seed)} — page ${cursor}, up to ${DIRECTORY_PAGES_PER_RUN} listing page(s) · ${how}`);
+
+  // Stream the crawler's own progress into the log: each listing page it opens,
+  // its detail-page progress, and any phase note (e.g. auto-switching to /listings).
+  const result = await crawlDirectory(seed, opts, (p) => {
+    if (p.type === "phase" && p.msg) dlog("dir", `  · ${p.msg}`);
+    else if (p.type === "page" && p.msg) dlog("dir", `  · ${p.msg}${p.url ? ` [${shortUrl(p.url)}]` : ""}`);
+    else if (p.type === "detail" && p.detailTotal && ((p.detailPages || 0) % 10 === 0 || p.detailPages === p.detailTotal)) {
+      dlog("dir", `  · opened ${p.detailPages}/${p.detailTotal} listing page(s) · ${p.contacts} with contact info`);
+    }
+  });
 
   // The crawler auto-found the real listings index (the URL you pasted had no
   // companies). Persist it so we page the correct URL from here on, and restart
@@ -289,7 +328,13 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     if (resolvedBase && resolvedBase !== base) {
       await q(`UPDATE discovery_sources SET base_url=? WHERE id=?`, [resolvedBase, src.id]);
       resolvedFromCursor = 1;
+      dlog("dir", `auto-detected the real listings index → ${shortUrl(resolvedBase)} (saved · walking from page 1)`);
     }
+  }
+
+  dlog("dir", `batch result: ${result.status.toUpperCase()} · ${result.listingPages} page(s) walked · ${result.detailPages} listing(s) opened · ${result.contacts.length} contact(s) extracted`);
+  if (result.note && (result.status === "blocked" || result.status === "empty" || result.status === "error")) {
+    dwarn("dir", `↳ ${result.note}`);
   }
 
   const dedup = await loadContactDedup();
@@ -297,7 +342,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     ? `${src.location || hostOf(base)} · ${src.category}`
     : (src.location || hostOf(base));
 
-  let found = 0;
+  let found = 0, skipped = 0;
   for (const co of result.contacts) {
     const email = (co.email || "").toLowerCase();
     const emailDomain = email ? (registrableDomain(email.split("@")[1] || "") || "") : "";
@@ -310,8 +355,10 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
       enriched: 1,                       // directory rows carry their own contact — nothing to crawl
       confidence: email ? "listed" : null,
     }, dedup);
-    if (added) found++;
+    if (added) { found++; dlog("dir", `  + ${leadLine(co.name, email, co.phone)}`); }
+    else skipped++;
   }
+  dlog("dir", `${shortUrl(base)}: +${found} new into pool, ${skipped} duplicate/already-known`);
 
   const pages = result.listingPages || 0;
   const okish = result.status === "ok" || result.status === "empty";
@@ -330,6 +377,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
 async function executeSource(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
   await q(`UPDATE discovery_sources SET last_status='running' WHERE id=?`, [src.id]);
   const interval = clamp(src.interval_minutes, 15, 100000);
+  dlog("", `▶ running ${src.type} source: ${srcLabel(src)}`);
 
   if (src.type === "directory") {
     let r: DirRunResult;
@@ -359,6 +407,9 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
        WHERE id=?`,
       [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
     );
+    if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
+    else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — no more listings (${EMPTY_STREAK_LIMIT} empty batches in a row); re-checking in ${interval}m`);
+    else if (cont) dlog("dir", `${srcLabel(src)}: continuing — next batch starts at page ${cursor} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
     return { found: r.found, error: r.error, continue: cont };
   }
 
@@ -376,6 +427,8 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
      WHERE id=?`,
     [nowIso(), next, result.error ? "error" : "ok", result.error || null, result.found, src.id]
   );
+  if (result.error) derr("osm", `${srcLabel(src)}: ERROR — ${result.error} (next scan in ${interval}m)`);
+  else dlog("osm", `${srcLabel(src)}: +${result.found} new · next scan in ${interval}m`);
   return { found: result.found, error: result.error, continue: false };
 }
 
@@ -383,7 +436,8 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
 // can test a source in isolation. Clears `exhausted` so a directory resumes.
 export async function runSourceNow(id: string): Promise<{ found: number; error?: string }> {
   const src = (await q(`SELECT * FROM discovery_sources WHERE id=?`, [id]))[0];
-  if (!src) return { found: 0, error: "Source not found" };
+  if (!src) { dwarn("", `manual "run now": source ${id} not found`); return { found: 0, error: "Source not found" }; }
+  dlog("", `manual "run now" requested for ${srcLabel(src)}`);
   if (src.type === "directory") { await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0 WHERE id=?`, [id]); src.exhausted = 0; src.empty_streak = 0; }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.
@@ -429,7 +483,7 @@ async function discoveryTick(): Promise<void> {
   }
   // Directory sources stream continuously: chain the next batch quickly instead
   // of waiting the full tick, so a big directory pours in fast (but politely).
-  if (keepStreaming) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
+  if (keepStreaming) setTimeout(() => discoveryTick().catch((e) => derr("", `discovery tick failed: ${String(e?.message || e)}`)), DIRECTORY_CONTINUE_MS);
 }
 
 async function enrichTick(): Promise<void> {
@@ -463,6 +517,7 @@ async function enrichTick(): Promise<void> {
       readerKey,
     };
 
+    dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"`);
     let email: string | null = null;
     let phone: string | null = lead.phone || null;
     let confidence: string | null = null;
@@ -471,13 +526,16 @@ async function enrichTick(): Promise<void> {
       if (site.phone && !phone) phone = site.phone;
       const best = pickSiteEmail(site.emails, lead.domain);
       if (best) { email = best.email; confidence = "likely"; }
-    } catch { /* leave email null — we still mark it tried below */ }
+    } catch (e: any) {
+      dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${String(e?.message || e)}`);
+    }
 
     // enriched=1 always, so we never spin on the same lead twice.
     await q(
       `UPDATE discovered_leads SET enriched=1, email=?, phone=?, confidence=? WHERE id=?`,
       [email, phone, email ? confidence : null, lead.id]
     );
+    dlog("enrich", `  ${email ? "✓ found " + email : "✗ no email found"} for "${lead.name || lead.domain}"`);
   } finally {
     enriching = false;
   }
@@ -488,9 +546,22 @@ async function enrichTick(): Promise<void> {
 export function startDiscoveryWorker(): void {
   if (started) return;
   started = true;
-  setInterval(() => { discoveryTick().catch(() => {}); }, DISCOVERY_TICK_MS);
-  setInterval(() => { enrichTick().catch(() => {}); }, ENRICH_TICK_MS);
+  setInterval(() => { discoveryTick().catch((e) => derr("", `discovery tick failed: ${String(e?.message || e)}`)); }, DISCOVERY_TICK_MS);
+  setInterval(() => { enrichTick().catch((e) => derr("", `enrich tick failed: ${String(e?.message || e)}`)); }, ENRICH_TICK_MS);
   // Kick once shortly after boot so a due source runs promptly.
-  setTimeout(() => { discoveryTick().catch(() => {}); }, 4000);
-  console.log("[discovery] worker started");
+  setTimeout(() => { discoveryTick().catch((e) => derr("", `discovery tick failed: ${String(e?.message || e)}`)); }, 4000);
+  dlog("", `worker started · discovery loop every ${DISCOVERY_TICK_MS / 1000}s · enrichment loop every ${ENRICH_TICK_MS / 1000}s`);
+
+  // Report the live state on boot so the logs immediately explain whether the
+  // bot will actually do anything (the #1 support question).
+  (async () => {
+    try {
+      const on = await isBotEnabled();
+      const active = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1`))[0]?.n ?? 0;
+      const auto = await autoEnrichOn();
+      dlog("", `state → bot ${on ? "ON" : "OFF"} · ${active} enabled source(s) · auto-find-emails ${auto ? "ON" : "OFF"}`);
+      if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");
+      else if (!active) dwarn("", "bot is ON but no sources are enabled — enable a source in the Discovery screen.");
+    } catch { /* ignore */ }
+  })();
 }
