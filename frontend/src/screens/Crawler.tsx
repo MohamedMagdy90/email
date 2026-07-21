@@ -963,7 +963,7 @@ export default function Crawler({
 
 /* --------------------- Location autocomplete ---------------------- */
 
-function LocationAutocomplete({
+export function LocationAutocomplete({
   value, onChange, onPick, placeholder, onEnter,
 }: {
   value: string;

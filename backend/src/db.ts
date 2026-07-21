@@ -126,6 +126,50 @@ export async function ensureSchema() {
     first_crawled_at TEXT NOT NULL,
     last_crawled_at TEXT NOT NULL
   )`);
+
+  /* ------------------------- 24/7 Discovery bot ------------------------ */
+
+  // "Watchers" the background bot cycles through. Each is a (location,
+  // industry) pair the bot re-runs on its own interval, forever, server-side.
+  await q(`CREATE TABLE IF NOT EXISTS discovery_sources (
+    id TEXT PRIMARY KEY,
+    location TEXT NOT NULL,
+    place_json TEXT,
+    category TEXT NOT NULL,
+    limit_n INTEGER NOT NULL DEFAULT 40,
+    interval_minutes INTEGER NOT NULL DEFAULT 360,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at TEXT,
+    next_run_at TEXT,
+    last_status TEXT,
+    last_error TEXT,
+    runs INTEGER NOT NULL DEFAULT 0,
+    total_found INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  )`);
+
+  // The growing pool of companies the bot has found, awaiting your review.
+  // dedup_key (domain / email / name+city) keeps the same company from being
+  // added twice across ticks or sources.
+  await q(`CREATE TABLE IF NOT EXISTS discovered_leads (
+    id TEXT PRIMARY KEY,
+    dedup_key TEXT UNIQUE,
+    name TEXT,
+    website TEXT,
+    domain TEXT,
+    email TEXT,
+    phone TEXT,
+    city TEXT,
+    country TEXT,
+    category TEXT,
+    source_id TEXT,
+    source_label TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    enriched INTEGER NOT NULL DEFAULT 0,
+    confidence TEXT,
+    via TEXT,
+    created_at TEXT NOT NULL
+  )`);
 }
 
 /* ---------------------------- Crawl ledger ---------------------------- */

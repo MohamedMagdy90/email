@@ -4,21 +4,23 @@ import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
 import Setup from "./screens/Setup";
 import Overview from "./screens/Overview";
+import Discovery from "./screens/Discovery";
 import Contacts from "./screens/Contacts";
 import Templates from "./screens/Templates";
 import Send from "./screens/Send";
 import History from "./screens/History";
 import Settings from "./screens/Settings";
 
-type Tab = "overview" | "contacts" | "templates" | "send" | "history" | "settings";
+type Tab = "overview" | "discovery" | "contacts" | "templates" | "send" | "history" | "settings";
 
 const NAV: { id: Tab; label: string; num: string }[] = [
   { id: "overview", label: "Overview", num: "01" },
-  { id: "contacts", label: "Contacts", num: "02" },
-  { id: "templates", label: "Templates", num: "03" },
-  { id: "send", label: "Send", num: "04" },
-  { id: "history", label: "History", num: "05" },
-  { id: "settings", label: "Settings", num: "06" },
+  { id: "discovery", label: "Discovery", num: "02" },
+  { id: "contacts", label: "Contacts", num: "03" },
+  { id: "templates", label: "Templates", num: "04" },
+  { id: "send", label: "Send", num: "05" },
+  { id: "history", label: "History", num: "06" },
+  { id: "settings", label: "Settings", num: "07" },
 ];
 
 export default function App() {
@@ -115,6 +117,7 @@ export default function App() {
       <main className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
           {tab === "overview" && <Overview />}
+          {tab === "discovery" && <Discovery />}
           {tab === "contacts" && <Contacts />}
           {tab === "templates" && <Templates />}
           {tab === "send" && <Send />}

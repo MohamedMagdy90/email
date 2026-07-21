@@ -11,12 +11,20 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import { fetchViaProxy, fetchViaReader, type ProxyConfig, type ScrapeProvider } from "./crawler/fetcher";
+import { fetchViaProxy, fetchViaReader, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
 import { searchCompanies } from "./search";
+import { SCRAPE_PROVIDERS, getProxyConfig, getReaderKey } from "./config";
+import {
+  startDiscoveryWorker,
+  getDiscoveryStatus,
+  setBotEnabled,
+  setAutoEnrich,
+  runSourceNow,
+} from "./discovery";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -29,6 +37,7 @@ import {
 
 await ensureSchema();
 await seedAuthFromEnv();
+startDiscoveryWorker(); // always-on company discovery (browser-independent)
 
 const app = new Hono();
 app.use(
@@ -42,24 +51,6 @@ app.use(
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-const SCRAPE_PROVIDERS: ScrapeProvider[] = ["scrapingbee", "scraperapi", "zenrows"];
-
-// Assemble the scraping-proxy config from settings, or undefined when disabled.
-async function getProxyConfig(): Promise<ProxyConfig | undefined> {
-  const provider = (await getSetting("scrape_provider")) as ScrapeProvider | null;
-  const apiKey = await getSetting("scrape_api_key");
-  if (!provider || !SCRAPE_PROVIDERS.includes(provider) || !apiKey) return undefined;
-  const mode = (await getSetting("scrape_mode")) === "always" ? "always" : "blocked";
-  const premium = (await getSetting("scrape_premium")) !== "0"; // default ON (needed for Cloudflare)
-  return { provider, apiKey, mode, premium, renderJs: true };
-}
-
-// Optional (free) Jina Reader key: raises the free rate limit for large PDF
-// runs. Prefer the value saved in Settings, then the Railway env var.
-async function getReaderKey(): Promise<string> {
-  return ((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").trim();
-}
 
 app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
@@ -1180,6 +1171,185 @@ app.post("/api/crawl/check", async (c) => {
     else fresh++;
   }
   return c.json({ total: seen.size, inContacts, crawled, fresh });
+});
+
+/* --------------------------- Discovery bot -------------------------- */
+// A server-side worker that continuously discovers companies into a reviewable
+// pool (discovered_leads). It runs while the process is up — no browser needed.
+
+// Live status: bot on/off, source counts, and the review-pool breakdown.
+app.get("/api/discovery/status", async (c) => c.json(await getDiscoveryStatus()));
+
+// Flip the global bot switch and/or the "auto-find emails" behaviour.
+app.post("/api/discovery/toggle", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (typeof b.enabled === "boolean") await setBotEnabled(b.enabled);
+  if (typeof b.autoEnrich === "boolean") await setAutoEnrich(b.autoEnrich);
+  return c.json(await getDiscoveryStatus());
+});
+
+// ---- Sources (the location+industry "watchers" the bot cycles through) ----
+
+app.get("/api/discovery/sources", async (c) => {
+  const sources = await q(`SELECT * FROM discovery_sources ORDER BY created_at DESC`);
+  return c.json({ sources });
+});
+
+app.post("/api/discovery/sources", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const location = String(b.location || "").trim();
+  const category = String(b.category || "Companies (general)").trim();
+  if (!location) return c.json({ error: "Location is required" }, 400);
+  const limit = clamp(Number(b.limit) || 40, 5, 120);
+  const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
+  const placeJson = b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null;
+  const enabled = b.enabled === false ? 0 : 1;
+  const rows = await q(
+    `INSERT INTO discovery_sources
+      (id,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?) RETURNING *`,
+    [uid(), location, placeJson, category, limit, interval, enabled, nowIso(), nowIso()]
+  );
+  return c.json({ source: rows[0] });
+});
+
+app.put("/api/discovery/sources/:id", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const id = c.req.param("id");
+  const existing = (await q(`SELECT * FROM discovery_sources WHERE id=?`, [id]))[0];
+  if (!existing) return c.json({ error: "not found" }, 404);
+  const location = b.location != null ? String(b.location).trim() : existing.location;
+  const category = b.category != null ? String(b.category).trim() : existing.category;
+  const limit = b.limit != null ? clamp(Number(b.limit), 5, 120) : existing.limit_n;
+  const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
+  const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
+  const placeJson =
+    b.place !== undefined ? (b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null) : existing.place_json;
+  const rows = await q(
+    `UPDATE discovery_sources SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=? WHERE id=? RETURNING *`,
+    [location, placeJson, category, limit, interval, enabled, id]
+  );
+  return c.json({ source: rows[0] });
+});
+
+app.delete("/api/discovery/sources/:id", async (c) => {
+  await q(`DELETE FROM discovery_sources WHERE id=?`, [c.req.param("id")]);
+  return c.json({ ok: true });
+});
+
+// Run one source immediately (works even when the bot is paused).
+app.post("/api/discovery/sources/:id/run", async (c) => {
+  const r = await runSourceNow(c.req.param("id"));
+  if (r.error) return c.json({ error: r.error, found: r.found }, 400);
+  return c.json({ found: r.found });
+});
+
+// ---- The review pool ----
+
+// Portable WHERE builder for the pool (status + free-text search).
+function discoveredWhere(opts: { status?: string | null; q?: string | null; hasEmail?: boolean }) {
+  const where: string[] = [];
+  const params: any[] = [];
+  const status = opts.status;
+  const search = opts.q;
+  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (opts.hasEmail) where.push(`(email IS NOT NULL AND email <> '')`);
+  if (search) {
+    const like = `%${String(search).toLowerCase()}%`;
+    where.push(`(lower(name) LIKE ? OR lower(email) LIKE ? OR lower(domain) LIKE ? OR lower(category) LIKE ?)`);
+    params.push(like, like, like, like);
+  }
+  return { where, params, clause: where.length ? `WHERE ${where.join(" AND ")}` : "" };
+}
+
+app.get("/api/discovery/leads", async (c) => {
+  const status = c.req.query("status") || "pending";
+  const search = c.req.query("q");
+  const hasEmail = c.req.query("hasEmail") === "1";
+  const limit = clamp(Number(c.req.query("limit") || 100), 1, 500);
+  const { clause, params } = discoveredWhere({ status, q: search, hasEmail });
+  const leads = await q(
+    `SELECT * FROM discovered_leads ${clause} ORDER BY created_at DESC LIMIT ?`,
+    [...params, limit]
+  );
+  const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
+  const filteredTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
+  // How many pending, emailable leads match the current search — exactly what
+  // "Approve all" would act on (independent of the with-email view toggle).
+  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true });
+  const approvableTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${ap.clause}`, ap.params))[0]?.n ?? 0;
+  return c.json({ leads, counts, filteredTotal, approvableTotal });
+});
+
+const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|mail|team|marketing|hr|jobs|career|reception)/i;
+
+// Approve leads → create Contacts (only ones with an email) and mark 'approved'.
+// Accepts an explicit id list, or every matching pending lead (`all:true`).
+app.post("/api/discovery/leads/approve", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const category = String(b.category ?? "").trim() || null;
+
+  let leads: any[];
+  if (b.all === true) {
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, hasEmail: true });
+    leads = await q(`SELECT * FROM discovered_leads ${clause} LIMIT 5000`, params);
+  } else {
+    const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+    if (!ids.length) return c.json({ added: 0, skipped: 0 });
+    const ph = ids.map(() => "?").join(",");
+    leads = await q(`SELECT * FROM discovered_leads WHERE id IN (${ph})`, ids);
+  }
+
+  let added = 0, skipped = 0;
+  const approvedIds: string[] = [];
+  for (const l of leads) {
+    const email = String(l.email || "").trim().toLowerCase();
+    approvedIds.push(l.id); // approving marks it handled even if it has no email
+    if (!email || !email.includes("@")) { skipped++; continue; }
+    const ins = await q(
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, l.name || l.domain || null, l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
+    );
+    if (ins.length) added++; else skipped++;
+  }
+  if (approvedIds.length) {
+    const ph = approvedIds.map(() => "?").join(",");
+    await q(`UPDATE discovered_leads SET status='approved' WHERE id IN (${ph})`, approvedIds);
+  }
+  return c.json({ added, skipped });
+});
+
+// Reject leads (dismiss from the pool) — by ids or every matching pending lead.
+app.post("/api/discovery/leads/reject", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (b.all === true) {
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q });
+    const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
+    await q(`UPDATE discovered_leads SET status='rejected' ${clause}`, params);
+    return c.json({ rejected: before });
+  }
+  const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) return c.json({ rejected: 0 });
+  const ph = ids.map(() => "?").join(",");
+  await q(`UPDATE discovered_leads SET status='rejected' WHERE id IN (${ph})`, ids);
+  return c.json({ rejected: ids.length });
+});
+
+// Permanently delete pool rows — by ids or every row matching a filter.
+app.post("/api/discovery/leads/delete", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (b.all === true) {
+    const { clause, params } = discoveredWhere({ status: b.status, q: b.q });
+    const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
+    await q(`DELETE FROM discovered_leads ${clause}`, params);
+    return c.json({ deleted: before });
+  }
+  const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+  if (!ids.length) return c.json({ deleted: 0 });
+  const ph = ids.map(() => "?").join(",");
+  await q(`DELETE FROM discovered_leads WHERE id IN (${ph})`, ids);
+  return c.json({ deleted: ids.length });
 });
 
 /* ------------------------------ History ----------------------------- */

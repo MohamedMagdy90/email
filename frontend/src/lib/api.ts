@@ -121,6 +121,54 @@ export interface ParsedRow {
   website?: string;
 }
 
+/* --------------------------- Discovery bot -------------------------- */
+
+export interface DiscoveryStatus {
+  enabled: boolean;
+  autoEnrich: boolean;
+  sources: number;
+  activeSources: number;
+  leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
+  pendingEnrich: number;
+  nextRunAt: string | null;
+  lastLeadAt: string | null;
+}
+
+export interface DiscoverySource {
+  id: string;
+  location: string;
+  place_json?: string | null;
+  category: string;
+  limit_n: number;
+  interval_minutes: number;
+  enabled: number; // 0 | 1
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  runs: number;
+  total_found: number;
+  created_at: string;
+}
+
+export interface DiscoveredLead {
+  id: string;
+  name?: string;
+  website?: string | null;
+  domain?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  city?: string | null;
+  country?: string | null;
+  category?: string | null;
+  source_label?: string | null;
+  status: string;
+  enriched: number;
+  confidence?: string | null;
+  via?: string | null;
+  created_at: string;
+}
+
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
@@ -334,6 +382,41 @@ export const api = {
       `/api/crawl/check`,
       { method: "POST", body: JSON.stringify({ urls }) }
     ),
+
+  // discovery bot
+  getDiscoveryStatus: () => req<DiscoveryStatus>(`/api/discovery/status`),
+  toggleDiscovery: (body: { enabled?: boolean; autoEnrich?: boolean }) =>
+    req<DiscoveryStatus>(`/api/discovery/toggle`, { method: "POST", body: JSON.stringify(body) }),
+  getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
+  addDiscoverySource: (body: {
+    location: string;
+    category: string;
+    limit?: number;
+    intervalMinutes?: number;
+    place?: Place | null;
+    enabled?: boolean;
+  }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+    req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
+  runDiscoverySource: (id: string) =>
+    req<{ found: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
+  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.status) qs.set("status", params.status);
+    if (params.q) qs.set("q", params.q);
+    if (params.hasEmail) qs.set("hasEmail", "1");
+    if (params.limit) qs.set("limit", String(params.limit));
+    return req<{ leads: DiscoveredLead[]; counts: { status: string; n: number }[]; filteredTotal: number; approvableTotal: number }>(
+      `/api/discovery/leads?${qs.toString()}`
+    );
+  },
+  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string }) =>
+    req<{ added: number; skipped: number }>(`/api/discovery/leads/approve`, { method: "POST", body: JSON.stringify(body) }),
+  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string }) =>
+    req<{ rejected: number }>(`/api/discovery/leads/reject`, { method: "POST", body: JSON.stringify(body) }),
+  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string }) =>
+    req<{ deleted: number }>(`/api/discovery/leads/delete`, { method: "POST", body: JSON.stringify(body) }),
 
   // export
   exportContacts: async (params: { status?: string; q?: string; category?: string } = {}) => {
