@@ -34,6 +34,10 @@ export interface DirectoryResult {
   detailPages: number;
   contacts: DirectoryContact[];
   note?: string;
+  // Set when the crawler auto-switched to a better listings/index URL because the
+  // URL you gave (e.g. a homepage) had no companies. The worker persists this so
+  // the source pages the correct URL from then on.
+  resolvedSeed?: string;
 }
 
 export interface DirectoryOptions {
@@ -253,6 +257,12 @@ function findDetailLinks(seed: string, links: string[]): string[] {
   const sReg = registrableDomain(s.hostname);
   const seedKey = pathTemplate(s.pathname).key;
 
+  // Segments in the seed's own path are the directory root, so their detail
+  // children (e.g. seed /listings → /listings/acme) must NOT be dropped as
+  // "navigation" even when they'd normally be a NAV_STOP word.
+  const seedSegs = new Set(s.pathname.split("/").filter(Boolean).map((x) => decode(x).toLowerCase()));
+  const navBlocks = (l: string) => NAV_STOP.has(l) && !seedSegs.has(l);
+
   const byTpl = new Map<string, Set<string>>();
   const bySeg = new Map<string, Set<string>>();
 
@@ -268,12 +278,12 @@ function findDetailLinks(seed: string, links: string[]): string[] {
     const full = u.origin + u.pathname + u.search;
     const first = decode(segs[0]).toLowerCase();
 
-    if (placeholders > 0 && !literals.some((l) => NAV_STOP.has(l)) && key !== seedKey) {
+    if (placeholders > 0 && !literals.some(navBlocks) && key !== seedKey) {
       let set = byTpl.get(key); if (!set) { set = new Set(); byTpl.set(key, set); }
       set.add(full);
     }
     // Fallback grouping by first path segment (for word-slug details with no id).
-    if (segs.length >= 2 && !NAV_STOP.has(first)) {
+    if (segs.length >= 2 && !navBlocks(first)) {
       let set = bySeg.get(first); if (!set) { set = new Set(); bySeg.set(first, set); }
       set.add(full);
     }
@@ -301,6 +311,53 @@ function findDetailLinks(seed: string, links: string[]): string[] {
   if (bestTpl && bestTpl.size >= 2) return [...bestTpl];
   if (bestSeg && bestSeg.size >= 3) return [...bestSeg];
   return [];
+}
+
+// Path words that mark a directory's "index" page — where the real listings live.
+const INDEX_WORDS = new Set([
+  "listings", "listing", "directory", "directories", "companies", "company",
+  "businesses", "business", "members", "member", "catalog", "catalogue",
+  "browse", "firms", "organizations", "organisations", "vendors", "suppliers",
+  "stores", "shops", "brands", "profiles", "results", "search",
+]);
+
+// When the pasted URL (often a homepage) has no usable companies, find the best
+// internal link that looks like the directory's index page so the crawl can be
+// retargeted there automatically. Returns candidate URLs, best-first.
+function pickIndexCandidates(seed: string, links: string[]): string[] {
+  let s: URL;
+  try { s = new URL(seed); } catch { return []; }
+  const sReg = registrableDomain(s.hostname);
+  const score = new Map<string, number>();
+  const popularity = new Map<string, number>();
+
+  for (const href of links) {
+    let u: URL;
+    try { u = new URL(href); } catch { continue; }
+    if (registrableDomain(u.hostname) !== sReg) continue;
+    const segs = u.pathname.split("/").filter(Boolean).map((x) => decode(x).toLowerCase());
+    if (!segs.length) continue;
+    const idx = segs.findIndex((x) => INDEX_WORDS.has(x));
+    if (idx < 0) continue;
+    // Truncate the path at the index word: /a/listings/102 → /a/listings.
+    const norm = u.origin + "/" + segs.slice(0, idx + 1).join("/");
+    popularity.set(norm, (popularity.get(norm) || 0) + 1);
+    if (score.has(norm)) continue;
+    let sc = 0;
+    if (idx === 0 && segs.length === 1) sc += 6;                    // exactly /listings
+    if (idx === segs.length - 1) sc += 3;                          // index word ends the path
+    if (["listings", "directory", "companies", "businesses", "listing"].includes(segs[idx])) sc += 3;
+    sc += Math.max(0, 4 - (idx + 1));                              // shallower = better
+    score.set(norm, sc);
+  }
+
+  const seedNorm = (s.origin + s.pathname).replace(/\/+$/, "");
+  return [...score.keys()]
+    .filter((u) => u.replace(/\/+$/, "") !== seedNorm)
+    .sort((a, b) =>
+      (score.get(b)! + Math.min(5, popularity.get(b) || 0)) -
+      (score.get(a)! + Math.min(5, popularity.get(a) || 0))
+    );
 }
 
 /* ----------------------------- extraction ------------------------------- */
@@ -348,6 +405,9 @@ interface Record { url: string; name: string; emails: { email: string; role: boo
 
 /* ------------------------------- crawl ---------------------------------- */
 
+// Paste ONE URL and get back a corrected, fully-walked directory result. If the
+// URL you gave has no companies (e.g. a homepage), it auto-retargets to the best
+// "listings/directory/companies" link it can find on that page and tries again.
 export async function crawlDirectory(
   seedInput: string,
   opts: DirectoryOptions = {},
@@ -356,6 +416,31 @@ export async function crawlDirectory(
   const seed = normalizeSeed(seedInput);
   if (!seed) return { seed: seedInput, site: seedInput, status: "error", listingPages: 0, detailPages: 0, contacts: [], note: "invalid URL" };
 
+  const firstLinks: string[] = [];
+  const result = await crawlOnce(seed, opts, onProgress, (links) => {
+    if (!firstLinks.length) firstLinks.push(...links);
+  });
+
+  // If we harvested nothing (and weren't hard-blocked), the URL probably isn't
+  // the listings page. Follow the strongest "index" link on it and retry once.
+  if (result.contacts.length === 0 && (result.status === "ok" || result.status === "empty")) {
+    const candidates = pickIndexCandidates(seed, firstLinks).slice(0, 2);
+    for (const cand of candidates) {
+      onProgress?.({ type: "phase", msg: `No companies on that page — trying the directory index: ${cand}` });
+      const retry = await crawlOnce(cand, opts, onProgress);
+      if (retry.contacts.length > 0) { retry.resolvedSeed = cand; return retry; }
+      if (retry.status === "blocked") return retry;
+    }
+  }
+  return result;
+}
+
+async function crawlOnce(
+  seed: string,
+  opts: DirectoryOptions = {},
+  onProgress?: (p: DirectoryProgress) => void,
+  onFirstPageLinks?: (links: string[]) => void
+): Promise<DirectoryResult> {
   const {
     maxPages = 20,
     maxDetails = 300,
@@ -405,6 +490,9 @@ export async function crawlDirectory(
     const viaProxy = res.via === "proxy";
 
     const links = collectLinks(res.html, res.url || pageUrl);
+    // Hand the first successfully-loaded page's links to the wrapper so it can
+    // auto-retarget to the real listings index if this page has no companies.
+    if (onFirstPageLinks) { onFirstPageLinks(links); onFirstPageLinks = undefined; }
     const details = findDetailLinks(seed, links);
     let added = 0;
     for (const d of details) {

@@ -194,6 +194,23 @@ export default function Discovery() {
         <Stat label="Finding emails" value={status?.pendingEnrich ?? 0} hint={status?.autoEnrich ? "queued" : "off"} />
       </div>
 
+      {/* Paused-with-sources nudge — the #1 reason "scanning stops": the bot is off. */}
+      {!running && (status?.activeSources ?? 0) > 0 && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#e0b354]/50 bg-[#fdf6e7] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">!</span>
+            <div>
+              <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren’t scanning</div>
+              <div className="text-xs leading-relaxed text-muted">
+                You have {status?.activeSources} enabled source{(status?.activeSources ?? 0) === 1 ? "" : "s"}. Turn the bot on and it scans
+                continuously in the background — paging through directories back-to-back — even with this tab closed.
+              </div>
+            </div>
+          </div>
+          <Button size="sm" onClick={() => toggleBot(true)} className="shrink-0">Turn bot on</Button>
+        </div>
+      )}
+
       {/* Sources */}
       <Card className="overflow-hidden">
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
@@ -392,7 +409,14 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const streaming = isDir && s.enabled && runningNow;
-  const host = (() => { try { return new URL(s.base_url || "").hostname.replace(/^www\./, ""); } catch { return s.base_url || ""; } })();
+  // Show host + path so a resolved index (e.g. …/listings) is visible.
+  const host = (() => {
+    try {
+      const u = new URL(s.base_url || "");
+      const p = u.pathname.replace(/\/+$/, "");
+      return u.hostname.replace(/^www\./, "") + (p && p !== "/" ? p : "");
+    } catch { return s.base_url || ""; }
+  })();
 
   return (
     <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
@@ -538,8 +562,8 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
           </>
         ) : (
           <>
-            <Field label="Directory URL" hint="A business-directory listing page. The bot walks its pages continuously and pulls company + email + phone from each listing.">
-              <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com/companies?page=1" className="font-mono text-xs" />
+            <Field label="Directory URL" hint="Paste the directory's listings page — or just its homepage. If you paste a homepage, the bot automatically finds the listings section, then walks every page pulling company + email + phone.">
+              <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com  (homepage or /listings both work)" className="font-mono text-xs" />
             </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Country" hint="Helps read local phone numbers">
@@ -564,7 +588,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               </Field>
             </div>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              The bot pages through the whole directory back-to-back until it runs out — this is how you reach tens of thousands. If a directory blocks crawlers, add a scraping proxy in Settings (the free reader is tried automatically).
+              The bot pages through the whole directory back-to-back until it runs out — this is how you reach tens of thousands. Not sure of the exact listings URL? Paste the homepage; it auto-detects the listings section. If a directory blocks crawlers, add a scraping proxy in Settings (the free reader is tried automatically).
             </p>
           </>
         )}

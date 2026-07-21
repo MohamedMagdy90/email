@@ -195,6 +195,17 @@ function withPage(base: string, page: number): string {
   } catch { return base; }
 }
 
+// Strip any page marker from a URL so it can serve as a clean paging base
+// (?page=N, /page/N, and trailing /N are all removed).
+function stripPage(url: string): string {
+  try {
+    const u = new URL(/^https?:\/\//i.test(url) ? url : "https://" + url);
+    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) u.searchParams.delete(k);
+    u.pathname = u.pathname.replace(/\/(?:page|p)[-/]\d+\/?$/i, "");
+    return u.toString();
+  } catch { return url; }
+}
+
 // The page number already present in a directory URL, so a source can start
 // walking from wherever the user pasted (defaults to 1).
 export function initialCursor(base: string): number {
@@ -268,6 +279,19 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   };
 
   const result = await crawlDirectory(seed, opts);
+
+  // The crawler auto-found the real listings index (the URL you pasted had no
+  // companies). Persist it so we page the correct URL from here on, and restart
+  // the walk at page 1 of that index so nothing is skipped.
+  let resolvedFromCursor = cursor;
+  if (result.resolvedSeed) {
+    const resolvedBase = stripPage(result.resolvedSeed);
+    if (resolvedBase && resolvedBase !== base) {
+      await q(`UPDATE discovery_sources SET base_url=? WHERE id=?`, [resolvedBase, src.id]);
+      resolvedFromCursor = 1;
+    }
+  }
+
   const dedup = await loadContactDedup();
   const label = src.category && src.category !== "Companies (general)"
     ? `${src.location || hostOf(base)} · ${src.category}`
@@ -292,7 +316,9 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   const pages = result.listingPages || 0;
   const okish = result.status === "ok" || result.status === "empty";
   const blocked = result.status === "blocked" || result.status === "error";
-  const nextCursor = okish ? cursor + Math.max(1, pages) : cursor; // don't advance past a block
+  // Advance from wherever this batch actually started (page 1 when we just
+  // switched to a freshly-resolved index), never past a block.
+  const nextCursor = okish ? resolvedFromCursor + Math.max(1, pages) : resolvedFromCursor;
   const error = blocked ? (result.note || result.status) : undefined;
   return { found, error, okish, nextCursor, pages };
 }
