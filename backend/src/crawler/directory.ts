@@ -46,6 +46,8 @@ export interface DirectoryOptions {
   timeoutMs?: number;
   politenessMs?: number;
   proxy?: ProxyConfig; // optional scraping proxy for JS-rendered / Cloudflare sites
+  readerKey?: string; // optional (free) Jina Reader key — renders JS / bypasses soft blocks for free
+  startPage?: number; // page number the seed represents (for continuous cursor walking)
 }
 
 export interface DirectoryProgress {
@@ -153,6 +155,18 @@ function nextPageUrl(u: URL): string | null {
     if (Number.isInteger(n) && n > 0) {
       const c = new URL(u.toString());
       c.pathname = u.pathname.replace(/(\d+)(\/?)$/, `${n + 1}$2`);
+      return c.toString();
+    }
+  }
+  // Trailing bare number segment (e.g. /listings/31 → /listings/32). Only called
+  // on listing pages that yielded new cards, so it walks deep pagers that only
+  // ever show "1 2 3 … next" and never link the far pages.
+  const bm = u.pathname.match(/\/(\d+)(\/?)$/);
+  if (bm) {
+    const n = Number(bm[1]);
+    if (Number.isInteger(n) && n > 0) {
+      const c = new URL(u.toString());
+      c.pathname = u.pathname.replace(/\d+(\/?)$/, `${n + 1}$1`);
       return c.toString();
     }
   }
@@ -352,6 +366,7 @@ export async function crawlDirectory(
     timeoutMs = 15000,
     politenessMs = 200,
     proxy,
+    readerKey,
   } = opts;
 
   const origin = new URL(seed).origin;
@@ -378,7 +393,7 @@ export async function crawlDirectory(
     let path = "/"; try { path = new URL(pageUrl).pathname; } catch { /* ignore */ }
     if (respectRobots && !robots.allow(path)) continue;
 
-    const res = await fetchWithRetry(pageUrl, 2, timeoutMs, proxy);
+    const res = await fetchWithRetry(pageUrl, 2, timeoutMs, proxy, readerKey);
     listingPages++;
     if (!res.ok) {
       if (res.blocked) { blocked++; if (!blockReason) blockReason = res.blockReason; }
@@ -436,7 +451,7 @@ export async function crawlDirectory(
       const url = detailUrls[my];
       let path = "/"; try { path = new URL(url).pathname; } catch { /* ignore */ }
       if (respectRobots && !robots.allow(path)) continue;
-      const res = await fetchWithRetry(url, 2, timeoutMs, proxy);
+      const res = await fetchWithRetry(url, 2, timeoutMs, proxy, readerKey);
       detailPages++;
       if (res.ok) {
         records.push({

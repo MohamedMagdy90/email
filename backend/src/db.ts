@@ -148,6 +148,14 @@ export async function ensureSchema() {
     created_at TEXT NOT NULL
   )`);
 
+  // Directory-source support (idempotent migrations). A 'directory' source walks
+  // a business-directory URL page-by-page, continuously, until exhausted —
+  // `cursor` is the next page to fetch, `exhausted` marks the end of the list.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN type TEXT NOT NULL DEFAULT 'osm'`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN base_url TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN cursor INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being
   // added twice across ticks or sources.

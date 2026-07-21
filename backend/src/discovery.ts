@@ -9,6 +9,7 @@
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeads, type Company } from "./leads";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
+import { crawlDirectory, type DirectoryOptions } from "./crawler/directory";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { getProxyConfig, getReaderKey } from "./config";
 
@@ -26,6 +27,10 @@ function safeParse(s?: string | null): any {
 // mirrors and on the sites we crawl — no bans, no hammering.
 const DISCOVERY_TICK_MS = 45_000;
 const ENRICH_TICK_MS = 15_000;
+// Directory sources walk continuously: pages per batch, and a short delay before
+// the next batch so a big directory streams in quickly without hammering.
+const DIRECTORY_PAGES_PER_RUN = 4;
+const DIRECTORY_CONTINUE_MS = 1_500;
 
 let discovering = false;
 let enriching = false;
@@ -98,17 +103,116 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
 
 /* ---------------------------- discovery run ---------------------------- */
 
+const onlyDigits = (s?: string | null) => (s || "").replace(/\D/g, "");
+
+// Free-mail providers are NOT a company's own domain — dozens of unrelated
+// businesses share gmail.com/hotmail.com, so we never dedupe or classify by them.
+const FREEMAIL = new Set([
+  "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com",
+  "msn.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "icloud.com", "me.com", "aol.com",
+  "protonmail.com", "proton.me", "gmx.com", "gmx.net", "mail.com", "zoho.com",
+  "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
+]);
+const isFreeMail = (domain?: string | null) => FREEMAIL.has((domain || "").toLowerCase());
+
 // Stable key so the same company is never added twice (across ticks / sources).
-function dedupKey(c: { domain?: string | null; email?: string | null; name?: string | null; city?: string | null }): string {
-  const domain = (c.domain || "").toLowerCase();
-  if (domain) return "d:" + domain;
+// Email first (most specific), so many different companies sharing gmail.com are
+// each kept — only an identical email/domain/phone is treated as a duplicate.
+function dedupKey(c: { domain?: string | null; email?: string | null; phone?: string | null; name?: string | null; city?: string | null }): string {
   const email = (c.email || "").toLowerCase();
   if (email) return "e:" + email;
+  const domain = (c.domain || "").toLowerCase();
+  if (domain) return "d:" + domain;
+  const phone = onlyDigits(c.phone);
+  if (phone.length >= 7) return "p:" + phone.slice(-9);
   return "n:" + String(c.name || "").toLowerCase().trim() + "|" + String(c.city || "").toLowerCase().trim();
 }
 
-// Run one source: discover companies, dedupe against contacts + the pool, and
-// insert whatever is genuinely new. Returns how many NEW leads were added.
+// Contact emails/domains we already hold — so discovery never re-surfaces them.
+// Free-mail domains are excluded (they'd wrongly block every gmail-based lead).
+async function loadContactDedup(): Promise<{ emails: Set<string>; domains: Set<string> }> {
+  const emails = new Set(await getContactEmails());
+  const domains = new Set<string>();
+  for (const e of emails) {
+    const d = registrableDomain((e.split("@")[1] || ""));
+    if (d && !isFreeMail(d)) domains.add(d);
+  }
+  return { emails, domains };
+}
+
+interface LeadRow {
+  name: string; website: string | null; domain: string | null; email: string | null;
+  phone: string | null; city: string | null; country: string; category: string;
+  sourceId: string; label: string; enriched: number; confidence: string | null;
+}
+
+// Insert one lead if it's genuinely new (not an existing contact, not already in
+// the pool). Returns true when a row was added.
+async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; domains: Set<string> }): Promise<boolean> {
+  const email = (row.email || "").toLowerCase();
+  const domain = (row.domain || "").toLowerCase();
+  if (email && dedup.emails.has(email)) return false;
+  if (domain && dedup.domains.has(domain)) return false;
+  const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
+  const rows = await q(
+    `INSERT INTO discovered_leads
+      (id,dedup_key,name,website,domain,email,phone,city,country,category,source_id,source_label,status,enriched,confidence,via,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?)
+     ON CONFLICT (dedup_key) DO NOTHING RETURNING id`,
+    [
+      uid(), key,
+      row.name || domain || email || "Unknown",
+      row.website, domain || null, email || null,
+      row.phone, row.city, row.country, row.category,
+      row.sourceId, row.label, row.enriched, row.confidence, nowIso(),
+    ]
+  );
+  return rows.length > 0;
+}
+
+// Set/replace the page number in a directory URL so we can walk it continuously
+// across separate runs. Handles ?page=N, /page/N, and a trailing bare number
+// (e.g. /listings/31 → /listings/32); otherwise appends ?page=N as a fallback.
+function withPage(base: string, page: number): string {
+  try {
+    const u = new URL(/^https?:\/\//i.test(base) ? base : "https://" + base);
+    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) {
+      if (u.searchParams.has(k)) { u.searchParams.set(k, String(page)); return u.toString(); }
+    }
+    if (/\/(?:page|p)[-/]\d+\/?$/i.test(u.pathname)) {
+      u.pathname = u.pathname.replace(/((?:page|p)[-/])\d+(\/?)$/i, `$1${page}$2`);
+      return u.toString();
+    }
+    // Trailing number segment = the page number (common: /listings/31, /dir/5).
+    if (/\/\d+\/?$/.test(u.pathname)) {
+      u.pathname = u.pathname.replace(/\d+(\/?)$/, `${page}$1`);
+      return u.toString();
+    }
+    if (page > 1) u.searchParams.set("page", String(page)); // leave page 1 as the clean base
+    return u.toString();
+  } catch { return base; }
+}
+
+// The page number already present in a directory URL, so a source can start
+// walking from wherever the user pasted (defaults to 1).
+export function initialCursor(base: string): number {
+  try {
+    const u = new URL(/^https?:\/\//i.test(base) ? base : "https://" + base);
+    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) {
+      const v = u.searchParams.get(k);
+      if (v && /^\d+$/.test(v)) return Math.max(1, Number(v));
+    }
+    let m = u.pathname.match(/\/(?:page|p)[-/](\d+)\/?$/i);
+    if (m) return Math.max(1, Number(m[1]));
+    m = u.pathname.match(/\/(\d+)\/?$/);
+    if (m) return Math.max(1, Number(m[1]));
+    return 1;
+  } catch { return 1; }
+}
+
+/* --------------------------- OSM area source --------------------------- */
+
+// Run one OSM source: discover companies, dedupe, insert new. Returns count.
 async function runSource(src: any): Promise<{ found: number; error?: string }> {
   const place = safeParse(src.place_json);
   const companies: Company[] = await findLeads(
@@ -117,72 +221,137 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
     clamp(src.limit_n, 5, 120),
     place
   );
-
-  // Skip anything we already hold as a contact (by exact email or by domain).
-  const contactEmails = new Set(await getContactEmails());
-  const contactDomains = new Set<string>();
-  for (const e of contactEmails) {
-    const d = registrableDomain((e.split("@")[1] || ""));
-    if (d) contactDomains.add(d);
-  }
-
+  const dedup = await loadContactDedup();
   const label = `${src.location} · ${src.category}`;
   let found = 0;
-
   for (const co of companies) {
     const domain = co.website ? (registrableDomain(hostOf(co.website)) || "") : "";
     const email = (co.email || "").toLowerCase();
-    if (email && contactEmails.has(email)) continue;
-    if (domain && contactDomains.has(domain)) continue;
-
-    const key = dedupKey({ domain, email, name: co.name, city: co.city });
-    const rows = await q(
-      `INSERT INTO discovered_leads
-        (id,dedup_key,name,website,domain,email,phone,city,country,category,source_id,source_label,status,enriched,confidence,via,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?)
-       ON CONFLICT (dedup_key) DO NOTHING RETURNING id`,
-      [
-        uid(), key,
-        co.name || domain || email || "Unknown",
-        co.website || null, domain || null, email || null,
-        co.phone || null, co.city || null, src.location, src.category,
-        src.id, label,
-        email ? 1 : 0,          // already has a listed email → no enrichment needed
-        email ? "listed" : null,
-        nowIso(),
-      ]
-    );
-    if (rows.length) found++;
+    const added = await insertDiscovered({
+      name: co.name, website: co.website || null, domain: domain || null, email: email || null,
+      phone: co.phone || null, city: co.city || null, country: src.location, category: src.category,
+      sourceId: src.id, label,
+      enriched: email ? 1 : 0,          // listed email → no enrichment needed
+      confidence: email ? "listed" : null,
+    }, dedup);
+    if (added) found++;
   }
-
   return { found };
 }
 
-// Run + persist the outcome for a single source row.
-async function executeSource(src: any): Promise<{ found: number; error?: string }> {
+/* -------------------------- Directory source -------------------------- */
+
+interface DirRunResult { found: number; error?: string; exhausted: boolean; nextCursor: number; pages: number; }
+
+// Walk ONE batch of a business directory (a few pages), starting at the saved
+// page cursor, and insert every new company. This is what scales to tens of
+// thousands: a directory lists every business, and we page through it forever.
+async function runDirectorySource(src: any): Promise<DirRunResult> {
+  const base = String(src.base_url || "").trim();
+  const cursor = Math.max(1, Number(src.cursor) || 1);
+  if (!base) return { found: 0, error: "No directory URL set", exhausted: true, nextCursor: cursor, pages: 0 };
+
+  const proxy = await getProxyConfig();
+  const readerKey = await getReaderKey();
+  const seed = withPage(base, cursor);
+  const opts: DirectoryOptions = {
+    maxPages: DIRECTORY_PAGES_PER_RUN,
+    maxDetails: clamp(src.limit_n, 20, 300),
+    concurrency: proxy ? 3 : 5,
+    respectRobots: true,
+    checkMx: true,
+    defaultCountry: String(src.location || "").trim() || undefined,
+    proxy,
+    readerKey,
+  };
+
+  const result = await crawlDirectory(seed, opts);
+  const dedup = await loadContactDedup();
+  const label = src.category && src.category !== "Companies (general)"
+    ? `${src.location || hostOf(base)} · ${src.category}`
+    : (src.location || hostOf(base));
+
+  let found = 0;
+  for (const co of result.contacts) {
+    const email = (co.email || "").toLowerCase();
+    const emailDomain = email ? (registrableDomain(email.split("@")[1] || "") || "") : "";
+    // Only treat a real company domain as the domain — never a free-mail host.
+    const domain = emailDomain && !isFreeMail(emailDomain) ? emailDomain : "";
+    const added = await insertDiscovered({
+      name: co.name, website: null, domain: domain || null, email: email || null,
+      phone: co.phone || null, city: null, country: String(src.location || ""), category: src.category || "",
+      sourceId: src.id, label,
+      enriched: 1,                       // directory rows carry their own contact — nothing to crawl
+      confidence: email ? "listed" : null,
+    }, dedup);
+    if (added) found++;
+  }
+
+  const pages = result.listingPages || 0;
+  const okish = result.status === "ok" || result.status === "empty";
+  const blocked = result.status === "blocked" || result.status === "error";
+  // End of the list = pages loaded fine but produced nothing new.
+  const exhausted = okish && found === 0;
+  const nextCursor = okish ? cursor + Math.max(1, pages) : cursor; // don't advance past a block
+  const error = blocked ? (result.note || result.status) : undefined;
+  return { found, error, exhausted, nextCursor, pages };
+}
+
+/* ------------------------------ scheduling ---------------------------- */
+
+// Run + persist the outcome for a single source. `continue` = run again on the
+// very next tick (directory sources stream continuously until exhausted).
+async function executeSource(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
   await q(`UPDATE discovery_sources SET last_status='running' WHERE id=?`, [src.id]);
+  const interval = clamp(src.interval_minutes, 15, 100000);
+
+  if (src.type === "directory") {
+    let r: DirRunResult;
+    try {
+      r = await runDirectorySource(src);
+    } catch (e: any) {
+      r = { found: 0, error: String(e?.message || e), exhausted: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
+    }
+    const cont = !r.exhausted && !r.error;                 // keep streaming while there's more
+    const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+    const status = r.error ? "error" : r.exhausted ? "done" : "ok";
+    await q(
+      `UPDATE discovery_sources
+         SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
+             total_found=total_found+?, cursor=?, exhausted=?
+       WHERE id=?`,
+      [nowIso(), next, status, r.error || null, r.found, r.nextCursor, r.exhausted ? 1 : 0, src.id]
+    );
+    return { found: r.found, error: r.error, continue: cont };
+  }
+
+  // OSM area source.
   let result: { found: number; error?: string };
   try {
     result = await runSource(src);
   } catch (e: any) {
     result = { found: 0, error: String(e?.message || e) };
   }
-  const next = new Date(Date.now() + clamp(src.interval_minutes, 15, 100000) * 60000).toISOString();
+  const next = new Date(Date.now() + interval * 60000).toISOString();
   await q(
     `UPDATE discovery_sources
        SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1, total_found=total_found+?
      WHERE id=?`,
     [nowIso(), next, result.error ? "error" : "ok", result.error || null, result.found, src.id]
   );
-  return result;
+  return { found: result.found, error: result.error, continue: false };
 }
 
 // Manual "run now" from the UI. Works even when the global bot is paused so you
-// can test a source in isolation.
+// can test a source in isolation. Clears `exhausted` so a directory resumes.
 export async function runSourceNow(id: string): Promise<{ found: number; error?: string }> {
   const src = (await q(`SELECT * FROM discovery_sources WHERE id=?`, [id]))[0];
   if (!src) return { found: 0, error: "Source not found" };
-  return executeSource(src);
+  if (src.type === "directory") { await q(`UPDATE discovery_sources SET exhausted=0 WHERE id=?`, [id]); src.exhausted = 0; }
+  const r = await executeSource(src);
+  // Keep streaming a directory in the background after a manual kick.
+  if (r.continue) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
+  return { found: r.found, error: r.error };
 }
 
 /* ------------------------------ enrichment ----------------------------- */
@@ -204,6 +373,7 @@ async function discoveryTick(): Promise<void> {
   if (discovering) return;
   if (!(await isBotEnabled())) return;
   discovering = true;
+  let keepStreaming = false;
   try {
     const now = nowIso();
     // Most-overdue enabled source (a null next_run_at = never run = due now).
@@ -215,10 +385,14 @@ async function discoveryTick(): Promise<void> {
       [now]
     ))[0];
     if (!src) return;
-    await executeSource(src);
+    const r = await executeSource(src);
+    keepStreaming = r.continue;
   } finally {
     discovering = false;
   }
+  // Directory sources stream continuously: chain the next batch quickly instead
+  // of waiting the full tick, so a big directory pours in fast (but politely).
+  if (keepStreaming) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
 }
 
 async function enrichTick(): Promise<void> {

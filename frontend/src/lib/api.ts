@@ -136,6 +136,10 @@ export interface DiscoveryStatus {
 
 export interface DiscoverySource {
   id: string;
+  type?: "osm" | "directory";
+  base_url?: string | null;
+  cursor?: number;
+  exhausted?: number; // 0 | 1
   location: string;
   place_json?: string | null;
   category: string;
@@ -389,18 +393,20 @@ export const api = {
     req<DiscoveryStatus>(`/api/discovery/toggle`, { method: "POST", body: JSON.stringify(body) }),
   getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
   addDiscoverySource: (body: {
-    location: string;
-    category: string;
+    type?: "osm" | "directory";
+    location?: string;
+    url?: string;
+    category?: string;
     limit?: number;
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>
-    req<{ found: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
+    req<{ started?: boolean; found?: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
   getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);

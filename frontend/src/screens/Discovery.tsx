@@ -108,13 +108,13 @@ export default function Discovery() {
   async function runSource(s: DiscoverySource) {
     setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, last_status: "running" } : x)));
     try {
-      const r = await api.runDiscoverySource(s.id);
-      toast(r.found ? `Found ${r.found} new compan${r.found === 1 ? "y" : "ies"}` : "No new companies this run", r.found ? "success" : "info");
+      await api.runDiscoverySource(s.id);
+      toast(s.type === "directory" ? "Streaming from the directory — new companies will appear below" : "Scanning — results will appear below", "info");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
-      refreshSources(); refreshStatus();
-      if (tab === "pending") refreshLeads();
+      // The run is now in the background; live polling + a nudge refresh show results.
+      setTimeout(() => { refreshSources(); refreshStatus(); if (tab === "pending") refreshLeads(); }, 2000);
     }
   }
   async function removeSource(s: DiscoverySource) {
@@ -199,7 +199,7 @@ export default function Discovery() {
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="font-clash text-lg font-semibold">Discovery sources</h2>
-            <p className="text-xs text-muted">Each source is a place + industry the bot re-scans on a schedule.</p>
+            <p className="text-xs text-muted">Area (map) sources for precision · Directory sources to pull in thousands.</p>
           </div>
           <Button size="sm" onClick={() => { setEditing(null); setModalOpen(true); }}>Add source</Button>
         </div>
@@ -207,8 +207,8 @@ export default function Discovery() {
         {sources.length === 0 ? (
           <div className="px-5 py-12 text-center">
             <p className="text-sm font-medium">No sources yet</p>
-            <p className="mx-auto mt-1 max-w-sm text-xs text-muted">
-              Add a place and industry — e.g. <span className="font-medium text-ink/70">Qatar · IT &amp; Software</span> — and the bot will start discovering companies around the clock.
+            <p className="mx-auto mt-1 max-w-md text-xs text-muted">
+              Add an <span className="font-medium text-ink/70">Area</span> source (e.g. Qatar · IT &amp; Software) for precise map results, or a <span className="font-medium text-ink/70">Directory</span> source (paste a business-directory URL) to stream in tens of thousands of companies around the clock.
             </p>
             <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
           </div>
@@ -390,26 +390,49 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle }: { running: b
 
 function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onDelete: () => void }) {
   const runningNow = s.last_status === "running";
+  const isDir = s.type === "directory";
+  const streaming = isDir && s.enabled && runningNow;
+  const host = (() => { try { return new URL(s.base_url || "").hostname.replace(/^www\./, ""); } catch { return s.base_url || ""; } })();
+
   return (
     <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
       <Switch small checked={!!s.enabled} onChange={onToggle} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="truncate font-medium">{s.location}</span>
-          <span className="text-ink/30">·</span>
-          <span className="truncate text-sm text-ink/70">{s.category}</span>
+          {isDir && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">Directory</span>}
+          <span className="truncate font-medium">{isDir ? host : s.location}</span>
+          {(!isDir || (s.category && s.category !== "Companies (general)")) && (
+            <>
+              <span className="text-ink/30">·</span>
+              <span className="truncate text-sm text-ink/70">{s.category}</span>
+            </>
+          )}
         </div>
         <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
-          <span>{intervalLabel(s.interval_minutes)}</span>
-          <span>· up to {s.limit_n}</span>
-          <span>· {s.total_found} found</span>
-          {s.enabled && s.next_run_at && <span>· next {fmtIn(s.next_run_at)}</span>}
-          {s.last_status === "error" && <span className="text-bad">· last run failed</span>}
+          {isDir ? (
+            <>
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> streaming · page {s.cursor}</span>
+                : s.exhausted
+                  ? <span>finished at page {s.cursor}</span>
+                  : <span>{s.enabled ? "queued" : "paused"} · resumes page {s.cursor}</span>}
+              <span>· {s.total_found} found</span>
+              {s.location && <span>· {s.location}</span>}
+            </>
+          ) : (
+            <>
+              <span>{intervalLabel(s.interval_minutes)}</span>
+              <span>· up to {s.limit_n}</span>
+              <span>· {s.total_found} found</span>
+              {s.enabled && s.next_run_at && <span>· next {fmtIn(s.next_run_at)}</span>}
+            </>
+          )}
+          {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1">
         <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
-          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : "Run now"}
+          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : isDir && s.exhausted ? "Restart" : "Run now"}
         </button>
         <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
         <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Remove">✕</button>
@@ -421,8 +444,10 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
 /* --------------------------- Add / edit modal -------------------------- */
 
 function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean; onClose: () => void; cats: string[]; editing: DiscoverySource | null; onSaved: () => void }) {
+  const [type, setType] = useState<"osm" | "directory">("osm");
   const [location, setLocation] = useState("");
   const [place, setPlace] = useState<Place | null>(null);
+  const [url, setUrl] = useState("");
   const [category, setCategory] = useState(cats[0] || "Companies (general)");
   const [limit, setLimit] = useState(40);
   const [interval, setInterval] = useState(360);
@@ -431,26 +456,36 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   useEffect(() => {
     if (!open) return;
     if (editing) {
-      setLocation(editing.location);
+      setType(editing.type === "directory" ? "directory" : "osm");
+      setLocation(editing.location || "");
+      setUrl(editing.base_url || "");
       setPlace(null);
       setCategory(editing.category);
       setLimit(editing.limit_n);
       setInterval(editing.interval_minutes);
     } else {
-      setLocation(""); setPlace(null); setCategory(cats[0] || "Companies (general)"); setLimit(40); setInterval(360);
+      setType("osm"); setLocation(""); setUrl(""); setPlace(null);
+      setCategory(cats[0] || "Companies (general)"); setLimit(40); setInterval(360);
     }
   }, [open, editing, cats]);
 
+  // Directory sources default to a bigger batch size.
+  useEffect(() => { if (!editing) setLimit(type === "directory" ? 100 : 40); }, [type, editing]);
+
   async function save() {
-    if (!location.trim()) return toast("Choose a country or city", "error");
+    if (type === "osm" && !location.trim()) return toast("Choose a country or city", "error");
+    if (type === "directory" && !url.trim()) return toast("Paste a directory URL", "error");
     setSaving(true);
     try {
+      const body = type === "directory"
+        ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, limit, intervalMinutes: interval }
+        : { type: "osm" as const, location: location.trim(), category, limit, intervalMinutes: interval, place };
       if (editing) {
-        await api.updateDiscoverySource(editing.id, { location: location.trim(), category, limit, intervalMinutes: interval, place });
+        await api.updateDiscoverySource(editing.id, body);
         toast("Source updated", "success");
       } else {
-        await api.addDiscoverySource({ location: location.trim(), category, limit, intervalMinutes: interval, place });
-        toast("Source added — the bot will scan it shortly", "success");
+        await api.addDiscoverySource(body);
+        toast(type === "directory" ? "Directory added — it'll start streaming companies in" : "Source added — the bot will scan it shortly", "success");
       }
       onSaved();
     } catch (e: any) { toast(e.message, "error"); } finally { setSaving(false); }
@@ -459,29 +494,81 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   return (
     <Modal open={open} onClose={onClose} title={editing ? "Edit source" : "Add discovery source"}>
       <div className="space-y-4">
-        <Field label="Country or city" hint="Where to look. Pick from the list for the most accurate area.">
-          <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="Start typing… e.g. Qatar" />
-        </Field>
-        <Field label="Industry">
-          <Select value={category} onChange={(e) => setCategory(e.target.value)}>
-            {cats.map((c) => <option key={c} value={c}>{c}</option>)}
-          </Select>
-        </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Re-scan">
-            <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
-              {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
-            </Select>
-          </Field>
-          <Field label="Max per scan">
-            <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
-              {[20, 40, 60, 100, 120].map((n) => <option key={n} value={n}>{n}</option>)}
-            </Select>
-          </Field>
+        {/* type switch */}
+        <div className="flex rounded-full border border-line bg-cream p-1">
+          {([["osm", "Area (map)"], ["directory", "Directory (bulk)"]] as const).map(([t, label]) => (
+            <button
+              key={t}
+              type="button"
+              disabled={!!editing && editing.type !== t}
+              onClick={() => setType(t)}
+              className={cn("flex-1 rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-30",
+                type === t ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
+            >
+              {label}
+            </button>
+          ))}
         </div>
-        <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-          The bot cycles through all your sources continuously. Re-scanning the same place only surfaces companies you haven't seen — duplicates and existing contacts are filtered out automatically.
-        </p>
+
+        {type === "osm" ? (
+          <>
+            <Field label="Country or city" hint="Where to look. Pick from the list for the most accurate area.">
+              <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="Start typing… e.g. Qatar" />
+            </Field>
+            <Field label="Industry">
+              <Select value={category} onChange={(e) => setCategory(e.target.value)}>
+                {cats.map((c) => <option key={c} value={c}>{c}</option>)}
+              </Select>
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Re-scan">
+                <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
+                  {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
+                </Select>
+              </Field>
+              <Field label="Max per scan">
+                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
+                  {[20, 40, 60, 100, 120].map((n) => <option key={n} value={n}>{n}</option>)}
+                </Select>
+              </Field>
+            </div>
+            <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
+              Map data (OpenStreetMap) is precise but limited — good for a few hundred well-tagged businesses. For <span className="font-medium text-ink/70">thousands</span> of companies, use a <span className="font-medium text-ink/70">Directory</span> source.
+            </p>
+          </>
+        ) : (
+          <>
+            <Field label="Directory URL" hint="A business-directory listing page. The bot walks its pages continuously and pulls company + email + phone from each listing.">
+              <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com/companies?page=1" className="font-mono text-xs" />
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Country" hint="Helps read local phone numbers">
+                <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Qatar" />
+              </Field>
+              <Field label="Label (optional)">
+                <Select value={category} onChange={(e) => setCategory(e.target.value)}>
+                  {cats.map((c) => <option key={c} value={c}>{c}</option>)}
+                </Select>
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Leads per batch">
+                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
+                  {[50, 100, 200, 300].map((n) => <option key={n} value={n}>{n}</option>)}
+                </Select>
+              </Field>
+              <Field label="Re-check when finished">
+                <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
+                  {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
+                </Select>
+              </Field>
+            </div>
+            <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
+              The bot pages through the whole directory back-to-back until it runs out — this is how you reach tens of thousands. If a directory blocks crawlers, add a scraping proxy in Settings (the free reader is tried automatically).
+            </p>
+          </>
+        )}
+
         <div className="flex justify-end gap-2 pt-1">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           <Button onClick={save} loading={saving}>{editing ? "Save changes" : "Add source"}</Button>

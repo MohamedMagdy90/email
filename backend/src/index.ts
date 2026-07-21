@@ -24,6 +24,7 @@ import {
   setBotEnabled,
   setAutoEnrich,
   runSourceNow,
+  initialCursor,
 } from "./discovery";
 import {
   seedAuthFromEnv,
@@ -1197,17 +1198,37 @@ app.get("/api/discovery/sources", async (c) => {
 
 app.post("/api/discovery/sources", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const location = String(b.location || "").trim();
+  const type = b.type === "directory" ? "directory" : "osm";
   const category = String(b.category || "Companies (general)").trim();
+  const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
+  const enabled = b.enabled === false ? 0 : 1;
+
+  // Directory source: walks a business-directory URL page-by-page, forever.
+  if (type === "directory") {
+    let url = String(b.url || b.base_url || "").trim();
+    if (!url) return c.json({ error: "Directory URL is required" }, 400);
+    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+    try { new URL(url); } catch { return c.json({ error: "Enter a valid directory URL" }, 400); }
+    const country = String(b.location || b.country || "").trim(); // for phone parsing + label
+    const limit = clamp(Number(b.limit) || 100, 20, 300); // leads per batch
+    const rows = await q(
+      `INSERT INTO discovery_sources
+        (id,type,base_url,cursor,exhausted,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
+       VALUES (?, 'directory', ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      [uid(), url, initialCursor(url), country, category, limit, interval, enabled, nowIso(), nowIso()]
+    );
+    return c.json({ source: rows[0] });
+  }
+
+  // OSM area source.
+  const location = String(b.location || "").trim();
   if (!location) return c.json({ error: "Location is required" }, 400);
   const limit = clamp(Number(b.limit) || 40, 5, 120);
-  const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
   const placeJson = b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null;
-  const enabled = b.enabled === false ? 0 : 1;
   const rows = await q(
     `INSERT INTO discovery_sources
-      (id,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
-     VALUES (?,?,?,?,?,?,?,?,?) RETURNING *`,
+      (id,type,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
+     VALUES (?, 'osm', ?,?,?,?,?,?,?,?) RETURNING *`,
     [uid(), location, placeJson, category, limit, interval, enabled, nowIso(), nowIso()]
   );
   return c.json({ source: rows[0] });
@@ -1220,14 +1241,30 @@ app.put("/api/discovery/sources/:id", async (c) => {
   if (!existing) return c.json({ error: "not found" }, 404);
   const location = b.location != null ? String(b.location).trim() : existing.location;
   const category = b.category != null ? String(b.category).trim() : existing.category;
-  const limit = b.limit != null ? clamp(Number(b.limit), 5, 120) : existing.limit_n;
+  const limit = b.limit != null ? clamp(Number(b.limit), 5, 300) : existing.limit_n;
   const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
   const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
   const placeJson =
     b.place !== undefined ? (b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null) : existing.place_json;
+
+  // For directory sources: a URL change restarts the walk; re-enabling resumes it.
+  let baseUrl = existing.base_url;
+  let cursor = existing.cursor;
+  let exhausted = existing.exhausted;
+  if (existing.type === "directory") {
+    if (b.url != null || b.base_url != null) {
+      let url = String(b.url ?? b.base_url ?? "").trim();
+      if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
+      if (url && url !== existing.base_url) { baseUrl = url; cursor = initialCursor(url); exhausted = 0; }
+    }
+    if (enabled && !existing.enabled) exhausted = 0; // re-enable ⇒ resume
+  }
+
   const rows = await q(
-    `UPDATE discovery_sources SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=? WHERE id=? RETURNING *`,
-    [location, placeJson, category, limit, interval, enabled, id]
+    `UPDATE discovery_sources
+       SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?
+     WHERE id=? RETURNING *`,
+    [location, placeJson, category, limit, interval, enabled, baseUrl, cursor, exhausted, id]
   );
   return c.json({ source: rows[0] });
 });
@@ -1237,11 +1274,15 @@ app.delete("/api/discovery/sources/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-// Run one source immediately (works even when the bot is paused).
+// Run one source immediately (works even when the bot is paused). Fire-and-
+// forget: a directory batch can take longer than the HTTP idle timeout, and the
+// UI polls status to show progress + results as they stream in.
 app.post("/api/discovery/sources/:id/run", async (c) => {
-  const r = await runSourceNow(c.req.param("id"));
-  if (r.error) return c.json({ error: r.error, found: r.found }, 400);
-  return c.json({ found: r.found });
+  const id = c.req.param("id");
+  const exists = (await q(`SELECT id FROM discovery_sources WHERE id=?`, [id]))[0];
+  if (!exists) return c.json({ error: "Source not found" }, 404);
+  runSourceNow(id).catch(() => {});
+  return c.json({ started: true });
 });
 
 // ---- The review pool ----
@@ -1481,4 +1522,5 @@ app.get("*", serveStatic({ path: `${DIST}/index.html` }));
 const port = Number(process.env.PORT) || 3001;
 console.log(`[dna-outreach] API listening on :${port}`);
 
-export default { port, fetch: app.fetch };
+// idleTimeout raised so long-running requests aren't cut off (max 255s in Bun).
+export default { port, idleTimeout: 120, fetch: app.fetch };
