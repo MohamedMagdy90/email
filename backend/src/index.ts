@@ -1251,20 +1251,21 @@ app.put("/api/discovery/sources/:id", async (c) => {
   let baseUrl = existing.base_url;
   let cursor = existing.cursor;
   let exhausted = existing.exhausted;
+  let emptyStreak = existing.empty_streak;
   if (existing.type === "directory") {
     if (b.url != null || b.base_url != null) {
       let url = String(b.url ?? b.base_url ?? "").trim();
       if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
-      if (url && url !== existing.base_url) { baseUrl = url; cursor = initialCursor(url); exhausted = 0; }
+      if (url && url !== existing.base_url) { baseUrl = url; cursor = initialCursor(url); exhausted = 0; emptyStreak = 0; }
     }
-    if (enabled && !existing.enabled) exhausted = 0; // re-enable ⇒ resume
+    if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
 
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?
+       SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, limit, interval, enabled, baseUrl, cursor, exhausted, id]
+    [location, placeJson, category, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
   );
   return c.json({ source: rows[0] });
 });

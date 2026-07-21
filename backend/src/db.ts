@@ -155,6 +155,7 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN base_url TEXT`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN cursor INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN empty_streak INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being

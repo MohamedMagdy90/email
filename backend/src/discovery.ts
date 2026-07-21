@@ -31,6 +31,8 @@ const ENRICH_TICK_MS = 15_000;
 // the next batch so a big directory streams in quickly without hammering.
 const DIRECTORY_PAGES_PER_RUN = 4;
 const DIRECTORY_CONTINUE_MS = 1_500;
+// Consecutive empty batches to tolerate before a directory is "finished".
+const EMPTY_STREAK_LIMIT = 3;
 
 let discovering = false;
 let enriching = false;
@@ -241,7 +243,7 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
 
 /* -------------------------- Directory source -------------------------- */
 
-interface DirRunResult { found: number; error?: string; exhausted: boolean; nextCursor: number; pages: number; }
+interface DirRunResult { found: number; error?: string; okish: boolean; nextCursor: number; pages: number; }
 
 // Walk ONE batch of a business directory (a few pages), starting at the saved
 // page cursor, and insert every new company. This is what scales to tens of
@@ -249,7 +251,7 @@ interface DirRunResult { found: number; error?: string; exhausted: boolean; next
 async function runDirectorySource(src: any): Promise<DirRunResult> {
   const base = String(src.base_url || "").trim();
   const cursor = Math.max(1, Number(src.cursor) || 1);
-  if (!base) return { found: 0, error: "No directory URL set", exhausted: true, nextCursor: cursor, pages: 0 };
+  if (!base) return { found: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 };
 
   const proxy = await getProxyConfig();
   const readerKey = await getReaderKey();
@@ -290,11 +292,9 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   const pages = result.listingPages || 0;
   const okish = result.status === "ok" || result.status === "empty";
   const blocked = result.status === "blocked" || result.status === "error";
-  // End of the list = pages loaded fine but produced nothing new.
-  const exhausted = okish && found === 0;
   const nextCursor = okish ? cursor + Math.max(1, pages) : cursor; // don't advance past a block
   const error = blocked ? (result.note || result.status) : undefined;
-  return { found, error, exhausted, nextCursor, pages };
+  return { found, error, okish, nextCursor, pages };
 }
 
 /* ------------------------------ scheduling ---------------------------- */
@@ -310,17 +310,28 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     try {
       r = await runDirectorySource(src);
     } catch (e: any) {
-      r = { found: 0, error: String(e?.message || e), exhausted: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
+      r = { found: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
     }
-    const cont = !r.exhausted && !r.error;                 // keep streaming while there's more
+
+    // Tolerate a few consecutive empty batches (thin pages between rich ones)
+    // before declaring the directory finished — but always advance past them.
+    let streak = Number(src.empty_streak) || 0;
+    let exhausted = false;
+    let cursor = Number(src.cursor) || 1;
+    if (!r.error && r.okish) {
+      cursor = r.nextCursor;                       // move on, even through thin pages
+      streak = r.found > 0 ? 0 : streak + 1;
+      exhausted = streak >= EMPTY_STREAK_LIMIT;    // truly out of listings
+    }
+    const cont = !r.error && !exhausted;           // keep streaming while there's more
     const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
-    const status = r.error ? "error" : r.exhausted ? "done" : "ok";
+    const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-             total_found=total_found+?, cursor=?, exhausted=?
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?
        WHERE id=?`,
-      [nowIso(), next, status, r.error || null, r.found, r.nextCursor, r.exhausted ? 1 : 0, src.id]
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
     );
     return { found: r.found, error: r.error, continue: cont };
   }
@@ -347,7 +358,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
 export async function runSourceNow(id: string): Promise<{ found: number; error?: string }> {
   const src = (await q(`SELECT * FROM discovery_sources WHERE id=?`, [id]))[0];
   if (!src) return { found: 0, error: "Source not found" };
-  if (src.type === "directory") { await q(`UPDATE discovery_sources SET exhausted=0 WHERE id=?`, [id]); src.exhausted = 0; }
+  if (src.type === "directory") { await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0 WHERE id=?`, [id]); src.exhausted = 0; src.empty_streak = 0; }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.
   if (r.continue) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
