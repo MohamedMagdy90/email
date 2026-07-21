@@ -177,6 +177,16 @@ function nextPageUrl(u: URL): string | null {
   return null;
 }
 
+// The numeric page a URL represents (?page=N or /page/N), or 0 when it carries
+// no numeric page marker (a clean first page, or a token/rel=next pager).
+function pageNumberOf(u: URL): number {
+  const k = pageParamOf(u);
+  if (k) { const n = Number(u.searchParams.get(k)); if (Number.isInteger(n) && n > 0) return n; }
+  const pm = u.pathname.match(PATH_PAGE_RE);
+  if (pm) { const n = Number(pm[2]); if (Number.isInteger(n) && n > 0) return n; }
+  return 0;
+}
+
 // Reduce a path to a template where slug/id segments become "*".
 function pathTemplate(pathname: string): { key: string; placeholders: number; literals: string[] } {
   const segs = pathname.split("/").filter(Boolean).map(decode);
@@ -510,21 +520,40 @@ async function crawlOnce(
       for (const rec of harvestInline(res.html, res.url || pageUrl, region)) records.push(rec);
     }
 
-    // Follow linked pagination…
-    for (const pl of findPageLinks(seed, links, res.html, res.url || pageUrl)) {
-      const pn = pl.split("#")[0];
-      if (!pagesSeen.has(pn) && !pageQueue.includes(pn)) pageQueue.push(pn);
-    }
-    // …and, when this page yielded new listings, also probe the next sequential
-    // page. Narrow pagers ("1 2 3 … next") never link the far pages, so
-    // linked-only discovery stalls early on big directories. Gating on *new
-    // detail links* (not inline footer emails) means the first empty page
-    // enqueues nothing and the walk stops cleanly at the end of the list.
+    // Walk pages STRICTLY FORWARD (only when this page yielded new listings, so
+    // the walk stops cleanly at the end of the list). Prefer incrementing the
+    // numeric page (?page=N → N+1 / /page/N → N+1): it guarantees we cover every
+    // consecutive page and never waste fetches re-crawling the low pages that a
+    // pager always links ("1 2 3 …") or the previous page. Only when the URL has
+    // NO numeric page pattern do we fall back to discovering pagination links.
     if (added > 0) {
+      let advanced = false;
       try {
         const np = nextPageUrl(new URL(pageUrl));
-        if (np) { const nn = np.split("#")[0]; if (!pagesSeen.has(nn) && !pageQueue.includes(nn)) pageQueue.push(nn); }
+        if (np) {
+          const nn = np.split("#")[0];
+          if (!pagesSeen.has(nn) && !pageQueue.includes(nn)) pageQueue.push(nn);
+          advanced = true;
+        }
       } catch { /* ignore */ }
+      if (!advanced) {
+        // No numeric page to increment — discover pagination links from the page
+        // (rel=next / listed page URLs) for pagers without a numeric pattern.
+        // Enqueue numeric pages FORWARD-ONLY, smallest first, so we never jump
+        // to page 1 or a far page; keep non-numeric (token/rel=next) links too.
+        const cur = pageNumberOf(new URL(pageUrl)) || 1;
+        const numeric: { url: string; n: number }[] = [];
+        const other: string[] = [];
+        for (const pl of findPageLinks(seed, links, res.html, res.url || pageUrl)) {
+          const url = pl.split("#")[0];
+          let n = 0; try { n = pageNumberOf(new URL(pl)); } catch { /* ignore */ }
+          if (n > 0) { if (n > cur) numeric.push({ url, n }); }
+          else other.push(url);
+        }
+        numeric.sort((a, b) => a.n - b.n);
+        for (const { url } of numeric) if (!pagesSeen.has(url) && !pageQueue.includes(url)) pageQueue.push(url);
+        for (const url of other) if (!pagesSeen.has(url) && !pageQueue.includes(url)) pageQueue.push(url);
+      }
     }
     onProgress?.({ type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length, msg: `page ${listingPages}: +${added} listings${viaProxy ? " · via proxy" : ""}` });
     await sleep(politenessMs);

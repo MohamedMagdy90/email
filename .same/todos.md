@@ -26,3 +26,14 @@
 - [x] `[discovery:enrich]` which site is crawled + ✓/✗ email result.
 - [x] Surface previously-swallowed tick errors via `console.error`.
 - [x] Verified log output live against qatarcontact.com (fresh temp DB).
+
+## Pagination bug (found in Railway logs) — DONE
+- Symptom: each batch crawled seed, seed-1, page 1, page 2 (e.g. 93 -> 92 -> 1 -> 2).
+- Impact: re-crawled pages 1-2 every batch (wasted ~half the proxy credits) AND
+  skipped ~half the directory's pages (94,95,98,99...), missing thousands of companies.
+- Root cause: findPageLinks enqueued all pager links (incl. page 1/2/prev) before
+  the forward nextPageUrl ran, starving the 4-page budget.
+- [x] Fix: walk STRICTLY FORWARD via nextPageUrl first; findPageLinks only as a
+      fallback for non-numeric pagers, and then forward-only + ascending.
+- [x] Verified: ?page=93 -> 93→94→95→96 (38 contacts); /listings -> 1→2→3→4 (39).
+- [ ] Note for user: Restart the source after deploy to re-cover skipped low pages.
