@@ -10,3 +10,5 @@ data.sqlite
 .env
 .env.*
 .DS_Store
+.same-test/
+.commit-msg.txt

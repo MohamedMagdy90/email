@@ -34,12 +34,85 @@ const STOP = new Set([
   "trad", "ind", "industries", "industrial", "enterprises", "enterprise",
 ]);
 
+// A token is meaningful if it's not a generic/legal word AND is either 3+ chars
+// or a short token carrying a digit ("3m", "4k", "21", "974"). Those short
+// alphanumerics are usually the most DISTINCTIVE part of a company name, so we
+// must keep them — dropping them was why "3m Gulf" matched gulf.com.
+function isMeaningful(t: string): boolean {
+  if (!t || STOP.has(t)) return false;
+  return t.length >= 3 || (t.length >= 2 && /\d/.test(t));
+}
+
+// Normalize ordinals so "49th"→"49", "21st"→"21", "3rd"→"3": the digit is the
+// distinctive part and domains drop the suffix ("49th Street Customs" →
+// 49customs.com).
+function normalizeOrdinals(s: string): string {
+  return s.replace(/(\d)(?:st|nd|rd|th)\b/gi, "$1");
+}
+
 function tokens(s: string): string[] {
-  return s
+  return normalizeOrdinals(s)
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((t) => t.length > 2 && !STOP.has(t));
+    .filter(isMeaningful);
+}
+
+// The country is appended to EVERY search query, so it must never count as a
+// matching token — otherwise "4k -Qatar" matches qatar.net. Build the set of
+// words (+ a few synonyms) to strip from the company's tokens/slug.
+function countryTokenSet(country: string): Set<string> {
+  const s = new Set<string>();
+  const key = (country || "").trim().toLowerCase();
+  for (const w of key.replace(/[^a-z\s]/g, " ").split(/\s+/)) if (w.length >= 2) s.add(w);
+  const syn: Record<string, string[]> = {
+    qatar: ["qa"], "united arab emirates": ["uae", "emirates", "arab"], uae: ["emirates", "arab"],
+    "saudi arabia": ["ksa", "saudi"], ksa: ["saudi"], bahrain: ["bh"], kuwait: ["kw"],
+    oman: ["om"], egypt: ["eg"],
+  };
+  for (const k of Object.keys(syn)) if (key.includes(k)) syn[k].forEach((x) => s.add(x));
+  return s;
+}
+
+// Distinctive company tokens = meaningful tokens with the country removed.
+function distinctiveTokens(name: string, country: string): string[] {
+  const drop = countryTokenSet(country);
+  return tokens(name).filter((t) => !drop.has(t));
+}
+
+// The compact company "slug": the name with legal suffixes, connectors and the
+// country removed, then all letters/digits joined. Used for prefix matching
+// against a domain core (the strongest "the domain IS the company" signal).
+const SLUG_DROP = new Set([
+  "llc", "wll", "w", "l", "ll", "ltd", "limited", "inc", "corp", "corporation",
+  "est", "establishment", "co", "company", "and", "the", "for", "of",
+]);
+function nameSlug(name: string, country: string): string {
+  const drop = new Set([...SLUG_DROP, ...countryTokenSet(country)]);
+  return normalizeOrdinals(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t && !drop.has(t))
+    .join("");
+}
+
+// The "core" of a registrable domain = its first label, letters/digits only
+// ("century21.com" → "century21", "almeera.com.qa" → "almeera").
+function domainCore(domain: string): string {
+  return (domain.split(".")[0] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function lcpLen(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
+}
+
+// ccTLD suffixes to prefer for a given country (e.g. Qatar → com.qa, qa).
+function countryTlds(country: string): string[] {
+  return COUNTRY_TLDS[(country || "").trim().toLowerCase()] || [];
 }
 
 export interface ResolvedSite {
@@ -47,17 +120,59 @@ export interface ResolvedSite {
   domain: string; // registrable domain
 }
 
-// Score a search hit against the company name. Domain-word matches are the
-// strongest signal, then title-word matches.
-function scoreHit(nameToks: string[], hit: RawHit): number {
-  const domCore = hit.domain.replace(/\.[a-z.]+$/i, "").toLowerCase();
-  const titleToks = tokens(hit.title || "");
+// After a brand-prefix match, what's LEFT in the domain core must be trivial —
+// a country word, a common corporate suffix, or ≤3 chars (e.g. a plural "s").
+// Otherwise the "prefix" is just a short word sitting inside a different brand
+// ("fresh" inside "freshthyme"), which we must reject.
+const GENERIC_REMAINDER = new Set([
+  "group", "holding", "intl", "international", "company", "est", "establishment",
+  "trading", "trad", "co", "llc", "wll", "ltd", "grp",
+]);
+function acceptableRemainder(rem: string, ccWords: Set<string>): boolean {
+  if (rem.length <= 3) return true;
+  if (ccWords.has(rem)) return true;
+  return GENERIC_REMAINDER.has(rem);
+}
+
+// Decide whether a search hit is a TRUSTWORTHY match for the company, and score
+// it. `strong` is the gate: we only ever attach a website that is `strong`
+// (or later phone-verified) — otherwise we return nothing rather than a guess.
+function analyzeCandidate(
+  nameToks: string[],
+  firstTok: string | undefined,
+  slug: string,
+  ccTlds: string[],
+  ccWords: Set<string>,
+  hit: RawHit
+): { score: number; strong: boolean } {
+  const domCore = domainCore(hit.domain);
+  if (!domCore) return { score: 0, strong: false };
+
+  const matched = nameToks.filter((t) => domCore.includes(t));
+  const firstMatched = !!firstTok && domCore.includes(firstTok);
+  const ccMatch = ccTlds.some((t) => hit.domain.toLowerCase().endsWith("." + t));
+
   let score = 0;
-  for (const t of nameToks) {
-    if (domCore.includes(t)) score += 3;
-    if (titleToks.includes(t)) score += 2;
+  let strong = false;
+
+  if (slug.length >= 3 && domCore === slug) {
+    score = 100; // the domain IS the company name
+    strong = true;
+  } else {
+    const lcp = slug.length >= 5 ? lcpLen(slug, domCore) : 0;
+    if (lcp >= 5 && acceptableRemainder(domCore.slice(lcp), ccWords)) {
+      score = 50 + lcp; // domain starts with the company name (brand prefix)
+      strong = true;
+    } else {
+      // Fall back to token overlap, but require the FIRST (most distinctive)
+      // token AND at least two tokens — a single generic word ("gulf",
+      // "garage", "print") is never enough on its own.
+      score = matched.length * 3 + (firstMatched ? 2 : 0) + (ccMatch ? 2 : 0);
+      strong = matched.length >= 2 && firstMatched;
+    }
   }
-  return score;
+  if (ccMatch) score += 1; // tiny tiebreak toward the country's own ccTLD
+  return { score, strong };
 }
 
 export async function resolveWebsite(company: string, country: string): Promise<ResolvedSite | null> {
@@ -70,33 +185,17 @@ export async function resolveWebsite(company: string, country: string): Promise<
   } catch {
     return null; // search rate-limited / unavailable — treat as "not found"
   }
-  if (!candidates.length) return null;
+  const hits: RawHit[] = candidates
+    .filter((c) => c.website)
+    .map((c) => {
+      const host = hostOf(c.website!);
+      return { url: c.website!, title: c.name || "", host, domain: registrableDomain(host) || "" };
+    })
+    .filter((h) => h.domain);
 
-  const nameToks = tokens(name);
-  let best: ResolvedSite | null = null;
-  let bestScore = -1;
-
-  for (const cnd of candidates) {
-    if (!cnd.website) continue;
-    const domain = registrableDomain(hostOf(cnd.website)) || "";
-    if (!domain) continue;
-    const domCore = domain.replace(/\.[a-z.]+$/i, "").toLowerCase();
-    const titleToks = tokens(cnd.name || "");
-
-    let score = 0;
-    for (const t of nameToks) {
-      if (domCore.includes(t)) score += 3; // domain match is the strongest signal
-      if (titleToks.includes(t)) score += 2;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      best = { website: cnd.website, domain };
-    }
-  }
-
-  // Require at least one shared, meaningful token — otherwise it's a guess.
-  if (!best || bestScore <= 0) return null;
-  return best;
+  const ranked = rankSites(name, country || "", hits);
+  if (!ranked.length) return null; // no strong match → return nothing, not a guess
+  return { website: ranked[0].url, domain: ranked[0].domain };
 }
 
 /* ========================================================================== *
@@ -194,13 +293,18 @@ async function fetchProfileHtml(url: string, proxy?: ProxyConfig, readerKey?: st
   return d?.ok && d.html ? d.html : null;
 }
 
-// Rank candidate real sites by name match; only keep ones sharing a token.
-function rankSites(company: string, sites: RawHit[]): RawHit[] {
-  const nameToks = tokens(company);
+// Rank candidate real sites by name match; ONLY keep trustworthy ("strong")
+// matches, best score first, with the country's ccTLD winning close ties.
+export function rankSites(company: string, country: string, sites: RawHit[]): RawHit[] {
+  const nameToks = distinctiveTokens(company, country);
+  const firstTok = nameToks[0];
+  const slug = nameSlug(company, country);
+  const ccTlds = countryTlds(country);
+  const ccWords = countryTokenSet(country);
   return sites
-    .map((s) => ({ s, score: scoreHit(nameToks, s) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
+    .map((s) => ({ s, a: analyzeCandidate(nameToks, firstTok, slug, ccTlds, ccWords, s) }))
+    .filter((x) => x.a.strong)
+    .sort((a, b) => b.a.score - a.a.score)
     .map((x) => x.s);
 }
 
@@ -218,12 +322,18 @@ export async function enrichCompany(
 
   // Crawl a real website for an email (+ phone), filling `out`. Returns whether
   // an email was found.
-  async function crawlForEmail(website: string, source: EnrichSource, via: string | null): Promise<boolean> {
+  async function crawlForEmail(
+    website: string,
+    source: EnrichSource,
+    via: string | null,
+    commitWebsite = true
+  ): Promise<boolean> {
     const site = await crawlSite(website, cfg.crawlOpts).catch(() => null);
     if (!site) return false;
-    if (!out.website) { out.website = website; out.domain = registrableDomain(hostOf(website)) || out.domain; }
     if (!out.phone && site.phone) { out.phone = site.phone; out.phoneMobile = !!site.phoneMobile; }
     if (input.phone && site.phone && phonesMatch(input.phone, site.phone)) phoneVerified = true;
+
+    let found = false;
     if (site.emails.length && !out.email) {
       // Take the first address that actually belongs to the company (skip a
       // directory/platform's own inbox that may have been crawled).
@@ -231,13 +341,19 @@ export async function enrichCompany(
       if (best) {
         out.email = best.email;
         out.role_based = best.role_based;
-        out.domain = best.domain || out.domain;
+        out.domain = best.domain || registrableDomain(hostOf(website)) || out.domain;
         out.source = source;
         out.via = via;
-        return true;
+        found = true;
       }
     }
-    return false;
+    // Only record the website when it's a trustworthy match (commitWebsite) or
+    // we actually found the company's email there — never for a blind guess.
+    if ((commitWebsite || found) && !out.website) {
+      out.website = website;
+      out.domain = out.domain || registrableDomain(hostOf(website));
+    }
+    return found;
   }
 
   // 0) Contact already on the PDF row.
@@ -256,13 +372,14 @@ export async function enrichCompany(
   let res: { sites: RawHit[]; profiles: RawHit[] } = { sites: [], profiles: [] };
   try { res = await searchRaw(input.company, country, 8); } catch { /* rate-limited */ }
 
-  // 2) Try the best-matching real sites.
-  if (!out.email) {
-    const ranked = rankSites(input.company, res.sites);
+  // 2) Try the best-matching real sites — but only STRONG matches. If none is
+  //    strong we set no website here and fall through (better nothing than a
+  //    wrong guess like gulf.com / garage.com).
+  {
+    const ranked = rankSites(input.company, country, res.sites);
     for (const s of ranked.slice(0, 2)) {
-      const hit = await crawlForEmail(s.url, "site", null);
-      if (!out.website) { out.website = s.url; out.domain = s.domain; }
-      if (hit) break;
+      const found = await crawlForEmail(s.url, "site", null, true);
+      if (found) break;
     }
   }
   if (out.email) return finalize(out, phoneVerified);
@@ -294,13 +411,18 @@ export async function enrichCompany(
   }
   if (out.email) return finalize(out, phoneVerified);
 
-  // 4) Domain guessing (verified by MX), then crawl it for an email.
+  // 4) Domain guessing (verified by MX): crawl the guessed domain, but only keep
+  //    it if we actually recover the company's email there (or the phone
+  //    matches) — an MX record alone is not proof it's the right company.
   if (cfg.guessDomains !== false && !out.website) {
     for (const domain of guessCandidates(input.company, country)) {
       if (!(await hasMx(domain))) continue;
       const w = "https://" + domain;
-      out.website = w; out.domain = domain; out.source = "guess";
-      await crawlForEmail(w, "guess", null);
+      const found = await crawlForEmail(w, "guess", null, false);
+      if (found || phoneVerified) {
+        if (!out.website) { out.website = w; out.domain = domain; }
+        if (!out.source) out.source = "guess";
+      }
       break;
     }
   }

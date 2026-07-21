@@ -15,7 +15,7 @@ export const PROFILE_HOST_RE =
 // Hosts that are pure noise — search infra, marketplaces, encyclopaediae, link
 // shorteners — never the company and never a useful contact source.
 export const JUNK_HOST_RE =
-  /(^|\.)(google|goo\.gl|bing|duckduckgo|yahoo|baidu|youtube|pinterest|tiktok|snapchat|whatsapp|telegram|t\.co|bit\.ly|tinyurl|wikipedia|wikimedia|amazon|ebay|aliexpress|alibaba|made-in-china|indiamart|exportersindia|tradeindia|indeed|glassdoor|naukri|apple|microsoft|reddit|quora|medium|blogspot|wordpress|wixsite|weebly|godaddy|booking|expedia|craigslist|dnb|zoominfo|crunchbase|opencorporates|bloomberg)\.[a-z.]+$/i;
+  /(^|\.)(fbcdn|cdninstagram|licdn|akamaihd|akamai|cloudfront|googleusercontent|ggpht|gstatic|fastly|twimg|imgur|jsdelivr|unpkg|gravatar|google|goo\.gl|bing|duckduckgo|yahoo|baidu|youtube|pinterest|tiktok|snapchat|whatsapp|telegram|t\.co|bit\.ly|tinyurl|wikipedia|wikimedia|amazon|ebay|aliexpress|alibaba|made-in-china|indiamart|exportersindia|tradeindia|indeed|glassdoor|naukri|apple|microsoft|reddit|quora|medium|blogspot|wordpress|wixsite|weebly|godaddy|booking|expedia|craigslist|dnb|zoominfo|crunchbase|opencorporates|bloomberg)\.[a-z.]+$/i;
 
 // Business directories / listing platforms. A company is only LISTED on these,
 // so the platform's OWN email (e.g. info@oilandgasdirectory.qa) must never be
