@@ -11,6 +11,7 @@ import { findLeads, type Company } from "./leads";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, type DirectoryOptions } from "./crawler/directory";
 import { registrableDomain, hostOf } from "./crawler/urls";
+import { getReaderStats } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
 
 const uid = () => crypto.randomUUID();
@@ -59,6 +60,17 @@ const DIRECTORY_PAGES_PER_RUN = 4;
 const DIRECTORY_CONTINUE_MS = 1_500;
 // Consecutive empty batches to tolerate before a directory is "finished".
 const EMPTY_STREAK_LIMIT = 3;
+// Enrichment retry policy: a BLOCKED / errored crawl is transient (Cloudflare
+// wall, reader rate-limit, timeout) — retry with growing backoff instead of
+// discarding the lead. Only give up after this many tries.
+const ENRICH_MAX_RETRIES = 6;
+const ENRICH_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 2 * 3_600_000, 6 * 3_600_000, 24 * 3_600_000, 72 * 3_600_000];
+function fmtBackoff(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `in ~${m}m`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `in ~${h}h` : `in ~${Math.round(h / 24)}d`;
+}
 
 let discovering = false;
 let enriching = false;
@@ -90,6 +102,13 @@ export interface DiscoveryStatus {
   activeSources: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
+  // Pending, email-less leads whose last crawl was BLOCKED/errored (Cloudflare,
+  // rate-limit, timeout) — recoverable, either automatically (retry backoff) or
+  // via "Re-check blocked" once a Jina key / scraping proxy is added.
+  blocked: number;
+  // Whether a scalable Cloudflare bypass is configured, + how often the free
+  // reader has been rate-limited — drives the "add a key/proxy" nudge in the UI.
+  bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
   nextRunAt: string | null;
   lastLeadAt: string | null;
 }
@@ -107,11 +126,22 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
       WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
         AND website IS NOT NULL AND website<>''`
   ))[0]?.n ?? 0;
+  // Leads whose enrichment was blocked/errored (either still retrying, or given
+  // up on after the retry cap) — the pool that "Re-check blocked" can recover.
+  const blocked = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
+      WHERE status='pending' AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''
+        AND (enrich_status IN ('blocked','error') OR retry_count > 0)`
+  ))[0]?.n ?? 0;
   const nextRunAt = (await q(`SELECT min(next_run_at) AS t FROM discovery_sources WHERE enabled=1`))[0]?.t ?? null;
   const lastLeadAt = (await q(`SELECT max(created_at) AS t FROM discovered_leads`))[0]?.t ?? null;
 
   const map: Record<string, number> = {};
   for (const r of statusRows) map[String(r.status)] = Number(r.n);
+
+  const [proxy, readerKey] = await Promise.all([getProxyConfig(), getReaderKey()]);
+  const rstats = getReaderStats();
 
   return {
     enabled: await isBotEnabled(),
@@ -126,6 +156,8 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
       total,
     },
     pendingEnrich,
+    blocked,
+    bypass: { readerKeyed: !!readerKey, proxy: !!proxy, readerRateLimited: rstats.rateLimited },
     nextRunAt,
     lastLeadAt,
   };
@@ -310,7 +342,7 @@ interface DirRunResult {
 async function runDirectorySource(src: any): Promise<DirRunResult> {
   const base = String(src.base_url || "").trim();
   const cursor = Math.max(1, Number(src.cursor) || 1);
-  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
+  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, extracted: 0, detailPages: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
 
   const proxy = await getProxyConfig();
   const readerKey = await getReaderKey();
@@ -369,16 +401,21 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   for (const co of result.contacts) {
     const email = (co.email || "").toLowerCase();
     const emailDomain = email ? (registrableDomain(email.split("@")[1] || "") || "") : "";
+    const website = (co.website || "").trim();
+    const websiteDomain = website ? (registrableDomain(hostOf(website)) || "") : "";
     // Only treat a real company domain as the domain — never a free-mail host.
-    const domain = emailDomain && !isFreeMail(emailDomain) ? emailDomain : "";
+    const domain = (emailDomain && !isFreeMail(emailDomain) ? emailDomain : "") || websiteDomain;
     const added = await insertDiscovered({
-      name: co.name, website: null, domain: domain || null, email: email || null,
+      name: co.name, website: website || null, domain: domain || null, email: email || null,
       phone: co.phone || null, city: null, country: String(src.location || ""), category: src.category || "",
       sourceId: src.id, label,
-      enriched: 1,                       // directory rows carry their own contact — nothing to crawl
+      // A listing with an inline email is complete. One that only exposes a
+      // WEBSITE still needs a crawl to find the email — leave it un-enriched so
+      // enrichTick picks it up (previously these were lost: website=null, enriched=1).
+      enriched: email ? 1 : (website ? 0 : 1),
       confidence: email ? "listed" : null,
     }, dedup);
-    if (added) { found++; dlog("dir", `  + ${leadLine(co.name, email, co.phone)}`); }
+    if (added) { found++; dlog("dir", `  + ${leadLine(co.name, email, co.phone)}${!email && website ? ` · site ${shortUrl(website)} → will find email` : ""}`); }
     else skipped++;
   }
   dlog("dir", `${shortUrl(base)}: +${found} new into pool, ${skipped} duplicate/already-known`);
@@ -529,13 +566,18 @@ async function enrichTick(): Promise<void> {
   if (!(await autoEnrichOn())) return;
   enriching = true;
   try {
-    // Oldest pending lead that has a site but no email and hasn't been tried.
+    // Next due lead with a site but no email. Fresh leads (next_enrich_at NULL)
+    // go first; retried ones only once their backoff has elapsed — so a wall of
+    // blocked leads never starves newly-discovered ones.
+    const now = nowIso();
     const lead = (await q(
       `SELECT * FROM discovered_leads
         WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
           AND website IS NOT NULL AND website<>''
-        ORDER BY created_at ASC
-        LIMIT 1`
+          AND (next_enrich_at IS NULL OR next_enrich_at <= ?)
+        ORDER BY (next_enrich_at IS NULL) DESC, next_enrich_at ASC, created_at ASC
+        LIMIT 1`,
+      [now]
     ))[0];
     if (!lead) return;
 
@@ -554,17 +596,30 @@ async function enrichTick(): Promise<void> {
       readerKey,
     };
 
-    dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"`);
+    const attempt = (Number(lead.retry_count) || 0) + 1;
+    dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"${attempt > 1 ? ` (try ${attempt})` : ""}`);
     let email: string | null = null;
     let phone: string | null = lead.phone || null;
     let confidence: string | null = null;
+    // Why the crawl ended, so we can tell a recoverable block from a real miss:
+    //   found  → got an email
+    //   empty  → site loaded fine but exposes no email (permanent)
+    //   blocked→ bot-wall / rate-limit (transient — retry)
+    //   error  → fetch failure / exception (transient — retry)
+    let outcome: "found" | "empty" | "blocked" | "error" = "error";
+    let note = "";
     try {
       const site = await crawlSite(lead.website, opts);
       if (site.phone && !phone) phone = site.phone;
       const best = pickSiteEmail(site.emails, lead.domain);
-      if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; }
+      if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; outcome = "found"; }
+      else if (site.status === "blocked") { outcome = "blocked"; note = site.note || "blocked"; }
+      else if (site.status === "error") { outcome = "error"; note = site.note || "could not open site"; }
+      else { outcome = "empty"; } // site loaded, genuinely no email present
     } catch (e: any) {
-      dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${String(e?.message || e)}`);
+      outcome = "error";
+      note = String(e?.message || e);
+      dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${note}`);
     }
 
     if (email) {
@@ -581,18 +636,74 @@ async function enrichTick(): Promise<void> {
       // Promote the dedup_key to the email so any FUTURE lead carrying it collides
       // on the unique key and is skipped. enriched=1 so we never re-crawl it.
       await q(
-        `UPDATE discovered_leads SET enriched=1, email=?, phone=?, confidence=?, dedup_key=? WHERE id=?`,
+        `UPDATE discovered_leads
+            SET enriched=1, email=?, phone=?, confidence=?, dedup_key=?, enrich_status='found', next_enrich_at=NULL
+          WHERE id=?`,
         [email, phone, confidence, "e:" + email, lead.id]
       );
       dlog("enrich", `  ✓ found ${email} for "${lead.name || lead.domain}"`);
-    } else {
-      // enriched=1 always, so we never spin on the same lead twice.
-      await q(`UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL WHERE id=?`, [phone, lead.id]);
-      dlog("enrich", `  ✗ no email found for "${lead.name || lead.domain}"`);
+      return;
     }
+
+    // No email. The old code marked EVERY miss enriched=1 — so a Cloudflare wall
+    // or a reader rate-limit permanently buried a recoverable lead. Now we only
+    // "give up" when the site actually loaded and simply has no email.
+    if (outcome === "empty") {
+      await q(
+        `UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL, enrich_status='empty', next_enrich_at=NULL WHERE id=?`,
+        [phone, lead.id]
+      );
+      dlog("enrich", `  ✗ no email on ${shortUrl(lead.website)} (site loaded fine) — "${lead.name || lead.domain}"`);
+      return;
+    }
+
+    // Blocked / errored → transient. Back off and retry later, up to the cap.
+    if (attempt >= ENRICH_MAX_RETRIES) {
+      // Give up for now, but record WHY (enrich_status) so "Re-check blocked"
+      // (or adding a Jina key / proxy later) can resurrect exactly these.
+      await q(
+        `UPDATE discovered_leads SET enriched=1, phone=?, retry_count=?, enrich_status=?, next_enrich_at=NULL WHERE id=?`,
+        [phone, attempt, outcome, lead.id]
+      );
+      dwarn("enrich", `  ⚠ giving up on "${lead.name || lead.domain}" after ${attempt} tries — ${note || outcome}. Add a free Jina key or a scraping proxy in Settings, then click "Re-check blocked".`);
+      return;
+    }
+    const backoffMs = ENRICH_BACKOFF_MS[Math.min(attempt - 1, ENRICH_BACKOFF_MS.length - 1)];
+    const nextAt = new Date(Date.now() + backoffMs).toISOString();
+    await q(
+      `UPDATE discovered_leads SET enriched=0, phone=?, retry_count=?, enrich_status=?, next_enrich_at=? WHERE id=?`,
+      [phone, attempt, outcome, nextAt, lead.id]
+    );
+    dlog("enrich", `  ↻ ${outcome} on "${lead.name || lead.domain}" (try ${attempt}/${ENRICH_MAX_RETRIES}) — retrying ${fmtBackoff(backoffMs)}${note ? ` · ${note}` : ""}`);
   } finally {
     enriching = false;
   }
+}
+
+/* ---------------------------- bulk recovery ---------------------------- */
+
+// One-click recovery for the historical "no email" pool. Resets pending,
+// email-less leads that have a website so enrichTick re-attempts them. Targets
+// the ones that were BLOCKED/errored or predate retry-tracking (enrich_status
+// NULL); leaves genuinely-empty sites (enrich_status='empty') alone so we don't
+// pointlessly re-crawl sites we already confirmed have no email.
+export async function reEnrichBlocked(): Promise<{ reset: number }> {
+  const rows = await q(
+    `UPDATE discovered_leads
+        SET enriched=0, retry_count=0, next_enrich_at=NULL, enrich_status=NULL
+      WHERE status='pending'
+        AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''
+        AND enriched=1
+        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))
+      RETURNING id`
+  );
+  const reset = rows.length;
+  dlog("enrich", `re-check requested → re-queued ${reset} blocked/untried lead(s) to find emails again`);
+  // Nudge the enrich loop so recovery starts immediately (respecting the bot's
+  // on/off + auto-enrich switches inside the tick).
+  if (reset > 0) setTimeout(() => { enrichTick().catch(() => {}); }, 500);
+  return { reset };
 }
 
 /* --------------------------------- boot -------------------------------- */
