@@ -13,6 +13,7 @@ import { extractEmails, decodeEntities } from "./extract";
 import { extractPhones, bestPhone, regionFromCountryName, type PhoneHit } from "./phones";
 import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./validate";
 import { normalizeSeed, hostOf, registrableDomain } from "./urls";
+import { extractContactFromProfile } from "./profiles";
 import { loadRobots } from "./robots";
 
 export interface DirectoryContact {
@@ -23,6 +24,9 @@ export interface DirectoryContact {
   role_based: boolean;
   detailUrl: string;
   domain: string;
+  // The company's OWN website, recovered from the listing's outbound link. Lets
+  // a listing with no inline email still be crawled for one during enrichment.
+  website?: string | null;
   mx?: boolean;
 }
 
@@ -411,7 +415,7 @@ function pickEmails(html: string): { email: string; role: boolean }[] {
   return out;
 }
 
-interface Record { url: string; name: string; emails: { email: string; role: boolean }[]; phones: PhoneHit[]; }
+interface Record { url: string; name: string; emails: { email: string; role: boolean }[]; phones: PhoneHit[]; website?: string | null; }
 
 /* ------------------------------- crawl ---------------------------------- */
 
@@ -571,11 +575,16 @@ async function crawlOnce(
       const res = await fetchWithRetry(url, 2, timeoutMs, proxy, readerKey);
       detailPages++;
       if (res.ok) {
+        // The listing's outbound "Website" link = the company's own site. It's on
+        // a different domain than this directory, so it survives enrichment's
+        // company-vs-platform email filter.
+        const site = extractContactFromProfile(res.html, res.url || url).website;
         records.push({
           url: res.url || url,
           name: extractName(res.html),
           emails: pickEmails(res.html),
           phones: extractPhones(res.html, { defaultCountry: region, hostname: hostOf(url) }),
+          website: site || null,
         });
       } else if (res.blocked) {
         blocked++;
@@ -610,23 +619,28 @@ async function crawlOnce(
     const phones = r.phones.filter((p) => !isChromePhone(p.number));
     const emailPick = emails[0];
     const phonePick = bestPhone(phones, region);
-    if (!emailPick && !phonePick) continue;
+    // Keep a listing even with no inline email/phone as long as it exposes a
+    // website — enrichment can then crawl that site for the email.
+    if (!emailPick && !phonePick && !r.website) continue;
 
     const email = emailPick?.email || null;
     const phone = phonePick?.formatted || null;
-    const key = email || phone || r.url;
+    const key = email || phone || r.website || r.url;
     if (seenKey.has(key)) continue;
     seenKey.add(key);
 
-    const domain = email ? registrableDomain(email.split("@")[1] || "") : registrableDomain(hostOf(r.url));
+    const domain = email
+      ? registrableDomain(email.split("@")[1] || "")
+      : r.website ? registrableDomain(hostOf(r.website)) : registrableDomain(hostOf(r.url));
     contacts.push({
-      name: r.name || (email ? email.split("@")[1] : hostOf(r.url)),
+      name: r.name || (email ? email.split("@")[1] : r.website ? hostOf(r.website) : hostOf(r.url)),
       email,
       phone,
       phoneMobile: phonePick ? phonePick.type === "mobile" : undefined,
       role_based: emailPick?.role || false,
       detailUrl: r.url,
       domain,
+      website: r.website || null,
     });
   }
 
@@ -642,7 +656,7 @@ async function crawlOnce(
       if (ok === false) { c.email = null; c.role_based = false; }
     }
   }
-  const finalContacts = contacts.filter((c) => c.email || c.phone);
+  const finalContacts = contacts.filter((c) => c.email || c.phone || c.website);
 
   let status: DirectoryResult["status"] = "ok";
   let note: string | undefined;
