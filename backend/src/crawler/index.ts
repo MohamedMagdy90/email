@@ -141,6 +141,11 @@ export async function crawlSite(
   const emailMap = new Map<string, FoundEmail>();
   let pagesCrawled = 0;
   let blockedHits = 0;
+  let lastBlockReason: string | undefined;
+  // The free reader that gets us past Cloudflare is rate-limited, so cap how many
+  // blocked pages we escalate per site — and spend that budget on the pages most
+  // likely to hold the email (the homepage's footer + contact/about pages).
+  let readerBudget = 2;
 
   while (queue.length && pagesCrawled < maxPages) {
     // Crawl the most promising (contact-like, shallow) pages first.
@@ -155,11 +160,18 @@ export async function crawlSite(
     try { path = new URL(norm).pathname; } catch {}
     if (respectRobots && !robots.allow(path)) continue;
 
-    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy, readerKey);
+    // Only spend a (scarce) free-reader escalation on high-value pages: the seed
+    // (depth 0 — footer emails) and contact/about-style pages (scoreLink flags
+    // those). This keeps the shared reader budget flowing across many sites
+    // instead of one Cloudflare site burning it on every sub-page.
+    const contactLike = depth === 0 || scoreLink(norm) >= 6;
+    const allowReader = readerBudget > 0 && contactLike;
+    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy, readerKey, allowReader);
+    if (allowReader && (res.via === "reader" || (!res.ok && res.blocked))) readerBudget--;
     pagesCrawled++;
 
     if (!res.ok) {
-      if (res.blocked || res.status === 403 || res.status === 429) blockedHits++;
+      if (res.blocked || res.status === 403 || res.status === 429) { blockedHits++; if (res.blockReason) lastBlockReason = res.blockReason; }
       onPage?.({ url: norm, found: 0, status: res.status });
       await sleep(politenessMs);
       continue;
@@ -265,8 +277,19 @@ export async function crawlSite(
     status = requireKeyword && keywords.length && matchedKeywords.length === 0 ? "empty" : blockedHits > 0 ? "blocked" : "empty";
   }
 
+  // A short reason, so the caller can tell a recoverable block (retry later, or
+  // add a key/proxy) from a site that simply lists no email.
+  let note: string | undefined;
+  if (status === "blocked") {
+    note =
+      lastBlockReason === "cloudflare" ? "Cloudflare challenge blocked the crawler (try a Jina key or scraping proxy)" :
+      lastBlockReason === "rate-limited" ? "site rate-limited the crawler (HTTP 429)" :
+      lastBlockReason === "forbidden" ? "site refused the crawler (HTTP 403 bot protection)" :
+      "blocked by bot protection";
+  }
+
   return {
-    seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords,
+    seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords, note,
     phone: sitePhone?.formatted, phoneMobile: sitePhone ? sitePhone.type === "mobile" : undefined,
   };
 }

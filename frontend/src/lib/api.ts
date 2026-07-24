@@ -130,6 +130,11 @@ export interface DiscoveryStatus {
   activeSources: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
+  // Pending, email-less leads whose last crawl was blocked/errored (recoverable).
+  blocked: number;
+  // Is a scalable Cloudflare bypass configured, and how often has the free reader
+  // been rate-limited — drives the "add a key/proxy" nudge.
+  bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
   nextRunAt: string | null;
   lastLeadAt: string | null;
 }
@@ -171,6 +176,9 @@ export interface DiscoveredLead {
   confidence?: string | null;
   via?: string | null;
   created_at: string;
+  // Enrichment retry state.
+  retry_count?: number;
+  enrich_status?: string | null; // found | empty | blocked | error
 }
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -391,6 +399,9 @@ export const api = {
   getDiscoveryStatus: () => req<DiscoveryStatus>(`/api/discovery/status`),
   toggleDiscovery: (body: { enabled?: boolean; autoEnrich?: boolean }) =>
     req<DiscoveryStatus>(`/api/discovery/toggle`, { method: "POST", body: JSON.stringify(body) }),
+  // Re-queue leads whose email couldn't be read (Cloudflare wall / reader rate
+  // limit) so the bot tries them again — the historical "no email" recovery.
+  reEnrichDiscovery: () => req<{ reset: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
   getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
   addDiscoverySource: (body: {
     type?: "osm" | "directory";

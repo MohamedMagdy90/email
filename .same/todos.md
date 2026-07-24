@@ -1,80 +1,44 @@
-# Directory bot — "0 found" fix
+# Discovery bot MISSES emails that are clearly on the site — FIXED (1–5)
 
-## Root cause
-- Directory crawler works perfectly on `/listings` (39 contacts / 4 pages) but the
-  user saved the **homepage** (`qatarcontact.com`) as the source URL, which has no
-  company listings → `0 found`. The real listings live at `/listings` (paginates to
-  page 412 ≈ 4,000+ companies).
-- Secondary: scanning "stops" because the **global bot is paused** — with it off,
-  "Run now" does one batch then stops. Both the source AND the bot must be on to stream.
+## Example verified: "Murshed Al Harbi Sons Ltd. Co" — https://mhsons.com.sa/contact-us/
+- Before: plain fetch → HTTP 403 `cf-mitigated: challenge` → 0 emails → lead buried.
+- After:  crawlSite("mhsons.com.sa") → status OK · found **info@mhsons.com.sa**
+  [cloudflare/high] · 2 reader calls · 0 rate-limited · 8.9s. (verified live)
 
-## Plan
-- [x] Add auto-index-discovery to `crawlDirectory`: if the pasted URL yields 0
-      companies, find the best internal "listings/directory/companies" link and retry there.
-- [x] Return `resolvedSeed` so the worker can persist the corrected base_url and page it.
-- [x] Relax NAV_STOP so detail pages under the seed's own path segment aren't dropped.
-- [x] Worker: persist resolved index as base_url, walk from page 1 of it.
-- [x] UI: paused-with-sources banner + "homepage works" guidance + show resolved path.
-- [x] Verify live: homepage seed → auto-resolved to /listings → streamed 39→106+ continuously.
-- [x] Commit & push (Railway auto-deploy).
+## Root causes (recap)
+1. Cloudflare wall on many sites; only free bypass (Jina reader) is 20/min → 429 at scale.
+2. enrichTick marked EVERY miss enriched=1 → transient blocks buried permanently.
+3. Reader called per-page (6x/site) → burned the tiny budget.
+4. Directory leads: website=null + enriched=1 → never enrichable.
 
-## Worker logging (for Railway debugging) — DONE
-- [x] `[discovery]` structured logs: boot state, bot on/off, per-source start.
-- [x] `[discovery:dir]` per-page crawl (URL), detail progress, auto-index switch,
-      batch summary, every new lead (name · email · phone), pool +new/skipped, schedule.
-- [x] `[discovery:osm]` search target, candidate count, each new lead, summary.
-- [x] `[discovery:enrich]` which site is crawled + ✓/✗ email result.
-- [x] Surface previously-swallowed tick errors via `console.error`.
-- [x] Verified log output live against qatarcontact.com (fresh temp DB).
+## Done
+- [x] #1 enrichTick: classify outcome (found/empty/blocked/error). Only 'empty'
+      (site loaded, no email) is permanent. blocked/error → retry_count + backoff
+      (5m→30m→2h→6h→24h→72h), give up after 6 tries but keep enrich_status.
+      New cols: retry_count, next_enrich_at, enrich_status (+ index). (db.ts, discovery.ts)
+- [x] #2 fetcher: global reader rate-limiter (serialized reservations, ~15/min
+      no key · ~120/min keyed) so calls queue not 429. crawlSite: reader budget
+      of 2/site spent on seed + contact/about pages only (allowReader gate). Verified.
+- [x] #3 reEnrichBlocked() + POST /api/discovery/re-enrich + "Re-check blocked"
+      button. Resets blocked/errored/legacy leads to enriched=0; leaves 'empty'
+      + 'found' alone. Verified: reset 3, skipped empty+has-email.
+- [x] #4 directory.ts: pull each listing's own website (extractContactFromProfile);
+      store it; runDirectorySource sets enriched=0 when website-but-no-email so
+      enrichTick crawls it. finalContacts keeps website-only leads.
+- [x] #5 SiteResult.note (block reason). getDiscoveryStatus → blocked count +
+      bypass{readerKeyed,proxy,readerRateLimited}. Discovery UI: blocked banner
+      w/ recommendation + EmailCell shows "blocked — retrying" / "couldn't read site".
+      Reader 429 tracking (getReaderStats).
 
-## Pagination bug (found in Railway logs) — DONE
-- Symptom: each batch crawled seed, seed-1, page 1, page 2 (e.g. 93 -> 92 -> 1 -> 2).
-- Impact: re-crawled pages 1-2 every batch (wasted ~half the proxy credits) AND
-  skipped ~half the directory's pages (94,95,98,99...), missing thousands of companies.
-- Root cause: findPageLinks enqueued all pager links (incl. page 1/2/prev) before
-  the forward nextPageUrl ran, starving the 4-page budget.
-- [x] Fix: walk STRICTLY FORWARD via nextPageUrl first; findPageLinks only as a
-      fallback for non-numeric pagers, and then forward-only + ascending.
-- [x] Verified: ?page=93 -> 93→94→95→96 (38 contacts); /listings -> 1→2→3→4 (39).
-- [ ] Note for user: Restart the source after deploy to re-cover skipped low pages.
+## Verified
+- [x] crawlSite live vs mhsons.com.sa → email recovered.
+- [x] reEnrichBlocked + status.blocked + bypass (DB test).
+- [x] backend tsc: no real errors (only Bun/Node env type-noise, pre-existing).
+- [x] frontend tsc clean + vite build OK.
+- [x] live API: /discovery/status (blocked,bypass) + /discovery/re-enrich → 200.
 
-## No duplicate emails (pool + contacts) — DONE
-- Contacts: already hard-guaranteed by `contacts.email UNIQUE` + ON CONFLICT DO NOTHING
-  on every insert path (approve, manual, bulk). Added within-batch dedup on approve.
-- Pool: `dedup_key` is `e:<email>` when present (UNIQUE) — blocks direct duplicates.
-  Closed the enrichment gap:
-  - insertDiscovered now also checks the pool's `email` column before inserting.
-  - enrichTick: if a found email is already a Contact or another pool row, the
-    redundant lead is deleted; otherwise its dedup_key is promoted to `e:<email>`.
-  - Added index `idx_discovered_leads_email` for fast lookups.
-- [x] Verified with a temp-DB test: contacts UNIQUE, pool dedup_key, enrichment
-      guard, and the index — all pass.
-
-## Approve: choose a country (like category) — DONE
-- Backend approve endpoint accepts `country`; applied as country || lead.country.
-- api.ts: approveDiscoveryLeads accepts `country`.
-- Discovery.tsx: `saveCountry` state, country input (w/ datalist of pool countries)
-  next to the category select, passed in approve + approve-all, confirm text updated.
-- [x] Verified live: lead country "Qatar" -> approved with override "Testland" ->
-      contact saved with country "Testland". Test data cleaned up.
-
-## Fix: OSM "Companies (general)" finds almost nothing (Qatar)
-- [x] Broaden category tag matching — support "any value of a key" (key-only) filters
-- [x] Make "Companies (general)"/"Trading & Retail"/"Manufacturing" match any office/shop/craft
-- [x] Raise per-scan cap (120 -> 500) so a whole country can stream in one scan
-- [x] Add clearer worker log when an area is fully harvested from OSM
-- [x] Update modal copy to explain OSM limits + steer to Directory for thousands
-- [x] Verified live: Qatar · Companies (general) 24 -> 178 (147 w/ site, 84 w/ email)
-- [x] Version 43 + committed 32b6552 + pushed to origin/main (Railway auto-deploy)
-- Note: restored local .git (was empty) → re-linked to MohamedMagdy90/email
-
-## Fix: qatarcontact.com directory crawler (path to thousands)
-- [x] Diagnosed: crawler DOES read /listing/ cards (proved: 39/40 w/ contact info)
-- [x] Root cause: "+0" logs were page 426 (past the 412-page end), not broken cards
-- [x] Fix premature-finish: end-of-directory now = "no listing cards seen",
-      not "no NEW leads" — so re-scans of known directories walk to the true end
-- [x] Safety: maxDetails >= pages*40 so dense pages aren't truncated by the cursor
-- [x] "Run now" on a FINISHED directory restarts from page 1 (manual re-scan)
-- [x] Clearer logs: "already known — still walking to the end"
-- [x] Integration test PASSED: duplicate re-scan no longer trips the empty streak
-- [ ] Version + push
+## Not done (needs user OK)
+- [ ] Commit + push to MohamedMagdy90/email (local .git is empty — must re-init;
+      pushing triggers Railway + Netlify deploy). Awaiting go-ahead.
+- Note: recommend adding a free JINA_API_KEY and/or a scraping proxy in
+  Settings → Crawler to bypass Cloudflare at full scale.
