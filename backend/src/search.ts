@@ -11,6 +11,7 @@
 
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { isProfileHost, isJunkHost } from "./crawler/profiles";
+import { fetchViaReader } from "./crawler/fetcher";
 import type { Company } from "./leads";
 
 const UAS = [
@@ -212,4 +213,101 @@ export async function searchRaw(
   const data = { sites: sites.slice(0, limit), profiles: profiles.slice(0, 5) };
   if (data.sites.length || data.profiles.length) rawCache.set(cacheKey, { at: Date.now(), data });
   return data;
+}
+
+/* ========================================================================== *
+ *  Reader-backed, paginated search — for the always-on discovery bot.        *
+ *                                                                            *
+ *  A datacenter IP (Railway) is reliably served DuckDuckGo's "anomaly" bot   *
+ *  wall on a plain fetch, so search returns nothing. The FREE Jina reader    *
+ *  (r.jina.ai) renders the results page and returns the real HTML — verified *
+ *  to bypass the wall — so the bot can search the web at scale. One page at a *
+ *  time (the bot walks many queries × pages via a cursor).                    *
+ * ========================================================================== */
+
+// SEO/listicle/data-broker hosts that show up in company searches but are NOT
+// the company — "top 10" articles, résumé/lead databases, slide hosts, etc.
+// Kept separate from BLOCK (social/marketplaces) so both apply to the bot.
+const CONTENT_BLOCK =
+  /(^|\.)(aeroleads|rocketreach|lusha|leadiq|apollo|signalhire|zoominfo|clearbit|owler|ambitionbox|comparably|f6s|ensun|getmanufacturers|saudifactories|rasmal|manta|bizapedia|tuugo|cybo|hotfrog|brownbook|cylex|wlw|dnb|dun|bloomberg|scribd|slideshare|issuu|academia|researchgate|clutch|goodfirms|designrush|sortlist|trustpilot|sitejabber|expatriates|expat|ksaexpats|blackridgeresearch|reportlinker|statista|ibisworld|mordorintelligence|globaldata|marketresearch|constructionweekonline|constructionweeksaudi|meed|zawya|argaam|mubasher|wikipedia|wikimedia|britannica|quora|reddit|medium|substack|pinterest|toplinehub|arabiantalks|gludo|atninfo|eyeofriyadh|saudiayp)\.[a-z.]+$/i;
+
+// Result URLs whose path screams "listicle / blog" rather than a company home.
+const LISTICLE_PATH = /\/(?:top-|best-|list-of|list\/|guide\/|blog\/|news\/|article|companies-in-|directory\/)/i;
+
+// Result TITLES that are clearly "top N" round-up articles, not a company.
+const LISTICLE_TITLE = /^\s*(?:the\s+)?(?:top|best|leading|\d+\s+(?:top|best|leading|of the best))\b/i;
+
+function ddgUrl(query: string, offset: number): string {
+  const base = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  return offset ? `${base}&s=${offset}&dc=${offset + 1}` : base;
+}
+
+// Fetch ONE results page. Try a plain fetch first (free); if the engine blocks it
+// (the "anomaly" wall on datacenter IPs) fall back to the reader, which renders
+// the page and returns real HTML. `blocked` = we couldn't get a real page at all.
+async function fetchSearchPage(query: string, offset: number, readerKey?: string): Promise<{ html: string; blocked: boolean }> {
+  const url = ddgUrl(query, offset);
+
+  // 1) Direct — cheap, and works when NOT on a flagged datacenter IP.
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": pickUA(),
+        "Accept-Language": "en-US,en;q=0.9",
+        Accept: "text/html,application/xhtml+xml",
+        Referer: "https://duckduckgo.com/",
+      },
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+    const html = await res.text();
+    if (res.ok && !isBlocked(html) && /uddg=|result__a/.test(html)) return { html, blocked: false };
+  } catch { /* fall through to reader */ }
+
+  // 2) FREE reader — bypasses the anomaly wall (verified). Rate-limited, so it's
+  //    serialized by the reader limiter; an optional JINA key raises the ceiling.
+  const rd = await fetchViaReader(url, 45000, readerKey).catch(() => null);
+  if (rd?.ok && rd.html && !isBlocked(rd.html) && /uddg=|result__a/.test(rd.html)) return { html: rd.html, blocked: false };
+
+  return { html: "", blocked: true };
+}
+
+// One page of company results for a query. Filters out social/marketplaces
+// (BLOCK), SEO/listicle/data-broker hosts (CONTENT_BLOCK), and obvious listicle
+// URLs — leaving individual company websites. No email/phone (search only gives
+// the site); the discovery bot then crawls each site to find the email.
+export async function searchCompaniesPaged(
+  query: string,
+  offset: number,
+  limit: number,
+  readerKey?: string
+): Promise<{ companies: Company[]; blocked: boolean }> {
+  const { html, blocked } = await fetchSearchPage(query, offset, readerKey);
+  if (blocked) return { companies: [], blocked: true };
+
+  const byDomain = new Map<string, Company>();
+  for (const h of parseHits(html)) {
+    let host = "";
+    try { host = hostOf(h.url); } catch { continue; }
+    if (!host || BLOCK.test(host) || CONTENT_BLOCK.test(host) || isProfileHost(host)) continue;
+    if (LISTICLE_TITLE.test(h.title || "")) continue; // "Top 20 …", "Best …", "10 Leading …"
+    let path = "/";
+    try { path = new URL(h.url).pathname.toLowerCase(); } catch { /* ignore */ }
+    if (LISTICLE_PATH.test(path)) continue;
+    const domain = registrableDomain(host);
+    if (!domain || byDomain.has(domain)) continue;
+    let website = h.url;
+    try { const u = new URL(h.url); website = `${u.protocol}//${u.host}/`; } catch { /* keep */ }
+    byDomain.set(domain, {
+      name: h.title?.replace(/\s+/g, " ").trim().slice(0, 90) || domain,
+      website,
+      city: "",
+      email: null,
+      phone: null,
+      hasWebsite: true,
+    });
+    if (byDomain.size >= limit) break;
+  }
+  return { companies: [...byDomain.values()], blocked: false };
 }

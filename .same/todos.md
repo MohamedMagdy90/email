@@ -1,44 +1,25 @@
-# Discovery bot MISSES emails that are clearly on the site — FIXED (1–5)
+# Discovery finds too few leads — add a "Web search" source (thousands, not 2)
 
-## Example verified: "Murshed Al Harbi Sons Ltd. Co" — https://mhsons.com.sa/contact-us/
-- Before: plain fetch → HTTP 403 `cf-mitigated: challenge` → 0 emails → lead buried.
-- After:  crawlSite("mhsons.com.sa") → status OK · found **info@mhsons.com.sa**
-  [cloudflare/high] · 2 reader calls · 0 rate-limited · 8.9s. (verified live)
+## Verified root cause (with live data)
+- OSM query for "Saudi Arabia · Construction & Contracting" → **exactly 2** companies
+  (matches user's report). OSM = a map, not a registry; only businesses tagged
+  with website/email are returned, and re-scans are deterministic (0 new).
+- Plain DuckDuckGo web search is **blocked from the server IP** ("anomaly" page).
+- Jina reader (already in app) **bypasses** the block → full SERP results, 0 anomaly.
+  Verified for multiple queries + city-level queries return different companies.
 
-## Root causes (recap)
-1. Cloudflare wall on many sites; only free bypass (Jina reader) is 20/min → 429 at scale.
-2. enrichTick marked EVERY miss enriched=1 → transient blocks buried permanently.
-3. Reader called per-page (6x/site) → burned the tiny budget.
-4. Directory leads: website=null + enriched=1 → never enrichable.
-
-## Done
-- [x] #1 enrichTick: classify outcome (found/empty/blocked/error). Only 'empty'
-      (site loaded, no email) is permanent. blocked/error → retry_count + backoff
-      (5m→30m→2h→6h→24h→72h), give up after 6 tries but keep enrich_status.
-      New cols: retry_count, next_enrich_at, enrich_status (+ index). (db.ts, discovery.ts)
-- [x] #2 fetcher: global reader rate-limiter (serialized reservations, ~15/min
-      no key · ~120/min keyed) so calls queue not 429. crawlSite: reader budget
-      of 2/site spent on seed + contact/about pages only (allowReader gate). Verified.
-- [x] #3 reEnrichBlocked() + POST /api/discovery/re-enrich + "Re-check blocked"
-      button. Resets blocked/errored/legacy leads to enriched=0; leaves 'empty'
-      + 'found' alone. Verified: reset 3, skipped empty+has-email.
-- [x] #4 directory.ts: pull each listing's own website (extractContactFromProfile);
-      store it; runDirectorySource sets enriched=0 when website-but-no-email so
-      enrichTick crawls it. finalContacts keeps website-only leads.
-- [x] #5 SiteResult.note (block reason). getDiscoveryStatus → blocked count +
-      bypass{readerKeyed,proxy,readerRateLimited}. Discovery UI: blocked banner
-      w/ recommendation + EmailCell shows "blocked — retrying" / "couldn't read site".
-      Reader 429 tracking (getReaderStats).
-
-## Verified
-- [x] crawlSite live vs mhsons.com.sa → email recovered.
-- [x] reEnrichBlocked + status.blocked + bypass (DB test).
-- [x] backend tsc: no real errors (only Bun/Node env type-noise, pre-existing).
-- [x] frontend tsc clean + vite build OK.
-- [x] live API: /discovery/status (blocked,bypass) + /discovery/re-enrich → 200.
-
-## Not done (needs user OK)
-- [ ] Commit + push to MohamedMagdy90/email (local .git is empty — must re-init;
-      pushing triggers Railway + Netlify deploy). Awaiting go-ahead.
-- Note: recommend adding a free JINA_API_KEY and/or a scraping proxy in
-  Settings → Crawler to bypass Cloudflare at full scale.
+## Plan — add a third source type: "search" (web search, reader-backed)
+- [ ] search.ts: `searchCompaniesPaged(query, offset, limit, readerKey)` — fetch one
+      DDG results page (direct → reader fallback), parse company domains, filter
+      aggregators/listicles. Returns { companies, blocked }.
+- [ ] discovery.ts: SEARCH_KEYWORDS (per category) + COUNTRY_CITIES + buildSearchPlan
+      (keywords × [country + cities] × pages). `runSearchSource` walks the plan by
+      cursor, inserts leads (enriched=0 → enrichTick finds emails), streams
+      continuously, restarts each interval. Wire into executeSource + runSourceNow.
+- [ ] db.ts: add `keywords` column (idempotent migration).
+- [ ] index.ts: POST/PUT /discovery/sources handle type='search' (+ keywords).
+- [ ] api.ts: DiscoverySource.keywords; add/update source accept keywords + 'search'.
+- [ ] Discovery.tsx: 3-way type toggle (Area / Directory / Web search), search row
+      rendering, modal fields + copy; clarify Area's limits point to Web search.
+- [ ] Verify live: run a search source for Saudi construction → many leads.
+- [ ] Version + push.

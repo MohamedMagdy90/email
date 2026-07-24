@@ -8,6 +8,7 @@
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeads, type Company } from "./leads";
+import { searchCompaniesPaged } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, type DirectoryOptions } from "./crawler/directory";
 import { registrableDomain, hostOf } from "./crawler/urls";
@@ -15,6 +16,7 @@ import { getReaderStats } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
 
 const uid = () => crypto.randomUUID();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function clamp(n: number, lo: number, hi: number) {
   const x = Number(n);
   return Math.max(lo, Math.min(hi, Number.isFinite(x) ? x : lo));
@@ -40,6 +42,7 @@ function shortUrl(u?: string | null): string {
 }
 function srcLabel(src: any): string {
   if (src?.type === "directory") return shortUrl(src.base_url) || "directory";
+  if (src?.type === "search") return `search · ${src?.location || "web"} · ${src?.category || "?"}`;
   return `${src?.location || "?"} · ${src?.category || "?"}`;
 }
 // One-line "what we found": name · email · phone (email/phone omitted if absent).
@@ -60,6 +63,14 @@ const DIRECTORY_PAGES_PER_RUN = 4;
 const DIRECTORY_CONTINUE_MS = 1_500;
 // Consecutive empty batches to tolerate before a directory is "finished".
 const EMPTY_STREAK_LIMIT = 3;
+// Web-search sources: how many search queries to run per batch (kept small so
+// the shared free-reader budget isn't starved), which result pages to pull per
+// query, spacing between queries, and how many all-duplicate batches to tolerate
+// before a full re-walk is considered "done" for this interval.
+const SEARCH_QUERIES_PER_RUN = 3;
+const SEARCH_PAGES = [0, 30];
+const SEARCH_PACING_MS = 1200;
+const SEARCH_EMPTY_STREAK_LIMIT = 6;
 // Enrichment retry policy: a BLOCKED / errored crawl is transient (Cloudflare
 // wall, reader rate-limit, timeout) — retry with growing backoff instead of
 // discarding the lead. Only give up after this many tries.
@@ -444,6 +455,171 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   return { found, extracted: result.contacts.length, detailPages: result.detailPages, error, okish, nextCursor, pages };
 }
 
+/* --------------------------- Web-search source ------------------------- */
+// The scalable, "works like a Google search" source. OpenStreetMap is a map
+// (a few hundred tagged businesses per country); a web search sees the whole
+// web. We generate many targeted queries (industry phrasings × the country and
+// its major cities), page through each, and stream every real company site into
+// the pool for the email-finder to enrich. Runs entirely on the free reader.
+
+// Industry → the search phrases that actually surface individual company sites.
+const SEARCH_KEYWORDS: Record<string, string[]> = {
+  "Companies (general)": ["companies", "trading company", "suppliers", "services company", "establishment"],
+  "Accounting & Tax": ["accounting firm", "audit firm", "tax consultants", "chartered accountants", "bookkeeping services"],
+  "IT & Software": ["IT company", "software company", "IT solutions", "technology company", "IT services provider"],
+  "Construction & Contracting": ["construction company", "contracting company", "building contractor", "civil contractor", "general contracting"],
+  "Consulting": ["consulting firm", "management consultants", "business consultants", "consultancy"],
+  "Engineering": ["engineering company", "engineering consultants", "MEP contractor", "electromechanical company"],
+  "Real Estate": ["real estate company", "property management company", "real estate developers", "real estate agency"],
+  "Legal": ["law firm", "legal consultants", "advocates and legal consultants", "attorneys"],
+  "Logistics & Transport": ["logistics company", "freight forwarders", "shipping company", "transport company", "cargo services"],
+  "Advertising & Marketing": ["advertising agency", "marketing agency", "digital marketing company", "branding agency"],
+  "Insurance": ["insurance company", "insurance brokers", "takaful company"],
+  "Healthcare & Clinics": ["medical clinic", "polyclinic", "medical center", "hospital", "pharmacy"],
+  "Hospitality & Food": ["catering company", "restaurant", "hotel", "hospitality company"],
+  "Manufacturing & Industrial": ["manufacturing company", "factory", "industrial company", "manufacturer", "fabrication company"],
+  "Education & Training": ["training institute", "training center", "academy", "educational institute"],
+  "Trading & Retail": ["trading company", "trading establishment", "distributors", "suppliers", "wholesale company"],
+};
+
+// Major cities per country, so a country-wide search fans out into local ones —
+// where individual company sites (not "top 10" articles) actually rank.
+const COUNTRY_CITIES: Record<string, string[]> = {
+  "saudi arabia": ["Riyadh", "Jeddah", "Dammam", "Mecca", "Medina", "Al Khobar", "Dhahran", "Jubail", "Yanbu", "Tabuk", "Abha", "Taif", "Buraidah", "Hail", "Najran", "Jizan"],
+  "united arab emirates": ["Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Al Ain", "Ras Al Khaimah", "Fujairah", "Umm Al Quwain"],
+  "qatar": ["Doha", "Al Rayyan", "Al Wakrah", "Al Khor", "Lusail", "Umm Salal"],
+  "kuwait": ["Kuwait City", "Hawalli", "Salmiya", "Al Ahmadi", "Al Jahra", "Farwaniya"],
+  "bahrain": ["Manama", "Riffa", "Muharraq", "Hamad Town", "Isa Town", "Sitra"],
+  "oman": ["Muscat", "Salalah", "Sohar", "Sur", "Nizwa", "Seeb"],
+  "egypt": ["Cairo", "Alexandria", "Giza", "Port Said", "Suez", "Mansoura", "Tanta"],
+  "jordan": ["Amman", "Zarqa", "Irbid", "Aqaba", "Russeifa"],
+  "lebanon": ["Beirut", "Tripoli", "Sidon", "Tyre", "Zahle"],
+  "iraq": ["Baghdad", "Basra", "Erbil", "Mosul", "Najaf", "Karbala"],
+  "india": ["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad", "Pune", "Ahmedabad", "Kolkata"],
+  "pakistan": ["Karachi", "Lahore", "Islamabad", "Faisalabad", "Rawalpindi"],
+  "turkey": ["Istanbul", "Ankara", "Izmir", "Bursa", "Antalya"],
+};
+
+// Country name synonyms so "KSA"/"UAE" map to the right city list.
+const COUNTRY_ALIASES: Record<string, string> = {
+  ksa: "saudi arabia", uae: "united arab emirates", emirates: "united arab emirates",
+};
+
+function normCountry(location: string): string {
+  const k = (location || "").trim().toLowerCase();
+  return COUNTRY_ALIASES[k] || k;
+}
+
+function searchKeywordsFor(category: string, custom?: string | null): string[] {
+  const typed = String(custom || "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+  if (typed.length) return [...new Set(typed)].slice(0, 8);
+  return SEARCH_KEYWORDS[category] || SEARCH_KEYWORDS["Companies (general)"];
+}
+
+// Cities to fan out into for a location. Only expand when the location is a
+// whole country we know; if the user gave a single city we search just that.
+function citiesFor(location: string): string[] {
+  const key = normCountry(location);
+  const cities = COUNTRY_CITIES[key];
+  if (!cities) return [];
+  // If they typed one of the cities as the "country", don't fan out.
+  if (cities.some((c) => c.toLowerCase() === (location || "").trim().toLowerCase())) return [];
+  return cities;
+}
+
+// The ordered (query, page) plan the cursor walks. Country-wide queries first
+// (broad), then each city (individual firms), each across a couple of result
+// pages. De-duplicated and capped so a single walk stays bounded.
+function buildSearchPlan(keywords: string[], location: string): { q: string; offset: number }[] {
+  const loc = (location || "").trim();
+  const locVariants = loc ? [loc, ...citiesFor(loc)] : [""];
+  const seen = new Set<string>();
+  const plan: { q: string; offset: number }[] = [];
+  for (const lv of locVariants) {
+    for (const kw of keywords) {
+      const variants = lv ? [`${kw} ${lv}`, `${kw} in ${lv} contact`] : [kw, `${kw} contact`];
+      for (const v of variants) {
+        const key = v.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        for (const offset of SEARCH_PAGES) plan.push({ q: v, offset });
+      }
+    }
+  }
+  return plan.slice(0, 800);
+}
+
+interface SearchRunResult {
+  found: number;      // NEW company leads inserted this batch
+  extracted: number;  // company sites seen this batch (new OR already-known)
+  searches: number;   // result pages actually fetched this batch
+  error?: string;
+  okish: boolean;     // the search engine responded (not blocked)
+  nextCursor: number; // where to resume in the plan
+  exhausted: boolean; // walked to the end of the plan (a full pass finished)
+  planLen: number;
+}
+
+// Walk ONE batch of a web-search source: a few queries from the plan, insert
+// every new company site (email-less → enrichTick crawls it for the address).
+async function runSearchSource(src: any): Promise<SearchRunResult> {
+  const location = String(src.location || "").trim();
+  const keywords = searchKeywordsFor(src.category, src.keywords);
+  const plan = buildSearchPlan(keywords, location);
+  const planLen = plan.length;
+  if (!planLen) {
+    return { found: 0, extracted: 0, searches: 0, error: "Add a country/city or some keywords", okish: false, nextCursor: 1, exhausted: true, planLen: 0 };
+  }
+
+  // Resume from the cursor; when a previous pass finished (or the plan shrank),
+  // start a fresh pass so an hourly source keeps finding newly-published sites.
+  let cursor = Math.max(1, Number(src.cursor) || 1);
+  if (Number(src.exhausted) === 1 || cursor > planLen) cursor = 1;
+  const start = cursor - 1;
+  const batch = plan.slice(start, start + SEARCH_QUERIES_PER_RUN);
+
+  const readerKey = await getReaderKey();
+  const dedup = await loadContactDedup();
+  const label = src.category && src.category !== "Companies (general)"
+    ? `${location || "web"} · ${src.category}`
+    : (location || "web search");
+  const how = readerKey ? "web search (reader, keyed)" : "web search (free reader)";
+  dlog("search", `${label} — step ${cursor}/${planLen} · ${batch.length} quer${batch.length === 1 ? "y" : "ies"} · ${how}`);
+
+  let found = 0, extracted = 0, ok = 0, blocked = false, err: string | undefined;
+  for (const item of batch) {
+    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey).catch(() => ({ companies: [], blocked: true }));
+    if (r.blocked) {
+      blocked = true;
+      err = "web search was blocked (add a free JINA key in Settings → Crawler to search at full speed)";
+      dwarn("search", `  ✗ "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} — blocked, will retry`);
+      break;
+    }
+    ok++;
+    let batchFound = 0;
+    for (const co of r.companies) {
+      const website = (co.website || "").trim();
+      const domain = website ? (registrableDomain(hostOf(website)) || "") : "";
+      if (!domain) continue;
+      extracted++;
+      const added = await insertDiscovered({
+        name: co.name, website, domain, email: null,
+        phone: null, city: null, country: location, category: src.category || "",
+        sourceId: src.id, label,
+        enriched: 0,            // web search gives the site, not the email → enrich it
+        confidence: null,
+      }, dedup);
+      if (added) { found++; batchFound++; }
+    }
+    dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} → ${r.companies.length} site(s), +${batchFound} new`);
+    await sleep(SEARCH_PACING_MS);
+  }
+
+  const nextCursor = cursor + ok;
+  const exhausted = !blocked && ok > 0 && nextCursor > planLen;
+  return { found, extracted, searches: ok, error: err, okish: !blocked, nextCursor, exhausted, planLen };
+}
+
 /* ------------------------------ scheduling ---------------------------- */
 
 // Run + persist the outcome for a single source. `continue` = run again on the
@@ -492,6 +668,40 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     return { found: r.found, error: r.error, continue: cont };
   }
 
+  // Web-search source (keywords × cities). Streams like a directory: walk a few
+  // queries per batch, chain the next batch quickly, until a full pass finishes.
+  if (src.type === "search") {
+    let r: SearchRunResult;
+    try {
+      r = await runSearchSource(src);
+    } catch (e: any) {
+      r = { found: 0, extracted: 0, searches: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, exhausted: false, planLen: 0 };
+    }
+    const productive = r.found > 0;
+    let streak = Number(src.empty_streak) || 0;
+    let cursor = Number(src.cursor) || 1;
+    let exhausted = false;
+    if (!r.error && r.okish) {
+      cursor = r.nextCursor;                                  // advance through the plan
+      streak = productive ? 0 : streak + 1;
+      exhausted = r.exhausted || streak >= SEARCH_EMPTY_STREAK_LIMIT; // full pass, or all-dupes
+    }
+    const cont = !r.error && !exhausted;
+    const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+    const status = r.error ? "error" : exhausted ? "done" : "ok";
+    await q(
+      `UPDATE discovery_sources
+         SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?
+       WHERE id=?`,
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
+    );
+    if (r.error) derr("search", `${srcLabel(src)}: ${r.error} (retry in ${interval}m)`);
+    else if (exhausted) dlog("search", `${srcLabel(src)}: FINISHED a full pass${r.planLen ? ` (${r.planLen} queries)` : ""} — re-searching in ${interval}m for newly-published sites. Click "Run now" to re-search now.`);
+    else if (cont) dlog("search", `${srcLabel(src)}: +${r.found} new · continuing (step ${cursor}${r.planLen ? `/${r.planLen}` : ""}) in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
+    return { found: r.found, error: r.error, continue: cont };
+  }
+
   // OSM area source.
   let result: { found: number; error?: string };
   try {
@@ -526,6 +736,14 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
     await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
     src.exhausted = 0; src.empty_streak = 0; src.cursor = cursor;
     if (restart) dlog("dir", `re-scanning ${srcLabel(src)} from page ${cursor} — re-checking every listing for anything new`);
+  } else if (src.type === "search") {
+    // A kick on a finished search re-runs the whole query plan from the top so
+    // any newly-published sites get picked up; mid-walk just resumes.
+    const restart = Number(src.exhausted) === 1;
+    const cursor = restart ? 1 : (Number(src.cursor) || 1);
+    await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
+    src.exhausted = 0; src.empty_streak = 0; src.cursor = cursor;
+    if (restart) dlog("search", `re-searching ${srcLabel(src)} from the top — checking every query again for new sites`);
   }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.

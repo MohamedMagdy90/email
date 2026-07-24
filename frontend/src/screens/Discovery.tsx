@@ -267,7 +267,7 @@ export default function Discovery() {
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="font-clash text-lg font-semibold">Discovery sources</h2>
-            <p className="text-xs text-muted">Area (map) sources for precision · Directory sources to pull in thousands.</p>
+            <p className="text-xs text-muted">Web search finds thousands like Google · Directory streams a listing site · Map area for precise, small results.</p>
           </div>
           <Button size="sm" onClick={() => { setEditing(null); setModalOpen(true); }}>Add source</Button>
         </div>
@@ -276,7 +276,7 @@ export default function Discovery() {
           <div className="px-5 py-12 text-center">
             <p className="text-sm font-medium">No sources yet</p>
             <p className="mx-auto mt-1 max-w-md text-xs text-muted">
-              Add an <span className="font-medium text-ink/70">Area</span> source (e.g. Qatar · IT &amp; Software) for precise map results, or a <span className="font-medium text-ink/70">Directory</span> source (paste a business-directory URL) to stream in tens of thousands of companies around the clock.
+              Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (The <span className="font-medium text-ink/70">Map area</span> source is precise but only finds a handful.)
             </p>
             <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
           </div>
@@ -476,8 +476,9 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle }: { running: b
 function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onDelete: () => void }) {
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
-  const streaming = isDir && s.enabled && runningNow;
-  // Show host + path so a resolved index (e.g. …/listings) is visible.
+  const isSearch = s.type === "search";
+  const streaming = (isDir || isSearch) && s.enabled && runningNow;
+  // Directory: show host + path so a resolved index (e.g. …/listings) is visible.
   const host = (() => {
     try {
       const u = new URL(s.base_url || "");
@@ -485,15 +486,17 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
       return u.hostname.replace(/^www\./, "") + (p && p !== "/" ? p : "");
     } catch { return s.base_url || ""; }
   })();
+  const title = isDir ? host : (s.location || (isSearch ? "Web search" : ""));
+  const badge = isDir ? "Directory" : isSearch ? "Web search" : "";
 
   return (
     <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
       <Switch small checked={!!s.enabled} onChange={onToggle} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          {isDir && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">Directory</span>}
-          <span className="truncate font-medium">{isDir ? host : s.location}</span>
-          {(!isDir || (s.category && s.category !== "Companies (general)")) && (
+          {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
+          <span className="truncate font-medium">{title}</span>
+          {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
             <>
               <span className="text-ink/30">·</span>
               <span className="truncate text-sm text-ink/70">{s.category}</span>
@@ -511,6 +514,16 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
               <span>· {s.total_found} found</span>
               {s.location && <span>· {s.location}</span>}
             </>
+          ) : isSearch ? (
+            <>
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> searching · step {s.cursor}</span>
+                : s.exhausted
+                  ? <span>swept the web · re-searches {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                  : <span>{s.enabled ? "searching the web" : "paused"} · step {s.cursor}</span>}
+              <span>· {s.total_found} found</span>
+              {s.keywords ? <span title={s.keywords}>· custom keywords</span> : null}
+            </>
           ) : (
             <>
               <span>{intervalLabel(s.interval_minutes)}</span>
@@ -524,7 +537,7 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
       </div>
       <div className="flex shrink-0 items-center gap-1">
         <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
-          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : isDir && s.exhausted ? "Restart" : "Run now"}
+          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : (isDir || isSearch) && s.exhausted ? (isSearch ? "Re-search" : "Restart") : "Run now"}
         </button>
         <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
         <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Remove">✕</button>
@@ -536,49 +549,57 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
 /* --------------------------- Add / edit modal -------------------------- */
 
 function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean; onClose: () => void; cats: string[]; editing: DiscoverySource | null; onSaved: () => void }) {
-  const [type, setType] = useState<"osm" | "directory">("osm");
+  const [type, setType] = useState<"osm" | "directory" | "search">("search");
   const [location, setLocation] = useState("");
   const [place, setPlace] = useState<Place | null>(null);
   const [url, setUrl] = useState("");
+  const [keywords, setKeywords] = useState("");
   const [category, setCategory] = useState(cats[0] || "Companies (general)");
-  const [limit, setLimit] = useState(40);
+  const [limit, setLimit] = useState(100);
   const [interval, setInterval] = useState(360);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     if (editing) {
-      setType(editing.type === "directory" ? "directory" : "osm");
+      setType(editing.type === "directory" ? "directory" : editing.type === "search" ? "search" : "osm");
       setLocation(editing.location || "");
       setUrl(editing.base_url || "");
+      setKeywords(editing.keywords || "");
       setPlace(null);
       setCategory(editing.category);
       setLimit(editing.limit_n);
       setInterval(editing.interval_minutes);
     } else {
-      setType("osm"); setLocation(""); setUrl(""); setPlace(null);
-      setCategory(cats[0] || "Companies (general)"); setLimit(40); setInterval(360);
+      setType("search"); setLocation(""); setUrl(""); setKeywords(""); setPlace(null);
+      setCategory(cats[0] || "Companies (general)"); setLimit(100); setInterval(360);
     }
   }, [open, editing, cats]);
 
-  // Directory sources default to a bigger batch size; a map source should pull a
-  // whole area's worth in one pass (OSM returns it all in a single request).
-  useEffect(() => { if (!editing) setLimit(type === "directory" ? 100 : 120); }, [type, editing]);
+  // A map source should pull a whole area in one pass; the others batch.
+  useEffect(() => { if (!editing) setLimit(type === "osm" ? 120 : 100); }, [type, editing]);
 
   async function save() {
     if (type === "osm" && !location.trim()) return toast("Choose a country or city", "error");
     if (type === "directory" && !url.trim()) return toast("Paste a directory URL", "error");
+    if (type === "search" && !location.trim() && !keywords.trim()) return toast("Enter a country/city or some keywords", "error");
     setSaving(true);
     try {
-      const body = type === "directory"
-        ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, limit, intervalMinutes: interval }
-        : { type: "osm" as const, location: location.trim(), category, limit, intervalMinutes: interval, place };
+      const body =
+        type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, limit, intervalMinutes: interval } :
+        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, limit, intervalMinutes: interval } :
+        { type: "osm" as const, location: location.trim(), category, limit, intervalMinutes: interval, place };
       if (editing) {
         await api.updateDiscoverySource(editing.id, body);
         toast("Source updated", "success");
       } else {
         await api.addDiscoverySource(body);
-        toast(type === "directory" ? "Directory added — it'll start streaming companies in" : "Source added — the bot will scan it shortly", "success");
+        toast(
+          type === "directory" ? "Directory added — it'll start streaming companies in" :
+          type === "search" ? "Web search added — it'll start finding companies right away" :
+          "Source added — the bot will scan it shortly",
+          "success"
+        );
       }
       onSaved();
     } catch (e: any) { toast(e.message, "error"); } finally { setSaving(false); }
@@ -588,14 +609,14 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
     <Modal open={open} onClose={onClose} title={editing ? "Edit source" : "Add discovery source"}>
       <div className="space-y-4">
         {/* type switch */}
-        <div className="flex rounded-full border border-line bg-cream p-1">
-          {([["osm", "Area (map)"], ["directory", "Directory (bulk)"]] as const).map(([t, label]) => (
+        <div className="grid grid-cols-3 gap-1 rounded-full border border-line bg-cream p-1">
+          {([["search", "Web search"], ["osm", "Map area"], ["directory", "Directory"]] as const).map(([t, label]) => (
             <button
               key={t}
               type="button"
-              disabled={!!editing && editing.type !== t}
+              disabled={!!editing && (editing.type || "osm") !== t}
               onClick={() => setType(t)}
-              className={cn("flex-1 rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-30",
+              className={cn("rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-30",
                 type === t ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
             >
               {label}
@@ -603,7 +624,29 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
           ))}
         </div>
 
-        {type === "osm" ? (
+        {type === "search" ? (
+          <>
+            <Field label="Country or city" hint="Where to search. For a whole country, the bot fans out across its major cities automatically to find far more companies.">
+              <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="e.g. Saudi Arabia" />
+            </Field>
+            <Field label="Industry">
+              <Select value={category} onChange={(e) => setCategory(e.target.value)}>
+                {cats.map((c) => <option key={c} value={c}>{c}</option>)}
+              </Select>
+            </Field>
+            <Field label="Custom keywords (optional)" hint="Leave blank to use the industry above. Or type your own search terms, comma-separated — exactly what you'd Google.">
+              <Input value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder="construction company, building contractor, MEP contractor" />
+            </Field>
+            <Field label="Re-search">
+              <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
+                {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
+              </Select>
+            </Field>
+            <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
+              This searches the web like Google — across the whole country <span className="font-medium text-ink/70">and its major cities</span> — and streams every company website it finds into your pool, then finds each one's email. This is the source that scales to <span className="font-medium text-ink/70">hundreds–thousands</span>. Tip: add a free <span className="font-medium text-ink/70">Jina key</span> in Settings → Crawler so it can search at full speed.
+            </p>
+          </>
+        ) : type === "osm" ? (
           <>
             <Field label="Country or city" hint="Where to look. Pick from the list for the most accurate area.">
               <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="Start typing… e.g. Qatar" />
@@ -626,7 +669,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               </Field>
             </div>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              OpenStreetMap is a <span className="font-medium text-ink/70">map, not a company registry</span> — it only knows businesses a mapper tagged with a website or email. That's typically a few hundred per country, and once you've pulled them a re-scan won't surface more. To reach <span className="font-medium text-ink/70">thousands</span>, add a <span className="font-medium text-ink/70">Directory (bulk)</span> source.
+              OpenStreetMap is a <span className="font-medium text-ink/70">map, not a company registry</span> — it only knows businesses a mapper tagged with a website or email (often just a handful per country), and re-scanning can't surface more. For <span className="font-medium text-ink/70">volume</span>, use a <span className="font-medium text-ink/70">Web search</span> or <span className="font-medium text-ink/70">Directory</span> source instead.
             </p>
           </>
         ) : (

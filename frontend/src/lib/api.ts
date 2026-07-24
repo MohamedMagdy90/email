@@ -144,8 +144,9 @@ export interface DiscoveryStatus {
 
 export interface DiscoverySource {
   id: string;
-  type?: "osm" | "directory";
+  type?: "osm" | "directory" | "search";
   base_url?: string | null;
+  keywords?: string | null; // web-search sources: custom keywords (blank = from category)
   cursor?: number;
   exhausted?: number; // 0 | 1
   location: string;
@@ -407,16 +408,17 @@ export const api = {
   reEnrichDiscovery: () => req<{ reset: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
   getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
   addDiscoverySource: (body: {
-    type?: "osm" | "directory";
+    type?: "osm" | "directory" | "search";
     location?: string;
     url?: string;
+    keywords?: string;
     category?: string;
     limit?: number;
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>

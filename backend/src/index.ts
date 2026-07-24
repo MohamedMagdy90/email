@@ -1207,10 +1207,27 @@ app.get("/api/discovery/sources", async (c) => {
 
 app.post("/api/discovery/sources", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const type = b.type === "directory" ? "directory" : "osm";
+  const type = b.type === "directory" ? "directory" : b.type === "search" ? "search" : "osm";
   const category = String(b.category || "Companies (general)").trim();
   const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
   const enabled = b.enabled === false ? 0 : 1;
+
+  // Web-search source: runs free-text searches (industry × the country and its
+  // cities), pages through the results, and streams every company site into the
+  // pool. This is the source that scales to thousands (OSM tops out in hundreds).
+  if (type === "search") {
+    const location = String(b.location || "").trim();
+    const keywords = String(b.keywords || "").trim();
+    if (!location && !keywords) return c.json({ error: "Enter a country/city and/or some keywords to search for" }, 400);
+    const limit = clamp(Number(b.limit) || 100, 20, 300);
+    const rows = await q(
+      `INSERT INTO discovery_sources
+        (id,type,location,keywords,category,limit_n,interval_minutes,enabled,cursor,next_run_at,created_at)
+       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING *`,
+      [uid(), location, keywords || null, category, limit, interval, enabled, nowIso(), nowIso()]
+    );
+    return c.json({ source: rows[0] });
+  }
 
   // Directory source: walks a business-directory URL page-by-page, forever.
   if (type === "directory") {
@@ -1250,6 +1267,7 @@ app.put("/api/discovery/sources/:id", async (c) => {
   if (!existing) return c.json({ error: "not found" }, 404);
   const location = b.location != null ? String(b.location).trim() : existing.location;
   const category = b.category != null ? String(b.category).trim() : existing.category;
+  const keywords = b.keywords != null ? String(b.keywords).trim() : existing.keywords;
   const limit = b.limit != null ? clamp(Number(b.limit), 5, 500) : existing.limit_n;
   const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
   const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
@@ -1268,13 +1286,21 @@ app.put("/api/discovery/sources/:id", async (c) => {
       if (url && url !== existing.base_url) { baseUrl = url; cursor = initialCursor(url); exhausted = 0; emptyStreak = 0; }
     }
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
+  } else if (existing.type === "search") {
+    // Changing what/where we search restarts the query plan from the top.
+    const changed =
+      (b.keywords != null && String(b.keywords).trim() !== String(existing.keywords || "")) ||
+      (b.location != null && String(b.location).trim() !== String(existing.location || "")) ||
+      (b.category != null && String(b.category).trim() !== String(existing.category || ""));
+    if (changed) { cursor = 1; exhausted = 0; emptyStreak = 0; }
+    if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
 
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
+       SET location=?, place_json=?, category=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
+    [location, placeJson, category, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
   );
   return c.json({ source: rows[0] });
 });
