@@ -46,6 +46,7 @@ export default function Discovery() {
   const [saveCountry, setSaveCountry] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
+  const [reEnriching, setReEnriching] = useState(false);
 
   // add / edit source
   const [modalOpen, setModalOpen] = useState(false);
@@ -97,6 +98,20 @@ export default function Discovery() {
   }
   async function toggleAutoEnrich(on: boolean) {
     try { setStatus(await api.toggleDiscovery({ autoEnrich: on })); } catch (e: any) { toast(e.message, "error"); }
+  }
+  // Recover the historical "no email" pool: re-queue every lead whose site
+  // blocked the crawler (Cloudflare) or hit the free reader's rate limit.
+  async function reCheckBlocked() {
+    setReEnriching(true);
+    try {
+      const r = await api.reEnrichDiscovery();
+      toast(
+        r.reset ? `Re-queued ${r.reset.toLocaleString()} lead${r.reset === 1 ? "" : "s"} — the bot will try to find their emails again` : "No blocked leads to re-check right now",
+        r.reset ? "success" : "info"
+      );
+      refreshStatus();
+      if (tab === "pending") refreshLeads();
+    } catch (e: any) { toast(e.message, "error"); } finally { setReEnriching(false); }
   }
 
   /* ---------------------------- source ops --------------------------- */
@@ -214,6 +229,32 @@ export default function Discovery() {
             </div>
           </div>
           <Button size="sm" onClick={() => toggleBot(true)} className="shrink-0">Turn bot on</Button>
+        </div>
+      )}
+
+      {/* Blocked-leads recovery — sites that blocked the crawler (usually a
+          Cloudflare "Just a moment" wall) or hit the free reader's rate limit.
+          These are retried automatically; this lets you re-run them all now and
+          points to the fix that scales (a free Jina key / a scraping proxy). */}
+      {(status?.blocked ?? 0) > 0 && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#5a86c2]/40 bg-[#eef4fb] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#5a86c2]/20 font-clash text-[#2f5a94]">↻</span>
+            <div>
+              <div className="text-sm font-semibold text-ink">
+                {status!.blocked.toLocaleString()} lead{status!.blocked === 1 ? "" : "s"} couldn’t be read yet
+              </div>
+              <div className="text-xs leading-relaxed text-muted">
+                Their sites blocked the crawler (often a Cloudflare “Just a moment” wall){status!.bypass?.readerRateLimited ? " and the free reader hit its rate limit" : ""}. The bot retries them automatically, but
+                {status!.bypass?.readerKeyed || status!.bypass?.proxy
+                  ? " you can re-run them all now."
+                  : <> to reach many more, add a free <span className="font-medium text-ink/70">Jina key</span> or a <span className="font-medium text-ink/70">scraping proxy</span> in <span className="font-medium text-ink/70">Settings → Crawler</span>, then re-check.</>}
+              </div>
+            </div>
+          </div>
+          <Button size="sm" variant="outline" loading={reEnriching} onClick={reCheckBlocked} className="shrink-0">
+            Re-check {status!.blocked.toLocaleString()} now
+          </Button>
         </div>
       )}
 
@@ -359,7 +400,7 @@ export default function Discovery() {
                     <td className="px-1 py-2.5">
                       <div className="font-medium leading-tight">{l.name || l.domain}</div>
                       <div className="flex items-center gap-1.5 text-xs text-muted">
-                        <span className="truncate">{l.email || (l.enriched ? <span className="italic">no email found</span> : <span className="inline-flex items-center gap-1 text-ink/50"><Spinner className="h-2.5 w-2.5" /> finding email…</span>)}</span>
+                        <span className="truncate"><EmailCell lead={l} /></span>
                         <ConfidenceTag c={l.confidence} />
                       </div>
                     </td>
@@ -651,6 +692,27 @@ function Switch({ checked, onChange, small }: { checked: boolean; onChange: (v: 
       <span className={cn("absolute top-0.5 rounded-full bg-white shadow transition-all", small ? "h-4 w-4" : "h-5 w-5", checked ? (small ? "left-[18px]" : "left-[22px]") : "left-0.5")} />
     </button>
   );
+}
+
+// The email column for a discovered lead — reflects enrichment state so an
+// empty cell tells you WHY: still searching, retrying after a block, blocked, or
+// genuinely none. This is what makes "missed" emails visible instead of silent.
+function EmailCell({ lead }: { lead: DiscoveredLead }) {
+  if (lead.email) return <>{lead.email}</>;
+  const tries = lead.retry_count ?? 0;
+  if (!lead.enriched) {
+    return tries > 0 ? (
+      <span className="inline-flex items-center gap-1 text-ink/45" title="The site blocked the crawler — retrying automatically with a delay">
+        <Spinner className="h-2.5 w-2.5" /> blocked — retrying (try {tries})
+      </span>
+    ) : (
+      <span className="inline-flex items-center gap-1 text-ink/50"><Spinner className="h-2.5 w-2.5" /> finding email…</span>
+    );
+  }
+  if (lead.enrich_status === "blocked" || lead.enrich_status === "error") {
+    return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn’t read site</span>;
+  }
+  return <span className="italic">no email found</span>;
 }
 
 function ConfidenceTag({ c }: { c?: string | null }) {
