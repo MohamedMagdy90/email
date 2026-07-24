@@ -11,6 +11,43 @@ const PROXY_TIMEOUT_MS = 70_000; // JS rendering + antibot solving can be slow
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/* ── Free-reader rate limiter ─────────────────────────────────────────────
+ * The free Jina reader (r.jina.ai) is the crawler's only no-cost way past a
+ * Cloudflare "Just a moment" wall — but WITHOUT an API key it allows only
+ * ~20 requests/minute. At the discovery bot's scale that cap is hit constantly,
+ * and every resulting 429 looks exactly like "this site has no email". We fix
+ * that by SERIALIZING reader reservations so calls are spaced just under the
+ * free limit (and much faster once a key raises it): 429 storms become an
+ * orderly queue. Only the slot reservation is serialized — the actual network
+ * fetch still runs concurrently the moment a slot is granted.
+ */
+const READER_RPM_NOKEY = Math.max(1, Number(process.env.READER_RPM) || 15); // < 20/min free cap
+const READER_RPM_KEYED = Math.max(1, Number(process.env.READER_RPM_KEYED) || 120);
+let readerReserveChain: Promise<void> = Promise.resolve();
+let readerNextSlotAt = 0;
+
+async function reserveReaderSlot(keyed: boolean): Promise<void> {
+  const minGapMs = Math.ceil(60_000 / (keyed ? READER_RPM_KEYED : READER_RPM_NOKEY));
+  const wait = readerReserveChain.then(async () => {
+    const now = Date.now();
+    const at = Math.max(now, readerNextSlotAt);
+    readerNextSlotAt = at + minGapMs;
+    const delay = at - now;
+    if (delay > 0) await sleep(delay);
+  });
+  readerReserveChain = wait.catch(() => {});
+  return wait;
+}
+
+// Reader health, surfaced in the Discovery UI so the operator knows when the
+// free tier is saturated and it's time to add a free key or a scraping proxy.
+let readerCalls = 0;
+let reader429s = 0;
+let reader429At = 0;
+export function getReaderStats(): { calls: number; rateLimited: number; lastRateLimitedAt: string | null } {
+  return { calls: readerCalls, rateLimited: reader429s, lastRateLimitedAt: reader429At ? new Date(reader429At).toISOString() : null };
+}
+
 export type BlockReason = "cloudflare" | "rate-limited" | "forbidden" | "blocked";
 
 export interface FetchResult {
@@ -191,6 +228,8 @@ const READER_KEY = process.env.JINA_API_KEY || "";
 
 export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS, apiKey?: string): Promise<FetchResult> {
   const key = (apiKey || READER_KEY || "").trim();
+  await reserveReaderSlot(!!key); // pace calls under the free rate limit (queue, don't 429)
+  readerCalls++;
   const headers: Record<string, string> = {
     "X-Return-Format": "html", // give us HTML so the existing extractors work
     "X-Timeout": "30", // tell Jina to cap its own render time
@@ -204,12 +243,13 @@ export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_
     via: "reader",
   });
   if (!r.ok && (r.status === 401 || r.status === 402 || r.status === 429)) {
-    r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit — add a free JINA_API_KEY)" : "");
+    if (r.status === 429) { reader429s++; reader429At = Date.now(); }
+    r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit — add a free JINA_API_KEY or a scraping proxy)" : "");
   }
   return r;
 }
 
-export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig, readerKey?: string): Promise<FetchResult> {
+export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig, readerKey?: string, allowReader = true): Promise<FetchResult> {
   // "always" mode: route every request through the proxy (with one transient retry).
   if (proxy && proxy.mode === "always") {
     let p = await fetchViaProxy(url, proxy);
@@ -232,9 +272,11 @@ export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, 
   }
 
   // …and if a bot-wall blocked us, escalate: FREE reader first, then the paid
-  // proxy only if one is configured (so most sites cost nothing to crawl).
+  // proxy only if one is configured (so most sites cost nothing to crawl). The
+  // reader escalation is gated by `allowReader` so callers can spend the scarce
+  // (rate-limited) free-reader budget only on their highest-value pages.
   if (last && last.blocked) {
-    if (READER_ENABLED) {
+    if (READER_ENABLED && allowReader) {
       const rd = await fetchViaReader(url, READER_TIMEOUT_MS, readerKey).catch(() => null);
       if (rd?.ok && rd.html) return rd;
     }

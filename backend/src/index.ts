@@ -25,6 +25,7 @@ import {
   setAutoEnrich,
   runSourceNow,
   initialCursor,
+  reEnrichBlocked,
 } from "./discovery";
 import {
   seedAuthFromEnv,
@@ -1187,6 +1188,14 @@ app.post("/api/discovery/toggle", async (c) => {
   if (typeof b.enabled === "boolean") await setBotEnabled(b.enabled);
   if (typeof b.autoEnrich === "boolean") await setAutoEnrich(b.autoEnrich);
   return c.json(await getDiscoveryStatus());
+});
+
+// Re-attempt the leads whose email couldn't be read because their site blocked
+// the crawler (Cloudflare) or the free reader was rate-limited — recovers the
+// historical "no email" pool, especially after adding a Jina key / scraping proxy.
+app.post("/api/discovery/re-enrich", async (c) => {
+  const r = await reEnrichBlocked();
+  return c.json(r);
 });
 
 // ---- Sources (the location+industry "watchers" the bot cycles through) ----
