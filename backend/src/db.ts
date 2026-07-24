@@ -183,6 +183,18 @@ export async function ensureSchema() {
   // Fast lookups for email de-duplication in the pool (never unique — many leads
   // legitimately have no email/NULL — the app guarantees email-uniqueness itself).
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_email ON discovered_leads(email)`); } catch { /* ignore */ }
+
+  // Enrichment retry state (idempotent migrations). A BLOCKED / rate-limited /
+  // errored crawl must NOT be treated like a genuine "no email" — otherwise a
+  // transient Cloudflare wall permanently discards a recoverable lead. Track the
+  // retry count + a backoff (`next_enrich_at`) so we come back to it, and record
+  // WHY the last attempt failed (`enrich_status`: found | empty | blocked | error)
+  // so the historical blocked ones can be re-run in bulk later.
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN next_enrich_at TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN enrich_status TEXT`); } catch { /* exists */ }
+  // Due-lead scan hits (enriched=0, next_enrich_at) on every enrich tick.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
 }
 
 /* ---------------------------- Crawl ledger ---------------------------- */
