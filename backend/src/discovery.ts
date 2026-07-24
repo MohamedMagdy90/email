@@ -103,9 +103,13 @@ export interface DiscoveryStatus {
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads whose last crawl was BLOCKED/errored (Cloudflare,
-  // rate-limit, timeout) — recoverable, either automatically (retry backoff) or
-  // via "Re-check blocked" once a Jina key / scraping proxy is added.
+  // rate-limit, timeout) and are still auto-retrying.
   blocked: number;
+  // Pending, email-less leads that HAVE a website but were given up on (or predate
+  // retry-tracking) — exactly what "Re-check" re-queues. This is the count that
+  // makes the recovery button appear, so the historical "no email" pool is
+  // actionable even before anything is freshly marked blocked.
+  recoverable: number;
   // Whether a scalable Cloudflare bypass is configured, + how often the free
   // reader has been rate-limited — drives the "add a key/proxy" nudge in the UI.
   bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
@@ -126,13 +130,22 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
       WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
         AND website IS NOT NULL AND website<>''`
   ))[0]?.n ?? 0;
-  // Leads whose enrichment was blocked/errored (either still retrying, or given
-  // up on after the retry cap) — the pool that "Re-check blocked" can recover.
+  // Leads still auto-retrying after a block/error (enriched=0 with retry state).
   const blocked = (await q(
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
       WHERE status='pending' AND (email IS NULL OR email='')
         AND website IS NOT NULL AND website<>''
-        AND (enrich_status IN ('blocked','error') OR retry_count > 0)`
+        AND enriched=0 AND (enrich_status IN ('blocked','error') OR retry_count > 0)`
+  ))[0]?.n ?? 0;
+  // Everything "Re-check" would revive: pending, has a website, no email, marked
+  // done (enriched=1) either because it was blocked/errored OR because it predates
+  // retry-tracking (enrich_status NULL = the historical ~1,000 "no email" pool).
+  const recoverable = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
+      WHERE status='pending' AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''
+        AND enriched=1
+        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))`
   ))[0]?.n ?? 0;
   const nextRunAt = (await q(`SELECT min(next_run_at) AS t FROM discovery_sources WHERE enabled=1`))[0]?.t ?? null;
   const lastLeadAt = (await q(`SELECT max(created_at) AS t FROM discovered_leads`))[0]?.t ?? null;
@@ -157,6 +170,7 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
     },
     pendingEnrich,
     blocked,
+    recoverable,
     bypass: { readerKeyed: !!readerKey, proxy: !!proxy, readerRateLimited: rstats.rateLimited },
     nextRunAt,
     lastLeadAt,

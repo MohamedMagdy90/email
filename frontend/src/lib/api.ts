@@ -130,8 +130,11 @@ export interface DiscoveryStatus {
   activeSources: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
-  // Pending, email-less leads whose last crawl was blocked/errored (recoverable).
+  // Pending, email-less leads still auto-retrying after a block/error.
   blocked: number;
+  // Pending, email-less leads WITH a website that were given up on / predate
+  // retry-tracking — the count "Re-check" re-queues (drives the recovery button).
+  recoverable: number;
   // Is a scalable Cloudflare bypass configured, and how often has the free reader
   // been rate-limited — drives the "add a key/proxy" nudge.
   bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };

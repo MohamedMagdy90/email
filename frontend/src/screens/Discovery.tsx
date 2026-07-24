@@ -232,29 +232,33 @@ export default function Discovery() {
         </div>
       )}
 
-      {/* Blocked-leads recovery — sites that blocked the crawler (usually a
-          Cloudflare "Just a moment" wall) or hit the free reader's rate limit.
-          These are retried automatically; this lets you re-run them all now and
-          points to the fix that scales (a free Jina key / a scraping proxy). */}
-      {(status?.blocked ?? 0) > 0 && (
+      {/* Recovery for the "no email" pool — leads that have a website but no email
+          (blocked by Cloudflare, rate-limited, or discovered before retry-tracking
+          existed, i.e. the historical ~1,000). "Re-check" re-queues them all so the
+          bot crawls their sites again. Shown whenever there's anything to recover
+          OR anything still auto-retrying, so the button is never hidden when needed. */}
+      {((status?.recoverable ?? 0) > 0 || (status?.blocked ?? 0) > 0) && (
         <div className="flex flex-col gap-3 rounded-2xl border border-[#5a86c2]/40 bg-[#eef4fb] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
             <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#5a86c2]/20 font-clash text-[#2f5a94]">↻</span>
             <div>
               <div className="text-sm font-semibold text-ink">
-                {status!.blocked.toLocaleString()} lead{status!.blocked === 1 ? "" : "s"} couldn’t be read yet
+                {(status?.recoverable ?? 0) > 0
+                  ? <>{status!.recoverable.toLocaleString()} lead{status!.recoverable === 1 ? "" : "s"} have a website but no email yet</>
+                  : <>{status!.blocked.toLocaleString()} lead{status!.blocked === 1 ? "" : "s"} being re-checked for emails…</>}
               </div>
               <div className="text-xs leading-relaxed text-muted">
-                Their sites blocked the crawler (often a Cloudflare “Just a moment” wall){status!.bypass?.readerRateLimited ? " and the free reader hit its rate limit" : ""}. The bot retries them automatically, but
-                {status!.bypass?.readerKeyed || status!.bypass?.proxy
-                  ? " you can re-run them all now."
-                  : <> to reach many more, add a free <span className="font-medium text-ink/70">Jina key</span> or a <span className="font-medium text-ink/70">scraping proxy</span> in <span className="font-medium text-ink/70">Settings → Crawler</span>, then re-check.</>}
+                Most were skipped because their site blocked the crawler (often a Cloudflare “Just a moment” wall){status!.bypass?.readerRateLimited ? ", and the free reader hit its rate limit" : ""}. Re-check crawls each site again to find the missing email — it runs in the background and can take a while for a big pool.
+                {(status?.recoverable ?? 0) > 0 && (status?.blocked ?? 0) > 0 ? ` (${status!.blocked.toLocaleString()} more are already auto-retrying.)` : ""}
+                {!status!.bypass?.readerKeyed && !status!.bypass?.proxy && <> To get past Cloudflare at scale, add a free <span className="font-medium text-ink/70">Jina key</span> or a <span className="font-medium text-ink/70">scraping proxy</span> in <span className="font-medium text-ink/70">Settings → Crawler</span> first.</>}
               </div>
             </div>
           </div>
-          <Button size="sm" variant="outline" loading={reEnriching} onClick={reCheckBlocked} className="shrink-0">
-            Re-check {status!.blocked.toLocaleString()} now
-          </Button>
+          {(status?.recoverable ?? 0) > 0 && (
+            <Button size="sm" variant="outline" loading={reEnriching} onClick={reCheckBlocked} className="shrink-0">
+              Re-check {status!.recoverable.toLocaleString()} now
+            </Button>
+          )}
         </div>
       )}
 
