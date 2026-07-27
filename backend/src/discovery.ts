@@ -10,7 +10,8 @@ import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeads, type Company } from "./leads";
 import { searchCompaniesPaged } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
-import { crawlDirectory, type DirectoryOptions } from "./crawler/directory";
+import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
+import { isBadName } from "./repair";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { getReaderStats } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
@@ -244,8 +245,18 @@ async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; doma
   // already blocks two directly-listed emails, but a lead that was ENRICHED to
   // this email carries a domain/phone key — so check the email column too.
   if (email) {
-    const dupe = (await q(`SELECT 1 FROM discovered_leads WHERE email=? LIMIT 1`, [email]))[0];
-    if (dupe) return false;
+    const dupe = (await q(`SELECT id, name FROM discovered_leads WHERE email=? LIMIT 1`, [email]))[0] as any;
+    if (dupe) {
+      // Self-healing: an older harvest may have stored a phone number (or other
+      // junk) where the company name belongs. If we now have a real name for the
+      // same lead, upgrade it in place rather than silently keeping the bad one.
+      const incoming = String(row.name || "").trim();
+      if (incoming && looksLikeName(incoming) && isBadName(dupe.name)) {
+        await q(`UPDATE discovered_leads SET name=? WHERE id=?`, [incoming, dupe.id]);
+        dlog("dir", `  ~ fixed company name: ${String(dupe.name).trim()} → ${incoming}`);
+      }
+      return false;
+    }
   }
   const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
   const rows = await q(
@@ -357,7 +368,8 @@ async function runSource(src: any): Promise<{ found: number; error?: string }> {
 interface DirRunResult {
   found: number;       // NEW leads inserted into the pool this batch
   extracted: number;   // listings actually read this batch (new OR already-known)
-  detailPages: number; // detail/card pages opened this batch
+  detailPages: number;  // detail/profile pages opened this batch (0 when read inline)
+  listingsRead: number; // listings read this batch, inline or via detail pages
   error?: string; okish: boolean; nextCursor: number; pages: number;
 }
 
@@ -367,7 +379,7 @@ interface DirRunResult {
 async function runDirectorySource(src: any): Promise<DirRunResult> {
   const base = String(src.base_url || "").trim();
   const cursor = Math.max(1, Number(src.cursor) || 1);
-  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, extracted: 0, detailPages: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
+  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
 
   const proxy = await getProxyConfig();
   const readerKey = await getReaderKey();
@@ -412,8 +424,10 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     }
   }
 
-  dlog("dir", `batch result: ${result.status.toUpperCase()} · ${result.listingPages} page(s) walked · ${result.detailPages} listing(s) opened · ${result.contacts.length} contact(s) extracted`);
-  if (result.note && (result.status === "blocked" || result.status === "empty" || result.status === "error")) {
+  dlog("dir", `batch result: ${result.status.toUpperCase()} · ${result.listingPages} page(s) walked · ${result.listingsRead} listing(s) read · ${result.contacts.length} contact(s) extracted`);
+  // A note can also arrive on an "ok" run — e.g. the walk was cut short by a
+  // rate-limit wall — so surface it whenever the crawler bothered to write one.
+  if (result.note) {
     dwarn("dir", `↳ ${result.note}`);
   }
 
@@ -449,10 +463,17 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   const okish = result.status === "ok" || result.status === "empty";
   const blocked = result.status === "blocked" || result.status === "error";
   // Advance from wherever this batch actually started (page 1 when we just
-  // switched to a freshly-resolved index), never past a block.
-  const nextCursor = okish ? resolvedFromCursor + Math.max(1, pages) : resolvedFromCursor;
+  // switched to a freshly-resolved index) by the number of pages we actually
+  // READ — not the number we attempted. A page a bot wall refused must be tried
+  // again next batch, otherwise its companies are skipped for good and the
+  // directory can never be walked to completion.
+  const read = Math.max(0, result.pagesRead || 0);
+  const nextCursor = okish ? resolvedFromCursor + read : resolvedFromCursor;
+  if (okish && read < pages) {
+    dwarn("dir", `↳ ${pages - read} page(s) were refused — resuming from page ${nextCursor} next batch so nothing is skipped.`);
+  }
   const error = blocked ? (result.note || result.status) : undefined;
-  return { found, extracted: result.contacts.length, detailPages: result.detailPages, error, okish, nextCursor, pages };
+  return { found, extracted: result.contacts.length, detailPages: result.detailPages, listingsRead: result.listingsRead, error, okish, nextCursor, pages };
 }
 
 /* --------------------------- Web-search source ------------------------- */
@@ -634,7 +655,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     try {
       r = await runDirectorySource(src);
     } catch (e: any) {
-      r = { found: 0, extracted: 0, detailPages: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
+      r = { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
     }
 
     // Decide "end of directory" by whether this batch actually READ listing cards,
@@ -643,16 +664,28 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     // we've already harvested would die after 3 duplicate pages and never re-walk
     // the whole thing. Only a batch that opened no detail pages and pulled nothing
     // real (a lone footer email leaks 1) counts toward the empty streak.
-    const productive = r.detailPages > 0 || r.extracted >= 2;
+    // "Productive" = this batch actually produced companies. Past the end of a
+    // directory, paging usually keeps returning a valid-looking shell (the same
+    // handful of cards on every page), which the chrome filter correctly strips
+    // to nothing — so listings-read must NOT count as progress, only real
+    // contacts can. Otherwise the walk never terminates.
+    const productive = r.extracted >= 2;
     let streak = Number(src.empty_streak) || 0;
     let exhausted = false;
     let cursor = Number(src.cursor) || 1;
+    // No cursor progress = the very first page of the batch was refused. Chaining
+    // straight into another attempt would just hammer the wall, so fall back to
+    // the normal interval and let the block expire.
+    const stalled = !r.error && r.okish && r.nextCursor <= cursor;
     if (!r.error && r.okish) {
       cursor = r.nextCursor;                       // move on, even through thin pages
-      streak = productive ? 0 : streak + 1;
-      exhausted = streak >= EMPTY_STREAK_LIMIT;    // genuinely off the end of the list
+      // A batch that was blocked told us nothing about the end of the list.
+      if (!stalled) {
+        streak = productive ? 0 : streak + 1;
+        exhausted = streak >= EMPTY_STREAK_LIMIT;  // genuinely off the end of the list
+      }
     }
-    const cont = !r.error && !exhausted;           // keep streaming while there's more
+    const cont = !r.error && !exhausted && !stalled; // keep streaming while there's more
     const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
     const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
@@ -664,6 +697,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     );
     if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
     else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${EMPTY_STREAK_LIMIT} pages with no more listings); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
+    else if (stalled) dwarn("dir", `${srcLabel(src)}: the site refused page ${cursor} — pausing ${interval}m so the block clears, then resuming from that exact page (nothing skipped).`);
     else if (cont) dlog("dir", `${srcLabel(src)}: continuing to page ${cursor} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s${r.extracted > 0 && r.found === 0 ? ` (page's ${r.extracted} listing(s) already known — still walking to the end)` : ""}`);
     return { found: r.found, error: r.error, continue: cont };
   }

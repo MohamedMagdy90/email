@@ -406,6 +406,10 @@ export const api = {
   // Re-queue leads whose email couldn't be read (Cloudflare wall / reader rate
   // limit) so the bot tries them again — the historical "no email" recovery.
   reEnrichDiscovery: () => req<{ reset: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
+  // Company names saved by the old directory harvester could be the card's phone
+  // number. Count them, and repair them by re-reading the directory sources.
+  getBadNameCount: () => req<{ leads: number; contacts: number }>(`/api/discovery/bad-names`),
+  repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
   getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
   addDiscoverySource: (body: {
     type?: "osm" | "directory" | "search";

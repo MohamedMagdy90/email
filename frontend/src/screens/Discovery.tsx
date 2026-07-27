@@ -47,6 +47,9 @@ export default function Discovery() {
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
+  const [badNames, setBadNames] = useState<{ leads: number; contacts: number } | null>(null);
+  const [repairing, setRepairing] = useState(false);
+  const [repairLog, setRepairLog] = useState<string>("");
 
   // add / edit source
   const [modalOpen, setModalOpen] = useState(false);
@@ -60,6 +63,9 @@ export default function Discovery() {
   }
   async function refreshSources() {
     try { setSources((await api.getDiscoverySources()).sources); } catch { /* ignore */ }
+  }
+  async function refreshBadNames() {
+    try { setBadNames(await api.getBadNameCount()); } catch { /* ignore */ }
   }
   async function refreshLeads() {
     setLoadingLeads(true);
@@ -76,13 +82,45 @@ export default function Discovery() {
     }
   }
 
+  // Re-read the directory sources and write the real company names back over the
+  // phone numbers an older version of the harvester stored.
+  async function repairNames() {
+    setRepairing(true);
+    setRepairLog("Checking every saved company name…");
+    try {
+      const { jobId } = await api.repairNames();
+      // Poll until the job finishes — a full re-walk of a big directory is slow.
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const job = await api.getCrawl(jobId);
+        const last = job.logs?.[job.logs.length - 1];
+        if (last?.msg) setRepairLog(String(last.msg));
+        if (job.status === "done") {
+          const r: any = job.result || {};
+          toast(
+            r.fixedLeads || r.fixedContacts
+              ? `Fixed ${((r.fixedLeads || 0) + (r.fixedContacts || 0)).toLocaleString()} company name${(r.fixedLeads || 0) + (r.fixedContacts || 0) === 1 ? "" : "s"}`
+              : "Nothing needed fixing",
+            "success"
+          );
+          break;
+        }
+        if (job.status === "error") { toast(job.error || "Repair failed", "error"); break; }
+      }
+      refreshBadNames();
+      refreshLeads();
+    } catch (e: any) { toast(e.message, "error"); }
+    finally { setRepairing(false); setRepairLog(""); }
+  }
+
   useEffect(() => {
     refreshStatus();
     refreshSources();
+    refreshBadNames();
     api.getLeadCategories().then((r) => r.categories?.length && setCats(r.categories)).catch(() => {});
     api.getCategories().then((r) => setContactCats(r.categories || [])).catch(() => {});
     // Live status + sources while the bot works in the background.
-    pollRef.current = window.setInterval(() => { refreshStatus(); refreshSources(); }, 5000);
+    pollRef.current = window.setInterval(() => { refreshStatus(); refreshSources(); refreshBadNames(); }, 5000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
@@ -130,7 +168,7 @@ export default function Discovery() {
       toast(e.message, "error");
     } finally {
       // The run is now in the background; live polling + a nudge refresh show results.
-      setTimeout(() => { refreshSources(); refreshStatus(); if (tab === "pending") refreshLeads(); }, 2000);
+      setTimeout(() => { refreshSources(); refreshStatus(); refreshBadNames(); if (tab === "pending") refreshLeads(); }, 2000);
     }
   }
   async function removeSource(s: DiscoverySource) {
@@ -214,6 +252,27 @@ export default function Discovery() {
         <Stat label="Approved → Contacts" value={counts.approved} />
         <Stat label="Finding emails" value={status?.pendingEnrich ?? 0} hint={status?.autoEnrich ? "queued" : "off"} />
       </div>
+
+      {/* Bad-name repair */}
+      {badNames && (badNames.leads > 0 || badNames.contacts > 0) && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#9b6bff]/35 bg-[#f6f1ff] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#9b6bff]/15 font-clash text-[#6c43c5]">✎</span>
+            <div>
+              <div className="text-sm font-semibold text-ink">
+                {badNames.leads.toLocaleString()} lead{badNames.leads === 1 ? "" : "s"} and {badNames.contacts.toLocaleString()} contact{badNames.contacts === 1 ? "" : "s"} have broken company names
+              </div>
+              <div className="text-xs leading-relaxed text-muted">
+                An older directory import sometimes saved a phone number where the company name should be. Run the repair to restore the real names.
+                {repairLog ? <span className="block mt-1 font-medium text-ink/70">{repairLog}</span> : null}
+              </div>
+            </div>
+          </div>
+          <Button size="sm" variant="outline" loading={repairing} onClick={repairNames} className="shrink-0">
+            Repair company names
+          </Button>
+        </div>
+      )}
 
       {/* Paused-with-sources nudge — the #1 reason "scanning stops": the bot is off. */}
       {!running && (status?.activeSources ?? 0) > 0 && (
@@ -439,7 +498,7 @@ export default function Discovery() {
         onClose={() => setModalOpen(false)}
         cats={cats}
         editing={editing}
-        onSaved={() => { setModalOpen(false); refreshSources(); refreshStatus(); }}
+        onSaved={() => { setModalOpen(false); refreshSources(); refreshStatus(); refreshBadNames(); }}
       />
     </div>
   );

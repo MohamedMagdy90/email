@@ -27,6 +27,7 @@ import {
   initialCursor,
   reEnrichBlocked,
 } from "./discovery";
+import { repairLeadNames, countBadNames } from "./repair";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -583,9 +584,9 @@ app.post("/api/crawl", async (c) => {
         const seen = new Set<string>();
         const contacts: any[] = [];
         for (const r of results) {
-          job.result.sites.push({ seed: r.seed, site: r.site, status: r.status, listingPages: r.listingPages, detailPages: r.detailPages, found: r.contacts.length, note: r.note });
-          log(job, { level: "info", msg: `${r.site}: ${r.contacts.length} lead(s) from ${r.detailPages} page(s) [${r.status}]` });
-          if (r.note && (r.status === "blocked" || r.status === "empty" || r.status === "error")) {
+          job.result.sites.push({ seed: r.seed, site: r.site, status: r.status, listingPages: r.listingPages, detailPages: r.listingsRead, found: r.contacts.length, note: r.note });
+          log(job, { level: "info", msg: `${r.site}: ${r.contacts.length} lead(s) from ${r.listingsRead} listing(s) across ${r.listingPages} page(s) [${r.status}]` });
+          if (r.note) {
             log(job, { level: r.status === "blocked" ? "warn" : "info", msg: `↳ ${r.note}` });
           }
           for (const co of r.contacts) {
@@ -1196,6 +1197,32 @@ app.post("/api/discovery/toggle", async (c) => {
 app.post("/api/discovery/re-enrich", async (c) => {
   const r = await reEnrichBlocked();
   return c.json(r);
+});
+// ---- Repair company names saved by the old (broken) directory harvester ----
+// It used to store the card's tel: link as the company name. This re-reads the
+// directory sources and writes the real names back. Runs as a job because a
+// full re-walk takes minutes.
+app.get("/api/discovery/bad-names", async (c) => c.json(await countBadNames()));
+app.post("/api/discovery/repair-names", async (c) => {
+  const job = createJob("crawl");
+  job.result = { mode: "repair" };
+  log(job, { level: "info", msg: "Checking every saved company name…" });
+  (async () => {
+    try {
+      const r = await repairLeadNames((msg) => log(job, { level: msg.startsWith("  ✓") ? "hit" : "info", msg }));
+      job.result = { mode: "repair", ...r };
+      job.total = r.badLeads + r.badContacts;
+      job.processed = r.fixedLeads + r.fixedContacts;
+      job.progress = 1;
+      for (const n of r.notes) log(job, { level: "warn", msg: n });
+      job.status = "done";
+    } catch (e: any) {
+      job.status = "error";
+      job.error = String(e?.message || e);
+      log(job, { level: "error", msg: job.error });
+    }
+  })();
+  return c.json({ jobId: job.id });
 });
 
 // ---- Sources (the location+industry "watchers" the bot cycles through) ----

@@ -93,12 +93,23 @@ function detectBlock(status: number, headers: Headers, bodySnippet: string): Blo
   return undefined;
 }
 
-// Does a 200 body actually look like an unsolved challenge page? (Happens when a
-// proxy renders without a strong enough antibot mode.)
+// Does a 200 body actually look like an unsolved challenge page?
+// Two flavours, both served with HTTP 200 so the status code tells us nothing:
+//   • Cloudflare's "Just a moment…" interstitial (usually via an under-powered proxy)
+//   • a bare reCAPTCHA/hCaptcha auto-submit page, which WAFs (Imperva, F5, Akamai)
+//     return once you've asked for a few pages too quickly
+// Both are tiny compared to a real page, so the size cap keeps false positives
+// away from genuine pages that merely embed a captcha in a contact form.
 function bodyIsChallenge(html: string): boolean {
   if (html.length > 30_000) return false;
   const b = html.toLowerCase();
-  return /just a moment|challenge-platform|cf[-_]chl|turnstile/.test(b) && /enable javascript|cloudflare|checking your browser/.test(b);
+  const cloudflare =
+    /just a moment|challenge-platform|cf[-_]chl|turnstile/.test(b) &&
+    /enable javascript|cloudflare|checking your browser/.test(b);
+  const captchaWall =
+    html.length < 10_000 &&
+    /recaptcha|hcaptcha|captcha_form|g-recaptcha|are you a robot|verify you are human/.test(b);
+  return cloudflare || captchaWall;
 }
 
 // Build the provider request URL that wraps a target URL. All three providers
@@ -175,9 +186,12 @@ async function rawFetch(
       html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
     }
 
-    // A proxy can return 200 with an unsolved challenge page — treat as blocked.
-    if (via === "proxy" && bodyIsChallenge(html)) {
-      return { ok: false, status: 403, url: finalUrl, html: "", contentType, blocked: true, blockReason: "cloudflare", via };
+    // A 200 can still be an unsolved challenge / captcha wall — treat as blocked
+    // whichever transport served it, so the crawl reports WHY it went quiet
+    // instead of silently recording an empty page.
+    if (bodyIsChallenge(html)) {
+      const reason: BlockReason = /cloudflare|turnstile|cf[-_]chl/i.test(html) ? "cloudflare" : "blocked";
+      return { ok: false, status: 403, url: finalUrl, html: "", contentType, blocked: true, blockReason: reason, via };
     }
 
     return { ok: true, status: res.status, url: finalUrl, html, contentType, via };

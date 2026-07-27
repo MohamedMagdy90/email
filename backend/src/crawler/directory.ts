@@ -1,9 +1,11 @@
 // Generic business-directory harvester.
 // Paste ONE listing URL (e.g. a "companies in Qatar" directory) and this:
 //   1. walks the pagination (?page=N, /page/N, rel=next, …)
-//   2. auto-detects the repeating "card" link pattern → the detail pages
-//   3. opens each detail page and pulls company name + email + phone (mobile
-//      preferred) using the same extractors the normal crawler uses
+//   2. reads the repeating "cards" straight off the listing page when they
+//      already carry the contact details; otherwise auto-detects the card link
+//      pattern and opens each detail page
+//   3. pulls company name + email + phone (mobile preferred) + website using the
+//      same extractors the normal crawler uses
 //   4. drops "site chrome" — an email/phone that appears on most pages is the
 //      DIRECTORY's own contact, not a listing's, so it's filtered out
 // Nothing is hardcoded to any specific site.
@@ -35,7 +37,16 @@ export interface DirectoryResult {
   site: string;
   status: "ok" | "error" | "empty" | "blocked";
   listingPages: number;
+  // Listing pages read successfully and CONTIGUOUSLY from the seed. A page cursor
+  // may only advance by this much: `listingPages` also counts pages a bot wall
+  // refused, and advancing past those would skip their companies for good.
+  pagesRead: number;
+  // Detail/profile pages actually opened. Stays 0 when the cards were read
+  // straight off the listing — callers use it to tell "this directory has
+  // listings we walked into" from "there was nothing here".
   detailPages: number;
+  // Listings read in total, however they were read (detail pages + inline cards).
+  listingsRead: number;
   contacts: DirectoryContact[];
   note?: string;
   // Set when the crawler auto-switched to a better listings/index URL because the
@@ -46,7 +57,7 @@ export interface DirectoryResult {
 
 export interface DirectoryOptions {
   maxPages?: number; // listing/index pages to walk
-  maxDetails?: number; // detail pages to open
+  maxDetails?: number; // listings to capture (detail pages opened, or cards read)
   concurrency?: number; // detail fetches in parallel
   respectRobots?: boolean;
   checkMx?: boolean;
@@ -130,6 +141,27 @@ function decode(seg: string): string {
   try { return decodeURIComponent(seg); } catch { return seg; }
 }
 
+// Language/locale path prefixes: /en/…, /ar-QA/…, /fr_FR/…, /pt-br/…
+// They're site chrome, not taxonomy, and leaving them in poisons link analysis:
+// "en" is a NAV_STOP word, so on a multilingual site EVERY listing link looks
+// like navigation and the crawler finds no companies at all.
+const LANG_CODES = new Set([
+  "en", "ar", "fr", "de", "es", "it", "pt", "nl", "ru", "tr", "zh", "ja", "ko",
+  "hi", "ur", "fa", "he", "pl", "sv", "no", "da", "fi", "cs", "el", "ro", "hu",
+  "th", "vi", "id", "ms", "bn", "ta", "uk", "sr", "hr", "bg", "sk", "sl", "lt",
+  "lv", "et", "ca", "eu", "gl", "af", "sw", "az", "kk", "uz", "hy", "ka",
+]);
+function isLocaleSeg(seg: string): boolean {
+  const s = decode(seg).toLowerCase();
+  if (!/^[a-z]{2}(?:[-_][a-z0-9]{2,4})?$/.test(s)) return false;
+  return LANG_CODES.has(s.split(/[-_]/)[0]);
+}
+// Path segments with a leading locale removed.
+function pathSegs(pathname: string): string[] {
+  const segs = pathname.split("/").filter(Boolean).map(decode);
+  return segs.length && isLocaleSeg(segs[0]) ? segs.slice(1) : segs;
+}
+
 function pageParamOf(u: URL): string | null {
   for (const k of PAGE_PARAMS) {
     const v = u.searchParams.get(k);
@@ -192,8 +224,10 @@ function pageNumberOf(u: URL): number {
 }
 
 // Reduce a path to a template where slug/id segments become "*".
+// A leading locale ("/en", "/ar-QA") is dropped first so the same listing
+// template is recognised whatever language prefix the site uses.
 function pathTemplate(pathname: string): { key: string; placeholders: number; literals: string[] } {
-  const segs = pathname.split("/").filter(Boolean).map(decode);
+  const segs = pathSegs(pathname);
   const parts = segs.map((seg) => {
     const s = seg.toLowerCase();
     const hyphens = (s.match(/-/g) || []).length;
@@ -274,56 +308,60 @@ function findDetailLinks(seed: string, links: string[]): string[] {
   // Segments in the seed's own path are the directory root, so their detail
   // children (e.g. seed /listings → /listings/acme) must NOT be dropped as
   // "navigation" even when they'd normally be a NAV_STOP word.
-  const seedSegs = new Set(s.pathname.split("/").filter(Boolean).map((x) => decode(x).toLowerCase()));
+  const seedSegs = new Set(pathSegs(s.pathname).map((x) => x.toLowerCase()));
   const navBlocks = (l: string) => NAV_STOP.has(l) && !seedSegs.has(l);
 
   const byTpl = new Map<string, Set<string>>();
-  const bySeg = new Map<string, Set<string>>();
+  const byParent = new Map<string, Set<string>>();
 
   for (const href of links) {
     let u: URL;
     try { u = new URL(href); } catch { continue; }
     if (registrableDomain(u.hostname) !== sReg) continue;
     if (isPaginationUrl(u)) continue;
-    const segs = u.pathname.split("/").filter(Boolean);
+    const segs = pathSegs(u.pathname);
     if (!segs.length) continue;
 
     const { key, placeholders, literals } = pathTemplate(u.pathname);
     const full = u.origin + u.pathname + u.search;
-    const first = decode(segs[0]).toLowerCase();
 
     if (placeholders > 0 && !literals.some(navBlocks) && key !== seedKey) {
       let set = byTpl.get(key); if (!set) { set = new Set(); byTpl.set(key, set); }
       set.add(full);
     }
-    // Fallback grouping by first path segment (for word-slug details with no id).
-    if (segs.length >= 2 && !navBlocks(first)) {
-      let set = bySeg.get(first); if (!set) { set = new Set(); bySeg.set(first, set); }
+    // Fallback grouping by the link's PARENT path (everything but the last
+    // segment). It catches clean one-word slugs that produce no wildcard
+    // (/listing/shark) and — unlike grouping by the FIRST segment — it stays
+    // precise on deep paths, where the first segment is a generic word shared
+    // with the whole navigation menu (/en/Services/… on a government site).
+    const parentSegs = segs.slice(0, -1).map((x) => x.toLowerCase());
+    if (parentSegs.length && !parentSegs.some(navBlocks)) {
+      const pKey = "/" + parentSegs.join("/");
+      let set = byParent.get(pKey); if (!set) { set = new Set(); byParent.set(pKey, set); }
       set.add(full);
     }
   }
 
   // Winning wildcard template (e.g. "/listing/*").
-  let bestTplKey = "";
   let bestTpl: Set<string> | null = null;
-  for (const [key, set] of byTpl) if (!bestTpl || set.size > bestTpl.size) { bestTpl = set; bestTplKey = key; }
+  for (const [, set] of byTpl) if (!bestTpl || set.size > bestTpl.size) bestTpl = set;
 
-  // Winning first-path-segment bucket (e.g. every "/listing/…" link).
-  let bestSegKey = "";
-  let bestSeg: Set<string> | null = null;
-  for (const [key, set] of bySeg) if (!bestSeg || set.size > bestSeg.size) { bestSeg = set; bestSegKey = key; }
+  // Winning parent-path bucket (e.g. every child of "/listing").
+  let bestParent: Set<string> | null = null;
+  for (const [, set] of byParent) if (!bestParent || set.size > bestParent.size) bestParent = set;
 
-  // Prefer the first-segment bucket when it shares the winning template's lead
-  // segment and is at least as large. The wildcard template alone skips clean
-  // one-word slugs like /listing/shark or /listing/kreston-svp (no digit, <2
-  // hyphens), so those listings would be silently lost. Unioning by the shared
-  // "/listing/" segment recovers every sibling detail page in the same bucket.
-  const tplLead = bestTplKey.split("/").filter(Boolean)[0] || "";
-  if (bestTpl && bestSeg && bestSegKey && bestSegKey === tplLead && bestSeg.size >= bestTpl.size) {
-    return [...bestSeg];
+  // When the two agree on the same bucket, union them: the wildcard template
+  // alone skips clean one-word slugs like /listing/shark or /listing/kreston-svp
+  // (no digit, <2 hyphens), so those listings would be silently lost.
+  if (bestTpl && bestParent) {
+    let overlap = 0;
+    for (const u of bestParent) if (bestTpl.has(u)) overlap++;
+    if (overlap >= Math.max(1, Math.min(bestTpl.size, bestParent.size) * 0.5)) {
+      return [...new Set([...bestTpl, ...bestParent])];
+    }
   }
   if (bestTpl && bestTpl.size >= 2) return [...bestTpl];
-  if (bestSeg && bestSeg.size >= 3) return [...bestSeg];
+  if (bestParent && bestParent.size >= 3) return [...bestParent];
   return [];
 }
 
@@ -349,19 +387,23 @@ function pickIndexCandidates(seed: string, links: string[]): string[] {
     let u: URL;
     try { u = new URL(href); } catch { continue; }
     if (registrableDomain(u.hostname) !== sReg) continue;
+    // Keep the locale prefix in the URL we build (dropping it would 404 on sites
+    // that require it) but ignore it when judging how deep the path is.
     const segs = u.pathname.split("/").filter(Boolean).map((x) => decode(x).toLowerCase());
     if (!segs.length) continue;
-    const idx = segs.findIndex((x) => INDEX_WORDS.has(x));
+    const off = isLocaleSeg(segs[0]) ? 1 : 0;
+    const idx = segs.findIndex((x, i) => i >= off && INDEX_WORDS.has(x));
     if (idx < 0) continue;
     // Truncate the path at the index word: /a/listings/102 → /a/listings.
     const norm = u.origin + "/" + segs.slice(0, idx + 1).join("/");
     popularity.set(norm, (popularity.get(norm) || 0) + 1);
     if (score.has(norm)) continue;
+    const depth = idx - off; // how deep the index word sits, locale ignored
     let sc = 0;
-    if (idx === 0 && segs.length === 1) sc += 6;                    // exactly /listings
-    if (idx === segs.length - 1) sc += 3;                          // index word ends the path
+    if (depth === 0 && segs.length === off + 1) sc += 6;            // exactly /listings
+    if (idx === segs.length - 1) sc += 3;                           // index word ends the path
     if (["listings", "directory", "companies", "businesses", "listing"].includes(segs[idx])) sc += 3;
-    sc += Math.max(0, 4 - (idx + 1));                              // shallower = better
+    sc += Math.max(0, 4 - (depth + 1));                             // shallower = better
     score.set(norm, sc);
   }
 
@@ -415,7 +457,75 @@ function pickEmails(html: string): { email: string; role: boolean }[] {
   return out;
 }
 
-interface Record { url: string; name: string; emails: { email: string; role: boolean }[]; phones: PhoneHit[]; website?: string | null; }
+// Labels that live inside a listing card but are never the company's name.
+const NAME_STOP = new Set([
+  "read more", "view more", "more", "more info", "details", "view details",
+  "show more", "see more", "learn more", "full profile", "view profile", "profile",
+  "contact", "contact us", "get in touch", "email", "e-mail", "mail", "send email",
+  "phone", "telephone", "tel", "mobile", "fax", "website", "web", "visit website",
+  "address", "location", "map", "view on map", "directions", "call", "call us",
+  "whatsapp", "home", "back", "next", "previous", "prev", "first", "last",
+  "search", "filter", "filters", "reset", "clear", "close", "menu", "share",
+  "login", "log in", "sign in", "sign up", "register", "subscribe", "print",
+  "download", "export", "export to excel", "apply", "apply now", "submit",
+  "commercial registration", "commercial permit", "registration", "permit",
+  "company", "companies", "category", "categories", "services", "products",
+  "about", "about us", "description", "overview", "summary", "n/a", "na", "-",
+]);
+
+// Is this text plausibly a COMPANY NAME? Everything the old harvester happily
+// stored as a name — a phone number, an email, a URL, a registration number, a
+// "Read more" link label — is rejected here.
+export function looksLikeName(raw: string): boolean {
+  const t = raw.trim();
+  if (t.length < 2 || t.length > 140) return false;
+  if (!/\p{L}/u.test(t)) return false;                                  // no letters → a number
+  if (/^[\d\s()+.\-/]+$/.test(t)) return false;                         // pure phone / id
+  if (t.includes("@")) return false;                                    // an email address
+  if (/^(https?:\/\/|www\.)/i.test(t)) return false;                    // a URL
+  if (/^[a-z0-9-]+\.[a-z]{2,6}(\.[a-z]{2,4})?$/i.test(t)) return false; // a bare domain
+  if (/\d{6,}/.test(t) && !/\p{L}{3,}/u.test(t)) return false;          // "66828808 x"
+  if (NAME_STOP.has(t.toLowerCase().replace(/\s+/g, " "))) return false;
+  return true;
+}
+
+// The company name inside ONE listing card, plus the card's own link.
+// Scans every heading / bold / anchor in the fragment and keeps the LAST one
+// that actually reads like a name, preferring real headings. Anchors whose href
+// is tel:/mailto: are skipped outright — mistaking that anchor for the heading
+// is exactly why phone numbers used to end up stored as company names.
+function pickCardName(fragment: string): { name: string; href: string | null } {
+  const RE = /<(h[1-6]|strong|b|a)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+  let best: { name: string; href: string | null; heading: boolean } | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = RE.exec(fragment))) {
+    const tag = m[1].toLowerCase();
+    const attrs = m[2] || "";
+    const inner = m[3] || "";
+    if (tag === "a" && /href\s*=\s*["']?\s*(?:tel:|mailto:|javascript:|whatsapp:|#)/i.test(attrs)) continue;
+    const name = finalizeName(stripTags(inner));
+    if (!looksLikeName(name)) continue;
+    const heading = /^h[1-6]$/.test(tag);
+    const hrefMatch = tag === "a"
+      ? attrs.match(/href\s*=\s*["']([^"']+)["']/i)
+      : inner.match(/<a\b[^>]*href\s*=\s*["']([^"']+)["']/i);
+    const href = hrefMatch ? hrefMatch[1] : null;
+    // Later beats earlier, but a heading always beats a non-heading.
+    if (!best || heading || !best.heading) best = { name, href, heading };
+  }
+  return best ? { name: best.name, href: best.href } : { name: "", href: null };
+}
+
+interface Record {
+  url: string;
+  name: string;
+  emails: { email: string; role: boolean }[];
+  phones: PhoneHit[];
+  website?: string | null;
+  // Listing page this record came from (inline harvest only). Used to spot
+  // header/footer contacts, which repeat on every page of the directory.
+  page?: string;
+}
 
 /* ------------------------------- crawl ---------------------------------- */
 
@@ -428,7 +538,7 @@ export async function crawlDirectory(
   onProgress?: (p: DirectoryProgress) => void
 ): Promise<DirectoryResult> {
   const seed = normalizeSeed(seedInput);
-  if (!seed) return { seed: seedInput, site: seedInput, status: "error", listingPages: 0, detailPages: 0, contacts: [], note: "invalid URL" };
+  if (!seed) return { seed: seedInput, site: seedInput, status: "error", listingPages: 0, pagesRead: 0, detailPages: 0, listingsRead: 0, contacts: [], note: "invalid URL" };
 
   const firstLinks: string[] = [];
   const result = await crawlOnce(seed, opts, onProgress, (links) => {
@@ -475,16 +585,27 @@ async function crawlOnce(
 
   const records: Record[] = [];
 
-  /* Pass 1 — walk listing pages, collect detail links (+ inline fallback). */
+  /* Pass 1 — walk listing pages: read their cards inline, or queue detail links. */
   const pageQueue: string[] = [seed];
   const pagesSeen = new Set<string>();
   const detailUrls: string[] = [];
   const detailSeen = new Set<string>();
   let listingPages = 0;
+  let pagesRead = 0;      // contiguous successful reads from the seed (cursor step)
+  let chainBroken = false; // a page in the sequence was refused → cursor must stop
+  let inlineListings = 0; // cards read straight off a listing page
+  let harvested = 0;      // listings captured so far, inline OR queued
   let blocked = 0;
   let blockReason: BlockReason | undefined;
+  // Some directories (government registers especially) throw a captcha wall once
+  // you ask for a few pages too quickly. Back off and retry before abandoning the
+  // walk, so a burst limit doesn't end the harvest early. The cooldown is never
+  // reset: once a site has shown it rate-limits, we stay slow for the whole run.
+  const RETRIES_PER_PAGE = 2;
+  const retries = new Map<string, number>();
+  let cooldownMs = 0;
 
-  while (pageQueue.length && listingPages < maxPages && detailUrls.length < maxDetails) {
+  while (pageQueue.length && listingPages < maxPages && harvested < maxDetails) {
     const pageUrl = pageQueue.shift()!.split("#")[0];
     if (pagesSeen.has(pageUrl)) continue;
     pagesSeen.add(pageUrl);
@@ -492,15 +613,29 @@ async function crawlOnce(
     let path = "/"; try { path = new URL(pageUrl).pathname; } catch { /* ignore */ }
     if (respectRobots && !robots.allow(path)) continue;
 
+    if (cooldownMs) await sleep(cooldownMs);
     const res = await fetchWithRetry(pageUrl, 2, timeoutMs, proxy, readerKey);
-    listingPages++;
     if (!res.ok) {
       if (res.blocked) { blocked++; if (!blockReason) blockReason = res.blockReason; }
       const why = describeBlock(res);
+      // Rate-limit walls clear on their own: wait longer, then try this page again.
+      const used = retries.get(pageUrl) || 0;
+      if (res.blocked && used < RETRIES_PER_PAGE) {
+        retries.set(pageUrl, used + 1);
+        pagesSeen.delete(pageUrl);
+        pageQueue.unshift(pageUrl);
+        cooldownMs = Math.min(30000, (cooldownMs || 2000) * 2);
+        onProgress?.({ type: "page", url: pageUrl, listingPages, msg: `page ${res.status || "error"}${why ? ` — ${why}` : ""} · waiting ${Math.round(cooldownMs / 1000)}s and retrying` });
+        continue; // NOT counted as a walked page — it hasn't been decided yet
+      }
+      listingPages++;
+      chainBroken = true; // never let the cursor advance past a page we couldn't read
       onProgress?.({ type: "page", url: pageUrl, listingPages, msg: `page ${res.status || "error"}${why ? ` — ${why}` : ""}` });
       await sleep(politenessMs);
       continue;
     }
+    listingPages++;
+    if (!chainBroken) pagesRead++;
     const viaProxy = res.via === "proxy";
 
     const links = collectLinks(res.html, res.url || pageUrl);
@@ -508,20 +643,45 @@ async function crawlOnce(
     // auto-retarget to the real listings index if this page has no companies.
     if (onFirstPageLinks) { onFirstPageLinks(links); onFirstPageLinks = undefined; }
     const details = findDetailLinks(seed, links);
-    let added = 0;
-    for (const d of details) {
-      const dn = d.split("#")[0];
-      if (detailSeen.has(dn)) continue;
-      detailSeen.add(dn);
-      detailUrls.push(dn);
-      added++;
-      if (detailUrls.length >= maxDetails) break;
-    }
 
-    // If this page has no detail links, treat it as an inline directory and
-    // harvest cards straight off the page.
-    if (details.length === 0) {
-      for (const rec of harvestInline(res.html, res.url || pageUrl, region)) records.push(rec);
+    // Read the cards on THIS page before deciding to open anything. When the
+    // listing already prints a distinct contact per card it IS the best source:
+    // one fetch instead of N, and no dependency on the per-company page being
+    // well-formed — some registers ship an empty <title> and the SAME
+    // placeholder tel: link on every profile, which would poison every name and
+    // phone we store.
+    const inline = harvestInline(res.html, res.url || pageUrl, region);
+    const distinct = new Set(
+      inline.map((r) => r.emails[0]?.email || r.phones[0]?.number || "").filter(Boolean)
+    ).size;
+    // Require real per-card variety, so a page that merely repeats the site's
+    // own switchboard number still falls through to the detail pages.
+    const useInline = distinct >= 3 && (details.length === 0 || distinct >= details.length * 0.6);
+
+    let added = 0;
+    if (useInline) {
+      for (const rec of inline) {
+        if (harvested >= maxDetails) break;
+        records.push(rec);
+        added++; harvested++; inlineListings++;
+      }
+    } else {
+      for (const d of details) {
+        const dn = d.split("#")[0];
+        if (detailSeen.has(dn)) continue;
+        detailSeen.add(dn);
+        detailUrls.push(dn);
+        added++; harvested++;
+        if (harvested >= maxDetails) break;
+      }
+      // No detail links either → keep whatever little the page exposed inline.
+      if (!details.length) {
+        for (const rec of inline) {
+          if (harvested >= maxDetails) break;
+          records.push(rec);
+          added++; harvested++; inlineListings++;
+        }
+      }
     }
 
     // Walk pages STRICTLY FORWARD (only when this page yielded new listings, so
@@ -559,11 +719,14 @@ async function crawlOnce(
         for (const url of other) if (!pagesSeen.has(url) && !pageQueue.includes(url)) pageQueue.push(url);
       }
     }
-    onProgress?.({ type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length, msg: `page ${listingPages}: +${added} listings${viaProxy ? " · via proxy" : ""}` });
+    onProgress?.({
+      type: "page", url: pageUrl, listingPages, detailTotal: detailUrls.length,
+      msg: `page ${listingPages}: +${added} listings${useInline ? " · read from the listing itself" : ""}${viaProxy ? " · via proxy" : ""}`,
+    });
     await sleep(politenessMs);
   }
 
-  /* Pass 2 — open each detail page. */
+  /* Pass 2 — open each detail page (skipped entirely when we read inline). */
   let detailPages = 0;
   let idx = 0;
   async function worker() {
@@ -596,21 +759,50 @@ async function crawlOnce(
       await sleep(politenessMs);
     }
   }
-  onProgress?.({ type: "phase", msg: `Opening ${detailUrls.length} listing page(s)…` });
-  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, detailUrls.length)) }, worker));
+  if (detailUrls.length) {
+    onProgress?.({ type: "phase", msg: `Opening ${detailUrls.length} listing page(s)…` });
+    await Promise.all(Array.from({ length: Math.min(concurrency, detailUrls.length) }, worker));
+  } else if (inlineListings) {
+    onProgress?.({ type: "phase", msg: `Read ${inlineListings} listing(s) straight off the directory pages — no extra page loads needed.` });
+  }
 
   /* Pass 3 — drop site chrome, then assemble one contact per record. */
   const N = records.length;
   const emailFreq = new Map<string, number>();
   const phoneFreq = new Map<string, number>();
+  const emailPages = new Map<string, Set<string>>();
+  const phonePages = new Map<string, Set<string>>();
+  const sourcePages = new Set<string>();
+  const track = (map: Map<string, Set<string>>, key: string, page: string) => {
+    let s = map.get(key); if (!s) { s = new Set(); map.set(key, s); }
+    s.add(page);
+  };
   for (const r of records) {
-    for (const e of new Set(r.emails.map((x) => x.email))) emailFreq.set(e, (emailFreq.get(e) || 0) + 1);
-    for (const p of new Set(r.phones.map((x) => x.number))) phoneFreq.set(p, (phoneFreq.get(p) || 0) + 1);
+    const page = r.page || r.url;
+    sourcePages.add(page);
+    for (const e of new Set(r.emails.map((x) => x.email))) {
+      emailFreq.set(e, (emailFreq.get(e) || 0) + 1);
+      track(emailPages, e, page);
+    }
+    for (const p of new Set(r.phones.map((x) => x.number))) {
+      phoneFreq.set(p, (phoneFreq.get(p) || 0) + 1);
+      track(phonePages, p, page);
+    }
   }
   const chromeMin = Math.max(3, Math.ceil(N * 0.35));
   const chromeApplies = N >= 4;
-  const isChromeEmail = (e: string) => chromeApplies && (emailFreq.get(e) || 0) >= chromeMin;
-  const isChromePhone = (p: string) => chromeApplies && (phoneFreq.get(p) || 0) >= chromeMin;
+  // Header/footer contacts repeat on EVERY listing page. Reading cards inline
+  // yields dozens of records per page, so the "35% of all records" rule alone
+  // never trips — count the distinct pages a value showed up on as well. In
+  // detail-page mode every record has its own URL, so this rule is a no-op.
+  const nPages = sourcePages.size;
+  const pageChromeMin = Math.max(2, Math.ceil(nPages * 0.6));
+  const onMostPages = (m: Map<string, Set<string>>, k: string) =>
+    nPages >= 2 && (m.get(k)?.size || 0) >= pageChromeMin;
+  const isChromeEmail = (e: string) =>
+    chromeApplies && ((emailFreq.get(e) || 0) >= chromeMin || onMostPages(emailPages, e));
+  const isChromePhone = (p: string) =>
+    chromeApplies && ((phoneFreq.get(p) || 0) >= chromeMin || onMostPages(phonePages, p));
 
   const contacts: DirectoryContact[] = [];
   const seenKey = new Set<string>();
@@ -664,30 +856,92 @@ async function crawlOnce(
   else if (finalContacts.length === 0) {
     if (blocked > 0) { status = "blocked"; note = blockNote(blockReason, !!proxy); }
     else { status = "empty"; note = "No listings or contact details were found on the pages that loaded."; }
+  } else if (blocked > 0) {
+    // We got results, but the walk was cut short — say so, otherwise a partial
+    // harvest looks like the whole directory.
+    note = `Harvest stopped early: ${blockNote(blockReason, !!proxy)} Re-run to continue from the next page.`;
   }
 
-  return { seed, site: siteHost, status, listingPages, detailPages, contacts: finalContacts, note };
+  return { seed, site: siteHost, status, listingPages, pagesRead, detailPages, listingsRead: detailPages + inlineListings, contacts: finalContacts, note };
 }
 
-// Fallback when a directory shows contacts inline (no detail pages): anchor on
-// each email and pair it with the nearest phone + a preceding heading as name.
+// Read the listing page itself. Plenty of directories (government registers,
+// chamber lists, association member pages…) print name + phone + email + website
+// right on the card, and their per-company page is a thinner — sometimes broken
+// — copy of it. This splits a page into cards and reads one contact per card.
+//
+// How a card is found, without knowing anything about the site:
+//   1. every mailto:/tel: link and every bare email is a "contact mark"
+//      (marks inside <header>/<footer>/<nav> are the directory's own, ignored)
+//   2. marks that sit close together belong to the same card
+//   3. a card's slice runs from the END of the previous card to the START of the
+//      next one, so a card can never borrow its neighbour's name or website
 function harvestInline(html: string, pageUrl: string, region: ReturnType<typeof regionFromCountryName>): Record[] {
-  const decoded = decodeEntities(html);
-  const emails = pickEmails(html);
-  if (!emails.length) return [];
+  // Collapse indentation first. Card markup is mostly whitespace, so a fixed
+  // look-back window has to reach the card's heading, not 900 spaces.
+  const doc = decodeEntities(html)
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/[ \t\r\n\f]+/g, " ");
+
+  // Site chrome: a header/footer contact belongs to the directory, not to any
+  // listing, so anything inside <header>/<footer>/<nav> is skipped.
+  const chrome: [number, number][] = [];
+  let c: RegExpExecArray | null;
+  const CHROME_RE = /<(header|footer|nav)\b[\s\S]*?<\/\1>/gi;
+  while ((c = CHROME_RE.exec(doc))) chrome.push([c.index, c.index + c[0].length]);
+  const inChrome = (i: number) => chrome.some(([a, b]) => i >= a && i < b);
+
+  interface Mark { start: number; end: number }
+  const marks: Mark[] = [];
+  let m: RegExpExecArray | null;
+  const CONTACT_A = /<a\b[^>]*href\s*=\s*["']?\s*(?:mailto:|tel:)[^>]*>[\s\S]*?<\/a>/gi;
+  while ((m = CONTACT_A.exec(doc))) marks.push({ start: m.index, end: m.index + m[0].length });
+  const BARE_EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+  while ((m = BARE_EMAIL.exec(doc))) marks.push({ start: m.index, end: m.index + m[0].length });
+  const usable = marks.filter((k) => !inChrome(k.start)).sort((a, b) => a.start - b.start);
+  if (!usable.length) return [];
+
+  // Merge marks that sit close together — one card's website + phone + email.
+  const cards: Mark[] = [];
+  for (const k of usable) {
+    const last = cards[cards.length - 1];
+    if (last && k.start - last.end <= 600) { last.end = Math.max(last.end, k.end); continue; }
+    cards.push({ start: k.start, end: k.end });
+  }
+
+  const pageDomain = registrableDomain(hostOf(pageUrl));
   const out: Record[] = [];
   const seen = new Set<string>();
-  for (const { email, role } of emails) {
-    const at = decoded.toLowerCase().indexOf(email.toLowerCase());
-    if (at < 0 || seen.has(email)) continue;
-    seen.add(email);
-    const windowHtml = decoded.slice(Math.max(0, at - 900), at + 300);
-    const phones = extractPhones(windowHtml, { defaultCountry: region, hostname: hostOf(pageUrl) });
-    // Name = nearest heading/strong before the email.
-    const before = decoded.slice(Math.max(0, at - 1400), at);
-    const heads = [...before.matchAll(/<(?:h[1-4]|strong|b|a)[^>]*>([\s\S]*?)<\/(?:h[1-4]|strong|b|a)>/gi)];
-    const name = heads.length ? finalizeName(stripTags(heads[heads.length - 1][1])) : "";
-    out.push({ url: pageUrl, name, emails: [{ email, role }], phones });
+
+  for (let i = 0; i < cards.length; i++) {
+    const card = cards[i];
+    const prevEnd = i > 0 ? cards[i - 1].end : 0;
+    const nextStart = i + 1 < cards.length ? cards[i + 1].start : doc.length;
+    const from = Math.max(prevEnd, card.start - 2200);
+    const to = Math.min(nextStart, card.end + 400);
+    const body = doc.slice(from, to);
+
+    // The directory's own address (info@thisdirectory.com) is never a listing's.
+    const emails = pickEmails(body).filter(
+      (e) => registrableDomain(e.email.split("@")[1] || "") !== pageDomain
+    );
+    const phones = extractPhones(body, { defaultCountry: region, hostname: hostOf(pageUrl) });
+    if (!emails.length && !phones.length) continue;
+
+    const key = emails[0]?.email || phones[0]?.number || "";
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+
+    // The name sits above the contact block; fall back to the whole card.
+    let picked = pickCardName(doc.slice(from, card.start));
+    if (!picked.name) picked = pickCardName(body);
+
+    // Point the lead at the card's own page when the heading links to one.
+    let url = pageUrl;
+    if (picked.href) { try { url = new URL(picked.href, pageUrl).toString(); } catch { /* keep page URL */ } }
+    const website = extractContactFromProfile(body, pageUrl).website;
+
+    out.push({ url, name: picked.name, emails, phones, website: website || null, page: pageUrl });
   }
   return out;
 }
@@ -703,7 +957,7 @@ export async function crawlDirectoryMany(
       const r = await crawlDirectory(seed, opts, (p) => onProgress?.({ ...p, seed }));
       results.push(r);
     } catch (e: any) {
-      results.push({ seed, site: seed, status: "error", listingPages: 0, detailPages: 0, contacts: [], note: String(e?.message || e) });
+      results.push({ seed, site: seed, status: "error", listingPages: 0, pagesRead: 0, detailPages: 0, listingsRead: 0, contacts: [], note: String(e?.message || e) });
     }
   }
   return results;
