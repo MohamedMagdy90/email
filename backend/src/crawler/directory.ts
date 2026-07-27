@@ -53,11 +53,20 @@ export interface DirectoryResult {
   // URL you gave (e.g. a homepage) had no companies. The worker persists this so
   // the source pages the correct URL from then on.
   resolvedSeed?: string;
+  // The EXACT URL of the first page this batch did not read — the resume point.
+  // `null` means the walk reached the end of the directory. This is what lets a
+  // paged walk survive any pager shape (Drupal's "?page=0,7", a rel=next-only
+  // pager, an opaque token) instead of guessing a page number.
+  nextUrl?: string | null;
 }
 
 export interface DirectoryOptions {
   maxPages?: number; // listing/index pages to walk
   maxDetails?: number; // listings to capture (detail pages opened, or cards read)
+  // Soft per-batch budget: once this many listings have been captured the walk
+  // stops STARTING new pages. Unlike maxDetails it never truncates a page
+  // half-read, so the resume point stays exact.
+  maxListings?: number;
   concurrency?: number; // detail fetches in parallel
   respectRobots?: boolean;
   checkMx?: boolean;
@@ -162,13 +171,66 @@ function pathSegs(pathname: string): string[] {
   return segs.length && isLocaleSeg(segs[0]) ? segs.slice(1) : segs;
 }
 
-function pageParamOf(u: URL): string | null {
+/* --------------------------- page markers ------------------------------ */
+// Directories number their pages in three shapes:
+//   ?page=7                a single numeric query param
+//   ?page=0,7              Drupal's MULTI-pager: one slot per pager on the page,
+//                          only ONE of which actually moves (the others stay 0).
+//                          Treating "0,7" as "not a page number" is why an
+//                          infinite-scroll Drupal view (tdv.motc.gov.qa) kept
+//                          re-reading page 1 forever.
+//   /page/7 · /p-7         in the path
+const MULTI_PAGE_RE = /^\d+(?:,\d+)+$/;
+
+interface PageMark {
+  kind: "query" | "path";
+  key?: string;     // query param name (query marks only)
+  slots?: number[]; // every slot of a multi-pager
+  slot?: number;    // index of the slot that actually pages
+  value: number;    // the page number currently in that slot
+}
+
+// The moving slot of a multi-pager is the last non-zero one — every other pager
+// on the page stays pinned at 0. Before you've paged at all they're all 0, and
+// the last slot is the convention (Drupal appends the newest pager last).
+function activeSlot(slots: number[]): number {
+  for (let i = slots.length - 1; i >= 0; i--) if (slots[i] > 0) return i;
+  return slots.length - 1;
+}
+
+function pageMarkOf(u: URL): PageMark | null {
   for (const k of PAGE_PARAMS) {
     const v = u.searchParams.get(k);
-    if (v != null && /^\d+$/.test(v)) return k;
+    if (v == null) continue;
+    if (/^\d+$/.test(v)) return { kind: "query", key: k, slots: [Number(v)], slot: 0, value: Number(v) };
+    if (MULTI_PAGE_RE.test(v)) {
+      const slots = v.split(",").map(Number);
+      const slot = activeSlot(slots);
+      return { kind: "query", key: k, slots, slot, value: slots[slot] };
+    }
+  }
+  const pm = u.pathname.match(PATH_PAGE_RE);
+  if (pm) {
+    const n = Number(pm[2]);
+    if (Number.isInteger(n)) return { kind: "path", value: n };
   }
   return null;
 }
+
+// Write a page number back into the marker the URL already uses, leaving every
+// other pager slot (and every filter param) exactly as it was.
+function setPageValue(u: URL, mark: PageMark, n: number): string {
+  const c = new URL(u.toString());
+  if (mark.kind === "query" && mark.key) {
+    const slots = [...(mark.slots || [n])];
+    slots[mark.slot ?? 0] = n;
+    c.searchParams.set(mark.key, slots.join(","));
+    return c.toString();
+  }
+  c.pathname = u.pathname.replace(/(\d+)(\/?)$/, `${n}$2`);
+  return c.toString();
+}
+
 
 function stripPageParams(u: URL): string {
   const c = new URL(u.toString());
@@ -176,28 +238,12 @@ function stripPageParams(u: URL): string {
   return c.search;
 }
 
-// The next sequential page URL (?page=N → ?page=N+1, or /page/N → /page/N+1).
-// Used to keep walking deep directories whose pager only shows a small window
-// ("1 2 3 … next") and never links the far pages directly.
+// The next sequential page URL (?page=N → ?page=N+1, ?page=0,N → ?page=0,N+1,
+// /page/N → /page/N+1). Used to keep walking deep directories whose pager only
+// shows a small window ("1 2 3 … next") and never links the far pages directly.
 function nextPageUrl(u: URL): string | null {
-  const k = pageParamOf(u);
-  if (k) {
-    const n = Number(u.searchParams.get(k));
-    if (Number.isInteger(n) && n > 0) {
-      const c = new URL(u.toString());
-      c.searchParams.set(k, String(n + 1));
-      return c.toString();
-    }
-  }
-  const pm = u.pathname.match(PATH_PAGE_RE);
-  if (pm) {
-    const n = Number(pm[2]);
-    if (Number.isInteger(n) && n > 0) {
-      const c = new URL(u.toString());
-      c.pathname = u.pathname.replace(/(\d+)(\/?)$/, `${n + 1}$2`);
-      return c.toString();
-    }
-  }
+  const mark = pageMarkOf(u);
+  if (mark) return setPageValue(u, mark, mark.value + 1);
   // Trailing bare number segment (e.g. /listings/31 → /listings/32). Only called
   // on listing pages that yielded new cards, so it walks deep pagers that only
   // ever show "1 2 3 … next" and never link the far pages.
@@ -213,14 +259,12 @@ function nextPageUrl(u: URL): string | null {
   return null;
 }
 
-// The numeric page a URL represents (?page=N or /page/N), or 0 when it carries
-// no numeric page marker (a clean first page, or a token/rel=next pager).
-function pageNumberOf(u: URL): number {
-  const k = pageParamOf(u);
-  if (k) { const n = Number(u.searchParams.get(k)); if (Number.isInteger(n) && n > 0) return n; }
-  const pm = u.pathname.match(PATH_PAGE_RE);
-  if (pm) { const n = Number(pm[2]); if (Number.isInteger(n) && n > 0) return n; }
-  return 0;
+// The page a URL represents, or null when it carries no page marker at all
+// (a clean first page, or a token/rel=next pager). null must NOT be read as
+// "page 0": on a 0-indexed pager that would make the real page 0 unreachable.
+function pageNumberOf(u: URL): number | null {
+  const mark = pageMarkOf(u);
+  return mark ? mark.value : null;
 }
 
 // Reduce a path to a template where slug/id segments become "*".
@@ -245,25 +289,53 @@ function pathTemplate(pathname: string): { key: string; placeholders: number; li
 // attributes (many directories put the card link in a data-* attribute).
 function collectLinks(html: string, base: string): string[] {
   const out = new Set<string>();
-  const push = (raw: string) => {
-    const href = (raw || "").trim();
-    if (!href || /^(#|mailto:|tel:|javascript:|data:|whatsapp:)/i.test(href)) return;
-    try {
-      const abs = new URL(href, base);
-      abs.hash = "";
-      if (abs.protocol === "http:" || abs.protocol === "https:") out.add(abs.toString());
-    } catch { /* ignore */ }
-  };
-  let m: RegExpExecArray | null;
-  const A = /<a\b[^>]*?href\s*=\s*["']?([^"'\s>]+)["']?/gi;
-  while ((m = A.exec(html))) push(m[1]);
-  const D = /\bdata-(?:route|href|url|link|permalink)\s*=\s*["']([^"']+)["']/gi;
-  while ((m = D.exec(html))) push(m[1]);
+  for (const href of rawHrefs(html)) {
+    const abs = absUrl(href, base);
+    if (abs) out.add(abs);
+  }
   return [...out];
 }
 
+function rawHrefs(html: string): string[] {
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  const A = /<a\b[^>]*?href\s*=\s*["']?([^"'\s>]+)["']?/gi;
+  while ((m = A.exec(html))) out.push(m[1]);
+  const D = /\bdata-(?:route|href|url|link|permalink)\s*=\s*["']([^"']+)["']/gi;
+  while ((m = D.exec(html))) out.push(m[1]);
+  return out;
+}
+
+// Resolve one raw href against the page URL. Entities are decoded FIRST: HTML
+// escapes every "&" in an href, so a pager link written as
+// `?sort=title&amp;page=0,1` parses into a param literally called "amp;page" —
+// the page number is silently lost and the crawler re-reads page 1 forever.
+function absUrl(raw: string, base: string): string | null {
+  const href = decodeEntities((raw || "").trim());
+  if (!href || /^(#|mailto:|tel:|javascript:|data:|whatsapp:)/i.test(href)) return null;
+  try {
+    const abs = new URL(href, base);
+    abs.hash = "";
+    if (abs.protocol !== "http:" && abs.protocol !== "https:") return null;
+    return abs.toString();
+  } catch { return null; }
+}
+
 function isPaginationUrl(u: URL): boolean {
-  return !!pageParamOf(u) || PATH_PAGE_RE.test(u.pathname);
+  return !!pageMarkOf(u);
+}
+
+// The "next page" link a page declares about itself (rel="next"). This is the
+// most reliable pager signal there is — it survives filters in the query string,
+// opaque tokens and multi-pager formats we couldn't otherwise reconstruct.
+function findRelNext(html: string, base: string): string | null {
+  const rel = /<(?:a|link)\b[^>]*rel\s*=\s*["'][^"']*\bnext\b[^"']*["'][^>]*href\s*=\s*["']([^"']+)["']/i;
+  const rel2 = /<(?:a|link)\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*rel\s*=\s*["'][^"']*\bnext\b[^"']*["']/i;
+  for (const re of [rel, rel2]) {
+    const m = html.match(re);
+    if (m) { const abs = absUrl(m[1], base); if (abs) return abs; }
+  }
+  return null;
 }
 
 // Pagination links that point at another page of THIS same listing.
@@ -278,7 +350,9 @@ function findPageLinks(seed: string, links: string[], html: string, base: string
     let u: URL;
     try { u = new URL(href); } catch { continue; }
     if (registrableDomain(u.hostname) !== sReg) continue;
-    if (pageParamOf(u)) {
+    const mark = pageMarkOf(u);
+    if (!mark) continue;
+    if (mark.kind === "query") {
       if (u.pathname.replace(/\/+$/, "") === sPath && stripPageParams(u) === sQuery) out.add(u.toString());
       continue;
     }
@@ -286,15 +360,8 @@ function findPageLinks(seed: string, links: string[], html: string, base: string
     if (pm && pm[1].replace(/\/+$/, "") === sPath && u.search === sQuery) out.add(u.toString());
   }
 
-  // rel="next" (link or a) as a fallback for "next"-only pagers.
-  const rel = /<(?:a|link)\b[^>]*rel\s*=\s*["'][^"']*\bnext\b[^"']*["'][^>]*href\s*=\s*["']([^"']+)["']/gi;
-  const rel2 = /<(?:a|link)\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*rel\s*=\s*["'][^"']*\bnext\b[^"']*["']/gi;
-  for (const re of [rel, rel2]) {
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) {
-      try { out.add(new URL(m[1], base).toString()); } catch { /* ignore */ }
-    }
-  }
+  const next = findRelNext(html, base);
+  if (next) out.add(next);
   return [...out];
 }
 
@@ -485,6 +552,11 @@ export function looksLikeName(raw: string): boolean {
   if (/^(https?:\/\/|www\.)/i.test(t)) return false;                    // a URL
   if (/^[a-z0-9-]+\.[a-z]{2,6}(\.[a-z]{2,4})?$/i.test(t)) return false; // a bare domain
   if (/\d{6,}/.test(t) && !/\p{L}{3,}/u.test(t)) return false;          // "66828808 x"
+  // A sentence is a description, not a name. Some directories mark the blurb up
+  // with the same heading tag as the company name (tdv.motc.gov.qa uses a second
+  // <h2>), so length alone can't tell them apart — prose can.
+  if (t.split(/\s+/).filter(Boolean).length > 14) return false;         // "At X we provide superior…"
+  if (/[.!?]\s+\p{Lu}/u.test(t)) return false;                          // more than one sentence
   if (NAME_STOP.has(t.toLowerCase().replace(/\s+/g, " "))) return false;
   return true;
 }
@@ -503,7 +575,11 @@ function pickCardName(fragment: string): { name: string; href: string | null } {
     const attrs = m[2] || "";
     const inner = m[3] || "";
     if (tag === "a" && /href\s*=\s*["']?\s*(?:tel:|mailto:|javascript:|whatsapp:|#)/i.test(attrs)) continue;
-    const name = finalizeName(stripTags(inner));
+    const raw = stripTags(inner);
+    // Judge the FULL text: truncating a 400-character blurb to 140 would leave
+    // something that could still pass for a (very long) company name.
+    if (raw.length > 160) continue;
+    const name = finalizeName(raw);
     if (!looksLikeName(name)) continue;
     const heading = /^h[1-6]$/.test(tag);
     const hrefMatch = tag === "a"
@@ -568,6 +644,7 @@ async function crawlOnce(
   const {
     maxPages = 20,
     maxDetails = 300,
+    maxListings,
     concurrency = 5,
     respectRobots = true,
     checkMx = true,
@@ -577,6 +654,10 @@ async function crawlOnce(
     proxy,
     readerKey,
   } = opts;
+
+  // Soft budget: stop STARTING pages once we've captured this many listings.
+  // Never truncates a page mid-way, so the resume point is always a whole page.
+  const listingBudget = Math.max(1, maxListings ?? maxDetails);
 
   const origin = new URL(seed).origin;
   const siteHost = hostOf(seed);
@@ -594,9 +675,19 @@ async function crawlOnce(
   let pagesRead = 0;      // contiguous successful reads from the seed (cursor step)
   let chainBroken = false; // a page in the sequence was refused → cursor must stop
   let inlineListings = 0; // cards read straight off a listing page
+  // Once a page has been read inline, every later page of the SAME walk is too.
+  // Past the last page a directory still serves a valid shell with no cards; the
+  // "detail links" left on it are the site's menu, and following those harvests
+  // the directory's own contact details instead of companies.
+  let inlineMode = false;
   let harvested = 0;      // listings captured so far, inline OR queued
   let blocked = 0;
   let blockReason: BlockReason | undefined;
+  // The exact page to resume from next batch. It is the first page we did NOT
+  // read: the one a bot wall refused, or the successor of the last page we read.
+  // Carrying the URL (instead of a page number) is what lets us resume through
+  // ANY pager — Drupal's "?page=0,7", a rel=next-only pager, an opaque token.
+  let refusedUrl: string | null = null;
   // Some directories (government registers especially) throw a captcha wall once
   // you ask for a few pages too quickly. Back off and retry before abandoning the
   // walk, so a burst limit doesn't end the harvest early. The cooldown is never
@@ -605,7 +696,7 @@ async function crawlOnce(
   const retries = new Map<string, number>();
   let cooldownMs = 0;
 
-  while (pageQueue.length && listingPages < maxPages && harvested < maxDetails) {
+  while (pageQueue.length && listingPages < maxPages && harvested < listingBudget) {
     const pageUrl = pageQueue.shift()!.split("#")[0];
     if (pagesSeen.has(pageUrl)) continue;
     pagesSeen.add(pageUrl);
@@ -629,6 +720,7 @@ async function crawlOnce(
         continue; // NOT counted as a walked page — it hasn't been decided yet
       }
       listingPages++;
+      if (!chainBroken) refusedUrl = pageUrl; // resume from the page we couldn't read
       chainBroken = true; // never let the cursor advance past a page we couldn't read
       onProgress?.({ type: "page", url: pageUrl, listingPages, msg: `page ${res.status || "error"}${why ? ` — ${why}` : ""}` });
       await sleep(politenessMs);
@@ -654,18 +746,28 @@ async function crawlOnce(
     const distinct = new Set(
       inline.map((r) => r.emails[0]?.email || r.phones[0]?.number || "").filter(Boolean)
     ).size;
+    // Do the "detail links" actually belong to these cards? On a directory whose
+    // cards link straight out to the company's own website (tdv.motc.gov.qa), the
+    // only internal repeating links are MENU items — following them harvests
+    // membership forms instead of companies. Comparing the winning link template
+    // against the cards' own hrefs tells the two apart.
+    const cardUrls = new Set(inline.map((r) => r.url));
+    const detailsAreCards =
+      details.length > 0 && details.filter((d) => cardUrls.has(d)).length >= Math.max(1, details.length * 0.5);
     // Require real per-card variety, so a page that merely repeats the site's
     // own switchboard number still falls through to the detail pages.
-    const useInline = distinct >= 3 && (details.length === 0 || distinct >= details.length * 0.6);
+    const useInline =
+      distinct >= 2 && (details.length === 0 || !detailsAreCards || distinct >= details.length * 0.6);
 
     let added = 0;
     if (useInline) {
+      inlineMode = true;
       for (const rec of inline) {
         if (harvested >= maxDetails) break;
         records.push(rec);
         added++; harvested++; inlineListings++;
       }
-    } else {
+    } else if (details.length && !inlineMode) {
       for (const d of details) {
         const dn = d.split("#")[0];
         if (detailSeen.has(dn)) continue;
@@ -674,22 +776,23 @@ async function crawlOnce(
         added++; harvested++;
         if (harvested >= maxDetails) break;
       }
-      // No detail links either → keep whatever little the page exposed inline.
-      if (!details.length) {
-        for (const rec of inline) {
-          if (harvested >= maxDetails) break;
-          records.push(rec);
-          added++; harvested++; inlineListings++;
-        }
+    } else {
+      // Nothing to open (or we're reading this directory inline) → keep whatever
+      // little the page exposed itself.
+      for (const rec of inline) {
+        if (harvested >= maxDetails) break;
+        records.push(rec);
+        added++; harvested++; inlineListings++;
       }
     }
 
     // Walk pages STRICTLY FORWARD (only when this page yielded new listings, so
     // the walk stops cleanly at the end of the list). Prefer incrementing the
-    // numeric page (?page=N → N+1 / /page/N → N+1): it guarantees we cover every
-    // consecutive page and never waste fetches re-crawling the low pages that a
-    // pager always links ("1 2 3 …") or the previous page. Only when the URL has
-    // NO numeric page pattern do we fall back to discovering pagination links.
+    // numeric page (?page=N → N+1 / ?page=0,N → 0,N+1 / /page/N → N+1): it
+    // guarantees we cover every consecutive page and never waste fetches
+    // re-crawling the low pages that a pager always links ("1 2 3 …") or the
+    // previous page. Only when the URL has NO page marker at all do we fall back
+    // to the links the page itself advertises (rel=next / numbered pager).
     if (added > 0) {
       let advanced = false;
       try {
@@ -701,17 +804,18 @@ async function crawlOnce(
         }
       } catch { /* ignore */ }
       if (!advanced) {
-        // No numeric page to increment — discover pagination links from the page
-        // (rel=next / listed page URLs) for pagers without a numeric pattern.
-        // Enqueue numeric pages FORWARD-ONLY, smallest first, so we never jump
-        // to page 1 or a far page; keep non-numeric (token/rel=next) links too.
-        const cur = pageNumberOf(new URL(pageUrl)) || 1;
+        // No page marker to increment (a clean first page, or a token pager).
+        // Enqueue numbered pages FORWARD-ONLY, smallest first, so we never jump
+        // back to page 1; keep non-numeric (token/rel=next) links too.
+        let cur: number | null = null;
+        try { cur = pageNumberOf(new URL(pageUrl)); } catch { /* ignore */ }
         const numeric: { url: string; n: number }[] = [];
         const other: string[] = [];
         for (const pl of findPageLinks(seed, links, res.html, res.url || pageUrl)) {
           const url = pl.split("#")[0];
-          let n = 0; try { n = pageNumberOf(new URL(pl)); } catch { /* ignore */ }
-          if (n > 0) { if (n > cur) numeric.push({ url, n }); }
+          let n: number | null = null;
+          try { n = pageNumberOf(new URL(pl)); } catch { /* ignore */ }
+          if (n !== null) { if (cur === null || n > cur) numeric.push({ url, n }); }
           else other.push(url);
         }
         numeric.sort((a, b) => a.n - b.n);
@@ -725,6 +829,11 @@ async function crawlOnce(
     });
     await sleep(politenessMs);
   }
+
+  // Where the next batch must pick up. A refused page wins (its companies were
+  // never read); otherwise it's whatever is still queued. An empty queue means
+  // the last page advertised no successor → we walked to the end of the list.
+  const nextUrl = refusedUrl || pageQueue.find((u) => !pagesSeen.has(u)) || null;
 
   /* Pass 2 — open each detail page (skipped entirely when we read inline). */
   let detailPages = 0;
@@ -862,7 +971,7 @@ async function crawlOnce(
     note = `Harvest stopped early: ${blockNote(blockReason, !!proxy)} Re-run to continue from the next page.`;
   }
 
-  return { seed, site: siteHost, status, listingPages, pagesRead, detailPages, listingsRead: detailPages + inlineListings, contacts: finalContacts, note };
+  return { seed, site: siteHost, status, listingPages, pagesRead, detailPages, listingsRead: detailPages + inlineListings, contacts: finalContacts, note, nextUrl };
 }
 
 // Read the listing page itself. Plenty of directories (government registers,

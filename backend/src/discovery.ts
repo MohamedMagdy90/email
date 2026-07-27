@@ -58,9 +58,14 @@ function leadLine(name?: string | null, email?: string | null, phone?: string | 
 // mirrors and on the sites we crawl — no bans, no hammering.
 const DISCOVERY_TICK_MS = 45_000;
 const ENRICH_TICK_MS = 15_000;
-// Directory sources walk continuously: pages per batch, and a short delay before
-// the next batch so a big directory streams in quickly without hammering.
-const DIRECTORY_PAGES_PER_RUN = 4;
+// Directory sources walk continuously: how far a single batch may go, and a
+// short delay before the next batch so a big directory streams in quickly
+// without hammering. The batch stops at whichever budget is hit FIRST — a page
+// cap alone is wrong for the two shapes directories come in: one lists 40
+// companies a page (4 pages is plenty), another lists 3 (an infinite-scroll
+// Drupal view), and a 4-page batch there would need 110 batches to finish.
+const DIRECTORY_PAGES_PER_RUN = 25;
+const DIRECTORY_LISTINGS_PER_RUN = 40;
 const DIRECTORY_CONTINUE_MS = 1_500;
 // Consecutive empty batches to tolerate before a directory is "finished".
 const EMPTY_STREAK_LIMIT = 3;
@@ -130,8 +135,8 @@ export interface DiscoveryStatus {
 }
 
 export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
-  const srcCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources`))[0]?.n ?? 0;
-  const activeCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1`))[0]?.n ?? 0;
+  const srcCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0`))[0]?.n ?? 0;
+  const activeCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.n ?? 0;
   const statusRows = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
   const withEmail = (await q(
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE status='pending' AND email IS NOT NULL AND email <> ''`
@@ -159,7 +164,7 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
         AND enriched=1
         AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))`
   ))[0]?.n ?? 0;
-  const nextRunAt = (await q(`SELECT min(next_run_at) AS t FROM discovery_sources WHERE enabled=1`))[0]?.t ?? null;
+  const nextRunAt = (await q(`SELECT min(next_run_at) AS t FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.t ?? null;
   const lastLeadAt = (await q(`SELECT max(created_at) AS t FROM discovered_leads`))[0]?.t ?? null;
 
   const map: Record<string, number> = {};
@@ -276,13 +281,23 @@ async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; doma
 }
 
 // Set/replace the page number in a directory URL so we can walk it continuously
-// across separate runs. Handles ?page=N, /page/N, and a trailing bare number
-// (e.g. /listings/31 → /listings/32); otherwise appends ?page=N as a fallback.
+// across separate runs. Handles ?page=N, Drupal's multi-pager ?page=0,N,
+// /page/N, and a trailing bare number (e.g. /listings/31 → /listings/32);
+// otherwise appends ?page=N as a fallback.
 function withPage(base: string, page: number): string {
   try {
     const u = new URL(/^https?:\/\//i.test(base) ? base : "https://" + base);
-    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) {
-      if (u.searchParams.has(k)) { u.searchParams.set(k, String(page)); return u.toString(); }
+    for (const k of PAGE_KEYS) {
+      const v = u.searchParams.get(k);
+      if (v == null) continue;
+      if (/^\d+$/.test(v)) { u.searchParams.set(k, String(page)); return u.toString(); }
+      // Multi-pager: only the slot that actually moves may be written.
+      if (/^\d+(?:,\d+)+$/.test(v)) {
+        const slots = v.split(",").map(Number);
+        slots[activePagerSlot(slots)] = page;
+        u.searchParams.set(k, slots.join(","));
+        return u.toString();
+      }
     }
     if (/\/(?:page|p)[-/]\d+\/?$/i.test(u.pathname)) {
       u.pathname = u.pathname.replace(/((?:page|p)[-/])\d+(\/?)$/i, `$1${page}$2`);
@@ -298,12 +313,20 @@ function withPage(base: string, page: number): string {
   } catch { return base; }
 }
 
+// Query params that carry a page number, and — for Drupal's "?page=0,7" style —
+// which slot of a multi-pager is the one that actually moves (see directory.ts).
+const PAGE_KEYS = ["page", "paged", "pg", "p", "start", "offset"];
+function activePagerSlot(slots: number[]): number {
+  for (let i = slots.length - 1; i >= 0; i--) if (slots[i] > 0) return i;
+  return slots.length - 1;
+}
+
 // Strip any page marker from a URL so it can serve as a clean paging base
 // (?page=N, /page/N, and trailing /N are all removed).
 function stripPage(url: string): string {
   try {
     const u = new URL(/^https?:\/\//i.test(url) ? url : "https://" + url);
-    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) u.searchParams.delete(k);
+    for (const k of PAGE_KEYS) u.searchParams.delete(k);
     u.pathname = u.pathname.replace(/\/(?:page|p)[-/]\d+\/?$/i, "");
     return u.toString();
   } catch { return url; }
@@ -314,9 +337,14 @@ function stripPage(url: string): string {
 export function initialCursor(base: string): number {
   try {
     const u = new URL(/^https?:\/\//i.test(base) ? base : "https://" + base);
-    for (const k of ["page", "paged", "pg", "p", "start", "offset"]) {
+    for (const k of PAGE_KEYS) {
       const v = u.searchParams.get(k);
-      if (v && /^\d+$/.test(v)) return Math.max(1, Number(v));
+      if (!v) continue;
+      if (/^\d+$/.test(v)) return Math.max(1, Number(v));
+      if (/^\d+(?:,\d+)+$/.test(v)) {
+        const slots = v.split(",").map(Number);
+        return Math.max(1, slots[activePagerSlot(slots)]);
+      }
     }
     let m = u.pathname.match(/\/(?:page|p)[-/](\d+)\/?$/i);
     if (m) return Math.max(1, Number(m[1]));
@@ -371,24 +399,41 @@ interface DirRunResult {
   detailPages: number;  // detail/profile pages opened this batch (0 when read inline)
   listingsRead: number; // listings read this batch, inline or via detail pages
   error?: string; okish: boolean; nextCursor: number; pages: number;
+  // Did this batch read at least one page? A batch whose very first page was
+  // refused made no progress at all, and must not chain straight into another
+  // attempt against the same wall.
+  progressed: boolean;
+  // The EXACT URL the next batch must start from — undefined when the crawler
+  // couldn't tell us, null when we walked off the end of the directory.
+  nextUrl?: string | null;
 }
 
-// Walk ONE batch of a business directory (a few pages), starting at the saved
-// page cursor, and insert every new company. This is what scales to tens of
+// Walk ONE batch of a business directory (a few pages), starting where the last
+// batch stopped, and insert every new company. This is what scales to tens of
 // thousands: a directory lists every business, and we page through it forever.
 async function runDirectorySource(src: any): Promise<DirRunResult> {
   const base = String(src.base_url || "").trim();
   const cursor = Math.max(1, Number(src.cursor) || 1);
-  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0 }; }
+  if (!base) { derr("dir", "source has no directory URL set — skipping"); return { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: "No directory URL set", okish: false, nextCursor: cursor, pages: 0, progressed: false }; }
 
   const proxy = await getProxyConfig();
   const readerKey = await getReaderKey();
-  const seed = withPage(base, cursor);
+  // Resume from the exact URL the last batch handed back. A page NUMBER can't
+  // address every pager: an infinite-scroll Drupal view pages with "?page=0,7"
+  // and silently ignores "?page=7", so a number-only cursor re-read page 1 on
+  // every batch and the source declared itself finished after 3 duplicate runs.
+  const resume = String(src.next_url || "").trim();
+  const seed = resume || withPage(base, cursor);
+  // Keep the displayed page honest: when we resume by URL, the page number the
+  // site itself uses is in that URL — trust it over the counter we carried.
+  const startCursor = resume ? Math.max(cursor, initialCursor(resume)) : cursor;
+
   const opts: DirectoryOptions = {
     maxPages: DIRECTORY_PAGES_PER_RUN,
-    // Open EVERY listing on the pages we walk — the cursor advances by whole
-    // pages, so a maxDetails smaller than (pages × listings-per-page) would
-    // silently skip listings. 40/page is a generous ceiling for dense directories.
+    // Stop between pages once the batch has captured enough listings…
+    maxListings: DIRECTORY_LISTINGS_PER_RUN,
+    // …but never truncate a page half-read: the resume point is a whole page, so
+    // a hard cap below (pages × listings-per-page) would skip the remainder.
     maxDetails: Math.max(clamp(src.limit_n, 20, 300), DIRECTORY_PAGES_PER_RUN * 40),
     concurrency: proxy ? 3 : 5,
     respectRobots: true,
@@ -399,7 +444,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   };
 
   const how = proxy ? `scraping proxy (${proxy.provider})` : readerKey ? "free reader (keyed)" : "direct fetch + free reader fallback";
-  dlog("dir", `crawling ${shortUrl(seed)} — page ${cursor}, up to ${DIRECTORY_PAGES_PER_RUN} listing page(s) · ${how}`);
+  dlog("dir", `crawling ${shortUrl(seed)} — page ${startCursor}, up to ${DIRECTORY_PAGES_PER_RUN} page(s) / ${DIRECTORY_LISTINGS_PER_RUN} listing(s) · ${how}`);
 
   // Stream the crawler's own progress into the log: each listing page it opens,
   // its detail-page progress, and any phase note (e.g. auto-switching to /listings).
@@ -414,7 +459,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   // The crawler auto-found the real listings index (the URL you pasted had no
   // companies). Persist it so we page the correct URL from here on, and restart
   // the walk at page 1 of that index so nothing is skipped.
-  let resolvedFromCursor = cursor;
+  let resolvedFromCursor = startCursor;
   if (result.resolvedSeed) {
     const resolvedBase = stripPage(result.resolvedSeed);
     if (resolvedBase && resolvedBase !== base) {
@@ -472,8 +517,11 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
   if (okish && read < pages) {
     dwarn("dir", `↳ ${pages - read} page(s) were refused — resuming from page ${nextCursor} next batch so nothing is skipped.`);
   }
+  // A freshly-resolved index invalidates any resume URL we were carrying.
+  const nextUrl = result.resolvedSeed && resolvedFromCursor === 1 ? undefined : result.nextUrl;
   const error = blocked ? (result.note || result.status) : undefined;
-  return { found, extracted: result.contacts.length, detailPages: result.detailPages, listingsRead: result.listingsRead, error, okish, nextCursor, pages };
+  const progressed = okish && read > 0;
+  return { found, extracted: result.contacts.length, detailPages: result.detailPages, listingsRead: result.listingsRead, error, okish, nextCursor, pages, nextUrl, progressed };
 }
 
 /* --------------------------- Web-search source ------------------------- */
@@ -655,7 +703,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     try {
       r = await runDirectorySource(src);
     } catch (e: any) {
-      r = { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0 };
+      r = { found: 0, extracted: 0, detailPages: 0, listingsRead: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, pages: 0, progressed: false };
     }
 
     // Decide "end of directory" by whether this batch actually READ listing cards,
@@ -673,30 +721,37 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     let streak = Number(src.empty_streak) || 0;
     let exhausted = false;
     let cursor = Number(src.cursor) || 1;
-    // No cursor progress = the very first page of the batch was refused. Chaining
-    // straight into another attempt would just hammer the wall, so fall back to
-    // the normal interval and let the block expire.
-    const stalled = !r.error && r.okish && r.nextCursor <= cursor;
+    // The exact page the next batch resumes from. `null` from the crawler means
+    // the last page it read advertised no successor — that IS the end of the
+    // list, and it's a far more reliable signal than counting thin pages.
+    let nextUrl: string | null = r.nextUrl === undefined ? String(src.next_url || "") || null : r.nextUrl;
+    const walkedOff = !r.error && r.okish && r.nextUrl === null;
+    // No page was read at all = the very first page of the batch was refused.
+    // Chaining straight into another attempt would just hammer the wall, so fall
+    // back to the normal interval and let the block expire.
+    const stalled = !r.error && r.okish && !r.progressed;
     if (!r.error && r.okish) {
       cursor = r.nextCursor;                       // move on, even through thin pages
       // A batch that was blocked told us nothing about the end of the list.
       if (!stalled) {
         streak = productive ? 0 : streak + 1;
-        exhausted = streak >= EMPTY_STREAK_LIMIT;  // genuinely off the end of the list
+        exhausted = walkedOff || streak >= EMPTY_STREAK_LIMIT; // genuinely off the end
       }
     }
+    // A finished walk starts over from the top next time it's kicked.
+    if (exhausted) nextUrl = null;
     const cont = !r.error && !exhausted && !stalled; // keep streaming while there's more
     const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
     const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, next_url=?
        WHERE id=?`,
-      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, nextUrl, src.id]
     );
     if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
-    else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${EMPTY_STREAK_LIMIT} pages with no more listings); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
+    else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${walkedOff ? "the last page had no next page" : `${EMPTY_STREAK_LIMIT} pages with no more listings`}); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
     else if (stalled) dwarn("dir", `${srcLabel(src)}: the site refused page ${cursor} — pausing ${interval}m so the block clears, then resuming from that exact page (nothing skipped).`);
     else if (cont) dlog("dir", `${srcLabel(src)}: continuing to page ${cursor} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s${r.extracted > 0 && r.found === 0 ? ` (page's ${r.extracted} listing(s) already known — still walking to the end)` : ""}`);
     return { found: r.found, error: r.error, continue: cont };
@@ -767,7 +822,12 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
     // on a mid-walk directory just resumes from where it left off.
     const restart = Number(src.exhausted) === 1;
     const cursor = restart ? initialCursor(String(src.base_url || "")) : (Number(src.cursor) || 1);
-    await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
+    if (restart) {
+      await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=?, next_url=NULL WHERE id=?`, [cursor, id]);
+      src.next_url = null;
+    } else {
+      await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
+    }
     src.exhausted = 0; src.empty_streak = 0; src.cursor = cursor;
     if (restart) dlog("dir", `re-scanning ${srcLabel(src)} from page ${cursor} — re-checking every listing for anything new`);
   } else if (src.type === "search") {
@@ -808,9 +868,10 @@ async function discoveryTick(): Promise<void> {
   try {
     const now = nowIso();
     // Most-overdue enabled source (a null next_run_at = never run = due now).
+    // Archived sources are invisible to the bot — that's what archiving means.
     const src = (await q(
       `SELECT * FROM discovery_sources
-        WHERE enabled=1 AND (next_run_at IS NULL OR next_run_at <= ?)
+        WHERE enabled=1 AND archived=0 AND (next_run_at IS NULL OR next_run_at <= ?)
         ORDER BY (next_run_at IS NULL) DESC, next_run_at ASC
         LIMIT 1`,
       [now]
@@ -988,7 +1049,7 @@ export function startDiscoveryWorker(): void {
   (async () => {
     try {
       const on = await isBotEnabled();
-      const active = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1`))[0]?.n ?? 0;
+      const active = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.n ?? 0;
       const auto = await autoEnrichOn();
       dlog("", `state → bot ${on ? "ON" : "OFF"} · ${active} enabled source(s) · auto-find-emails ${auto ? "ON" : "OFF"}`);
       if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");

@@ -22,7 +22,10 @@ if (DATABASE_URL) {
   console.log("[db] using Postgres (DATABASE_URL)");
 } else {
   const { Database } = await import("bun:sqlite");
-  const db = new Database("data.sqlite");
+  // SQLITE_PATH lets a second process (a script, a test) use its own file —
+  // two processes sharing one WAL database corrupts it.
+  const file = process.env.SQLITE_PATH || "data.sqlite";
+  const db = new Database(file);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA busy_timeout = 5000;");
   query = async (text, params = []) => {
@@ -32,7 +35,7 @@ if (DATABASE_URL) {
     stmt.run(...(params as any[]));
     return [];
   };
-  console.log("[db] using SQLite (data.sqlite)");
+  console.log(`[db] using SQLite (${file})`);
 }
 
 export const q = query;
@@ -160,6 +163,15 @@ export async function ensureSchema() {
   // generated query plan by `cursor`. Optional custom keywords live here; when
   // blank the bot derives them from the category.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN keywords TEXT`); } catch { /* exists */ }
+  // The EXACT URL a directory walk must resume from. A page NUMBER can't describe
+  // every pager (Drupal's multi-pager "?page=0,7", rel=next-only pagers, opaque
+  // tokens), so the crawler hands back the next unread page and we store it.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN next_url TEXT`); } catch { /* exists */ }
+  // Archiving: retire a source without losing it (or the leads it found). An
+  // archived source is invisible to the worker and to every count, and can be
+  // restored later exactly where it left off.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN archived_at TEXT`); } catch { /* exists */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being

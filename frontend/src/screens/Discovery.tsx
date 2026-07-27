@@ -31,6 +31,9 @@ type LeadTab = "pending" | "approved" | "rejected";
 export default function Discovery() {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
   const [sources, setSources] = useState<DiscoverySource[]>([]);
+  const [archived, setArchived] = useState<DiscoverySource[]>([]);
+  const [archivedCount, setArchivedCount] = useState(0);
+  const [showArchived, setShowArchived] = useState(false);
   const [cats, setCats] = useState<string[]>(FALLBACK_CATS);
   const [contactCats, setContactCats] = useState<string[]>([]);
 
@@ -62,7 +65,18 @@ export default function Discovery() {
     try { setStatus(await api.getDiscoveryStatus()); } catch { /* ignore */ }
   }
   async function refreshSources() {
-    try { setSources((await api.getDiscoverySources()).sources); } catch { /* ignore */ }
+    try {
+      const r = await api.getDiscoverySources();
+      setSources(r.sources);
+      setArchivedCount(r.archivedCount ?? 0);
+    } catch { /* ignore */ }
+  }
+  async function refreshArchived() {
+    try {
+      const r = await api.getDiscoverySources(true);
+      setArchived(r.sources);
+      setArchivedCount(r.archivedCount ?? r.sources.length);
+    } catch { /* ignore */ }
   }
   async function refreshBadNames() {
     try { setBadNames(await api.getBadNameCount()); } catch { /* ignore */ }
@@ -116,6 +130,7 @@ export default function Discovery() {
   useEffect(() => {
     refreshStatus();
     refreshSources();
+    refreshArchived();
     refreshBadNames();
     api.getLeadCategories().then((r) => r.categories?.length && setCats(r.categories)).catch(() => {});
     api.getCategories().then((r) => setContactCats(r.categories || [])).catch(() => {});
@@ -171,9 +186,23 @@ export default function Discovery() {
       setTimeout(() => { refreshSources(); refreshStatus(); refreshBadNames(); if (tab === "pending") refreshLeads(); }, 2000);
     }
   }
+  async function archiveSource(s: DiscoverySource) {
+    try {
+      await api.archiveDiscoverySource(s.id);
+      toast(`Archived "${sourceTitle(s)}" — restore it any time`, "success");
+      refreshSources(); refreshArchived(); refreshStatus();
+    } catch (e: any) { toast(e.message, "error"); }
+  }
+  async function restoreSource(s: DiscoverySource) {
+    try {
+      await api.unarchiveDiscoverySource(s.id);
+      toast(`Restored "${sourceTitle(s)}" — it picks up where it left off`, "success");
+      refreshSources(); refreshArchived(); refreshStatus();
+    } catch (e: any) { toast(e.message, "error"); }
+  }
   async function removeSource(s: DiscoverySource) {
-    if (!confirm(`Remove the "${s.location} · ${s.category}" source? Leads it already found stay in your review pool.`)) return;
-    try { await api.deleteDiscoverySource(s.id); refreshSources(); refreshStatus(); }
+    if (!confirm(`Permanently delete the "${sourceTitle(s)}" source?\n\nLeads it already found stay in your review pool, but its settings and walk position are gone for good. Archive it instead if you might want it back.`)) return;
+    try { await api.deleteDiscoverySource(s.id); refreshSources(); refreshArchived(); refreshStatus(); }
     catch (e: any) { toast(e.message, "error"); }
   }
 
@@ -348,9 +377,40 @@ export default function Discovery() {
                 onToggle={() => toggleSource(s)}
                 onRun={() => runSource(s)}
                 onEdit={() => { setEditing(s); setModalOpen(true); }}
+                onArchive={() => archiveSource(s)}
                 onDelete={() => removeSource(s)}
               />
             ))}
+          </div>
+        )}
+
+        {/* Archived drawer — retired sources, kept intact and restorable. */}
+        {archivedCount > 0 && (
+          <div className="border-t border-line bg-cream/40">
+            <button
+              type="button"
+              onClick={() => { setShowArchived((v) => !v); if (!showArchived) refreshArchived(); }}
+              className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-ink/[0.03]"
+            >
+              <span className="flex items-center gap-2 text-[13px] font-medium text-ink/70">
+                <span className="grid h-5 w-5 place-items-center rounded-md bg-ink/[0.07] text-[10px] font-semibold tabular-nums text-ink/55">
+                  {archivedCount}
+                </span>
+                Archived source{archivedCount === 1 ? "" : "s"}
+              </span>
+              <span className={cn("text-xs text-ink/40 transition-transform", showArchived && "rotate-180")}>▾</span>
+            </button>
+            {showArchived && (
+              archived.length === 0 ? (
+                <div className="px-5 pb-4 text-xs text-muted">Loading…</div>
+              ) : (
+                <div className="divide-y divide-line-soft border-t border-line-soft">
+                  {archived.map((s) => (
+                    <ArchivedRow key={s.id} s={s} onRestore={() => restoreSource(s)} onDelete={() => removeSource(s)} />
+                  ))}
+                </div>
+              )
+            )}
           </div>
         )}
       </Card>
@@ -532,20 +592,13 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle }: { running: b
 
 /* ------------------------------ Source row ----------------------------- */
 
-function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onDelete: () => void }) {
+function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void }) {
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const isSearch = s.type === "search";
   const streaming = (isDir || isSearch) && s.enabled && runningNow;
   // Directory: show host + path so a resolved index (e.g. …/listings) is visible.
-  const host = (() => {
-    try {
-      const u = new URL(s.base_url || "");
-      const p = u.pathname.replace(/\/+$/, "");
-      return u.hostname.replace(/^www\./, "") + (p && p !== "/" ? p : "");
-    } catch { return s.base_url || ""; }
-  })();
-  const title = isDir ? host : (s.location || (isSearch ? "Web search" : ""));
+  const title = isDir ? sourceHost(s.base_url) : (s.location || (isSearch ? "Web search" : ""));
   const badge = isDir ? "Directory" : isSearch ? "Web search" : "";
 
   return (
@@ -599,7 +652,14 @@ function SourceRow({ s, onToggle, onRun, onEdit, onDelete }: { s: DiscoverySourc
           {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : (isDir || isSearch) && s.exhausted ? (isSearch ? "Re-search" : "Restart") : "Run now"}
         </button>
         <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
-        <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Remove">✕</button>
+        <button
+          onClick={onArchive}
+          className="rounded-full px-2.5 py-1.5 text-xs font-medium text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink"
+          title="Archive — stops scanning but keeps the source, its position and its leads"
+        >
+          Archive
+        </button>
+        <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
       </div>
     </div>
   );
@@ -841,6 +901,41 @@ function StatusChip({ status }: { status: string }) {
   return <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-medium capitalize", map[status] || "bg-ink/[0.06] text-ink/60")}>{status}</span>;
 }
 
+/* ------------------------------ Archived row ----------------------------- */
+
+// A retired source. Everything it knew is still here — where it stopped, how
+// much it found — so restoring it resumes the walk instead of starting over.
+function ArchivedRow({ s, onRestore, onDelete }: { s: DiscoverySource; onRestore: () => void; onDelete: () => void }) {
+  const isDir = s.type === "directory";
+  const isSearch = s.type === "search";
+  const badge = isDir ? "Directory" : isSearch ? "Web search" : "Map area";
+  return (
+    <div className="flex items-center gap-4 px-5 py-3.5">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/45">{badge}</span>
+          <span className="truncate font-medium text-ink/70">{sourceTitle(s)}</span>
+        </div>
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
+          <span>{(s.total_found || 0).toLocaleString()} found</span>
+          {(isDir || isSearch) && <span>· {s.exhausted ? "completed" : `stopped at ${isDir ? "page" : "step"} ${s.cursor}`}</span>}
+          {s.archived_at && <span>· archived {fmtAgo(s.archived_at)}</span>}
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        <button
+          onClick={onRestore}
+          className="rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:border-ink hover:bg-ink hover:text-cream"
+          title="Restore — the bot picks it up again from where it stopped"
+        >
+          Restore
+        </button>
+        <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------ helpers -------------------------------- */
 
 function intervalLabel(min: number): string {
@@ -856,4 +951,32 @@ function fmtIn(iso: string): string {
   const h = Math.round(m / 60);
   if (h < 48) return `in ${h}h`;
   return `in ${Math.round(h / 24)}d`;
+}
+
+// "just now", "12m ago", "3h ago", "5d ago" — relative PAST formatting.
+function fmtAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  const m = Math.round(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+function sourceTitle(s: DiscoverySource): string {
+  if (s.type === "directory") return sourceHost(s.base_url) || "directory";
+  if (s.type === "search") return s.location ? `${s.location} · ${s.category}` : "Web search";
+  return [s.location, s.category].filter(Boolean).join(" · ") || "source";
+}
+
+// Host + path for a directory (so a resolved index like …/listings is visible),
+// otherwise the place being watched. Used by the row headings and every confirm
+// dialog, so a source is always referred to by the same name.
+function sourceHost(url?: string | null): string {
+  try {
+    const u = new URL(url || "");
+    const p = u.pathname.replace(/\/+$/, "");
+    return u.hostname.replace(/^www\./, "") + (p && p !== "/" ? p : "");
+  } catch { return url || ""; }
 }

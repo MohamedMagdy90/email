@@ -1228,8 +1228,16 @@ app.post("/api/discovery/repair-names", async (c) => {
 // ---- Sources (the location+industry "watchers" the bot cycles through) ----
 
 app.get("/api/discovery/sources", async (c) => {
-  const sources = await q(`SELECT * FROM discovery_sources ORDER BY created_at DESC`);
-  return c.json({ sources });
+  // Archived sources are kept out of the way but never deleted: they keep their
+  // walk position, their stats and every lead they ever found, and can be
+  // restored later exactly where they left off.
+  const archived = c.req.query("archived") === "1";
+  const sources = await q(
+    `SELECT * FROM discovery_sources WHERE archived=? ORDER BY ${archived ? "archived_at DESC, created_at DESC" : "created_at DESC"}`,
+    [archived ? 1 : 0]
+  );
+  const archivedCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=1`))[0]?.n ?? 0;
+  return c.json({ sources, archivedCount });
 });
 
 app.post("/api/discovery/sources", async (c) => {
@@ -1337,13 +1345,40 @@ app.delete("/api/discovery/sources/:id", async (c) => {
   return c.json({ ok: true });
 });
 
+// ---- Archive / restore ----
+// Archiving retires a source WITHOUT losing anything: the bot stops scheduling
+// it, it disappears from the active list and every count, but its walk position,
+// stats and all the leads it found stay exactly as they were. Restoring puts it
+// back on the very page it stopped at.
+app.post("/api/discovery/sources/:id/archive", async (c) => {
+  const id = c.req.param("id");
+  const rows = await q(
+    `UPDATE discovery_sources SET archived=1, archived_at=?, last_status=NULL, next_run_at=NULL WHERE id=? RETURNING *`,
+    [nowIso(), id]
+  );
+  if (!rows.length) return c.json({ error: "Source not found" }, 404);
+  return c.json({ source: rows[0] });
+});
+
+app.post("/api/discovery/sources/:id/unarchive", async (c) => {
+  const id = c.req.param("id");
+  // Comes back due immediately so a restored source picks straight up.
+  const rows = await q(
+    `UPDATE discovery_sources SET archived=0, archived_at=NULL, next_run_at=? WHERE id=? RETURNING *`,
+    [nowIso(), id]
+  );
+  if (!rows.length) return c.json({ error: "Source not found" }, 404);
+  return c.json({ source: rows[0] });
+});
+
 // Run one source immediately (works even when the bot is paused). Fire-and-
 // forget: a directory batch can take longer than the HTTP idle timeout, and the
 // UI polls status to show progress + results as they stream in.
 app.post("/api/discovery/sources/:id/run", async (c) => {
   const id = c.req.param("id");
-  const exists = (await q(`SELECT id FROM discovery_sources WHERE id=?`, [id]))[0];
+  const exists = (await q(`SELECT id, archived FROM discovery_sources WHERE id=?`, [id]))[0];
   if (!exists) return c.json({ error: "Source not found" }, 404);
+  if (Number(exists.archived) === 1) return c.json({ error: "This source is archived — restore it first." }, 400);
   runSourceNow(id).catch(() => {});
   return c.json({ started: true });
 });

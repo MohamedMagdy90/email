@@ -23,21 +23,34 @@ export function hostOf(url: string): string {
   }
 }
 
-// Common multi-part TLDs so "company.com.sa" resolves correctly.
+// Explicit multi-part TLDs that are NOT covered by the generic rule below.
 const MULTI_TLD = new Set([
-  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk",
-  "com.au", "net.au", "org.au", "gov.au",
-  "co.nz", "co.za", "co.in", "co.jp", "co.kr",
-  "com.sa", "com.qa", "com.kw", "com.bh", "com.om", "com.eg", "com.jo", "com.lb",
-  "com.sg", "com.my", "com.tr", "com.br", "com.mx", "com.ar", "com.hk", "com.tw",
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "gov.au", "edu.au", "asn.au", "id.au",
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+]);
+
+// Second-level labels that act as a public suffix under a 2-letter ccTLD:
+// "gov.qa", "com.sa", "org.eg", "ac.ae", "edu.pk", "co.in", "gob.mx", "or.jp"…
+// Without this, "tdv.motc.gov.qa" collapsed to "gov.qa" — so EVERY Qatari
+// government site looked like the same company, and a directory's own address
+// could never be told apart from a listing's.
+const SECOND_LEVEL = new Set([
+  "com", "co", "net", "org", "edu", "gov", "govt", "gob", "gouv", "mil", "ac",
+  "or", "ne", "go", "sch", "info", "biz", "int", "nom", "web", "res", "ind", "firm", "gen",
 ]);
 
 export function registrableDomain(host: string): string {
   const parts = (host || "").replace(/^www\./i, "").toLowerCase().split(".").filter(Boolean);
   if (parts.length <= 2) return parts.join(".");
-  const lastTwo = parts.slice(-2).join(".");
+  const tld = parts[parts.length - 1];
+  const sld = parts[parts.length - 2];
+  const lastTwo = `${sld}.${tld}`;
   const lastThree = parts.slice(-3).join(".");
   if (MULTI_TLD.has(lastTwo)) return lastThree;
+  // Generic: a known second-level label directly under a 2-letter country TLD is
+  // part of the suffix, so the registrable name is one label further left.
+  if (tld.length === 2 && SECOND_LEVEL.has(sld)) return lastThree;
   return lastTwo;
 }
 

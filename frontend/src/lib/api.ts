@@ -149,6 +149,11 @@ export interface DiscoverySource {
   keywords?: string | null; // web-search sources: custom keywords (blank = from category)
   cursor?: number;
   exhausted?: number; // 0 | 1
+  // Directory sources: the exact URL the next batch resumes from (any pager shape).
+  next_url?: string | null;
+  // Archived sources are retired but fully recoverable — the bot ignores them.
+  archived?: number; // 0 | 1
+  archived_at?: string | null;
   location: string;
   place_json?: string | null;
   category: string;
@@ -410,7 +415,16 @@ export const api = {
   // number. Count them, and repair them by re-reading the directory sources.
   getBadNameCount: () => req<{ leads: number; contacts: number }>(`/api/discovery/bad-names`),
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
-  getDiscoverySources: () => req<{ sources: DiscoverySource[] }>(`/api/discovery/sources`),
+  getDiscoverySources: (archived = false) =>
+    req<{ sources: DiscoverySource[]; archivedCount: number }>(
+      `/api/discovery/sources${archived ? "?archived=1" : ""}`
+    ),
+  // Retire a source without deleting it — the bot stops scheduling it, but its
+  // walk position, stats and leads are all kept, ready to be restored.
+  archiveDiscoverySource: (id: string) =>
+    req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}/archive`, { method: "POST", body: "{}" }),
+  unarchiveDiscoverySource: (id: string) =>
+    req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}/unarchive`, { method: "POST", body: "{}" }),
   addDiscoverySource: (body: {
     type?: "osm" | "directory" | "search";
     location?: string;
