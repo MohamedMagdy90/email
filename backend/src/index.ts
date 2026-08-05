@@ -16,6 +16,7 @@ import { registrableDomain, hostOf } from "./crawler/urls";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
+import { backfillCountries, normalizeCountry } from "./country";
 import { searchCompanies } from "./search";
 import { SCRAPE_PROVIDERS, getProxyConfig, getReaderKey } from "./config";
 import {
@@ -42,6 +43,17 @@ import {
 await ensureSchema();
 await seedAuthFromEnv();
 startDiscoveryWorker(); // always-on company discovery (browser-independent)
+
+// Give every lead and contact one canonical country. Rows saved before the
+// country was resolved properly are blank (the source's Country box was left
+// empty) or hold a full address instead of a country — both are repaired from
+// the domain and phone number. Idempotent and set-based, so it's safe to run on
+// every boot; kept off the critical path so it never delays serving.
+backfillCountries(q, (m) => console.log(`[country] ${m}`))
+  .then((r) => {
+    if (r.leads || r.contacts) console.log(`[country] backfill done — ${r.leads} lead(s), ${r.contacts} contact(s)`);
+  })
+  .catch((e) => console.error(`[country] backfill failed: ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(
@@ -1396,14 +1408,23 @@ app.post("/api/discovery/sources/:id/run", async (c) => {
 
 // ---- The review pool ----
 
-// Portable WHERE builder for the pool (status + free-text search).
-function discoveredWhere(opts: { status?: string | null; q?: string | null; hasEmail?: boolean }) {
+// Portable WHERE builder for the pool (status + country + free-text search).
+// Every bulk action reuses this, so "Approve all" acts on EXACTLY the rows the
+// table is showing — including the country filter.
+function discoveredWhere(opts: { status?: string | null; q?: string | null; hasEmail?: boolean; country?: string | null }) {
   const where: string[] = [];
   const params: any[] = [];
   const status = opts.status;
   const search = opts.q;
+  const country = String(opts.country || "").trim();
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
   if (opts.hasEmail) where.push(`(email IS NOT NULL AND email <> '')`);
+  if (country) {
+    // "—" is the explicit "no country on file" bucket, so those leads are
+    // reviewable rather than invisible.
+    if (country === NO_COUNTRY) where.push(`(country IS NULL OR country = '')`);
+    else { where.push(`lower(country) = ?`); params.push(country.toLowerCase()); }
+  }
   if (search) {
     const like = `%${String(search).toLowerCase()}%`;
     where.push(`(lower(name) LIKE ? OR lower(email) LIKE ? OR lower(domain) LIKE ? OR lower(category) LIKE ?)`);
@@ -1411,24 +1432,36 @@ function discoveredWhere(opts: { status?: string | null; q?: string | null; hasE
   }
   return { where, params, clause: where.length ? `WHERE ${where.join(" AND ")}` : "" };
 }
+const NO_COUNTRY = "__none__";
 
 app.get("/api/discovery/leads", async (c) => {
   const status = c.req.query("status") || "pending";
   const search = c.req.query("q");
+  const country = c.req.query("country");
   const hasEmail = c.req.query("hasEmail") === "1";
   const limit = clamp(Number(c.req.query("limit") || 100), 1, 500);
-  const { clause, params } = discoveredWhere({ status, q: search, hasEmail });
+  const { clause, params } = discoveredWhere({ status, q: search, hasEmail, country });
   const leads = await q(
     `SELECT * FROM discovered_leads ${clause} ORDER BY created_at DESC LIMIT ?`,
     [...params, limit]
   );
   const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
   const filteredTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
-  // How many pending, emailable leads match the current search — exactly what
-  // "Approve all" would act on (independent of the with-email view toggle).
-  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true });
+  // How many leads in the CURRENT tab + country + search are approvable — that
+  // is exactly what the "Approve all" button will act on.
+  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true, country });
   const approvableTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${ap.clause}`, ap.params))[0]?.n ?? 0;
-  return c.json({ leads, counts, filteredTotal, approvableTotal });
+  // Every country present in this tab, with counts, so the filter lists real
+  // options for the WHOLE pool — not just the page that happens to be loaded.
+  const cw = discoveredWhere({ status });
+  const countries = await q(
+    `SELECT COALESCE(NULLIF(country, ''), '${NO_COUNTRY}') AS country, CAST(count(*) AS INTEGER) AS n
+       FROM discovered_leads ${cw.clause}
+      GROUP BY COALESCE(NULLIF(country, ''), '${NO_COUNTRY}')
+      ORDER BY n DESC`,
+    cw.params
+  );
+  return c.json({ leads, counts, filteredTotal, approvableTotal, countries });
 });
 
 const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|mail|team|marketing|hr|jobs|career|reception)/i;
@@ -1439,12 +1472,14 @@ app.post("/api/discovery/leads/approve", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const category = String(b.category ?? "").trim() || null;
   // Optional country override applied to every approved contact (blank = keep
-  // each lead's own country from its source).
-  const country = String(b.country ?? "").trim() || null;
+  // each lead's own). Normalised so an override always matches the spelling the
+  // filter and the Contacts list use.
+  const rawCountry = String(b.country ?? "").trim();
+  const country = normalizeCountry(rawCountry) || rawCountry || null;
 
   let leads: any[];
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, hasEmail: true });
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, hasEmail: true, country: b.filterCountry });
     leads = await q(`SELECT * FROM discovered_leads ${clause} LIMIT 5000`, params);
   } else {
     const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
@@ -1483,7 +1518,7 @@ app.post("/api/discovery/leads/approve", async (c) => {
 app.post("/api/discovery/leads/reject", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: "pending", q: b.q });
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, country: b.filterCountry });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`UPDATE discovered_leads SET status='rejected' ${clause}`, params);
     return c.json({ rejected: before });
@@ -1499,7 +1534,7 @@ app.post("/api/discovery/leads/reject", async (c) => {
 app.post("/api/discovery/leads/delete", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: b.status, q: b.q });
+    const { clause, params } = discoveredWhere({ status: b.status, q: b.q, country: b.filterCountry });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`DELETE FROM discovered_leads ${clause}`, params);
     return c.json({ deleted: before });

@@ -131,3 +131,29 @@ after you deleted it.
 
 Verified: control batch 71s / 6 tiles. Deleting 5s in -> stopped at 11s,
 zero leads added after the delete, position preserved.
+
+## Country was blank on approved contacts, and unfilterable in the pool
+
+Leads DID have a country column, and approve DID carry it. Three holes made it
+useless:
+  a) Directory's Country field was labelled "helps read local phone numbers",
+     so it was left blank -> country "" -> approves as NULL
+  b) Map area stored the raw pick: "Amman, Amman Governorate, Jordan"
+  c) No country column, no country filter; the visible "Country (optional)" box
+     is a WRITE override, easily mistaken for a filter. Approve all ignored it.
+
+- [x] `backend/src/country.ts` — canonical names, alias/city-path normalisation,
+      ccTLD and dialling-code inference
+- [x] All three source runners resolve: source -> domain TLD -> phone code
+- [x] Boot backfill repairs existing leads AND contacts (set-based SQL)
+- [x] `discoveredWhere` gains a country filter; `__none__` = no country on file
+- [x] Approve/reject/delete "all" honour the filter via `filterCountry`
+- [x] Country column in the pool; click a value to filter by it
+- [x] Country dropdown with per-country counts for the whole tab
+- [x] "Approve all N in Qatar -> Contacts" label reflects the filter
+- [x] Relabelled the override box; Directory Country hint now tells the truth
+- [x] Dropped `.co` from TLD inference (generic startup TLD, not Colombia)
+
+Verified: city paths and aliases normalise, .jo/.com.qa/+962/+974 all infer,
+backfill fixed 4/5 legacy rows (the 5th has a local phone + gmail = genuinely
+unknowable), and approval carries the country into Contacts.

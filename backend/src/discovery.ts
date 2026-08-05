@@ -13,6 +13,7 @@ import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
 import { registrableDomain, hostOf } from "./crawler/urls";
+import { resolveLeadCountry } from "./country";
 import { getReaderStats } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
 
@@ -279,7 +280,7 @@ async function loadContactDedup(): Promise<{ emails: Set<string>; domains: Set<s
 
 interface LeadRow {
   name: string; website: string | null; domain: string | null; email: string | null;
-  phone: string | null; city: string | null; country: string; category: string;
+  phone: string | null; city: string | null; country: string | null; category: string;
   sourceId: string; label: string; enriched: number; confidence: string | null;
 }
 
@@ -467,7 +468,9 @@ async function runOsmSource(src: any): Promise<OsmRunResult> {
       const email = (co.email || "").toLowerCase();
       const added = await insertDiscovered({
         name: co.name, website: co.website || null, domain: domain || null, email: email || null,
-        phone: co.phone || null, city: co.city || null, country: src.location, category: src.category,
+        phone: co.phone || null, city: co.city || null,
+        country: resolveLeadCountry({ sourceCountry: src.location, domain, website: co.website, phone: co.phone }),
+        category: src.category,
         sourceId: src.id, label,
         enriched: email ? 1 : 0,          // listed email → no enrichment needed
         confidence: email ? "listed" : null,
@@ -593,7 +596,9 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     const domain = (emailDomain && !isFreeMail(emailDomain) ? emailDomain : "") || websiteDomain;
     const added = await insertDiscovered({
       name: co.name, website: website || null, domain: domain || null, email: email || null,
-      phone: co.phone || null, city: null, country: String(src.location || ""), category: src.category || "",
+      phone: co.phone || null, city: null,
+      country: resolveLeadCountry({ sourceCountry: src.location, domain, website, phone: co.phone }),
+      category: src.category || "",
       sourceId: src.id, label,
       // A listing with an inline email is complete. One that only exposes a
       // WEBSITE still needs a crawl to find the email — leave it un-enriched so
@@ -781,7 +786,9 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       extracted++;
       const added = await insertDiscovered({
         name: co.name, website, domain, email: null,
-        phone: null, city: null, country: location, category: src.category || "",
+        phone: null, city: null,
+        country: resolveLeadCountry({ sourceCountry: location, domain, website }),
+        category: src.category || "",
         sourceId: src.id, label,
         enriched: 0,            // web search gives the site, not the email → enrich it
         confidence: null,

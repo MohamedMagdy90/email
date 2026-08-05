@@ -446,21 +446,28 @@ export const api = {
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>
     req<{ started?: boolean; found?: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
-  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number } = {}) => {
+  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number; country?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.hasEmail) qs.set("hasEmail", "1");
     if (params.limit) qs.set("limit", String(params.limit));
-    return req<{ leads: DiscoveredLead[]; counts: { status: string; n: number }[]; filteredTotal: number; approvableTotal: number }>(
-      `/api/discovery/leads?${qs.toString()}`
-    );
+    if (params.country) qs.set("country", params.country);
+    return req<{
+      leads: DiscoveredLead[];
+      counts: { status: string; n: number }[];
+      filteredTotal: number;
+      approvableTotal: number;
+      // Every country present in the current tab, with a count — "__none__" is
+      // the bucket for leads with no country on file.
+      countries: { country: string; n: number }[];
+    }>(`/api/discovery/leads?${qs.toString()}`);
   },
-  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string }) =>
+  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string }) =>
     req<{ added: number; skipped: number }>(`/api/discovery/leads/approve`, { method: "POST", body: JSON.stringify(body) }),
-  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string }) =>
+  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; filterCountry?: string }) =>
     req<{ rejected: number }>(`/api/discovery/leads/reject`, { method: "POST", body: JSON.stringify(body) }),
-  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string }) =>
+  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string; filterCountry?: string }) =>
     req<{ deleted: number }>(`/api/discovery/leads/delete`, { method: "POST", body: JSON.stringify(body) }),
 
   // export

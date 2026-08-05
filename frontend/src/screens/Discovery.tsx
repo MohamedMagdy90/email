@@ -28,6 +28,11 @@ const INTERVALS: { v: number; label: string }[] = [
 
 type LeadTab = "pending" | "approved" | "rejected";
 
+// The server's bucket for leads with no country on file — kept reviewable
+// rather than hidden, so nothing silently falls out of the pool.
+const NO_COUNTRY = "__none__";
+const countryLabel = (c: string) => (c === NO_COUNTRY ? "No country" : c);
+
 export default function Discovery() {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
   const [sources, setSources] = useState<DiscoverySource[]>([]);
@@ -47,6 +52,10 @@ export default function Discovery() {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [saveCategory, setSaveCategory] = useState("");
   const [saveCountry, setSaveCountry] = useState("");
+  // Country FILTER for the pool. Applied server-side so every bulk action acts
+  // on exactly the rows on screen — "Approve all" included.
+  const [country, setCountry] = useState("");
+  const [countries, setCountries] = useState<{ country: string; n: number }[]>([]);
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
@@ -84,10 +93,11 @@ export default function Discovery() {
   async function refreshLeads() {
     setLoadingLeads(true);
     try {
-      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200 });
+      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200, country: country || undefined });
       setLeads(r.leads);
       setFilteredTotal(r.filteredTotal);
       setApprovableTotal(r.approvableTotal);
+      setCountries(r.countries || []);
       setPicked(new Set());
     } catch (e: any) {
       toast(e.message, "error");
@@ -140,7 +150,7 @@ export default function Discovery() {
   }, []);
 
   // Reload the pool whenever the filters change.
-  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail]);
+  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail, country]);
 
   /* ------------------------------ bot ops ---------------------------- */
   async function toggleBot(on: boolean) {
@@ -229,17 +239,19 @@ export default function Discovery() {
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
   }
-  // Approve every pending lead with an email that matches the current search —
-  // not just the loaded page. Drains a large pool in one action.
+  // Approve every pending lead with an email that matches the CURRENT view —
+  // search *and* country filter — not just the loaded page. Drains a large pool
+  // one country at a time, in one action.
   async function approveAll() {
     if (!approvableTotal) return;
+    const scope = country ? ` in ${countryLabel(country)}` : "";
     const tags = [saveCategory && `category "${saveCategory}"`, saveCountry.trim() && `country "${saveCountry.trim()}"`].filter(Boolean);
     const suffix = tags.length ? `\nThey'll be saved under ${tags.join(" and ")}.` : "";
-    if (!confirm(`Approve all ${approvableTotal.toLocaleString()} matching lead${approvableTotal === 1 ? "" : "s"} into Contacts?${suffix}`)) return;
+    if (!confirm(`Approve all ${approvableTotal.toLocaleString()} lead${approvableTotal === 1 ? "" : "s"}${scope} into Contacts?${suffix}`)) return;
     setBusy(true);
     try {
-      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined });
-      toast(`Approved ${r.added.toLocaleString()} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
+      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined, filterCountry: country || undefined });
+      toast(`Approved ${r.added.toLocaleString()}${scope} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
   }
@@ -257,9 +269,9 @@ export default function Discovery() {
   }
 
   const pickedWithEmail = leads.filter((l) => picked.has(l.id) && l.email);
-  // Countries already present in the loaded pool — offered as quick-picks when
-  // choosing a country to save approved contacts under.
-  const poolCountries = [...new Set(leads.map((l) => (l.country || "").trim()).filter(Boolean))].sort();
+  // Real countries in the pool (the "no country" bucket is a filter option, not
+  // something you'd ever want to SAVE a contact under).
+  const poolCountries = countries.map((c) => c.country).filter((c) => c && c !== NO_COUNTRY);
   const running = !!status?.enabled;
   const counts = { pending: status?.leads.pending ?? 0, approved: status?.leads.approved ?? 0, rejected: status?.leads.rejected ?? 0 };
 
@@ -436,6 +448,21 @@ export default function Discovery() {
               ))}
             </div>
             <div className="flex items-center gap-2">
+              {countries.length > 0 && (
+                <Select
+                  value={country}
+                  onChange={(e) => setCountry(e.target.value)}
+                  className="h-9 w-44 text-[13px]"
+                  title="Show only leads from this country. Every action below — including Approve all — then acts on just these."
+                >
+                  <option value="">All countries</option>
+                  {countries.map((c) => (
+                    <option key={c.country} value={c.country}>
+                      {countryLabel(c.country)} · {c.n.toLocaleString()}
+                    </option>
+                  ))}
+                </Select>
+              )}
               <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && refreshLeads()} placeholder="Search name, email, domain…" className="h-9 w-56 text-[13px]" />
               <Button size="sm" variant="outline" onClick={refreshLeads}>Search</Button>
             </div>
@@ -465,10 +492,10 @@ export default function Discovery() {
                   <Input
                     value={saveCountry}
                     onChange={(e) => setSaveCountry(e.target.value)}
-                    placeholder="Country (optional)"
+                    placeholder="Override country"
                     list="pool-countries"
                     className="h-8 w-36 text-[13px]"
-                    title="Save approved contacts under this country (blank = keep each lead's own)"
+                    title="Optional. Force every approved contact to this country. Leave blank to keep each lead's own country — which is what you normally want."
                   />
                   {poolCountries.length > 0 && (
                     <datalist id="pool-countries">
@@ -488,7 +515,7 @@ export default function Discovery() {
                     </Button>
                   )}
                   <Button size="sm" onClick={approveAll} loading={busy} disabled={!approvableTotal}>
-                    Approve all {approvableTotal ? approvableTotal.toLocaleString() : ""} → Contacts
+                    Approve all {approvableTotal ? approvableTotal.toLocaleString() : ""}{country ? ` in ${countryLabel(country)}` : ""} → Contacts
                   </Button>
                 </>
               ) : (
@@ -514,6 +541,7 @@ export default function Discovery() {
                 <tr className="border-b border-line">
                   <th className="w-8 px-5 py-2.5" />
                   <th className="px-1 py-2.5 font-medium">Company</th>
+                  <th className="px-1 py-2.5 font-medium">Country</th>
                   <th className="px-1 py-2.5 font-medium">Phone</th>
                   <th className="px-1 py-2.5 font-medium">Source</th>
                   <th className="px-5 py-2.5 text-right font-medium">{tab === "pending" ? "" : "Status"}</th>
@@ -531,6 +559,21 @@ export default function Discovery() {
                         <span className="truncate"><EmailCell lead={l} /></span>
                         <ConfidenceTag c={l.confidence} />
                       </div>
+                    </td>
+                    <td className="px-1 py-2.5">
+                      {l.country
+                        ? <button
+                            type="button"
+                            onClick={() => setCountry(l.country === country ? "" : String(l.country))}
+                            title={l.country === country ? "Clear the country filter" : `Show only ${l.country}`}
+                            className={cn(
+                              "max-w-[9rem] truncate rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                              l.country === country ? "bg-ink text-cream" : "bg-ink/[0.06] text-ink/65 hover:bg-ink/10 hover:text-ink"
+                            )}
+                          >
+                            {l.country}
+                          </button>
+                        : <span className="text-xs text-muted">—</span>}
                     </td>
                     <td className="px-1 py-2.5 text-xs tabular-nums text-ink/70">{l.phone || <span className="text-muted">—</span>}</td>
                     <td className="px-1 py-2.5 text-xs text-ink/55">{l.source_label}</td>
@@ -812,7 +855,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com  (homepage or /listings both work)" className="font-mono text-xs" />
             </Field>
             <div className="grid grid-cols-2 gap-3">
-              <Field label="Country" hint="Helps read local phone numbers">
+              <Field label="Country" hint="Every lead from this directory is filed under it — so you can filter and approve by country later. Also used to read local phone numbers.">
                 <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Qatar" />
               </Field>
               <Field label="Label (optional)">
