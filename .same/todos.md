@@ -114,3 +114,20 @@ The 61 emails WERE the entire database. Not a speed problem — a ceiling proble
 
 Verified end-to-end: 12 of 56 tiles (the empty southern desert) -> 132 leads,
 43 emails, 77 websites. Old system: 61 emails in 3 days for the whole country.
+
+## Delete/archive/pause left the running batch alive
+
+Delete only removed the DB row. The batch already in flight kept going (a
+country sweep is ~70s, a directory batch is minutes) and kept filing leads
+under a source that no longer existed — so the bot really was "still active"
+after you deleted it.
+
+- [x] Cooperative stop flag (`stopSource` / `stopAllSources`) + DB backstop
+- [x] Checkpoint before every OSM tile, directory page and search query
+- [x] DELETE, archive and switch-off endpoints now signal the worker
+- [x] Bot master switch OFF halts the in-flight batch too
+- [x] A stopped sweep keeps its position — resumes at the tile it never reached
+- [x] Delete confirm warns when it's mid-scan; toast confirms the stop
+
+Verified: control batch 71s / 6 tiles. Deleting 5s in -> stopped at 11s,
+zero leads added after the delete, position preserved.

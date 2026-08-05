@@ -26,6 +26,7 @@ import {
   runSourceNow,
   initialCursor,
   reEnrichBlocked,
+  stopSource,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -1331,6 +1332,10 @@ app.put("/api/discovery/sources/:id", async (c) => {
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
 
+  // Switching a source OFF must stop the batch it's running right now, not just
+  // stop scheduling the next one.
+  if (!enabled && existing.enabled) stopSource(id);
+
   const rows = await q(
     `UPDATE discovery_sources
        SET location=?, place_json=?, category=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
@@ -1341,7 +1346,12 @@ app.put("/api/discovery/sources/:id", async (c) => {
 });
 
 app.delete("/api/discovery/sources/:id", async (c) => {
-  await q(`DELETE FROM discovery_sources WHERE id=?`, [c.req.param("id")]);
+  const id = c.req.param("id");
+  // Tell any batch already in flight to stop BEFORE the row disappears. Without
+  // this, deleting a running source left it crawling for minutes and still
+  // filing leads — it genuinely stayed active after you deleted it.
+  stopSource(id);
+  await q(`DELETE FROM discovery_sources WHERE id=?`, [id]);
   return c.json({ ok: true });
 });
 
@@ -1352,6 +1362,7 @@ app.delete("/api/discovery/sources/:id", async (c) => {
 // back on the very page it stopped at.
 app.post("/api/discovery/sources/:id/archive", async (c) => {
   const id = c.req.param("id");
+  stopSource(id); // halt an in-flight batch too, not just future scheduling
   const rows = await q(
     `UPDATE discovery_sources SET archived=1, archived_at=?, last_status=NULL, next_run_at=NULL WHERE id=? RETURNING *`,
     [nowIso(), id]

@@ -201,9 +201,14 @@ export default function Discovery() {
     } catch (e: any) { toast(e.message, "error"); }
   }
   async function removeSource(s: DiscoverySource) {
-    if (!confirm(`Permanently delete the "${sourceTitle(s)}" source?\n\nLeads it already found stay in your review pool, but its settings and walk position are gone for good. Archive it instead if you might want it back.`)) return;
-    try { await api.deleteDiscoverySource(s.id); refreshSources(); refreshArchived(); refreshStatus(); }
-    catch (e: any) { toast(e.message, "error"); }
+    const wasRunning = s.last_status === "running";
+    const note = wasRunning ? "\n\nIt's scanning right now — that stops immediately." : "";
+    if (!confirm(`Permanently delete the "${sourceTitle(s)}" source?${note}\n\nLeads it already found stay in your review pool, but its settings and walk position are gone for good. Archive it instead if you might want it back.`)) return;
+    try {
+      await api.deleteDiscoverySource(s.id);
+      toast(wasRunning ? `Deleted "${sourceTitle(s)}" — its running scan was stopped` : `Deleted "${sourceTitle(s)}"`, "success");
+      refreshSources(); refreshArchived(); refreshStatus();
+    } catch (e: any) { toast(e.message, "error"); }
   }
 
   /* ----------------------------- lead ops ---------------------------- */

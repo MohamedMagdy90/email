@@ -98,6 +98,42 @@ let discovering = false;
 let enriching = false;
 let started = false;
 
+/* ---------------------------- cancellation ----------------------------- */
+
+// A batch is long-lived: a country sweep is dozens of Overpass calls, a
+// directory batch is minutes of crawling. Delete / archive / switch-off all
+// used to change a DB row and nothing else, so the batch already in flight kept
+// running and kept filing leads under a source that no longer existed — the bot
+// looked "still active" after you deleted it. Every loop now asks between units
+// of work and stops cleanly on the spot.
+const stopping = new Set<string>();
+
+// Ask an in-flight batch for this source to stop at its next checkpoint.
+export function stopSource(id: string): void {
+  if (!id) return;
+  stopping.add(id);
+}
+// Switching the whole bot off stops whatever is mid-flight too.
+export function stopAllSources(): void {
+  stopping.add("*");
+}
+
+// Should the batch for this source stop now? In-memory flag first (instant, and
+// covers "deleted a moment ago"), then the DB as the authority — that also
+// catches a source removed by another process or before this one restarted.
+async function shouldStop(id: string): Promise<boolean> {
+  if (stopping.has("*") || stopping.has(id)) return true;
+  const row = (await q(`SELECT archived FROM discovery_sources WHERE id=?`, [id]))[0];
+  if (!row) return true;                        // deleted
+  return Number(row.archived) === 1;            // archived
+}
+// Called when a batch finishes so the flag doesn't leak into the next run. The
+// global "*" flag is deliberately left alone — only switching the bot back on
+// lifts that.
+function clearStop(id: string): void {
+  stopping.delete(id);
+}
+
 /* --------------------------- global switches --------------------------- */
 
 export async function isBotEnabled(): Promise<boolean> {
@@ -105,7 +141,10 @@ export async function isBotEnabled(): Promise<boolean> {
 }
 export async function setBotEnabled(on: boolean): Promise<void> {
   await setSetting("discovery_enabled", on ? "1" : "0");
-  dlog("", `bot switched ${on ? "ON — will start scanning enabled sources" : "OFF — scanning paused"}`);
+  // Switching off must also halt whatever batch is already running, or the bot
+  // keeps working for minutes after you told it to stop. Switching on lifts it.
+  if (on) stopping.delete("*"); else stopAllSources();
+  dlog("", `bot switched ${on ? "ON — will start scanning enabled sources" : "OFF — scanning paused (any running batch stops at its next step)"}`);
 }
 async function autoEnrichOn(): Promise<boolean> {
   return (await getSetting("discovery_auto_enrich")) !== "0"; // default ON
@@ -369,6 +408,7 @@ interface OsmRunResult {
   tiles: number;      // tiles in the grid
   available: number;  // contactable businesses OSM holds in the whole area (0 = unknown)
   exhausted: boolean; // the whole grid has been swept
+  stopped?: boolean;  // cut short: the source was deleted / archived / switched off
 }
 
 // Run one Map-area source. The area is split into a grid and swept a few tiles
@@ -402,7 +442,14 @@ async function runOsmSource(src: any): Promise<OsmRunResult> {
   const end = Math.min(total, cursor + OSM_TILES_PER_RUN - 1);
   let found = 0, seen = 0, err: string | undefined;
 
+  let stoppedAt = 0;
   for (let i = cursor; i <= end; i++) {
+    // Deleted / archived / switched off mid-sweep? Stop here, keep the position.
+    if (await shouldStop(src.id)) {
+      dlog("osm", `${label}: stopped at tile ${i}/${total} — the source was removed or switched off`);
+      stoppedAt = i;
+      break;
+    }
     const tile = tiles[i - 1];
     let companies: Company[] = [];
     try {
@@ -431,9 +478,16 @@ async function runOsmSource(src: any): Promise<OsmRunResult> {
     if (i < end) await sleep(OSM_TILE_PACING_MS);
   }
 
-  const nextCursor = end + 1;
-  const exhausted = nextCursor > total;
-  return { found, seen, error: err && seen === 0 && found === 0 ? err : undefined, nextCursor: exhausted ? 1 : nextCursor, tiles: total, available, exhausted };
+  // A sweep cut short resumes from the tile it never reached — nothing skipped.
+  const nextCursor = stoppedAt || end + 1;
+  const exhausted = !stoppedAt && nextCursor > total;
+  return {
+    found, seen,
+    error: err && seen === 0 && found === 0 ? err : undefined,
+    nextCursor: exhausted ? 1 : nextCursor,
+    tiles: total, available, exhausted,
+    stopped: stoppedAt > 0,
+  };
 }
 
 /* -------------------------- Directory source -------------------------- */
@@ -486,6 +540,9 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
     defaultCountry: String(src.location || "").trim() || undefined,
     proxy,
     readerKey,
+    // Abandon the walk the moment this source is deleted / archived / paused,
+    // instead of crawling on for minutes under a source that no longer exists.
+    shouldStop: () => shouldStop(src.id),
   };
 
   const how = proxy ? `scraping proxy (${proxy.provider})` : readerKey ? "free reader (keyed)" : "direct fetch + free reader fallback";
@@ -702,6 +759,12 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
 
   let found = 0, extracted = 0, ok = 0, blocked = false, err: string | undefined;
   for (const item of batch) {
+    // Deleted / archived / switched off mid-batch? Stop, keeping the position.
+    if (await shouldStop(src.id)) {
+      dlog("search", `${label}: stopped at step ${cursor + ok} — the source was removed or switched off`);
+      blocked = true; // don't advance the cursor past a query we never ran
+      break;
+    }
     const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey).catch(() => ({ companies: [], blocked: true }));
     if (r.blocked) {
       blocked = true;
@@ -739,6 +802,22 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
 // Run + persist the outcome for a single source. `continue` = run again on the
 // very next tick (directory sources stream continuously until exhausted).
 async function executeSource(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
+  try {
+    return await runBatch(src);
+  } finally {
+    // Whatever happened, this source's stop request has been honoured — drop it
+    // so a later run (or a restored source) isn't blocked by a stale flag.
+    clearStop(src.id);
+  }
+}
+
+async function runBatch(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
+  // Never start a batch for a source that's already gone. Between the tick's
+  // SELECT and here, it may have been deleted, archived or switched off.
+  if (await shouldStop(src.id)) {
+    dlog("", `skipping ${srcLabel(src)} — it was removed or switched off`);
+    return { found: 0, continue: false };
+  }
   await q(`UPDATE discovery_sources SET last_status='running' WHERE id=?`, [src.id]);
   const interval = clamp(src.interval_minutes, 15, 100000);
   dlog("", `▶ running ${src.type} source: ${srcLabel(src)}`);
@@ -844,7 +923,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
   } catch (e: any) {
     r = { found: 0, seen: 0, error: String(e?.message || e), nextCursor: Number(src.cursor) || 1, tiles: Number(src.osm_tiles) || 0, available: Number(src.osm_available) || 0, exhausted: false };
   }
-  const cont = !r.error && !r.exhausted;
+  const cont = !r.error && !r.exhausted && !r.stopped;
   const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
   const status = r.error ? "error" : r.exhausted ? "done" : "ok";
   await q(
@@ -862,7 +941,8 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     const have = await osmHarvested(src.id);
     const pct = r.available > 0 ? Math.min(100, Math.round((have / r.available) * 100)) : null;
     dlog("osm", `${srcLabel(src)}: SWEPT the whole area (${r.tiles} tile${r.tiles === 1 ? "" : "s"}) — ${have.toLocaleString()}${r.available ? ` of the ${r.available.toLocaleString()} businesses OpenStreetMap has here${pct !== null ? ` (${pct}%)` : ""}` : ""}. Re-checking in ${interval}m for newly-mapped ones. For more volume than the map holds, add a Web search or Directory source.`);
-  } else dlog("osm", `${srcLabel(src)}: +${r.found} new · continuing at tile ${r.nextCursor}/${r.tiles} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
+  } else if (r.stopped) dlog("osm", `${srcLabel(src)}: stopped · +${r.found} new before it halted`);
+  else dlog("osm", `${srcLabel(src)}: +${r.found} new · continuing at tile ${r.nextCursor}/${r.tiles} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
   return { found: r.found, error: r.error, continue: cont };
 }
 

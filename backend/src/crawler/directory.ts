@@ -76,6 +76,10 @@ export interface DirectoryOptions {
   proxy?: ProxyConfig; // optional scraping proxy for JS-rendered / Cloudflare sites
   readerKey?: string; // optional (free) Jina Reader key — renders JS / bypasses soft blocks for free
   startPage?: number; // page number the seed represents (for continuous cursor walking)
+  // Asked between pages: return true and the walk stops cleanly, keeping every
+  // contact found so far. Lets the caller abandon a batch the moment its source
+  // is deleted, archived or switched off instead of crawling on for minutes.
+  shouldStop?: () => boolean | Promise<boolean>;
 }
 
 export interface DirectoryProgress {
@@ -697,6 +701,12 @@ async function crawlOnce(
   let cooldownMs = 0;
 
   while (pageQueue.length && listingPages < maxPages && harvested < listingBudget) {
+    // Caller pulled the plug (source deleted / archived / switched off). Keep
+    // what we have and leave the queue intact so the cursor doesn't advance.
+    if (opts.shouldStop && (await opts.shouldStop())) {
+      onProgress?.({ type: "phase", msg: "Stopped — the source was removed or switched off." });
+      break;
+    }
     const pageUrl = pageQueue.shift()!.split("#")[0];
     if (pagesSeen.has(pageUrl)) continue;
     pagesSeen.add(pageUrl);
