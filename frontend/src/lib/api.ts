@@ -154,6 +154,11 @@ export interface DiscoverySource {
   // Archived sources are retired but fully recoverable — the bot ignores them.
   archived?: number; // 0 | 1
   archived_at?: string | null;
+  // Map-area sources sweep their country as a grid: `cursor` is the next tile,
+  // `osm_tiles` the grid size, `osm_available` how many contactable businesses
+  // OpenStreetMap holds in the area in total (the hard ceiling).
+  osm_tiles?: number;
+  osm_available?: number;
   location: string;
   place_json?: string | null;
   category: string;

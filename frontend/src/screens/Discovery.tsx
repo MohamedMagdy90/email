@@ -355,7 +355,7 @@ export default function Discovery() {
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="font-clash text-lg font-semibold">Discovery sources</h2>
-            <p className="text-xs text-muted">Web search finds thousands like Google · Directory streams a listing site · Map area for precise, small results.</p>
+            <p className="text-xs text-muted">Web search finds thousands like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped.</p>
           </div>
           <Button size="sm" onClick={() => { setEditing(null); setModalOpen(true); }}>Add source</Button>
         </div>
@@ -364,7 +364,7 @@ export default function Discovery() {
           <div className="px-5 py-12 text-center">
             <p className="text-sm font-medium">No sources yet</p>
             <p className="mx-auto mt-1 max-w-md text-xs text-muted">
-              Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (The <span className="font-medium text-ink/70">Map area</span> source is precise but only finds a handful.)
+              Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
             </p>
             <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
           </div>
@@ -596,10 +596,13 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const isSearch = s.type === "search";
-  const streaming = (isDir || isSearch) && s.enabled && runningNow;
+  const streaming = s.enabled && runningNow;
   // Directory: show host + path so a resolved index (e.g. …/listings) is visible.
   const title = isDir ? sourceHost(s.base_url) : (s.location || (isSearch ? "Web search" : ""));
   const badge = isDir ? "Directory" : isSearch ? "Web search" : "";
+  // Map area: how much of what OpenStreetMap actually holds here we've taken.
+  const osmTiles = s.osm_tiles || 0;
+  const osmAvail = s.osm_available || 0;
 
   return (
     <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
@@ -638,10 +641,17 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
             </>
           ) : (
             <>
-              <span>{intervalLabel(s.interval_minutes)}</span>
-              <span>· up to {s.limit_n}</span>
-              <span>· {s.total_found} found</span>
-              {s.enabled && s.next_run_at && <span>· next {fmtIn(s.next_run_at)}</span>}
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> sweeping{osmTiles ? ` · tile ${s.cursor} of ${osmTiles}` : ""}</span>
+                : s.exhausted
+                  ? <span>swept the whole area · re-checks {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                  : <span>{s.enabled ? "queued" : "paused"}{osmTiles ? ` · resumes tile ${s.cursor} of ${osmTiles}` : ""}</span>}
+              <span>· {(s.total_found || 0).toLocaleString()} found</span>
+              {osmAvail > 0 && (
+                <span title="Everything OpenStreetMap has mapped with a website, email or phone in this area. This is the ceiling — no amount of re-scanning can exceed it.">
+                  · of {osmAvail.toLocaleString()} on the map
+                </span>
+              )}
             </>
           )}
           {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
@@ -649,7 +659,7 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
       </div>
       <div className="flex shrink-0 items-center gap-1">
         <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
-          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : (isDir || isSearch) && s.exhausted ? (isSearch ? "Re-search" : "Restart") : "Run now"}
+          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : s.exhausted ? (isSearch ? "Re-search" : isDir ? "Restart" : "Re-sweep") : "Run now"}
         </button>
         <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
         <button
@@ -781,14 +791,14 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                   {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
                 </Select>
               </Field>
-              <Field label="Max per scan">
+              <Field label="Max per tile">
                 <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
                   {[40, 60, 120, 250, 500].map((n) => <option key={n} value={n}>{n}</option>)}
                 </Select>
               </Field>
             </div>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              OpenStreetMap is a <span className="font-medium text-ink/70">map, not a company registry</span> — it only knows businesses a mapper tagged with a website or email (often just a handful per country), and re-scanning can't surface more. For <span className="font-medium text-ink/70">volume</span>, use a <span className="font-medium text-ink/70">Web search</span> or <span className="font-medium text-ink/70">Directory</span> source instead.
+              The area is swept <span className="font-medium text-ink/70">tile by tile</span> until every business OpenStreetMap has mapped here — with a website, email <span className="font-medium text-ink/70">or phone</span> — is collected. The source card then shows how many of them you hold. OpenStreetMap is still a <span className="font-medium text-ink/70">map, not a company registry</span>, so that total is a hard ceiling (a country typically holds hundreds, not tens of thousands). Once it's swept, add a <span className="font-medium text-ink/70">Web search</span> or <span className="font-medium text-ink/70">Directory</span> source to go past it.
             </p>
           </>
         ) : (

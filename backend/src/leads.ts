@@ -1,8 +1,12 @@
 // Company discovery by location + industry using free OpenStreetMap data.
 //  - Nominatim: turn "Qatar" / "Dubai" into an OSM area or bounding box
 //  - Overpass: find businesses of a category that expose a contact signal
-//    (website, email, or contact:email) so every result is actionable.
+//    (website, email or phone) so every result is actionable.
 // Fully free, no API key. (OSM data is ODbL-licensed open data.)
+
+// Every OSM key that can denote a business/organisation. Used by the umbrella
+// category and by the "is this actually a company?" filter further down.
+const BUSINESS_KEYS = ["office", "shop", "craft", "company", "amenity", "tourism", "healthcare", "leisure", "industrial"] as const;
 
 export const LEAD_CATEGORIES: Record<string, { k: string; v?: string }[]> = {
   "Accounting & Tax": [
@@ -71,14 +75,74 @@ export const LEAD_CATEGORIES: Record<string, { k: string; v?: string }[]> = {
   ],
   // Umbrella category: match ANY value of the core "business" keys so the whole
   // long tail of companies OSM knows about is captured — not a hand-picked few.
-  "Companies (general)": [
-    { k: "office" }, { k: "shop" }, { k: "craft" }, { k: "company" },
-  ],
+  // `office/shop/craft` alone is far too narrow: most real businesses in OSM are
+  // tagged `amenity` (bank, restaurant, pharmacy, car_rental…), `tourism`
+  // (hotel, guest_house), `healthcare` or `leisure` (gym, sports centre).
+  // Measured on Jordan: office/shop/craft = 180 contactable, this set = 1,089.
+  "Companies (general)": BUSINESS_KEYS.map((k) => ({ k })),
 };
 
-// Contact signals we query for. A result needs at least one of these to be useful.
-// Explicit keys are far faster in Overpass than a key-regex, so we list them.
-const CONTACT_KEYS = ["website", "email", "contact:email"];
+// Values that carry one of the business keys but are NOT a company anyone can
+// sell to — street furniture, public infrastructure, landscape. Everything not
+// listed here passes, so newly-invented tags keep flowing in (deny, not allow).
+const NON_BUSINESS: Record<string, Set<string>> = {
+  amenity: new Set([
+    "atm", "bench", "bicycle_parking", "bicycle_repair_station", "bbq", "clock",
+    "charging_station", "drinking_water", "fountain", "grit_bin", "hunting_stand",
+    "letter_box", "motorcycle_parking", "parking", "parking_entrance", "parking_space",
+    "post_box", "public_bookcase", "recycling", "shelter", "telephone", "toilets",
+    "vending_machine", "waste_basket", "waste_disposal", "water_point",
+    "place_of_worship", "grave_yard", "police", "fire_station", "prison",
+  ]),
+  tourism: new Set(["viewpoint", "artwork", "picnic_site", "information", "board", "map", "wilderness_hut", "alpine_hut"]),
+  leisure: new Set([
+    "park", "garden", "playground", "pitch", "common", "nature_reserve", "picnic_table",
+    "slipway", "swimming_area", "track", "dog_park", "firepit", "bleachers", "outdoor_seating",
+  ]),
+  shop: new Set(["vacant", "no"]),
+  office: new Set(["vacant", "no"]),
+  healthcare: new Set(["yes"]),
+};
+
+// Hosts that are somebody's *profile*, not a company's own site. Mappers often
+// drop a Facebook page or a YouTube clip into `website`, and treating those as
+// the business's domain poisons de-duplication (every such lead collapses onto
+// "facebook.com") and wastes the email-finder crawling a platform that will
+// never yield a company address.
+const NOT_A_COMPANY_SITE = new Set([
+  "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.me", "m.facebook.com",
+  "instagram.com", "twitter.com", "x.com", "tiktok.com", "linkedin.com", "snapchat.com",
+  "pinterest.com", "wa.me", "api.whatsapp.com", "chat.whatsapp.com", "t.me", "telegram.me",
+  "maps.google.com", "goo.gl", "maps.app.goo.gl", "google.com", "bit.ly", "linktr.ee",
+  "booking.com", "airbnb.com", "tripadvisor.com", "foursquare.com", "yelp.com",
+  "wikipedia.org", "en.wikipedia.org", "wikidata.org",
+]);
+function isCompanySite(domain: string): boolean {
+  if (NOT_A_COMPANY_SITE.has(domain)) return false;
+  // …and their country variants (tripadvisor.co.uk, facebook.com.eg, …).
+  const base = domain.split(".")[0];
+  return !["facebook", "youtube", "instagram", "tripadvisor", "wikipedia", "linkedin"].includes(base);
+}
+
+// Does this POI represent a real business? It matched one of our selectors, so
+// it carries at least one business key — keep it unless EVERY business key it
+// carries is on the deny list (a `shop=car_repair` + `amenity=fuel` stays).
+function isBusinessPoi(t: Record<string, string>): boolean {
+  for (const k of BUSINESS_KEYS) {
+    const v = t[k];
+    if (!v || v === "no") continue;
+    if (NON_BUSINESS[k]?.has(v)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Contact signals that make a result actionable. Collapsed into ONE key-regex
+// rather than one query statement per key: 9 keys × 9 selectors would be 81
+// statements per query, which Overpass times out on. Phone counts — a named
+// company with a phone number is a real lead, and requiring website/email threw
+// away ~80% of everything OSM knows (Jordan: 861 phones vs 391 emails).
+const CONTACT_FILTER = `[~"^(website|contact:website|url|email|contact:email|phone|contact:phone|contact:mobile|contact:whatsapp)$"~"."]`;
 
 const NOMINATIM = "https://nominatim.openstreetmap.org/search";
 // Multiple public Overpass mirrors with independent rate limits. We race them
@@ -91,7 +155,7 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass.osm.jp/api/interpreter",
 ];
 const UA = "DNA-Outreach/1.0 (dna.systems outreach tool)";
-const OVERPASS_TIMEOUT_MS = 55000; // abort a slow endpoint and fall through (broad "any office/shop" queries need room)
+const OVERPASS_TIMEOUT_MS = 90000; // abort a slow endpoint and fall through (broad "any business" queries need room)
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface Company {
@@ -204,14 +268,13 @@ export async function geocodeSuggest(qStr: string, limit = 6): Promise<Place[]> 
   return scored.slice(0, limit).map((s) => s.place);
 }
 
-function buildQuery(filters: { k: string; v?: string }[], areaClause: string, limit: number) {
-  // Two kinds of filter:
-  //  • value filters      → specific values of a key (office~"^(it|software)$")
-  //  • key-only filters    → ANY value of a key (any office/shop/craft). This is
-  //    how umbrella categories capture the long tail of businesses OSM knows,
-  //    instead of a hand-picked handful of tag values.
-  // Grouping keeps each key to a single fast regex. `nw` (node+way) skips slow
-  // relation processing.
+// Turn a category's filters into Overpass selectors.
+//  • value filters   → specific values of a key (office~"^(it|software)$")
+//  • key-only filters → ANY value of a key (any office/shop/amenity…). This is
+//    how umbrella categories capture the long tail of businesses OSM knows,
+//    instead of a hand-picked handful of tag values.
+// Grouping keeps each key to a single fast regex.
+function selectorsFor(filters: { k: string; v?: string }[]): string[] {
   const groups = new Map<string, string[]>();
   const anyKey = new Set<string>();
   for (const f of filters) {
@@ -229,15 +292,92 @@ function buildQuery(filters: { k: string; v?: string }[], areaClause: string, li
   const selectors: string[] = [];
   for (const [k, vals] of groups) selectors.push(`["${k}"~"^(${[...new Set(vals)].join("|")})$"]`);
   for (const k of anyKey) selectors.push(`["${k}"]`);
+  return selectors;
+}
 
-  const parts: string[] = [];
-  for (const sel of selectors) {
-    for (const ck of CONTACT_KEYS) parts.push(`nw${sel}["${ck}"]${areaClause};`);
+// `nw` (node+way) skips slow relation processing. One statement per selector —
+// the contact requirement rides along as a single key-regex.
+function statements(selectors: string[], scope: string): string {
+  return selectors.map((sel) => `nw${sel}${CONTACT_FILTER}${scope};`).join("");
+}
+
+/* --------------------------- areas & tiling --------------------------- */
+
+// A resolved search area: the Overpass prelude that defines it (if any), the
+// filter clause that scopes a statement to it, and its bounding box so we can
+// sweep it tile-by-tile.
+export interface AreaRef {
+  prelude: string;                                    // "area(3600184818)->.a;" | ""
+  clause: string;                                     // "(area.a)" | "(s,w,n,e)"
+  bbox: [number, number, number, number] | null;      // [south, west, north, east]
+}
+
+export type Tile = [number, number, number, number];  // [south, west, north, east]
+
+export async function resolveArea(
+  location: string,
+  place?: { osm_type?: string; osm_id?: number; boundingbox?: string[] }
+): Promise<AreaRef> {
+  let geo: { osm_type: string; osm_id: number; boundingbox?: string[] } | null = null;
+  if (place?.osm_type && place?.osm_id) {
+    geo = { osm_type: place.osm_type, osm_id: place.osm_id, boundingbox: place.boundingbox };
+  } else {
+    geo = await geocode(location);
   }
-  // Pull a generous slice — we de-dupe hard by domain afterwards, and a whole
-  // country of "any office/shop/craft" can legitimately be several hundred rows.
-  const cap = Math.min(Math.max(limit * 3, 900), 3000);
-  return `[out:json][timeout:50];(${parts.join("")});out tags center ${cap};`;
+  if (!geo) throw new Error("Could not find that location. Try a country or city name.");
+
+  // Nominatim/Photon hand back [south, north, west, east]; Overpass wants
+  // [south, west, north, east]. Re-order once, here, so nothing downstream has
+  // to remember which convention it is holding.
+  const bb = geo.boundingbox?.length === 4 ? geo.boundingbox.map(Number) : null;
+  const bbox: Tile | null = bb && bb.every((n) => Number.isFinite(n)) ? [bb[0], bb[2], bb[1], bb[3]] : null;
+
+  if (geo.osm_type === "relation") return { prelude: `area(${3600000000 + geo.osm_id})->.a;`, clause: "(area.a)", bbox };
+  if (geo.osm_type === "way") return { prelude: `area(${2400000000 + geo.osm_id})->.a;`, clause: "(area.a)", bbox };
+  if (bbox) return { prelude: "", clause: `(${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]})`, bbox };
+  throw new Error("Could not resolve that area. Try a more specific city.");
+}
+
+// Split an area into a grid the worker can walk one slice at a time.
+//
+// Why tile at all: Overpass caps what a single query may return, and a whole
+// country asked in one shot either truncates or times out — which is exactly
+// why a country-wide scan used to plateau at a few hundred rows and never grow.
+// Sweeping ~0.6° slices keeps every request small and fast, and gives the run a
+// real, visible position ("tile 23 of 56") instead of an opaque re-scan.
+const TILE_DEG = 0.6;
+const TILES_PER_AXIS_MAX = 10;
+
+export function tilesFor(bbox: [number, number, number, number] | null): Tile[] {
+  if (!bbox) return [];
+  const [s, w, n, e] = bbox;
+  const dLat = Math.abs(n - s);
+  const dLon = Math.abs(e - w);
+  const rows = Math.max(1, Math.min(TILES_PER_AXIS_MAX, Math.ceil(dLat / TILE_DEG)));
+  const cols = Math.max(1, Math.min(TILES_PER_AXIS_MAX, Math.ceil(dLon / TILE_DEG)));
+  if (rows === 1 && cols === 1) return [[s, w, n, e]];
+  const hLat = dLat / rows;
+  const hLon = dLon / cols;
+  const out: Tile[] = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      // A hair of overlap so a POI sitting exactly on a seam is never missed;
+      // the caller de-dupes by domain/email anyway.
+      out.push([s + r * hLat - 1e-6, w + c * hLon - 1e-6, s + (r + 1) * hLat + 1e-6, w + (c + 1) * hLon + 1e-6]);
+    }
+  }
+  return out;
+}
+
+// How many contactable businesses OSM holds in this area, full stop. This is the
+// hard ceiling of what a Map-area source can ever return, so we surface it in
+// the UI rather than letting a source look "stuck" when it is simply finished.
+export async function countAvailable(area: AreaRef, category: string): Promise<number> {
+  const filters = LEAD_CATEGORIES[category] || LEAD_CATEGORIES["Companies (general)"];
+  const query = `[out:json][timeout:180];${area.prelude}(${statements(selectorsFor(filters), area.clause)});out count;`;
+  const data = await runOverpass(query);
+  const total = Number(data?.elements?.[0]?.tags?.total);
+  return Number.isFinite(total) ? total : 0;
 }
 
 async function fetchOverpass(endpoint: string, query: string): Promise<any> {
@@ -275,46 +415,36 @@ async function runOverpass(query: string): Promise<any> {
   throw new Error(`Discovery service busy (${msg}). Try again in a moment or narrow the area.`);
 }
 
-export async function findLeads(
-  location: string,
+// Harvest one already-resolved area, optionally narrowed to a single tile.
+// This is what the always-on worker calls, once per tile, so a whole country
+// arrives in small fast slices instead of one truncated mega-query.
+export async function findLeadsIn(
+  area: AreaRef,
   category: string,
   limit: number,
-  place?: { osm_type?: string; osm_id?: number; boundingbox?: string[] }
+  tile?: Tile
 ): Promise<Company[]> {
   const filters = LEAD_CATEGORIES[category] || LEAD_CATEGORIES["Companies (general)"];
-
-  // Use the exact place picked from autocomplete when available; else geocode.
-  let geo: { osm_type: string; osm_id: number; boundingbox?: string[] } | null = null;
-  if (place?.osm_type && place?.osm_id) {
-    geo = { osm_type: place.osm_type, osm_id: place.osm_id, boundingbox: place.boundingbox };
-  } else {
-    geo = await geocode(location);
-  }
-  if (!geo) throw new Error("Could not find that location. Try a country or city name.");
-
-  let areaClause: string;
-  if (geo.osm_type === "relation") {
-    areaClause = `(area:${3600000000 + geo.osm_id})`;
-  } else if (geo.osm_type === "way") {
-    areaClause = `(area:${2400000000 + geo.osm_id})`;
-  } else if (geo.boundingbox?.length === 4) {
-    const [s, n, w, e] = geo.boundingbox.map(Number);
-    areaClause = `(${s},${w},${n},${e})`;
-  } else {
-    throw new Error("Could not resolve that area. Try a more specific city.");
-  }
-
-  const query = buildQuery(filters, areaClause, limit);
+  const scope = area.clause + (tile ? `(${tile[0]},${tile[1]},${tile[2]},${tile[3]})` : "");
+  // Room for the whole slice — we de-dupe hard afterwards, and truncating here
+  // is precisely how leads used to go missing and never come back.
+  const cap = Math.min(Math.max(limit * 4, 2000), 20000);
+  const query = `[out:json][timeout:180];${area.prelude}(${statements(selectorsFor(filters), scope)});out tags center ${cap};`;
   const data = await runOverpass(query);
 
   const byDomain = new Map<string, Company>();
   const noSite: Company[] = [];
   const seenEmail = new Set<string>();
+  const seenPhone = new Set<string>();
 
   for (const el of data.elements || []) {
     const t = el.tags || {};
+    // Matched a business key, but is it a business? Drop cash machines, benches,
+    // car parks and public toilets — they carry contact tags but sell nothing.
+    if (!isBusinessPoi(t)) continue;
+
     const rawEmail = (t.email || t["contact:email"] || "").split(";")[0].trim().toLowerCase() || null;
-    const phone = (t.phone || t["contact:phone"] || t["contact:mobile"] || "").split(";")[0].trim() || null;
+    const phone = (t.phone || t["contact:phone"] || t["contact:mobile"] || t["contact:whatsapp"] || "").split(";")[0].trim() || null;
     let website: string | undefined = t.website || t["contact:website"] || t.url;
     const name = t.name || t["name:en"] || "";
     const city = t["addr:city"] || t["addr:town"] || t["addr:suburb"] || "";
@@ -323,6 +453,9 @@ export async function findLeads(
       if (!/^https?:\/\//i.test(website)) website = "https://" + website;
       let domain = "";
       try { domain = new URL(website).hostname.replace(/^www\./i, "").toLowerCase(); } catch { website = undefined; }
+      // A social/profile link isn't the company's site. Forget it and let the
+      // lead through on its email or phone instead of inventing a fake domain.
+      if (domain && !isCompanySite(domain)) { domain = ""; website = undefined; }
       if (domain) {
         const existing = byDomain.get(domain);
         if (existing) {
@@ -332,25 +465,43 @@ export async function findLeads(
           if (existing.name === domain && name) existing.name = name;
           continue;
         }
-        byDomain.set(domain, {
-          name: name || domain,
-          website,
-          city,
-          email: rawEmail,
-          phone,
-          hasWebsite: true,
-        });
+        byDomain.set(domain, { name: name || domain, website, city, email: rawEmail, phone, hasWebsite: true });
         continue;
       }
     }
 
     // No usable website — still valuable if it exposes an email directly.
-    if (rawEmail && !seenEmail.has(rawEmail)) {
+    if (rawEmail) {
+      if (seenEmail.has(rawEmail)) continue;
       seenEmail.add(rawEmail);
       noSite.push({ name: name || rawEmail.split("@")[1], website: "", city, email: rawEmail, phone, hasWebsite: false });
+      continue;
+    }
+
+    // Named company with only a phone number. Still a real, reachable lead —
+    // and dropping these was throwing away most of the map (Jordan: 861 phones
+    // vs 391 emails). Nameless phone pins are noise, so they stay out.
+    if (phone && name) {
+      const key = phone.replace(/[^\d+]/g, "");
+      if (!key || seenPhone.has(key)) continue;
+      seenPhone.add(key);
+      noSite.push({ name, website: "", city, email: null, phone, hasWebsite: false });
     }
   }
 
-  // Websites first (crawlable), then direct-email-only leads.
-  return [...byDomain.values(), ...noSite].slice(0, limit);
+  // Websites first (crawlable into a real email), then direct contacts.
+  const all = [...byDomain.values(), ...noSite];
+  return limit > 0 ? all.slice(0, limit) : all;
+}
+
+// One-shot search for the manual "find companies" screen: resolve the place and
+// harvest the whole area in a single call.
+export async function findLeads(
+  location: string,
+  category: string,
+  limit: number,
+  place?: { osm_type?: string; osm_id?: number; boundingbox?: string[] }
+): Promise<Company[]> {
+  const area = await resolveArea(location, place);
+  return findLeadsIn(area, category, limit);
 }

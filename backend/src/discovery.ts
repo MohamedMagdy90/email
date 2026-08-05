@@ -7,7 +7,7 @@
 // become Contacts. All state lives in the DB, so it survives restarts.
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
-import { findLeads, type Company } from "./leads";
+import { findLeadsIn, resolveArea, tilesFor, countAvailable, type Company, type Tile } from "./leads";
 import { searchCompaniesPaged } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
@@ -73,6 +73,11 @@ const EMPTY_STREAK_LIMIT = 3;
 // the shared free-reader budget isn't starved), which result pages to pull per
 // query, spacing between queries, and how many all-duplicate batches to tolerate
 // before a full re-walk is considered "done" for this interval.
+// Map-area sources sweep their country as a grid of tiles: how many tiles one
+// batch covers, and the pause between them so the free Overpass mirrors stay
+// happy. A batch chains straight into the next until the grid is fully swept.
+const OSM_TILES_PER_RUN = 6;
+const OSM_TILE_PACING_MS = 1_200;
 const SEARCH_QUERIES_PER_RUN = 3;
 const SEARCH_PAGES = [0, 30];
 const SEARCH_PACING_MS = 1200;
@@ -356,39 +361,79 @@ export function initialCursor(base: string): number {
 
 /* --------------------------- OSM area source --------------------------- */
 
-// Run one OSM source: discover companies, dedupe, insert new. Returns count.
-async function runSource(src: any): Promise<{ found: number; error?: string }> {
+interface OsmRunResult {
+  found: number;      // NEW leads inserted this batch
+  seen: number;       // businesses read this batch (new OR already-known)
+  error?: string;
+  nextCursor: number; // next tile to sweep
+  tiles: number;      // tiles in the grid
+  available: number;  // contactable businesses OSM holds in the whole area (0 = unknown)
+  exhausted: boolean; // the whole grid has been swept
+}
+
+// Run one Map-area source. The area is split into a grid and swept a few tiles
+// per batch, chaining until the whole country is covered — a single country-wide
+// query hits Overpass' output cap and silently truncates, which is why these
+// sources used to plateau at a few hundred rows and never grow again.
+async function runOsmSource(src: any): Promise<OsmRunResult> {
   const place = safeParse(src.place_json);
-  const limit = clamp(src.limit_n, 5, 500);
-  dlog("osm", `searching "${src.location}" · ${src.category} (up to ${limit}) via OpenStreetMap`);
-  const companies: Company[] = await findLeads(src.location, src.category, limit, place);
-  dlog("osm", `OpenStreetMap returned ${companies.length} candidate(s) for "${src.location}"`);
+  const perTile = clamp(src.limit_n, 5, 500);
+  const area = await resolveArea(src.location, place);
+  const grid = tilesFor(area.bbox);
+  const tiles: (Tile | undefined)[] = grid.length ? grid : [undefined]; // no bbox → one whole-area sweep
+  const total = tiles.length;
+
+  let cursor = Math.max(1, Number(src.cursor) || 1);
+  if (cursor > total) cursor = 1;                       // grid resized, or a fresh pass
+
+  // Once per pass, ask OSM how much it actually has here. This is the number
+  // that answers "why isn't it finding more?" — it's a map, and the answer is
+  // usually "because that is everything it knows".
+  let available = Number(src.osm_available) || 0;
+  if (cursor === 1) {
+    try {
+      available = await countAvailable(area, src.category);
+      dlog("osm", `${src.location} · ${src.category}: OpenStreetMap holds ${available.toLocaleString()} contactable business(es) here — that is the ceiling for this source.`);
+    } catch { /* coverage is nice-to-have, never fatal */ }
+  }
+
   const dedup = await loadContactDedup();
   const label = `${src.location} · ${src.category}`;
-  let found = 0, skipped = 0;
-  for (const co of companies) {
-    const domain = co.website ? (registrableDomain(hostOf(co.website)) || "") : "";
-    const email = (co.email || "").toLowerCase();
-    const added = await insertDiscovered({
-      name: co.name, website: co.website || null, domain: domain || null, email: email || null,
-      phone: co.phone || null, city: co.city || null, country: src.location, category: src.category,
-      sourceId: src.id, label,
-      enriched: email ? 1 : 0,          // listed email → no enrichment needed
-      confidence: email ? "listed" : null,
-    }, dedup);
-    if (added) { found++; dlog("osm", `  + ${leadLine(co.name, email, co.phone)}`); }
-    else skipped++;
+  const end = Math.min(total, cursor + OSM_TILES_PER_RUN - 1);
+  let found = 0, seen = 0, err: string | undefined;
+
+  for (let i = cursor; i <= end; i++) {
+    const tile = tiles[i - 1];
+    let companies: Company[] = [];
+    try {
+      companies = await findLeadsIn(area, src.category, perTile, tile);
+    } catch (e: any) {
+      // One bad tile must not sink the sweep — note it and keep walking.
+      err = String(e?.message || e);
+      dwarn("osm", `${label}: tile ${i}/${total} failed (${err}) — continuing`);
+      continue;
+    }
+    seen += companies.length;
+    let tileNew = 0;
+    for (const co of companies) {
+      const domain = co.website ? (registrableDomain(hostOf(co.website)) || "") : "";
+      const email = (co.email || "").toLowerCase();
+      const added = await insertDiscovered({
+        name: co.name, website: co.website || null, domain: domain || null, email: email || null,
+        phone: co.phone || null, city: co.city || null, country: src.location, category: src.category,
+        sourceId: src.id, label,
+        enriched: email ? 1 : 0,          // listed email → no enrichment needed
+        confidence: email ? "listed" : null,
+      }, dedup);
+      if (added) { found++; tileNew++; dlog("osm", `  + ${leadLine(co.name, email, co.phone)}`); }
+    }
+    dlog("osm", `${label}: tile ${i}/${total} — ${companies.length} business(es) on the map, +${tileNew} new`);
+    if (i < end) await sleep(OSM_TILE_PACING_MS);
   }
-  dlog("osm", `"${src.location}" done: +${found} new, ${skipped} already-known/duplicate`);
-  // When OSM returned rows but they're ALL already in the pool/contacts, the area
-  // is fully harvested — re-scanning can't surface more. Say so, and point at the
-  // one thing that actually scales beyond OSM's tagged set: a Directory source.
-  if (found === 0 && companies.length > 0) {
-    dlog("osm", `↳ "${src.location}" · ${src.category} is fully harvested from OpenStreetMap (all ${companies.length} known already). OSM is a map, not a company registry — add a Directory (bulk) source to go beyond it.`);
-  } else if (companies.length === 0) {
-    dlog("osm", `↳ OpenStreetMap has no ${src.category} tagged with a website/email in "${src.location}". Try a broader Industry, a bigger area, or a Directory (bulk) source.`);
-  }
-  return { found };
+
+  const nextCursor = end + 1;
+  const exhausted = nextCursor > total;
+  return { found, seen, error: err && seen === 0 && found === 0 ? err : undefined, nextCursor: exhausted ? 1 : nextCursor, tiles: total, available, exhausted };
 }
 
 /* -------------------------- Directory source -------------------------- */
@@ -791,23 +836,41 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
     return { found: r.found, error: r.error, continue: cont };
   }
 
-  // OSM area source.
-  let result: { found: number; error?: string };
+  // Map-area (OSM) source — sweeps its grid a few tiles per batch, chaining
+  // until the whole area is covered, then rests until the next interval.
+  let r: OsmRunResult;
   try {
-    result = await runSource(src);
+    r = await runOsmSource(src);
   } catch (e: any) {
-    result = { found: 0, error: String(e?.message || e) };
+    r = { found: 0, seen: 0, error: String(e?.message || e), nextCursor: Number(src.cursor) || 1, tiles: Number(src.osm_tiles) || 0, available: Number(src.osm_available) || 0, exhausted: false };
   }
-  const next = new Date(Date.now() + interval * 60000).toISOString();
+  const cont = !r.error && !r.exhausted;
+  const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+  const status = r.error ? "error" : r.exhausted ? "done" : "ok";
   await q(
     `UPDATE discovery_sources
-       SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1, total_found=total_found+?
+       SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
+           total_found=total_found+?, cursor=?, exhausted=?, osm_tiles=?, osm_available=?
      WHERE id=?`,
-    [nowIso(), next, result.error ? "error" : "ok", result.error || null, result.found, src.id]
+    [nowIso(), next, status, r.error || null, r.found, r.error ? (Number(src.cursor) || 1) : r.nextCursor,
+     r.exhausted ? 1 : 0, r.tiles, r.available, src.id]
   );
-  if (result.error) derr("osm", `${srcLabel(src)}: ERROR — ${result.error} (next scan in ${interval}m)`);
-  else dlog("osm", `${srcLabel(src)}: +${result.found} new · next scan in ${interval}m`);
-  return { found: result.found, error: result.error, continue: false };
+  if (r.error) derr("osm", `${srcLabel(src)}: ERROR — ${r.error} (next scan in ${interval}m)`);
+  else if (r.exhausted) {
+    // A finished sweep is the normal, healthy end state — not a stall. Say how
+    // complete it is so "it only found 60" is never a mystery again.
+    const have = await osmHarvested(src.id);
+    const pct = r.available > 0 ? Math.min(100, Math.round((have / r.available) * 100)) : null;
+    dlog("osm", `${srcLabel(src)}: SWEPT the whole area (${r.tiles} tile${r.tiles === 1 ? "" : "s"}) — ${have.toLocaleString()}${r.available ? ` of the ${r.available.toLocaleString()} businesses OpenStreetMap has here${pct !== null ? ` (${pct}%)` : ""}` : ""}. Re-checking in ${interval}m for newly-mapped ones. For more volume than the map holds, add a Web search or Directory source.`);
+  } else dlog("osm", `${srcLabel(src)}: +${r.found} new · continuing at tile ${r.nextCursor}/${r.tiles} in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
+  return { found: r.found, error: r.error, continue: cont };
+}
+
+// How many leads this Map-area source has actually put in the pool (lifetime),
+// used to report coverage against what OSM holds.
+async function osmHarvested(sourceId: string): Promise<number> {
+  const row = (await q(`SELECT COUNT(*) AS n FROM discovered_leads WHERE source_id=?`, [sourceId]))[0] as any;
+  return Number(row?.n) || 0;
 }
 
 // Manual "run now" from the UI. Works even when the global bot is paused so you
@@ -838,6 +901,14 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
     await q(`UPDATE discovery_sources SET exhausted=0, empty_streak=0, cursor=? WHERE id=?`, [cursor, id]);
     src.exhausted = 0; src.empty_streak = 0; src.cursor = cursor;
     if (restart) dlog("search", `re-searching ${srcLabel(src)} from the top — checking every query again for new sites`);
+  } else {
+    // Map area: a kick on a finished sweep starts the grid again from tile 1 so
+    // anything newly mapped is picked up; mid-sweep it just resumes.
+    const restart = Number(src.exhausted) === 1;
+    const cursor = restart ? 1 : (Number(src.cursor) || 1);
+    await q(`UPDATE discovery_sources SET exhausted=0, cursor=? WHERE id=?`, [cursor, id]);
+    src.exhausted = 0; src.cursor = cursor;
+    if (restart) dlog("osm", `re-sweeping ${srcLabel(src)} from tile 1 — re-checking the whole area for newly-mapped businesses`);
   }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.

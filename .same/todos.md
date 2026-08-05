@@ -84,3 +84,33 @@
   detection in `fetcher.ts`.
 - **Web search source** (`search.ts` + `runSearchSource`): keywords × country/cities
   query plan walked by cursor, reader-backed so DuckDuckGo's IP block is bypassed.
+
+---
+
+# Todos
+
+## Map area (OSM) source — "Jordan found only 60+ in 3 days"
+
+Measured live against Overpass (Jordan, relation 184818):
+
+| scope | POIs | website | email | phone |
+|---|---|---|---|---|
+| old query: office/shop/craft | 3,943 | 134 | **61** | 237 |
+| new query: + amenity/tourism/healthcare/leisure/industrial | 18,823 | 717 | 391 | 861 |
+
+The 61 emails WERE the entire database. Not a speed problem — a ceiling problem.
+
+- [x] Widen `Companies (general)` to every business key, not just office/shop/craft
+- [x] Accept phone as a contact signal (was website/email only)
+- [x] Collapse contact keys into one key-regex (81 statements -> 9, no timeouts)
+- [x] Deny-list street furniture (ATMs, benches, car parks) that carry contact tags
+- [x] Ignore social/profile links in `website` (youtube/facebook were becoming "domains")
+- [x] Tile the area into a ~0.6-degree grid; sweep 6 tiles/batch via `cursor`
+- [x] Fix bbox ordering ([S,N,W,E] from Nominatim -> [S,W,N,E] for Overpass)
+- [x] Probe `out count` once per pass -> `osm_available` (the real ceiling)
+- [x] "Run now" on a finished sweep restarts from tile 1
+- [x] UI: sweeping · tile n of m / swept the whole area · "N of M on the map"
+- [x] Rewrite the modal note that claimed re-scanning "can't surface more"
+
+Verified end-to-end: 12 of 56 tiles (the empty southern desert) -> 132 leads,
+43 emails, 77 websites. Old system: 61 emails in 3 days for the whole country.

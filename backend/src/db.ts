@@ -172,6 +172,13 @@ export async function ensureSchema() {
   // restored later exactly where it left off.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN archived_at TEXT`); } catch { /* exists */ }
+  // A Map-area ('osm') source sweeps its country tile-by-tile, reusing `cursor`
+  // as "next tile". `osm_tiles` is how many tiles the grid has, and
+  // `osm_available` is how many contactable businesses OpenStreetMap holds in
+  // that area in total — the hard ceiling, so the UI can show real coverage
+  // instead of leaving a finished source looking stuck.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_tiles INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_available INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being
