@@ -249,6 +249,21 @@ const JUNK_TITLE =
 // Bidi/zero-width marks wrap Arabic phone numbers and break plain matching.
 const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
+// A tail like ", 712 County Road 4026, Lampasas, TX 76550" or ", Taif, Masarah
+// 1" is a postal address the site printed after its name, not part of it.
+const ADDRESS_TAIL =
+  /,\s*(?:p\.?o\.?\s*box\b|\d+[\w-]*\s+\w|[\w\s.'-]+,\s*(?:[A-Z]{2}\s*\d|\d{4,}))/i;
+// A comma-separated tail that just re-states the category or the SEO phrase —
+// ", construction company, Taif" / ", construction companies near me".
+const DESCRIPTOR_TAIL =
+  /,\s*(?:the\s+)?(?:best|top|leading|professional|licensed)?\s*(?:general\s+)?(?:construction|contracting|contractor|building|engineering|manufacturing|trading|maintenance|cleaning|transport|logistics|catering)\s+(?:company|companies|contractors?|services?|firm)\b/i;
+// Trailing filler a site appends to its own name in the <title>.
+const NAME_TAIL_NOISE = /\s*[-–—|]?\s*(official\s+)?(web\s?site|homepage|home\s?page|online)\s*$/i;
+// A fragment that is really just the site's URL ("FMCKSA.COM", "gsconstmena.com").
+const BARE_DOMAIN = /^(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\/?$/i;
+// The letters of a name, for comparing a title fragment against its domain.
+const letters = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
 /** The business name inside a page title, or null when the title isn't one. */
 export function companyNameFromTitle(rawTitle: string, domain: string): string | null {
   const t = (rawTitle || "").replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
@@ -264,12 +279,40 @@ export function companyNameFromTitle(rawTitle: string, domain: string): string |
     .filter((s) => !/^call\s/i.test(s));
   if (!parts.length) return domain;
 
-  // A fragment naming a legal entity wins; among several, the tightest one.
-  // Otherwise take the first — titles conventionally lead with the site's name,
-  // and "shortest" would happily pick the city out of an Arabic title.
-  const named = parts.filter((p) => COMPANY_SUFFIX.test(p));
-  const best = named.length ? named.sort((a, b) => a.length - b.length)[0] : parts[0];
-  const out = best.replace(/[|\-–—\s]+$/, "").trim();
+  // 1. The fragment that matches the domain is the site's own name — the single
+  //    most reliable signal there is. Without this, "Construction | Home page -
+  //    Camso" on camso.com became "Construction", and "BLACK CAT GC | Discover
+  //    the Leading Construction Company in Jubail" became the marketing
+  //    tagline, because it was the fragment carrying the word "Company".
+  //    A fragment that is literally the URL ("FMCKSA.COM") is skipped — it
+  //    matches the domain perfectly but is the one thing worse than a headline.
+  const root = letters((domain || "").replace(/^www\./i, "").split(".")[0] || "");
+  const onDomain =
+    root.length >= 4
+      ? parts.find((p) => { const l = letters(p); return l && !BARE_DOMAIN.test(p) && (root.includes(l) || l.includes(root)); })
+      : undefined;
+
+  // 2. Otherwise a fragment naming a legal entity, and among several the
+  //    tightest. Capped at six words so a sentence that merely CONTAINS
+  //    "Company"/"Group" can't outrank the actual name beside it.
+  const named = parts.filter((p) => COMPANY_SUFFIX.test(p) && p.split(/\s+/).length <= 6);
+
+  // 3. Failing both, the first fragment — titles conventionally lead with the
+  //    site's name, and "shortest" would happily pick the city out of an
+  //    Arabic title.
+  const best = onDomain || (named.length ? named.sort((a, b) => a.length - b.length)[0] : parts[0]);
+
+  let out = best.replace(/[|\-–—\s]+$/, "").trim();
+  // Drop a postal address, or a re-statement of the category, that the title
+  // tacked on after the name.
+  for (const tail of [ADDRESS_TAIL, DESCRIPTOR_TAIL]) {
+    const at = out.search(tail);
+    if (at > 1) out = out.slice(0, at).trim();
+  }
+  // Drop trailing "Website" / "Official Site" ("Imalco Website" → "Imalco").
+  const trimmed = out.replace(NAME_TAIL_NOISE, "").trim();
+  if (trimmed.length >= 2) out = trimmed;
+  out = out.replace(/[,;:\s]+$/, "").trim();
   return out.length >= 2 ? out.slice(0, 90) : domain;
 }
 

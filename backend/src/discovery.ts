@@ -60,6 +60,19 @@ function leadLine(name?: string | null, email?: string | null, phone?: string | 
 // mirrors and on the sites we crawl — no bans, no hammering.
 const DISCOVERY_TICK_MS = 45_000;
 const ENRICH_TICK_MS = 15_000;
+// How the enrichment loop is fed. It used to take ONE lead per tick and then
+// sleep out the rest of the 15s — measured on production logs, a lead needs
+// 1-3s of actual work, so ~85% of the loop was idle and the pool drained at
+// ~4 leads/min however many were waiting.
+//
+// Now a pass claims a batch, works several at a time (a lead is almost entirely
+// waiting on someone else's server, so running a few fills that dead air rather
+// than adding load), and chains straight into the next pass while work remains.
+// The reader's own global pacer — 500ms/call with a key — stays the real
+// throttle, so this can't outrun the rate limit no matter how it's tuned.
+const ENRICH_BATCH = 12;
+const ENRICH_CONCURRENCY = 4;
+const ENRICH_CHAIN_MS = 750;
 // Directory sources walk continuously: how far a single batch may go, and a
 // short delay before the next batch so a big directory streams in quickly
 // without hammering. The batch stops at whichever budget is hit FIRST — a page
@@ -1118,193 +1131,245 @@ async function enrichTick(): Promise<void> {
   if (!(await isBotEnabled())) return;
   if (!(await autoEnrichOn())) return;
   enriching = true;
+  let more = false;
   try {
-    // Next due lead with a site but no email. Fresh leads (next_enrich_at NULL)
-    // go first; retried ones only once their backoff has elapsed — so a wall of
-    // blocked leads never starves newly-discovered ones.
     const now = nowIso();
-    let lead = (await q(
+
+    // Tier 1 — leads that already have a site. Cheapest work and by far the
+    // likeliest to yield an address, so they always fill the batch first.
+    // Fresh leads (next_enrich_at NULL) go before retried ones, so a wall of
+    // blocked leads never starves newly-discovered ones.
+    const withSite = (await q(
       `SELECT * FROM discovered_leads
         WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
           AND website IS NOT NULL AND website<>''
           AND (next_enrich_at IS NULL OR next_enrich_at <= ?)
         ORDER BY (next_enrich_at IS NULL) DESC, next_enrich_at ASC, created_at ASC
-        LIMIT 1`,
-      [now]
-    ))[0];
+        LIMIT ?`,
+      [now, ENRICH_BATCH]
+    )) as any[];
 
-    // Nothing left to crawl? Then work the far bigger pile: leads that have a
-    // NAME and a phone but no website at all. OpenStreetMap and directories list
-    // a phone for many more businesses than they list a site, so these are the
-    // majority of any real pool — and with nothing to crawl they used to sit
-    // there for ever, permanently un-emailable. Find their website by searching
-    // the web for the company, then crawl that. Done second so it never delays
-    // the cheap work, and marked 'no-site' when the search comes up empty so we
-    // ask once, not for ever.
-    let needsSite = false;
-    if (!lead) {
-      lead = (await q(
-        `SELECT * FROM discovered_leads
-          WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
-            AND (website IS NULL OR website='')
-            AND name IS NOT NULL AND name<>''
-            AND (enrich_status IS NULL OR enrich_status<>'no-site')
-            AND (next_enrich_at IS NULL OR next_enrich_at <= ?)
-          ORDER BY (next_enrich_at IS NULL) DESC, next_enrich_at ASC, created_at ASC
-          LIMIT 1`,
-        [now]
-      ))[0];
-      needsSite = !!lead;
-    }
-    if (!lead) return;
+    // Tier 2 — a NAME and a phone but no website at all. OpenStreetMap and
+    // directories list a phone for many more businesses than they list a site,
+    // so these are the majority of any real pool — and with nothing to crawl
+    // they'd sit there for ever, permanently un-emailable. Find their site by
+    // searching the web, then crawl that. Only tops up whatever tier 1 left
+    // free, so a huge no-site tail can never starve a crawlable lead.
+    const room = ENRICH_BATCH - withSite.length;
+    const noSite =
+      room > 0
+        ? ((await q(
+            `SELECT * FROM discovered_leads
+              WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
+                AND (website IS NULL OR website='')
+                AND name IS NOT NULL AND name<>''
+                AND (enrich_status IS NULL OR enrich_status<>'no-site')
+                AND (next_enrich_at IS NULL OR next_enrich_at <= ?)
+              ORDER BY (next_enrich_at IS NULL) DESC, next_enrich_at ASC, created_at ASC
+              LIMIT ?`,
+            [now, room]
+          )) as any[])
+        : [];
 
-    if (needsSite) {
-      const company = String(lead.name || "").trim();
-      // Only search for something that reads like a company. A phone number or
-      // a bare domain that slipped into the name column would just burn search
-      // budget on nonsense.
-      if (!looksLikeName(company) || isBadName(company) || /^[\d\s+()-]+$/.test(company)) {
-        await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
-        return;
-      }
-      dlog("enrich", `no website on file for "${company}" — searching the web for its site`);
-      const hit = await resolveWebsite(company, String(lead.country || "")).catch(() => null);
-      if (!hit) {
-        await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
-        dlog("enrich", `  ✗ no website found for "${company}" — it stays a phone-only lead`);
-        return;
-      }
-      await q(`UPDATE discovered_leads SET website=?, domain=? WHERE id=?`, [hit.website, hit.domain, lead.id]);
-      lead.website = hit.website;
-      lead.domain = hit.domain;
-      dlog("enrich", `  → ${shortUrl(hit.website)} — crawling it for an email`);
-    }
+    const batch = [
+      ...withSite.map((lead) => ({ lead, needsSite: false })),
+      ...noSite.map((lead) => ({ lead, needsSite: true })),
+    ];
+    if (!batch.length) return;
 
+    // Read the shared settings once per batch, not once per lead.
     const proxy = await getProxyConfig();
     const readerKey = await getReaderKey();
-    const opts: CrawlOptions = {
-      maxPages: 6,
-      maxDepth: 1,
-      respectRobots: true,
-      checkMx: true,
-      guessInbox: false,
-      useSitemap: true,
-      defaultCountry: lead.country || undefined,
-      concurrency: 1,
-      proxy,
-      readerKey,
-    };
 
-    // A social/profile page is not the company's site. Crawling one never yields
-    // a company address, and because Facebook blocks bots it would burn all six
-    // retries doing it. Retire the lead's URL instead of chasing it.
-    const leadHost = hostOf(String(lead.website || "")).replace(/^www\./i, "");
-    if (leadHost && !isCompanySiteHost(leadHost)) {
-      await q(
-        `UPDATE discovered_leads SET website=NULL, domain=NULL, enriched=0, retry_count=0,
-             enrich_status=NULL, next_enrich_at=NULL WHERE id=?`,
-        [lead.id]
-      );
-      dlog("enrich", `  ~ ${leadHost} is a social page, not a company site — cleared it; the web search will look for the real one`);
+    // Work the batch a few at a time. Nearly all of a lead's wall-clock time is
+    // waiting on a remote server, so running several fills that dead air rather
+    // than adding load — and the reader has its own global pacer (500ms/call
+    // with a key), which stays the real throttle no matter how many run here.
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < batch.length) {
+        const item = batch[cursor++];
+        try {
+          await enrichOne(item.lead, item.needsSite, proxy, readerKey);
+        } catch (e: any) {
+          derr("enrich", `"${item.lead.name || item.lead.domain}" failed: ${String(e?.message || e)}`);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(ENRICH_CONCURRENCY, batch.length) }, () => worker())
+    );
+    more = batch.length >= ENRICH_BATCH;
+  } finally {
+    enriching = false;
+  }
+  // Still work queued? Go straight on instead of idling until the next tick.
+  // One-lead-per-tick spent ~85% of its time waiting rather than crawling.
+  if (more) setTimeout(() => { enrichTick().catch(() => {}); }, ENRICH_CHAIN_MS);
+}
+
+/** Find the email for one lead. Every exit path settles the row's enrich state. */
+async function enrichOne(
+  lead: any,
+  needsSite: boolean,
+  proxy: Awaited<ReturnType<typeof getProxyConfig>>,
+  readerKey: Awaited<ReturnType<typeof getReaderKey>>
+): Promise<void> {
+  if (needsSite) {
+    const company = String(lead.name || "").trim();
+    // Only search for something that reads like a company. A phone number or
+    // a bare domain that slipped into the name column would just burn search
+    // budget on nonsense.
+    if (!looksLikeName(company) || isBadName(company) || /^[\d\s+()-]+$/.test(company)) {
+      await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
       return;
     }
-
-    const attempt = (Number(lead.retry_count) || 0) + 1;
-    dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"${attempt > 1 ? ` (try ${attempt})` : ""}`);
-    let email: string | null = null;
-    let phone: string | null = lead.phone || null;
-    let confidence: string | null = null;
-    // Why the crawl ended, so we can tell a recoverable block from a real miss:
-    //   found  → got an email
-    //   empty  → site loaded fine but exposes no email (permanent)
-    //   blocked→ bot-wall / rate-limit (transient — retry)
-    //   error  → fetch failure / exception (transient — retry)
-    let outcome: "found" | "empty" | "blocked" | "error" = "error";
-    let note = "";
-    try {
-      const site = await crawlSite(lead.website, opts);
-      if (site.phone && !phone) phone = site.phone;
-      const best = pickSiteEmail(site.emails, lead.domain);
-      if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; outcome = "found"; }
-      else if (site.status === "blocked") { outcome = "blocked"; note = site.note || "blocked"; }
-      else if (site.status === "error") { outcome = "error"; note = site.note || "could not open site"; }
-      else { outcome = "empty"; } // site loaded, genuinely no email present
-    } catch (e: any) {
-      outcome = "error";
-      note = String(e?.message || e);
-      dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${note}`);
+    dlog("enrich", `no website on file for "${company}" — searching the web for its site`);
+    const hit = await resolveWebsite(company, String(lead.country || "")).catch(() => null);
+    if (!hit) {
+      await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
+      dlog("enrich", `  ✗ no website found for "${company}" — it stays a phone-only lead`);
+      return;
     }
+    await q(`UPDATE discovered_leads SET website=?, domain=? WHERE id=?`, [hit.website, hit.domain, lead.id]);
+    lead.website = hit.website;
+    lead.domain = hit.domain;
+    dlog("enrich", `  → ${shortUrl(hit.website)} — crawling it for an email`);
+  }
 
-    if (email) {
-      // Guard against duplicates: this address is already a saved Contact, or
-      // already sits on another pool row, so this lead is redundant.
-      const asContact = (await q(`SELECT 1 FROM contacts WHERE email=? LIMIT 1`, [email]))[0];
-      const inPool = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [email, lead.id]))[0];
-      if (asContact || inPool) {
-        // DON'T delete it. Deleting frees the dedup_key, so the source that
-        // found this company simply finds it again on its next pass, we crawl
-        // it again, and delete it again — a loop that consumed the entire
-        // enrichment budget re-discovering companies we already had.
-        //
-        // Retire the row in place instead. `status='duplicate'` keeps it out of
-        // every tab and out of the enrichment queue, while its dedup_key stays
-        // put and blocks the re-insert for good. The email column stays empty so
-        // the pool's one-row-per-address rule still holds.
-        await q(
-          `UPDATE discovered_leads
-              SET status='duplicate', enriched=1, enrich_status='duplicate',
-                  next_enrich_at=NULL, phone=?
-            WHERE id=?`,
-          [phone, lead.id]
-        );
-        dlog("enrich", `  = ${email} already in your list — retired "${lead.name || lead.domain}" so it stops being re-found`);
-        return;
-      }
-      // Promote the dedup_key to the email so any FUTURE lead carrying it collides
-      // on the unique key and is skipped. enriched=1 so we never re-crawl it.
+  const opts: CrawlOptions = {
+    maxPages: 6,
+    maxDepth: 1,
+    respectRobots: true,
+    checkMx: true,
+    guessInbox: false,
+    useSitemap: true,
+    defaultCountry: lead.country || undefined,
+    concurrency: 1,
+    proxy,
+    readerKey,
+  };
+
+  // A social/profile page is not the company's site. Crawling one never yields
+  // a company address, and because Facebook blocks bots it would burn all six
+  // retries doing it. Retire the lead's URL instead of chasing it.
+  const leadHost = hostOf(String(lead.website || "")).replace(/^www\./i, "");
+  if (leadHost && !isCompanySiteHost(leadHost)) {
+    await q(
+      `UPDATE discovered_leads SET website=NULL, domain=NULL, enriched=0, retry_count=0,
+           enrich_status=NULL, next_enrich_at=NULL WHERE id=?`,
+      [lead.id]
+    );
+    dlog("enrich", `  ~ ${leadHost} is a social page, not a company site — cleared it; the web search will look for the real one`);
+    return;
+  }
+
+  const attempt = (Number(lead.retry_count) || 0) + 1;
+  dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"${attempt > 1 ? ` (try ${attempt})` : ""}`);
+  let email: string | null = null;
+  let phone: string | null = lead.phone || null;
+  let confidence: string | null = null;
+  // Why the crawl ended, so we can tell a recoverable block from a real miss:
+  //   found  → got an email
+  //   empty  → site loaded fine but exposes no email (permanent)
+  //   blocked→ bot-wall / rate-limit (transient — retry)
+  //   error  → fetch failure / exception (transient — retry)
+  let outcome: "found" | "empty" | "blocked" | "error" = "error";
+  let note = "";
+  try {
+    const site = await crawlSite(lead.website, opts);
+    if (site.phone && !phone) phone = site.phone;
+    const best = pickSiteEmail(site.emails, lead.domain);
+    if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; outcome = "found"; }
+    else if (site.status === "blocked") { outcome = "blocked"; note = site.note || "blocked"; }
+    else if (site.status === "error") { outcome = "error"; note = site.note || "could not open site"; }
+    else { outcome = "empty"; } // site loaded, genuinely no email present
+  } catch (e: any) {
+    outcome = "error";
+    note = String(e?.message || e);
+    dwarn("enrich", `  crawl failed for ${shortUrl(lead.website)}: ${note}`);
+  }
+
+  if (email) {
+    // Guard against duplicates: this address is already a saved Contact, or
+    // already sits on another pool row, so this lead is redundant.
+    const asContact = (await q(`SELECT 1 FROM contacts WHERE email=? LIMIT 1`, [email]))[0];
+    const inPool = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [email, lead.id]))[0];
+    if (asContact || inPool) {
+      await retireDuplicate(lead, phone, email);
+      return;
+    }
+    // Promote the dedup_key to the email so any FUTURE lead carrying it collides
+    // on the unique key and is skipped. enriched=1 so we never re-crawl it.
+    //
+    // Two leads in the same batch can land on the same address at the same
+    // moment, and dedup_key is UNIQUE — so a conflict here is a duplicate that
+    // the SELECT above simply couldn't see yet. Retire it like any other.
+    try {
       await q(
         `UPDATE discovered_leads
             SET enriched=1, email=?, phone=?, confidence=?, dedup_key=?, enrich_status='found', next_enrich_at=NULL
           WHERE id=?`,
         [email, phone, confidence, "e:" + email, lead.id]
       );
-      dlog("enrich", `  ✓ found ${email} for "${lead.name || lead.domain}"`);
+    } catch {
+      await retireDuplicate(lead, phone, email);
       return;
     }
-
-    // No email. The old code marked EVERY miss enriched=1 — so a Cloudflare wall
-    // or a reader rate-limit permanently buried a recoverable lead. Now we only
-    // "give up" when the site actually loaded and simply has no email.
-    if (outcome === "empty") {
-      await q(
-        `UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL, enrich_status='empty', next_enrich_at=NULL WHERE id=?`,
-        [phone, lead.id]
-      );
-      dlog("enrich", `  ✗ no email on ${shortUrl(lead.website)} (site loaded fine) — "${lead.name || lead.domain}"`);
-      return;
-    }
-
-    // Blocked / errored → transient. Back off and retry later, up to the cap.
-    if (attempt >= ENRICH_MAX_RETRIES) {
-      // Give up for now, but record WHY (enrich_status) so "Re-check blocked"
-      // (or adding a Jina key / proxy later) can resurrect exactly these.
-      await q(
-        `UPDATE discovered_leads SET enriched=1, phone=?, retry_count=?, enrich_status=?, next_enrich_at=NULL WHERE id=?`,
-        [phone, attempt, outcome, lead.id]
-      );
-      dwarn("enrich", `  ⚠ giving up on "${lead.name || lead.domain}" after ${attempt} tries — ${note || outcome}. Add a free Jina key or a scraping proxy in Settings, then click "Re-check blocked".`);
-      return;
-    }
-    const backoffMs = ENRICH_BACKOFF_MS[Math.min(attempt - 1, ENRICH_BACKOFF_MS.length - 1)];
-    const nextAt = new Date(Date.now() + backoffMs).toISOString();
-    await q(
-      `UPDATE discovered_leads SET enriched=0, phone=?, retry_count=?, enrich_status=?, next_enrich_at=? WHERE id=?`,
-      [phone, attempt, outcome, nextAt, lead.id]
-    );
-    dlog("enrich", `  ↻ ${outcome} on "${lead.name || lead.domain}" (try ${attempt}/${ENRICH_MAX_RETRIES}) — retrying ${fmtBackoff(backoffMs)}${note ? ` · ${note}` : ""}`);
-  } finally {
-    enriching = false;
+    dlog("enrich", `  ✓ found ${email} for "${lead.name || lead.domain}"`);
+    return;
   }
+
+  // No email. The old code marked EVERY miss enriched=1 — so a Cloudflare wall
+  // or a reader rate-limit permanently buried a recoverable lead. Now we only
+  // "give up" when the site actually loaded and simply has no email.
+  if (outcome === "empty") {
+    await q(
+      `UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL, enrich_status='empty', next_enrich_at=NULL WHERE id=?`,
+      [phone, lead.id]
+    );
+    dlog("enrich", `  ✗ no email on ${shortUrl(lead.website)} (site loaded fine) — "${lead.name || lead.domain}"`);
+    return;
+  }
+
+  // Blocked / errored → transient. Back off and retry later, up to the cap.
+  if (attempt >= ENRICH_MAX_RETRIES) {
+    // Give up for now, but record WHY (enrich_status) so "Re-check blocked"
+    // (or adding a Jina key / proxy later) can resurrect exactly these.
+    await q(
+      `UPDATE discovered_leads SET enriched=1, phone=?, retry_count=?, enrich_status=?, next_enrich_at=NULL WHERE id=?`,
+      [phone, attempt, outcome, lead.id]
+    );
+    dwarn("enrich", `  ⚠ giving up on "${lead.name || lead.domain}" after ${attempt} tries — ${note || outcome}. Add a free Jina key or a scraping proxy in Settings, then click "Re-check blocked".`);
+    return;
+  }
+  const backoffMs = ENRICH_BACKOFF_MS[Math.min(attempt - 1, ENRICH_BACKOFF_MS.length - 1)];
+  const nextAt = new Date(Date.now() + backoffMs).toISOString();
+  await q(
+    `UPDATE discovered_leads SET enriched=0, phone=?, retry_count=?, enrich_status=?, next_enrich_at=? WHERE id=?`,
+    [phone, attempt, outcome, nextAt, lead.id]
+  );
+  dlog("enrich", `  ↻ ${outcome} on "${lead.name || lead.domain}" (try ${attempt}/${ENRICH_MAX_RETRIES}) — retrying ${fmtBackoff(backoffMs)}${note ? ` · ${note}` : ""}`);
+}
+
+// DON'T delete a duplicate. Deleting frees the dedup_key, so the source that
+// found this company simply finds it again on its next pass, we crawl it again,
+// and delete it again — a loop that consumed the entire enrichment budget
+// re-discovering companies we already had.
+//
+// Retire the row in place instead. `status='duplicate'` keeps it out of every
+// tab and out of the enrichment queue, while its dedup_key stays put and blocks
+// the re-insert for good. The email column stays empty so the pool's
+// one-row-per-address rule still holds.
+async function retireDuplicate(lead: any, phone: string | null, email: string): Promise<void> {
+  await q(
+    `UPDATE discovered_leads
+        SET status='duplicate', enriched=1, enrich_status='duplicate',
+            next_enrich_at=NULL, phone=?
+      WHERE id=?`,
+    [phone, lead.id]
+  );
+  dlog("enrich", `  = ${email} already in your list — retired "${lead.name || lead.domain}" so it stops being re-found`);
 }
 
 /* --------------------------- one-off cleanups -------------------------- */
@@ -1361,17 +1426,25 @@ export async function rejectAggregatorLeads(): Promise<number> {
 // demonstrably a page title, so a real name containing a dash is never touched.
 const LOOKS_LIKE_PAGE_TITLE =
   /(^|\s[|\-–—]\s)(home|homepage|home page|welcome|official (web)?site|website|contact us|about us|index)(\s[|\-–—]\s|$)/i;
+// A name still carrying the street address or the SEO category phrase the title
+// printed after it — "… Inc, 712 County Road 4026, Lampasas, TX 76550".
+const LOOKS_LIKE_TITLE_TAIL = /,\s*(?:p\.?o\.?\s*box|\d+\s+\w)|,\s*[\w\s]+,\s*(?:[A-Z]{2}\s*\d|\d{4,})|,\s*[\w\s]*\b(?:company|companies|contractors?)\b/i;
 export async function repairPageTitleNames(): Promise<number> {
   const rows = await q(
     `SELECT id, name, domain FROM discovered_leads
       WHERE status='pending' AND name IS NOT NULL AND name <> ''
-        AND (name LIKE '%|%' OR name LIKE '% - %' OR name LIKE '%...')`
+        AND (name LIKE '%|%' OR name LIKE '% - %' OR name LIKE '%...' OR name LIKE '%,%')`
   );
   let fixed = 0;
   for (const r of rows as any[]) {
     const current = String(r.name || "");
-    // Only obvious page titles: boilerplate segment, or a truncated headline.
-    if (!LOOKS_LIKE_PAGE_TITLE.test(current) && !current.trimEnd().endsWith("...")) continue;
+    // Only obvious page titles: a boilerplate segment, a truncated headline, or
+    // a name with an address / category phrase still hanging off the end.
+    if (
+      !LOOKS_LIKE_PAGE_TITLE.test(current) &&
+      !LOOKS_LIKE_TITLE_TAIL.test(current) &&
+      !current.trimEnd().endsWith("...")
+    ) continue;
     const better = companyNameFromTitle(current, String(r.domain || ""));
     if (!better || better === current || better.length < 2) continue;
     await q(`UPDATE discovered_leads SET name=? WHERE id=?`, [better, r.id]);

@@ -157,3 +157,24 @@ useless:
 Verified: city paths and aliases normalise, .jo/.com.qa/+962/+974 all infer,
 backfill fixed 4/5 legacy rows (the 5th has a local phone + gmail = genuinely
 unknowable), and approval carries the country into Contacts.
+
+## Log review — email finding (2026-08-06)
+
+Measured from the posted log: 07:52:21 → 07:58:40 = 379s, ~22 leads = **17s/lead**.
+Actual work per lead is 1–3s. **~85% of the loop is idle**, waiting for the next tick.
+
+- [x] Fix 1 — parallel enrichment: batch (12) + worker pool (4) + chain 750ms instead of idling 15s
+- [x] Fix 2 — website-bearing leads always fill the batch first, no-site tail only tops up
+- [x] Fix 3 — dedup_key UNIQUE race caught and retired like any other duplicate
+- [x] Fix 4 — companyNameFromTitle: domain match wins (skipping a bare URL fragment),
+      COMPANY_SUFFIX capped at 6 words, address + category tails cut, "Website" stripped
+- [x] repairPageTitleNames now also re-selects names with a comma tail, so the
+      already-mangled rows get repaired on next boot
+- [x] Verified: tsc clean on both files, boots clean
+
+### Still open (reported to user, not changed)
+- Geographic drift: Gulf queries returning US firms via homonym cities
+  ("Medina, Ohio", "Hail ... Lampasas TX", "District of Oregon")
+- Yield in the sampled window: 0 emails / 22 leads — the queue is 100% no-site
+  micro-businesses (bakeries, shawarma, liquor stores) from the OSM map source.
+  Worth narrowing the map source's categories to B2B-ish ones.
