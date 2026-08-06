@@ -8,7 +8,7 @@
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeadsIn, resolveArea, tilesFor, countAvailable, type Company, type Tile } from "./leads";
-import { searchCompaniesPaged } from "./search";
+import { searchCompaniesPaged, CONTENT_BLOCK } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
@@ -1312,6 +1312,30 @@ export async function rejectDiplomaticLeads(): Promise<number> {
     await q(`UPDATE discovered_leads SET status='rejected' WHERE id IN (${chunk.map(() => "?").join(",")})`, chunk);
   }
   dlog("", `retired ${ids.length} embassy/consulate lead(s) into Rejected — they are not companies`);
+  return ids.length;
+}
+
+// Retire leads that are directories, job boards, classifieds and data brokers
+// rather than companies — chamberofcommerce.com, jooble.org, micompanyregistry
+// .com and friends. They can never be a prospect, and because they all sit
+// behind Cloudflare they were re-queued for ever, consuming crawl slots that
+// real companies needed. Rejected, not deleted, so the call is reversible.
+export async function rejectAggregatorLeads(): Promise<number> {
+  const rows = await q(
+    `SELECT id, domain, website FROM discovered_leads
+      WHERE status='pending' AND (domain IS NOT NULL OR website IS NOT NULL)`
+  );
+  const ids: string[] = [];
+  for (const r of rows as any[]) {
+    const host = String(r.domain || hostOf(String(r.website || "")) || "").toLowerCase();
+    if (host && CONTENT_BLOCK.test(host)) ids.push(r.id);
+  }
+  if (!ids.length) return 0;
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    await q(`UPDATE discovered_leads SET status='rejected' WHERE id IN (${chunk.map(() => "?").join(",")})`, chunk);
+  }
+  dlog("", `retired ${ids.length} directory/job-board/classified lead(s) into Rejected — they are not companies`);
   return ids.length;
 }
 

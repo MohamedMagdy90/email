@@ -29,6 +29,7 @@ import {
   reEnrichBlocked,
   stopSource,
   rejectDiplomaticLeads,
+  rejectAggregatorLeads,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -59,6 +60,10 @@ backfillCountries(q, (m) => console.log(`[country] ${m}`))
 // Embassies and consulates harvested before they were excluded. Moved to
 // Rejected, not deleted, so the change is visible and reversible.
 rejectDiplomaticLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
+// Same for directories, job boards and classifieds saved as if they were
+// companies. They sit behind Cloudflare, so they were also monopolising the
+// crawl queue with retries that could never succeed.
+rejectAggregatorLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(

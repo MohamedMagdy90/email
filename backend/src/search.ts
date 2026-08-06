@@ -228,8 +228,50 @@ export async function searchRaw(
 // SEO/listicle/data-broker hosts that show up in company searches but are NOT
 // the company — "top 10" articles, résumé/lead databases, slide hosts, etc.
 // Kept separate from BLOCK (social/marketplaces) so both apply to the bot.
-const CONTENT_BLOCK =
-  /(^|\.)(aeroleads|rocketreach|lusha|leadiq|apollo|signalhire|zoominfo|clearbit|owler|ambitionbox|comparably|f6s|ensun|getmanufacturers|saudifactories|rasmal|manta|bizapedia|tuugo|cybo|hotfrog|brownbook|cylex|wlw|dnb|dun|bloomberg|scribd|slideshare|issuu|academia|researchgate|clutch|goodfirms|designrush|sortlist|trustpilot|sitejabber|expatriates|expat|ksaexpats|blackridgeresearch|reportlinker|statista|ibisworld|mordorintelligence|globaldata|marketresearch|constructionweekonline|constructionweeksaudi|meed|zawya|argaam|mubasher|wikipedia|wikimedia|britannica|quora|reddit|medium|substack|pinterest|toplinehub|arabiantalks|gludo|atninfo|eyeofriyadh|saudiayp)\.[a-z.]+$/i;
+export const CONTENT_BLOCK =
+  /(^|\.)(aeroleads|rocketreach|lusha|leadiq|apollo|signalhire|zoominfo|clearbit|owler|ambitionbox|comparably|f6s|ensun|getmanufacturers|saudifactories|rasmal|manta|bizapedia|tuugo|cybo|hotfrog|brownbook|cylex|wlw|dnb|dun|bloomberg|scribd|slideshare|issuu|academia|researchgate|clutch|goodfirms|designrush|sortlist|trustpilot|sitejabber|expatriates|expat|ksaexpats|blackridgeresearch|reportlinker|statista|ibisworld|mordorintelligence|globaldata|marketresearch|constructionweekonline|constructionweeksaudi|meed|zawya|argaam|mubasher|wikipedia|wikimedia|britannica|quora|reddit|medium|substack|pinterest|toplinehub|arabiantalks|gludo|atninfo|eyeofriyadh|saudiayp|chamberofcommerce|infobel|infobelpro|myhomepro|micompanyregistry|companyregistry|poidata|qatarsale|callroofingnow|bizmideast|linktr|linktree|opencorporates|yellowpages|yellowpages-uae|yalwa|opendi|fyple|storeboard|callupcontact|businesslist|bizdirlib|dubaiyellowpagesonline|qataryellowpages|justdial|indiamart|tradeindia|europages|kompass|thomasnet|superpages|whitepages|citysearch|bbb|glassdoor|crunchbase|pitchbook|zaubacorp|tofler|jooble|indeed|bayt|gulftalent|naukrigulf|monstergulf|laimoon|dubizzle|olx|propertyfinder|bproperty|craigslist|alibaba|aliexpress|made-in-china|ec21|exportersindia)\.[a-z.]+$/i;
+
+/* ------------------------ result title → company ------------------------ */
+// A search result's <title> is a page headline, not a company name. Saved
+// verbatim it produced leads called "MEP Contractor in Mecca, Saudi Arabia -
+// Wafaiyah Contractors", "FCCSA - Home" and "Hail Damage Repair Dallesport, WA
+// | Call 844-633-0805" — nothing you could ever address an email to.
+const TITLE_SPLIT = /\s+[|｜·•‣—–]\s+|\s+-\s+|\s*::\s*/;
+const TITLE_BOILERPLATE =
+  /^(home|homepage|home page|welcome|official (web)?site|website|contact( us)?|about( us)?|index|services|products|our services|main page|landing page)$/i;
+// Words that mark a fragment as the legal/trading name of a business.
+const COMPANY_SUFFIX =
+  /\b(llc|l\.l\.c|ltd|limited|inc|co|company|corp|corporation|group|holdings?|est|establishment|wll|w\.l\.l|plc|gmbh|sarl|srl|bv|nv|pte|pty|trading|contractors?|contracting|industries|enterprises?|solutions|systems|technologies|engineering|consultancy|consultants?|factory|works)\b|شركة|مؤسسة|مجموعة|مصنع/i;
+// Titles that describe a PAGE — a question, a directory search, a classified —
+// rather than a business. The whole result is dropped.
+const JUNK_TITLE =
+  /^(how|what|where|why|which|when|who)\b|\b(find any business|company search|business directory|company directory|for rent|for sale|jobs? in|job vacanc|vacancies|classifieds?|price list|listings? in|search results)\b/i;
+// Bidi/zero-width marks wrap Arabic phone numbers and break plain matching.
+const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+
+/** The business name inside a page title, or null when the title isn't one. */
+export function companyNameFromTitle(rawTitle: string, domain: string): string | null {
+  const t = (rawTitle || "").replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
+  if (!t) return domain;
+  if (JUNK_TITLE.test(t)) return null; // not a company page at all
+
+  const parts = t
+    .split(TITLE_SPLIT)
+    .map((s) => s.trim().replace(/\.{2,}$/, "").trim())
+    .filter(Boolean)
+    .filter((s) => !TITLE_BOILERPLATE.test(s))
+    .filter((s) => !/^\+?[\d\s()+-]{6,}$/.test(s)) // a bare phone number
+    .filter((s) => !/^call\s/i.test(s));
+  if (!parts.length) return domain;
+
+  // A fragment naming a legal entity wins; among several, the tightest one.
+  // Otherwise take the first — titles conventionally lead with the site's name,
+  // and "shortest" would happily pick the city out of an Arabic title.
+  const named = parts.filter((p) => COMPANY_SUFFIX.test(p));
+  const best = named.length ? named.sort((a, b) => a.length - b.length)[0] : parts[0];
+  const out = best.replace(/[|\-–—\s]+$/, "").trim();
+  return out.length >= 2 ? out.slice(0, 90) : domain;
+}
 
 // Result URLs whose path screams "listicle / blog" rather than a company home.
 const LISTICLE_PATH = /\/(?:top-|best-|list-of|list\/|guide\/|blog\/|news\/|article|companies-in-|directory\/)/i;
@@ -297,10 +339,13 @@ export async function searchCompaniesPaged(
     if (LISTICLE_PATH.test(path)) continue;
     const domain = registrableDomain(host);
     if (!domain || byDomain.has(domain)) continue;
+    // The title has to yield a usable business name, or this isn't a company page.
+    const name = companyNameFromTitle(h.title || "", domain);
+    if (!name) continue;
     let website = h.url;
     try { const u = new URL(h.url); website = `${u.protocol}//${u.host}/`; } catch { /* keep */ }
     byDomain.set(domain, {
-      name: h.title?.replace(/\s+/g, " ").trim().slice(0, 90) || domain,
+      name,
       website,
       city: "",
       email: null,
