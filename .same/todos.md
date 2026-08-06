@@ -172,9 +172,31 @@ Actual work per lead is 1–3s. **~85% of the loop is idle**, waiting for the ne
       already-mangled rows get repaired on next boot
 - [x] Verified: tsc clean on both files, boots clean
 
-### Still open (reported to user, not changed)
-- Geographic drift: Gulf queries returning US firms via homonym cities
-  ("Medina, Ohio", "Hail ... Lampasas TX", "District of Oregon")
-- Yield in the sampled window: 0 emails / 22 leads — the queue is 100% no-site
-  micro-businesses (bakeries, shawarma, liquor stores) from the OSM map source.
-  Worth narrowing the map source's categories to B2B-ish ones.
+## Web search quality (2026-08-06, v55)
+
+Root cause: the QUERIES, not the filters. "Companies (general)" generated head
+terms — "companies", "suppliers", "establishment" — which no operating company
+competes for. Page one of "companies Qatar" is structurally directories,
+listicles and company-formation agencies.
+
+- [x] Head terms removed; general sweep = portfolio of specific trades + Gulf
+      legal suffixes ("trading and contracting W.L.L.", "MEP contractor")
+- [x] Query variants: dropped "<kw> in <place> contact" (reads as a question,
+      pulls explainers) for "<kw> <place> contact" and quoted "<kw>" <place> email
+- [x] isContentTitle(): rejects guides, rankings, B2B directories, news
+      headlines, and category phrases ("Companies in Qatar")
+- [x] SETUP_BLOCK: company-formation agency cluster (qshield, emerhub, qcfglobal,
+      agentsgrp, generisonline, rch, qatarcompanyformation …)
+- [x] OFFICIAL_BLOCK: regulators/exchanges/gov/edu (qfc.qa, qe.com.qa)
+- [x] rejectContentLeads() + repairEscapedEmails() wired into boot
+- [x] BUG: JSON escapes not decoded → "u003einfo@companydata.com" was saved as a
+      real address. decodeEntities now handles \uXXXX and \xXX
+- [x] REGRESSION FIX: ADDRESS_TAIL matched thousands separators, so
+      "List of 15,506 Registered Companies" → "List of 15". Now requires a space
+- [x] Validated: 20/20 junk titles rejected, 11/11 real companies kept
+
+### Still open
+- Geographic drift: Gulf city names matching US homonyms (Medina OH, Hail TX)
+- OSM map source still sweeping micro-businesses with no websites
+- Web search has a structural ceiling (~10 results/query); Directory sources are
+  the higher-yield path for volume
