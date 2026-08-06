@@ -8,7 +8,7 @@
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeadsIn, resolveArea, tilesFor, countAvailable, isCompanySite as isCompanySiteHost, type Company, type Tile } from "./leads";
-import { searchCompaniesPaged, CONTENT_BLOCK } from "./search";
+import { searchCompaniesPaged, CONTENT_BLOCK, companyNameFromTitle } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
@@ -1353,6 +1353,33 @@ export async function rejectAggregatorLeads(): Promise<number> {
   }
   dlog("", `retired ${ids.length} directory/job-board/classified lead(s) into Rejected — they are not companies`);
   return ids.length;
+}
+
+// Leads saved before result titles were parsed still carry the raw page
+// headline as their company name — "FCCSA - Home", "Homepage - Anmatt Al-Amar
+// Construction Co Ltd. | Construction and ...". Rewrite only the ones that are
+// demonstrably a page title, so a real name containing a dash is never touched.
+const LOOKS_LIKE_PAGE_TITLE =
+  /(^|\s[|\-–—]\s)(home|homepage|home page|welcome|official (web)?site|website|contact us|about us|index)(\s[|\-–—]\s|$)/i;
+export async function repairPageTitleNames(): Promise<number> {
+  const rows = await q(
+    `SELECT id, name, domain FROM discovered_leads
+      WHERE status='pending' AND name IS NOT NULL AND name <> ''
+        AND (name LIKE '%|%' OR name LIKE '% - %' OR name LIKE '%...')`
+  );
+  let fixed = 0;
+  for (const r of rows as any[]) {
+    const current = String(r.name || "");
+    // Only obvious page titles: boilerplate segment, or a truncated headline.
+    if (!LOOKS_LIKE_PAGE_TITLE.test(current) && !current.trimEnd().endsWith("...")) continue;
+    const better = companyNameFromTitle(current, String(r.domain || ""));
+    if (!better || better === current || better.length < 2) continue;
+    await q(`UPDATE discovered_leads SET name=? WHERE id=?`, [better, r.id]);
+    fixed++;
+    dlog("", `  name: "${current.slice(0, 60)}" → "${better}"`);
+  }
+  if (fixed) dlog("", `cleaned ${fixed} company name(s) that were page titles`);
+  return fixed;
 }
 
 /* ---------------------------- bulk recovery ---------------------------- */

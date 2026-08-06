@@ -30,6 +30,7 @@ import {
   stopSource,
   rejectDiplomaticLeads,
   rejectAggregatorLeads,
+  repairPageTitleNames,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -64,6 +65,8 @@ rejectDiplomaticLeads().catch((e) => console.error(`[cleanup] ${String(e?.messag
 // companies. They sit behind Cloudflare, so they were also monopolising the
 // crawl queue with retries that could never succeed.
 rejectAggregatorLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
+// And rewrite company names that are really page headlines ("FCCSA - Home").
+repairPageTitleNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(
