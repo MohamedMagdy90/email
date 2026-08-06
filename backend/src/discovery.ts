@@ -12,6 +12,7 @@ import { searchCompaniesPaged } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
+import { resolveWebsite } from "./enrich";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { resolveLeadCountry } from "./country";
 import { getReaderStats } from "./crawler/fetcher";
@@ -1055,7 +1056,7 @@ async function enrichTick(): Promise<void> {
     // go first; retried ones only once their backoff has elapsed — so a wall of
     // blocked leads never starves newly-discovered ones.
     const now = nowIso();
-    const lead = (await q(
+    let lead = (await q(
       `SELECT * FROM discovered_leads
         WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
           AND website IS NOT NULL AND website<>''
@@ -1064,7 +1065,53 @@ async function enrichTick(): Promise<void> {
         LIMIT 1`,
       [now]
     ))[0];
+
+    // Nothing left to crawl? Then work the far bigger pile: leads that have a
+    // NAME and a phone but no website at all. OpenStreetMap and directories list
+    // a phone for many more businesses than they list a site, so these are the
+    // majority of any real pool — and with nothing to crawl they used to sit
+    // there for ever, permanently un-emailable. Find their website by searching
+    // the web for the company, then crawl that. Done second so it never delays
+    // the cheap work, and marked 'no-site' when the search comes up empty so we
+    // ask once, not for ever.
+    let needsSite = false;
+    if (!lead) {
+      lead = (await q(
+        `SELECT * FROM discovered_leads
+          WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
+            AND (website IS NULL OR website='')
+            AND name IS NOT NULL AND name<>''
+            AND (enrich_status IS NULL OR enrich_status<>'no-site')
+            AND (next_enrich_at IS NULL OR next_enrich_at <= ?)
+          ORDER BY (next_enrich_at IS NULL) DESC, next_enrich_at ASC, created_at ASC
+          LIMIT 1`,
+        [now]
+      ))[0];
+      needsSite = !!lead;
+    }
     if (!lead) return;
+
+    if (needsSite) {
+      const company = String(lead.name || "").trim();
+      // Only search for something that reads like a company. A phone number or
+      // a bare domain that slipped into the name column would just burn search
+      // budget on nonsense.
+      if (!looksLikeName(company) || isBadName(company) || /^[\d\s+()-]+$/.test(company)) {
+        await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
+        return;
+      }
+      dlog("enrich", `no website on file for "${company}" — searching the web for its site`);
+      const hit = await resolveWebsite(company, String(lead.country || "")).catch(() => null);
+      if (!hit) {
+        await q(`UPDATE discovered_leads SET enriched=1, enrich_status='no-site', next_enrich_at=NULL WHERE id=?`, [lead.id]);
+        dlog("enrich", `  ✗ no website found for "${company}" — it stays a phone-only lead`);
+        return;
+      }
+      await q(`UPDATE discovered_leads SET website=?, domain=? WHERE id=?`, [hit.website, hit.domain, lead.id]);
+      lead.website = hit.website;
+      lead.domain = hit.domain;
+      dlog("enrich", `  → ${shortUrl(hit.website)} — crawling it for an email`);
+    }
 
     const proxy = await getProxyConfig();
     const readerKey = await getReaderKey();

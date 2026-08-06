@@ -56,6 +56,7 @@ export default function Discovery() {
   // on exactly the rows on screen — "Approve all" included.
   const [country, setCountry] = useState("");
   const [countries, setCountries] = useState<{ country: string; n: number }[]>([]);
+  const [breakdown, setBreakdown] = useState<{ withEmail: number; crawling: number; queued: number; noEmail: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
@@ -98,6 +99,7 @@ export default function Discovery() {
       setFilteredTotal(r.filteredTotal);
       setApprovableTotal(r.approvableTotal);
       setCountries(r.countries || []);
+      setBreakdown(r.breakdown || null);
       setPicked(new Set());
     } catch (e: any) {
       toast(e.message, "error");
@@ -467,6 +469,40 @@ export default function Discovery() {
               <Button size="sm" variant="outline" onClick={refreshLeads}>Search</Button>
             </div>
           </div>
+
+          {/* Where this view's leads stand on their way to an email. Without it,
+              a 1,387-lead pool showing 107 "with email only" reads as "the bot
+              only found 107". */}
+          {tab === "pending" && breakdown && (breakdown.withEmail + breakdown.crawling + breakdown.queued + breakdown.noEmail) > 0 && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted">
+              <span className="font-medium text-ink/70">
+                {(breakdown.withEmail + breakdown.crawling + breakdown.queued + breakdown.noEmail).toLocaleString()} lead{breakdown.withEmail + breakdown.crawling + breakdown.queued + breakdown.noEmail === 1 ? "" : "s"}
+                {country ? ` in ${countryLabel(country)}` : ""}
+              </span>
+              <span className="inline-flex items-center gap-1.5" title="Have an email address — these are what Approve acts on">
+                <span className="h-1.5 w-1.5 rounded-full bg-good" />
+                {breakdown.withEmail.toLocaleString()} ready
+              </span>
+              {breakdown.crawling > 0 && (
+                <span className="inline-flex items-center gap-1.5" title="Their website is being crawled for the address">
+                  <span className="h-1.5 w-1.5 rounded-full bg-ink/40" />
+                  {breakdown.crawling.toLocaleString()} crawling for an email
+                </span>
+              )}
+              {breakdown.queued > 0 && (
+                <span className="inline-flex items-center gap-1.5" title="Only a phone number so far. The bot searches the web for the company's website, then crawls that for an email.">
+                  <span className="h-1.5 w-1.5 rounded-full bg-ink/20" />
+                  {breakdown.queued.toLocaleString()} phone only — looking for a website
+                </span>
+              )}
+              {breakdown.noEmail > 0 && (
+                <span className="inline-flex items-center gap-1.5" title="Searched and crawled, but no email address is published anywhere">
+                  <span className="h-1.5 w-1.5 rounded-full bg-ink/10" />
+                  {breakdown.noEmail.toLocaleString()} no email published
+                </span>
+              )}
+            </div>
+          )}
 
           {/* action bar */}
           <div className="flex flex-wrap items-center justify-between gap-3">

@@ -1461,7 +1461,26 @@ app.get("/api/discovery/leads", async (c) => {
       ORDER BY n DESC`,
     cw.params
   );
-  return c.json({ leads, counts, filteredTotal, approvableTotal, countries });
+  // Where the leads in this exact view stand. Without this, a pool of 1,387 that
+  // shows 107 "with email only" looks like the bot found 107 — when it actually
+  // found 1,387 and is still turning the rest into email addresses.
+  const bw = discoveredWhere({ status, q: search, country });
+  const b = (await q(
+    `SELECT
+        CAST(SUM(CASE WHEN email IS NOT NULL AND email <> '' THEN 1 ELSE 0 END) AS INTEGER) AS withEmail,
+        CAST(SUM(CASE WHEN (email IS NULL OR email = '') AND website IS NOT NULL AND website <> '' AND enriched = 0 THEN 1 ELSE 0 END) AS INTEGER) AS crawling,
+        CAST(SUM(CASE WHEN (email IS NULL OR email = '') AND (website IS NULL OR website = '') AND enriched = 0 THEN 1 ELSE 0 END) AS INTEGER) AS queued,
+        CAST(SUM(CASE WHEN (email IS NULL OR email = '') AND enriched = 1 THEN 1 ELSE 0 END) AS INTEGER) AS noEmail
+       FROM discovered_leads ${bw.clause}`,
+    bw.params
+  ))[0] || {};
+  const breakdown = {
+    withEmail: Number(b.withEmail) || 0,   // ready to approve
+    crawling: Number(b.crawling) || 0,     // has a site, being crawled for the address
+    queued: Number(b.queued) || 0,         // no site yet — we'll search the web for one
+    noEmail: Number(b.noEmail) || 0,       // looked everywhere, none published
+  };
+  return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown });
 });
 
 const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|mail|team|marketing|hr|jobs|career|reception)/i;

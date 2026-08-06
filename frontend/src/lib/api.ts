@@ -461,6 +461,8 @@ export const api = {
       // Every country present in the current tab, with a count — "__none__" is
       // the bucket for leads with no country on file.
       countries: { country: string; n: number }[];
+      // Where the leads in this exact view stand on their way to an email.
+      breakdown: { withEmail: number; crawling: number; queued: number; noEmail: number };
     }>(`/api/discovery/leads?${qs.toString()}`);
   },
   approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string }) =>
