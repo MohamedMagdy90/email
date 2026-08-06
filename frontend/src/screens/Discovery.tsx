@@ -290,7 +290,14 @@ export default function Discovery() {
           </p>
         </div>
 
-        <BotSwitch running={running} nextRunAt={status?.nextRunAt ?? null} activeSources={status?.activeSources ?? 0} onToggle={toggleBot} />
+        <BotSwitch
+          running={running}
+          nextRunAt={status?.nextRunAt ?? null}
+          activeSources={status?.activeSources ?? 0}
+          onToggle={toggleBot}
+          readerKeyed={status?.bypass?.readerKeyed}
+          proxied={status?.bypass?.proxy}
+        />
       </div>
 
       {/* Stat strip */}
@@ -650,7 +657,7 @@ export default function Discovery() {
 
 /* ------------------------------ Bot switch ----------------------------- */
 
-function BotSwitch({ running, nextRunAt, activeSources, onToggle }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void }) {
+function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean }) {
   return (
     <div className={cn("w-full shrink-0 rounded-2xl border p-4 sm:w-[300px]", running ? "border-good/40 bg-good/[0.06]" : "border-line bg-paper")}>
       <div className="flex items-center justify-between">
@@ -669,6 +676,21 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle }: { running: b
           </div>
         </div>
         <Switch checked={running} onChange={onToggle} />
+      </div>
+      {/* Whether the crawler is keyed decides how many sites it can actually
+          read. Stating it here means never having to infer it from a log. */}
+      <div className="mt-3 flex items-center gap-1.5 border-t border-line/60 pt-2.5 text-[11px]">
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", readerKeyed || proxied ? "bg-good" : "bg-ink/25")} />
+        {readerKeyed ? (
+          <span className="text-ink/60">Jina key active · <span className="font-medium text-ink/75">120 pages/min</span></span>
+        ) : proxied ? (
+          <span className="text-ink/60">Scraping proxy active</span>
+        ) : (
+          <span className="text-muted">
+            Free reader · 20 pages/min ·{" "}
+            <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium text-ink/70 underline">get a free key</a>
+          </span>
+        )}
       </div>
     </div>
   );

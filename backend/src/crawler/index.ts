@@ -281,8 +281,12 @@ export async function crawlSite(
   // add a key/proxy) from a site that simply lists no email.
   let note: string | undefined;
   if (status === "blocked") {
+    // Only suggest a key when there isn't one. Advising "try a Jina key" to
+    // someone who already added one reads like the key isn't working, when in
+    // fact this site simply blocks the reader too.
+    const advice = readerKey || proxy ? "" : " (try a free Jina key or a scraping proxy)";
     note =
-      lastBlockReason === "cloudflare" ? "Cloudflare challenge blocked the crawler (try a Jina key or scraping proxy)" :
+      lastBlockReason === "cloudflare" ? `Cloudflare challenge blocked the crawler${advice}` :
       lastBlockReason === "rate-limited" ? "site rate-limited the crawler (HTTP 429)" :
       lastBlockReason === "forbidden" ? "site refused the crawler (HTTP 403 bot protection)" :
       "blocked by bot protection";

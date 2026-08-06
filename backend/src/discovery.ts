@@ -7,7 +7,7 @@
 // become Contacts. All state lives in the DB, so it survives restarts.
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
-import { findLeadsIn, resolveArea, tilesFor, countAvailable, type Company, type Tile } from "./leads";
+import { findLeadsIn, resolveArea, tilesFor, countAvailable, isCompanySite as isCompanySiteHost, type Company, type Tile } from "./leads";
 import { searchCompaniesPaged, CONTENT_BLOCK } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
@@ -78,6 +78,8 @@ const EMPTY_STREAK_LIMIT = 3;
 // Map-area sources sweep their country as a grid of tiles: how many tiles one
 // batch covers, and the pause between them so the free Overpass mirrors stay
 // happy. A batch chains straight into the next until the grid is fully swept.
+// Mirrors READER_RPM_KEYED in the fetcher — for the startup log line only.
+const READER_RPM_KEYED_HINT = 120;
 const OSM_TILES_PER_RUN = 6;
 const OSM_TILE_PACING_MS = 1_200;
 const SEARCH_QUERIES_PER_RUN = 3;
@@ -1193,6 +1195,20 @@ async function enrichTick(): Promise<void> {
       readerKey,
     };
 
+    // A social/profile page is not the company's site. Crawling one never yields
+    // a company address, and because Facebook blocks bots it would burn all six
+    // retries doing it. Retire the lead's URL instead of chasing it.
+    const leadHost = hostOf(String(lead.website || "")).replace(/^www\./i, "");
+    if (leadHost && !isCompanySiteHost(leadHost)) {
+      await q(
+        `UPDATE discovered_leads SET website=NULL, domain=NULL, enriched=0, retry_count=0,
+             enrich_status=NULL, next_enrich_at=NULL WHERE id=?`,
+        [lead.id]
+      );
+      dlog("enrich", `  ~ ${leadHost} is a social page, not a company site — cleared it; the web search will look for the real one`);
+      return;
+    }
+
     const attempt = (Number(lead.retry_count) || 0) + 1;
     dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"${attempt > 1 ? ` (try ${attempt})` : ""}`);
     let email: string | null = null;
@@ -1384,6 +1400,15 @@ export function startDiscoveryWorker(): void {
       const active = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.n ?? 0;
       const auto = await autoEnrichOn();
       dlog("", `state → bot ${on ? "ON" : "OFF"} · ${active} enabled source(s) · auto-find-emails ${auto ? "ON" : "OFF"}`);
+      // Say plainly whether the reader is keyed. Without this line the only way
+      // to know whether a Jina key took effect is to guess from block messages.
+      const [key, prox] = await Promise.all([getReaderKey(), getProxyConfig()]);
+      dlog(
+        "",
+        key
+          ? `reader → Jina key ACTIVE (${READER_RPM_KEYED_HINT}/min, 25x the free tier)${prox ? ` · scraping proxy: ${prox.provider}` : ""}`
+          : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
+      );
       if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");
       else if (!active) dwarn("", "bot is ON but no sources are enabled — enable a source in the Discovery screen.");
     } catch { /* ignore */ }

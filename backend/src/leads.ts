@@ -127,7 +127,7 @@ const FREEMAIL = new Set([
   "mail.com", "zoho.com", "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
 ]);
 
-function isCompanySite(domain: string): boolean {
+export function isCompanySite(domain: string): boolean {
   if (NOT_A_COMPANY_SITE.has(domain)) return false;
   // …and their country variants (tripadvisor.co.uk, facebook.com.eg, …).
   const base = domain.split(".")[0];
