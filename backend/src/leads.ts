@@ -117,6 +117,15 @@ const NOT_A_COMPANY_SITE = new Set([
   "booking.com", "airbnb.com", "tripadvisor.com", "foursquare.com", "yelp.com",
   "wikipedia.org", "en.wikipedia.org", "wikidata.org",
 ]);
+// Shared mailbox hosts. Thousands of unrelated businesses sit behind each, so
+// one can never stand in for a company's identity or name.
+const FREEMAIL = new Set([
+  "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk", "outlook.com",
+  "live.com", "msn.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "icloud.com",
+  "me.com", "aol.com", "protonmail.com", "proton.me", "gmx.com", "gmx.net",
+  "mail.com", "zoho.com", "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
+]);
+
 function isCompanySite(domain: string): boolean {
   if (NOT_A_COMPANY_SITE.has(domain)) return false;
   // …and their country variants (tripadvisor.co.uk, facebook.com.eg, …).
@@ -476,8 +485,13 @@ export async function findLeadsIn(
     // No usable website — still valuable if it exposes an email directly.
     if (rawEmail) {
       if (seenEmail.has(rawEmail)) continue;
+      const mailDomain = rawEmail.split("@")[1] || "";
+      // An unnamed pin has to borrow a name from its email domain. That's fine
+      // for "acme.qa", but a free-mail host would file the lead as a company
+      // literally called "gmail.com" — so an unnamed free-mail pin is dropped.
+      if (!name && (!mailDomain || FREEMAIL.has(mailDomain))) continue;
       seenEmail.add(rawEmail);
-      noSite.push({ name: name || rawEmail.split("@")[1], website: "", city, email: rawEmail, phone, hasWebsite: false });
+      noSite.push({ name: name || mailDomain, website: "", city, email: rawEmail, phone, hasWebsite: false });
       continue;
     }
 
