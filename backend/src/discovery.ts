@@ -187,7 +187,9 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
   const withEmail = (await q(
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE status='pending' AND email IS NOT NULL AND email <> ''`
   ))[0]?.n ?? 0;
-  const total = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads`))[0]?.n ?? 0;
+  // 'duplicate' rows are bookkeeping — retired markers that stop an already-known
+  // company being re-discovered for ever. They are not leads, so they don't count.
+  const total = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE status<>'duplicate'`))[0]?.n ?? 0;
   const pendingEnrich = (await q(
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
       WHERE status='pending' AND enriched=0 AND (email IS NULL OR email='')
@@ -419,7 +421,10 @@ interface OsmRunResult {
 // sources used to plateau at a few hundred rows and never grow again.
 async function runOsmSource(src: any): Promise<OsmRunResult> {
   const place = safeParse(src.place_json);
-  const perTile = clamp(src.limit_n, 5, 500);
+  // Take everything the tile holds. A per-tile row cap silently truncated the
+  // densest tile — Doha came back at exactly 500, the cap, which is why Qatar
+  // reported 54% coverage of a 759-business area. The tile bounds the work; a
+  // row limit only ever throws away the capital city.
   const area = await resolveArea(src.location, place);
   const grid = tilesFor(area.bbox);
   const tiles: (Tile | undefined)[] = grid.length ? grid : [undefined]; // no bbox → one whole-area sweep
@@ -455,7 +460,7 @@ async function runOsmSource(src: any): Promise<OsmRunResult> {
     const tile = tiles[i - 1];
     let companies: Company[] = [];
     try {
-      companies = await findLeadsIn(area, src.category, perTile, tile);
+      companies = await findLeadsIn(area, src.category, 0, tile);
     } catch (e: any) {
       // One bad tile must not sink the sweep — note it and keep walking.
       err = String(e?.message || e);
@@ -1155,14 +1160,28 @@ async function enrichTick(): Promise<void> {
     }
 
     if (email) {
-      // Guard against duplicates: if this email is already a saved Contact, or
-      // already sits on another pool row, this lead is now redundant — remove it
-      // so the same email is never listed twice.
+      // Guard against duplicates: this address is already a saved Contact, or
+      // already sits on another pool row, so this lead is redundant.
       const asContact = (await q(`SELECT 1 FROM contacts WHERE email=? LIMIT 1`, [email]))[0];
       const inPool = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [email, lead.id]))[0];
       if (asContact || inPool) {
-        await q(`DELETE FROM discovered_leads WHERE id=?`, [lead.id]);
-        dlog("enrich", `  ✓ ${email} already known — removed duplicate "${lead.name || lead.domain}"`);
+        // DON'T delete it. Deleting frees the dedup_key, so the source that
+        // found this company simply finds it again on its next pass, we crawl
+        // it again, and delete it again — a loop that consumed the entire
+        // enrichment budget re-discovering companies we already had.
+        //
+        // Retire the row in place instead. `status='duplicate'` keeps it out of
+        // every tab and out of the enrichment queue, while its dedup_key stays
+        // put and blocks the re-insert for good. The email column stays empty so
+        // the pool's one-row-per-address rule still holds.
+        await q(
+          `UPDATE discovered_leads
+              SET status='duplicate', enriched=1, enrich_status='duplicate',
+                  next_enrich_at=NULL, phone=?
+            WHERE id=?`,
+          [phone, lead.id]
+        );
+        dlog("enrich", `  = ${email} already in your list — retired "${lead.name || lead.domain}" so it stops being re-found`);
         return;
       }
       // Promote the dedup_key to the email so any FUTURE lead carrying it collides

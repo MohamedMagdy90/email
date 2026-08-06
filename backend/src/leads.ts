@@ -427,8 +427,11 @@ export async function findLeadsIn(
   const filters = LEAD_CATEGORIES[category] || LEAD_CATEGORIES["Companies (general)"];
   const scope = area.clause + (tile ? `(${tile[0]},${tile[1]},${tile[2]},${tile[3]})` : "");
   // Room for the whole slice — we de-dupe hard afterwards, and truncating here
-  // is precisely how leads used to go missing and never come back.
-  const cap = Math.min(Math.max(limit * 4, 2000), 20000);
+  // is precisely how leads used to go missing and never come back. `limit <= 0`
+  // means "everything in this tile", which is what the always-on sweep asks for:
+  // the tile already bounds the work geographically, so a row cap can only lose
+  // businesses in the one place that matters most (the capital city).
+  const cap = limit > 0 ? Math.min(Math.max(limit * 4, 2000), 20000) : 20000;
   const query = `[out:json][timeout:180];${area.prelude}(${statements(selectorsFor(filters), scope)});out tags center ${cap};`;
   const data = await runOverpass(query);
 

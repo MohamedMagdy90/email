@@ -869,18 +869,11 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 {cats.map((c) => <option key={c} value={c}>{c}</option>)}
               </Select>
             </Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Re-scan">
-                <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
-                  {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
-                </Select>
-              </Field>
-              <Field label="Max per tile">
-                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
-                  {[40, 60, 120, 250, 500].map((n) => <option key={n} value={n}>{n}</option>)}
-                </Select>
-              </Field>
-            </div>
+            <Field label="Re-scan" hint="How often to sweep the area again for businesses added to the map since last time.">
+              <Select value={interval} onChange={(e) => setInterval(Number(e.target.value))}>
+                {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
+              </Select>
+            </Field>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
               The area is swept <span className="font-medium text-ink/70">tile by tile</span> until every business OpenStreetMap has mapped here — with a website, email <span className="font-medium text-ink/70">or phone</span> — is collected. The source card then shows how many of them you hold. OpenStreetMap is still a <span className="font-medium text-ink/70">map, not a company registry</span>, so that total is a hard ceiling (a country typically holds hundreds, not tens of thousands). Once it's swept, add a <span className="font-medium text-ink/70">Web search</span> or <span className="font-medium text-ink/70">Directory</span> source to go past it.
             </p>
