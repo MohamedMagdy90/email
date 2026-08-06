@@ -21,6 +21,12 @@ function safeChar(code: number): string {
 // Decode the numeric / named HTML entities that matter for emails.
 export function decodeEntities(s: string): string {
   return s
+    // JS/JSON escapes first. Pages embed JSON everywhere (__NEXT_DATA__, JSON-LD,
+    // inline config) where "\u003e" is ">" — left encoded, the email regex reads
+    // "\u003einfo@x.com" as the address "u003einfo@x.com" and files an
+    // unmailable contact. Seen in production on companydata.com.
+    .replace(/\\u([0-9a-f]{4})/gi, (_, h) => safeChar(parseInt(h, 16)))
+    .replace(/\\x([0-9a-f]{2})/gi, (_, h) => safeChar(parseInt(h, 16)))
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeChar(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => safeChar(parseInt(d, 10)))
     .replace(/&commat;/gi, "@")

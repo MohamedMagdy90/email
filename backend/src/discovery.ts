@@ -8,7 +8,14 @@
 
 import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
 import { findLeadsIn, resolveArea, tilesFor, countAvailable, isCompanySite as isCompanySiteHost, type Company, type Tile } from "./leads";
-import { searchCompaniesPaged, CONTENT_BLOCK, companyNameFromTitle } from "./search";
+import {
+  searchCompaniesPaged,
+  CONTENT_BLOCK,
+  SETUP_BLOCK,
+  OFFICIAL_BLOCK,
+  isContentTitle,
+  companyNameFromTitle,
+} from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
@@ -677,8 +684,32 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
 // the pool for the email-finder to enrich. Runs entirely on the free reader.
 
 // Industry → the search phrases that actually surface individual company sites.
+//
+// The rule every entry here obeys: a phrase must be one that ONLY AN OPERATING
+// COMPANY can rank for. Head terms like "companies", "suppliers" or
+// "establishment" fail that test — nobody optimises their own homepage for
+// "companies Qatar", so page one is wall-to-wall directories, "top 30" listicles
+// and company-formation agencies. That single mistake is what filled the pool
+// with entries like "A Comprehensive Guide to Company Formation in Qatar".
+// Long-tail trade phrases ("MEP contractor", "steel fabrication") are the
+// opposite: the only pages that rank are the firms that do the work.
 const SEARCH_KEYWORDS: Record<string, string[]> = {
-  "Companies (general)": ["companies", "trading company", "suppliers", "services company", "establishment"],
+  // Deliberately NOT the word "companies". A general sweep is a portfolio of
+  // specific trades — plus the Gulf legal suffixes ("W.L.L.", "Trading &
+  // Contracting"), which appear in the <title> of real firms and almost nowhere
+  // else.
+  "Companies (general)": [
+    "trading and contracting W.L.L.",
+    "general trading est",
+    "MEP contractor",
+    "electromechanical company",
+    "steel fabrication",
+    "facilities management company",
+    "industrial supplies",
+    "manufacturing factory",
+    "logistics and freight company",
+    "IT solutions provider",
+  ],
   "Accounting & Tax": ["accounting firm", "audit firm", "tax consultants", "chartered accountants", "bookkeeping services"],
   "IT & Software": ["IT company", "software company", "IT solutions", "technology company", "IT services provider"],
   "Construction & Contracting": ["construction company", "contracting company", "building contractor", "civil contractor", "general contracting"],
@@ -693,7 +724,7 @@ const SEARCH_KEYWORDS: Record<string, string[]> = {
   "Hospitality & Food": ["catering company", "restaurant", "hotel", "hospitality company"],
   "Manufacturing & Industrial": ["manufacturing company", "factory", "industrial company", "manufacturer", "fabrication company"],
   "Education & Training": ["training institute", "training center", "academy", "educational institute"],
-  "Trading & Retail": ["trading company", "trading establishment", "distributors", "suppliers", "wholesale company"],
+  "Trading & Retail": ["trading company", "trading establishment", "distributors", "wholesale company"],
 };
 
 // Major cities per country, so a country-wide search fans out into local ones —
@@ -751,7 +782,11 @@ function buildSearchPlan(keywords: string[], location: string): { q: string; off
   const plan: { q: string; offset: number }[] = [];
   for (const lv of locVariants) {
     for (const kw of keywords) {
-      const variants = lv ? [`${kw} ${lv}`, `${kw} in ${lv} contact`] : [kw, `${kw} contact`];
+      // "<trade> <place>" finds the firms; "… contact" and "… email" push the
+      // engine towards their contact page, which is where the address lives.
+      // The old "<kw> in <place> contact" phrasing read as a question and
+      // pulled in explainer articles, so it's gone.
+      const variants = lv ? [`${kw} ${lv}`, `${kw} ${lv} contact`, `"${kw}" ${lv} email`] : [kw, `${kw} contact`];
       for (const v of variants) {
         const key = v.toLowerCase();
         if (seen.has(key)) continue;
@@ -1418,6 +1453,52 @@ export async function rejectAggregatorLeads(): Promise<number> {
   }
   dlog("", `retired ${ids.length} directory/job-board/classified lead(s) into Rejected — they are not companies`);
   return ids.length;
+}
+
+// Retire what the old generic queries dragged in: company-formation agencies,
+// regulators, and pages that are ARTICLES about companies ("Company Setup in
+// Qatar", "The 30 Most Valuable Companies In Qatar"). Rejected, not deleted —
+// they stay reviewable in the Rejected tab and nothing is destroyed.
+export async function rejectContentLeads(): Promise<number> {
+  const rows = await q(
+    `SELECT id, name, domain, website FROM discovered_leads WHERE status='pending'`
+  );
+  const ids: string[] = [];
+  for (const r of rows as any[]) {
+    const host = String(r.domain || hostOf(String(r.website || "")) || "").toLowerCase();
+    if ((host && (SETUP_BLOCK.test(host) || OFFICIAL_BLOCK.test(host))) || isContentTitle(String(r.name || ""))) {
+      ids.push(r.id);
+    }
+  }
+  if (!ids.length) return 0;
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    await q(`UPDATE discovered_leads SET status='rejected' WHERE id IN (${chunk.map(() => "?").join(",")})`, chunk);
+  }
+  dlog("", `retired ${ids.length} lead(s) that were articles, directories, formation agencies or regulators — not companies`);
+  return ids.length;
+}
+
+// "u003einfo@company.com" — a JSON-escaped ">" the extractor read as part of the
+// address before escapes were decoded. Strip the prefix so the lead is mailable
+// again instead of silently sitting in the pool with a dead address.
+export async function repairEscapedEmails(): Promise<number> {
+  const rows = await q(
+    `SELECT id, email FROM discovered_leads WHERE email LIKE 'u003e%' OR email LIKE 'u0026%' OR email LIKE 'x3e%'`
+  );
+  let fixed = 0;
+  for (const r of rows as any[]) {
+    const cleaned = String(r.email || "").replace(/^(?:u00[0-9a-f]{2}|x[0-9a-f]{2})+/i, "").trim();
+    if (!cleaned || cleaned === r.email || !cleaned.includes("@")) continue;
+    // The cleaned address may already be on another row; drop this one if so.
+    const clash = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [cleaned, r.id]))[0];
+    if (clash) { await q(`UPDATE discovered_leads SET status='duplicate' WHERE id=?`, [r.id]); continue; }
+    await q(`UPDATE discovered_leads SET email=?, dedup_key=? WHERE id=?`, [cleaned, "e:" + cleaned, r.id]);
+    fixed++;
+    dlog("", `  email: "${r.email}" → "${cleaned}"`);
+  }
+  if (fixed) dlog("", `repaired ${fixed} email(s) mangled by JSON escapes`);
+  return fixed;
 }
 
 // Leads saved before result titles were parsed still carry the raw page

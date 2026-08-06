@@ -231,6 +231,17 @@ export async function searchRaw(
 export const CONTENT_BLOCK =
   /(^|\.)(aeroleads|rocketreach|lusha|leadiq|apollo|signalhire|zoominfo|clearbit|owler|ambitionbox|comparably|f6s|ensun|getmanufacturers|saudifactories|rasmal|manta|bizapedia|tuugo|cybo|hotfrog|brownbook|cylex|wlw|dnb|dun|bloomberg|scribd|slideshare|issuu|academia|researchgate|clutch|goodfirms|designrush|sortlist|trustpilot|sitejabber|expatriates|expat|ksaexpats|blackridgeresearch|reportlinker|statista|ibisworld|mordorintelligence|globaldata|marketresearch|constructionweekonline|constructionweeksaudi|meed|zawya|argaam|mubasher|wikipedia|wikimedia|britannica|quora|reddit|medium|substack|pinterest|toplinehub|arabiantalks|gludo|atninfo|eyeofriyadh|saudiayp|chamberofcommerce|infobel|infobelpro|myhomepro|micompanyregistry|companyregistry|poidata|qatarsale|callroofingnow|bizmideast|linktr|linktree|opencorporates|yellowpages|yellowpages-uae|yalwa|opendi|fyple|storeboard|callupcontact|businesslist|bizdirlib|dubaiyellowpagesonline|qataryellowpages|justdial|indiamart|tradeindia|europages|kompass|thomasnet|superpages|whitepages|citysearch|bbb|glassdoor|crunchbase|pitchbook|zaubacorp|tofler|jooble|indeed|bayt|gulftalent|naukrigulf|monstergulf|laimoon|dubizzle|olx|propertyfinder|bproperty|craigslist|alibaba|aliexpress|made-in-china|ec21|exportersindia)\.[a-z.]+$/i;
 
+// The company-FORMATION industry. These agencies exist to rank for "company
+// formation Qatar" / "establishment Qatar", so a generic company search returns
+// a page of them instead of companies — they filled most of the pool in
+// production. Blocked as hosts because their page titles vary too much to catch.
+export const SETUP_BLOCK =
+  /(^|\.)(qshield|qcfglobal|agentsgrp|emerhub|qatarcompanyformation|generisonline|companyformation\w*|businesssetup\w*|setupinqatar|startanybusiness|commitbiz|shuraatax|aurionbs|creationbc|adamglobal|jitendra\w*|riz\w*consult|bizfiling|incorporations?|formationhub|klgates|dlapiper|cliffordchance|bakermckenzie|lexology|mondaq|iprocure|volza|eximnext|exporthub|importgenius|panjiva|tradeatlas|companiesmarketcap|forbesmiddleeast|arabianlocal|naviqatar|qhelp|companiesinqatar|companydata|qatarcontact)\.[a-z.]+$/i;
+
+// Government, regulators and exchanges — real organisations, but not prospects.
+export const OFFICIAL_BLOCK =
+  /(^|\.)(qfc|qe|qatarchamber|moci|mofa|mol|gov|edu|ministry\w*|chamber\w*|customs|centralbank|\w*stockexchange|\w*bourse)\.[a-z.]*$|\.(gov|gov\.[a-z]{2}|edu|edu\.[a-z]{2}|mil)$/i;
+
 /* ------------------------ result title → company ------------------------ */
 // A search result's <title> is a page headline, not a company name. Saved
 // verbatim it produced leads called "MEP Contractor in Mecca, Saudi Arabia -
@@ -246,17 +257,61 @@ const COMPANY_SUFFIX =
 // rather than a business. The whole result is dropped.
 const JUNK_TITLE =
   /^(how|what|where|why|which|when|who)\b|\b(find any business|company search|business directory|company directory|for rent|for sale|jobs? in|job vacanc|vacancies|classifieds?|price list|listings? in|search results)\b/i;
+
+// Content that ranks for "companies <country>" but is never itself a company.
+// Three families, all straight out of the production log:
+//
+//   guides/explainers  "A Comprehensive Guide to Company Formation in Qatar",
+//                      "Establishment Card in Qatar: Meaning & Apply"
+//   rankings/lists     "List of 15,506 Registered Companies in Doha",
+//                      "The 30 Most Valuable Companies In Qatar",
+//                      "Largest companies of Qatar by market capitalization"
+//   directories        "Qatar's leading online B2B listing & directory",
+//                      "ExportHub: Qatar B2B Marketplace & … Directory"
+const CONTENT_TITLE =
+  /\b(?:a\s+)?(?:comprehensive\s+|complete\s+|ultimate\s+|step[- ]by[- ]step\s+)?guide\s+(?:to|for)\b|\b(?:company|business)\s+(?:formation|setup|registration|incorporation)\b|\bset\s?up\s+a\s+(?:company|business)\b|\b(?:establishment|trade|commercial)\s+(?:card|licen[cs]e)\b|:\s*meaning\b|\blist\s+of\s+[\d,]*\s*\w|\baccess\s+list\b|\b(?:the\s+)?\d+\s+most\s+\w+\s+compan/i;
+const RANKING_TITLE =
+  /\blargest\s+compan|\bby\s+market\s+capitali|\bmarket\s+cap\b|\brichest\b|\branking\s+of\b/i;
+// News headlines about a company — "Construction company cited $157,500
+// following a fatal trench collapse" is a story, and the email on that page
+// belongs to the newsroom.
+const NEWS_TITLE =
+  /\b(?:cited|fined|charged|indicted|sentenced|convicted|sued|arrested|acquires|acquired|merges|files for bankruptcy|lays off|announces)\b.*\$|\$[\d,.]+\s*(?:million|billion|m\b|bn\b)|\b(?:lawsuit|osha|investigation|probe|scandal|verdict|settlement)\b/i;
+const DIRECTORY_TITLE =
+  /\bb2b\s+(?:marketplace|portal|listing)|\b(?:business|company|online|trade)\s+(?:directory|listings?)\b|\bdirectory\s+of\b|\byellow\s?pages\b|\bsupplier\s+discovery\b|\brfqs?\b/i;
+// A category phrase pointing at a place — "Companies in Qatar", "Construction
+// companies in Mecca". The PLURAL category is what gives a directory away; a
+// real firm writes "Company" singular ("Al Jaleel Trading Company"), so
+// "Spieker General Contractors" and "…Company in Qatar" both survive.
+const CATEGORY_PHRASE =
+  /^(?:the\s+)?(?:top\s+|best\s+|leading\s+|all\s+)?(?:\w+\s+){0,2}(?:companies|suppliers|manufacturers|traders|contractors|distributors|factories|businesses|firms|agencies|providers|vendors|exporters|importers)\s+(?:in|of|near|from)\b/i;
+
+/** True when a result title is content ABOUT companies rather than a company. */
+export function isContentTitle(title: string): boolean {
+  const t = (title || "").replace(INVISIBLE, "").trim();
+  if (!t) return false;
+  return (
+    CONTENT_TITLE.test(t) ||
+    RANKING_TITLE.test(t) ||
+    DIRECTORY_TITLE.test(t) ||
+    NEWS_TITLE.test(t) ||
+    CATEGORY_PHRASE.test(t)
+  );
+}
 // Bidi/zero-width marks wrap Arabic phone numbers and break plain matching.
 const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
 // A tail like ", 712 County Road 4026, Lampasas, TX 76550" or ", Taif, Masarah
 // 1" is a postal address the site printed after its name, not part of it.
+// The space after the comma is required: "15,506 Registered Companies" and
+// "$157,500 following" are thousands separators, not addresses, and cutting
+// there produced leads called "List of 15" and "Construction company cited $157".
 const ADDRESS_TAIL =
-  /,\s*(?:p\.?o\.?\s*box\b|\d+[\w-]*\s+\w|[\w\s.'-]+,\s*(?:[A-Z]{2}\s*\d|\d{4,}))/i;
+  /,\s+(?:p\.?o\.?\s*box\b|\d+[\w-]*\s+\w|[\w\s.'-]+,\s+(?:[A-Z]{2}\s*\d|\d{4,}))/i;
 // A comma-separated tail that just re-states the category or the SEO phrase —
 // ", construction company, Taif" / ", construction companies near me".
 const DESCRIPTOR_TAIL =
-  /,\s*(?:the\s+)?(?:best|top|leading|professional|licensed)?\s*(?:general\s+)?(?:construction|contracting|contractor|building|engineering|manufacturing|trading|maintenance|cleaning|transport|logistics|catering)\s+(?:company|companies|contractors?|services?|firm)\b/i;
+  /,\s+(?:the\s+)?(?:best|top|leading|professional|licensed)?\s*(?:general\s+)?(?:construction|contracting|contractor|building|engineering|manufacturing|trading|maintenance|cleaning|transport|logistics|catering)\s+(?:company|companies|contractors?|services?|firm)\b/i;
 // Trailing filler a site appends to its own name in the <title>.
 const NAME_TAIL_NOISE = /\s*[-–—|]?\s*(official\s+)?(web\s?site|homepage|home\s?page|online)\s*$/i;
 // A fragment that is really just the site's URL ("FMCKSA.COM", "gsconstmena.com").
@@ -269,6 +324,7 @@ export function companyNameFromTitle(rawTitle: string, domain: string): string |
   const t = (rawTitle || "").replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
   if (!t) return domain;
   if (JUNK_TITLE.test(t)) return null; // not a company page at all
+  if (isContentTitle(t)) return null; // an article/ranking/directory about companies
 
   const parts = t
     .split(TITLE_SPLIT)
@@ -376,6 +432,7 @@ export async function searchCompaniesPaged(
     let host = "";
     try { host = hostOf(h.url); } catch { continue; }
     if (!host || BLOCK.test(host) || CONTENT_BLOCK.test(host) || isProfileHost(host)) continue;
+    if (SETUP_BLOCK.test(host) || OFFICIAL_BLOCK.test(host)) continue; // formation agencies, regulators
     if (LISTICLE_TITLE.test(h.title || "")) continue; // "Top 20 …", "Best …", "10 Leading …"
     let path = "/";
     try { path = new URL(h.url).pathname.toLowerCase(); } catch { /* ignore */ }

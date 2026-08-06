@@ -30,6 +30,8 @@ import {
   stopSource,
   rejectDiplomaticLeads,
   rejectAggregatorLeads,
+  rejectContentLeads,
+  repairEscapedEmails,
   repairPageTitleNames,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
@@ -65,6 +67,11 @@ rejectDiplomaticLeads().catch((e) => console.error(`[cleanup] ${String(e?.messag
 // companies. They sit behind Cloudflare, so they were also monopolising the
 // crawl queue with retries that could never succeed.
 rejectAggregatorLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
+// And the haul from the old head-term queries: company-formation agencies,
+// regulators, and articles ABOUT companies ("Company Setup in Qatar").
+rejectContentLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
+// Addresses mangled by JSON escapes ("u003einfo@…") are unmailable — unmangle them.
+repairEscapedEmails().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 // And rewrite company names that are really page headlines ("FCCSA - Home").
 repairPageTitleNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
