@@ -87,6 +87,7 @@ export const LEAD_CATEGORIES: Record<string, { k: string; v?: string }[]> = {
 // listed here passes, so newly-invented tags keep flowing in (deny, not allow).
 const NON_BUSINESS: Record<string, Set<string>> = {
   amenity: new Set([
+    "embassy", // legacy tagging for a diplomatic mission — not a company
     "atm", "bench", "bicycle_parking", "bicycle_repair_station", "bbq", "clock",
     "charging_station", "drinking_water", "fountain", "grit_bin", "hunting_stand",
     "letter_box", "motorcycle_parking", "parking", "parking_entrance", "parking_space",
@@ -100,7 +101,7 @@ const NON_BUSINESS: Record<string, Set<string>> = {
     "slipway", "swimming_area", "track", "dog_park", "firepit", "bleachers", "outdoor_seating",
   ]),
   shop: new Set(["vacant", "no"]),
-  office: new Set(["vacant", "no"]),
+  office: new Set(["vacant", "no", "diplomatic"]), // current tagging for embassies/consulates
   healthcare: new Set(["yes"]),
 };
 
@@ -137,6 +138,9 @@ function isCompanySite(domain: string): boolean {
 // it carries at least one business key — keep it unless EVERY business key it
 // carries is on the deny list (a `shop=car_repair` + `amenity=fuel` stays).
 function isBusinessPoi(t: Record<string, string>): boolean {
+  // A `diplomatic` tag of any value settles it: embassy, consulate, permanent
+  // mission, liaison office. None of them buy anything.
+  if (t.diplomatic) return false;
   for (const k of BUSINESS_KEYS) {
     const v = t[k];
     if (!v || v === "no") continue;

@@ -255,6 +255,21 @@ const FREEMAIL = new Set([
   "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
 ]);
 const isFreeMail = (domain?: string | null) => FREEMAIL.has((domain || "").toLowerCase());
+const FREEMAIL_HOSTS = FREEMAIL;
+
+// Embassies, consulates and missions are not companies — nobody is selling to
+// them, and they were arriving from every source type. Caught by name here so
+// one rule covers map pins, directories and web search alike. "Embassy Suites"
+// is a hotel chain, so a hospitality word vetoes the match.
+const DIPLOMATIC_EN = /\b(embassy|embassies|consulate|consular|high\s+commission|permanent\s+mission|chancery|ambassade|embajada)\b/i;
+const DIPLOMATIC_AR = /سفارة|قنصلية/;
+const DIPLOMATIC_FALSE_FRIEND = /\b(suites?|hotel|inn|resort|apartments?|residences?|tower|gardens?|restaurant|caf[eé]|coffee|mall|spa|salon|laundry|bakery)\b/i;
+export function isDiplomatic(name?: string | null): boolean {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  if (!DIPLOMATIC_EN.test(n) && !DIPLOMATIC_AR.test(n)) return false;
+  return !DIPLOMATIC_FALSE_FRIEND.test(n);
+}
 
 // Stable key so the same company is never added twice (across ticks / sources).
 // Email first (most specific), so many different companies sharing gmail.com are
@@ -290,6 +305,8 @@ interface LeadRow {
 // Insert one lead if it's genuinely new (not an existing contact, not already in
 // the pool). Returns true when a row was added.
 async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; domains: Set<string> }): Promise<boolean> {
+  // Not a company — never worth a pool row, and never worth a crawl.
+  if (isDiplomatic(row.name)) return false;
   const email = (row.email || "").trim().toLowerCase();
   const domain = (row.domain || "").trim().toLowerCase();
   if (email && dedup.emails.has(email)) return false;   // already a saved Contact
@@ -1013,13 +1030,56 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
 
 // Best deliverable email from a crawled site: prefer an address on the site's
 // own domain, and a personal mailbox over a role inbox.
-function pickSiteEmail(emails: FoundEmail[], siteDomain?: string | null): { email: string; role_based: boolean } | null {
+// The brand part of a domain — "k108hotel.com" → "k108hotel" — with punctuation
+// stripped so "retaj-realestate" and "retajrealestate" compare equal.
+function brandLabel(domain: string): string {
+  return (domain || "").toLowerCase().split(".")[0].replace(/[^a-z0-9]/g, "");
+}
+// Same company, different domain? Covers a brand's other TLD (k108hotel.com →
+// k108hotel.qa) and a sister domain (retaj-realestate.com → retaj.com).
+function sameBrand(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 4 && b.includes(a)) return true;
+  if (b.length >= 4 && a.includes(b)) return true;
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i >= 6; // a long shared prefix — "alsamriyaestate" / "alsamriyariding"
+}
+
+/**
+ * Pick the address that actually belongs to the company whose site we crawled.
+ *
+ * This used to take ANY address on the page when it found none on the site's own
+ * domain, which is how a McDonald's branch ended up filed as
+ * `than@restaurants.delivery` and Nobu Doha as an address in Cape Town: a
+ * delivery widget, a partner or an agency credit sitting in the footer. Worse,
+ * the "own domain" test compared FoundEmail.domain — which holds the SITE's
+ * domain, identical on every hit — so it never actually filtered anything.
+ *
+ * Now the email's own domain decides, and a third party's domain is refused
+ * outright. No email is far better than the wrong company's email, because the
+ * wrong one gets written to.
+ */
+export function pickSiteEmail(emails: FoundEmail[], siteDomain?: string | null): { email: string; role_based: boolean } | null {
   if (!emails?.length) return null;
-  const dom = (siteDomain || "").toLowerCase();
-  const onDomain = dom ? emails.filter((e) => (e.domain || "").toLowerCase() === dom) : [];
-  const pool = onDomain.length ? onDomain : emails;
-  pool.sort((a, b) => Number(a.role_based) - Number(b.role_based));
-  return { email: pool[0].email, role_based: pool[0].role_based };
+  const site = registrableDomain((siteDomain || "").toLowerCase()) || (siteDomain || "").toLowerCase();
+  const siteBrand = brandLabel(site);
+
+  const ranked: { e: FoundEmail; rank: number }[] = [];
+  for (const e of emails) {
+    const mailDomain = registrableDomain((e.email.split("@")[1] || "").toLowerCase()) || "";
+    if (!mailDomain) continue;
+    let rank: number;
+    if (site && mailDomain === site) rank = 0;                              // the company's own address
+    else if (sameBrand(siteBrand, brandLabel(mailDomain))) rank = 1;        // same brand, other domain
+    else if (FREEMAIL_HOSTS.has(mailDomain)) rank = 2;                      // small firm on gmail — plausible
+    else continue;                                                          // someone else's domain — refuse
+    ranked.push({ e, rank });
+  }
+  if (!ranked.length) return null;
+  ranked.sort((a, b) => a.rank - b.rank || Number(a.e.role_based) - Number(b.e.role_based));
+  return { email: ranked[0].e.email, role_based: ranked[0].e.role_based };
 }
 
 /* -------------------------------- ticks -------------------------------- */
@@ -1229,6 +1289,30 @@ async function enrichTick(): Promise<void> {
   } finally {
     enriching = false;
   }
+}
+
+/* --------------------------- one-off cleanups -------------------------- */
+
+// Retire embassies and consulates already sitting in the pool from before they
+// were excluded. Rejected rather than deleted: they leave Pending but stay in
+// the Rejected tab, so nothing is destroyed and the call can be undone.
+export async function rejectDiplomaticLeads(): Promise<number> {
+  const rows = await q(
+    `SELECT id, name FROM discovered_leads
+      WHERE status='pending' AND name IS NOT NULL AND name <> ''
+        AND (lower(name) LIKE '%embassy%' OR lower(name) LIKE '%consulate%'
+          OR lower(name) LIKE '%high commission%' OR lower(name) LIKE '%ambassade%'
+          OR name LIKE '%سفارة%' OR name LIKE '%قنصلية%')`
+  );
+  const ids = rows.filter((r: any) => isDiplomatic(r.name)).map((r: any) => r.id);
+  if (!ids.length) return 0;
+  // Chunked so a big pool never builds an oversized statement.
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    await q(`UPDATE discovered_leads SET status='rejected' WHERE id IN (${chunk.map(() => "?").join(",")})`, chunk);
+  }
+  dlog("", `retired ${ids.length} embassy/consulate lead(s) into Rejected — they are not companies`);
+  return ids.length;
 }
 
 /* ---------------------------- bulk recovery ---------------------------- */

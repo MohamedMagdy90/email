@@ -28,6 +28,7 @@ import {
   initialCursor,
   reEnrichBlocked,
   stopSource,
+  rejectDiplomaticLeads,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -54,6 +55,10 @@ backfillCountries(q, (m) => console.log(`[country] ${m}`))
     if (r.leads || r.contacts) console.log(`[country] backfill done — ${r.leads} lead(s), ${r.contacts} contact(s)`);
   })
   .catch((e) => console.error(`[country] backfill failed: ${String(e?.message || e)}`));
+
+// Embassies and consulates harvested before they were excluded. Moved to
+// Rejected, not deleted, so the change is visible and reversible.
+rejectDiplomaticLeads().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(
