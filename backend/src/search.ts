@@ -286,6 +286,33 @@ const DIRECTORY_TITLE =
 const CATEGORY_PHRASE =
   /^(?:the\s+)?(?:top\s+|best\s+|leading\s+|all\s+)?(?:\w+\s+){0,2}(?:companies|suppliers|manufacturers|traders|contractors|distributors|factories|businesses|firms|agencies|providers|vendors|exporters|importers)\s+(?:in|of|near|from)\b/i;
 
+/* ------------------------- foreign-result guard ------------------------- */
+// Even with the country in the query, a US result slips through on a homonym:
+// Medina (Saudi Arabia / Ohio), Hail (Saudi Arabia / hail damage), Lusail,
+// Tripoli, Alexandria. These markers are unambiguous — a comma before a US
+// state, a ZIP code, or a toll-free number — so a non-US search can drop them.
+const US_STATE =
+  "alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming";
+const US_ABBR =
+  "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY";
+const US_MARKERS: RegExp[] = [
+  new RegExp(`,\\s*(?:${US_STATE})\\b`, "i"),        // "Medina, Ohio"
+  new RegExp(`,\\s*(?:${US_ABBR})\\b`),               // "Lampasas, TX" (case-sensitive)
+  new RegExp(`\\b(?:${US_ABBR})\\s+\\d{5}\\b`),       // "TX 76550"
+  new RegExp(`\\b(?:district|state|county)\\s+of\\s+(?:${US_STATE})\\b`, "i"),
+  /\b1?[\s-]?\(?8(?:00|33|44|55|66|77|88)\)?[\s-]?\d{3}[\s-]?\d{4}\b/, // toll-free
+];
+const US_COUNTRY = /^(usa?|united states( of america)?|u\.s\.a?\.?|america|canada)$/i;
+
+/** True when a result is plainly in the US and the search wasn't. */
+export function looksForeign(title: string, expectCountry: string): boolean {
+  const want = (expectCountry || "").trim();
+  if (!want || US_COUNTRY.test(want)) return false; // searching the US — allow it
+  const t = (title || "").replace(INVISIBLE, "").trim();
+  if (!t) return false;
+  return US_MARKERS.some((re) => re.test(t));
+}
+
 /** True when a result title is content ABOUT companies rather than a company. */
 export function isContentTitle(title: string): boolean {
   const t = (title || "").replace(INVISIBLE, "").trim();
@@ -422,7 +449,8 @@ export async function searchCompaniesPaged(
   query: string,
   offset: number,
   limit: number,
-  readerKey?: string
+  readerKey?: string,
+  expectCountry?: string
 ): Promise<{ companies: Company[]; blocked: boolean }> {
   const { html, blocked } = await fetchSearchPage(query, offset, readerKey);
   if (blocked) return { companies: [], blocked: true };
@@ -434,6 +462,7 @@ export async function searchCompaniesPaged(
     if (!host || BLOCK.test(host) || CONTENT_BLOCK.test(host) || isProfileHost(host)) continue;
     if (SETUP_BLOCK.test(host) || OFFICIAL_BLOCK.test(host)) continue; // formation agencies, regulators
     if (LISTICLE_TITLE.test(h.title || "")) continue; // "Top 20 …", "Best …", "10 Leading …"
+    if (looksForeign(h.title || "", expectCountry || "")) continue; // "Medina, Ohio"
     let path = "/";
     try { path = new URL(h.url).pathname.toLowerCase(); } catch { /* ignore */ }
     if (LISTICLE_PATH.test(path)) continue;

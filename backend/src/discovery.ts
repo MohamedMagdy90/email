@@ -750,6 +750,15 @@ const COUNTRY_ALIASES: Record<string, string> = {
   ksa: "saudi arabia", uae: "united arab emirates", emirates: "united arab emirates",
 };
 
+// Country-code top-level domains. A "site:.qa" query returns Qatari domains and
+// nothing else — the highest-precision slice of the web there is for a country,
+// and immune to the homonym problem entirely.
+const COUNTRY_TLD: Record<string, string> = {
+  "saudi arabia": "sa", "united arab emirates": "ae", qatar: "qa", kuwait: "kw",
+  bahrain: "bh", oman: "om", egypt: "eg", jordan: "jo", lebanon: "lb", iraq: "iq",
+  india: "in", pakistan: "pk", turkey: "tr",
+};
+
 function normCountry(location: string): string {
   const k = (location || "").trim().toLowerCase();
   return COUNTRY_ALIASES[k] || k;
@@ -777,22 +786,34 @@ function citiesFor(location: string): string[] {
 // pages. De-duplicated and capped so a single walk stays bounded.
 function buildSearchPlan(keywords: string[], location: string): { q: string; offset: number }[] {
   const loc = (location || "").trim();
-  const locVariants = loc ? [loc, ...citiesFor(loc)] : [""];
+  const cities = citiesFor(loc);
   const seen = new Set<string>();
   const plan: { q: string; offset: number }[] = [];
-  for (const lv of locVariants) {
-    for (const kw of keywords) {
-      // "<trade> <place>" finds the firms; "… contact" and "… email" push the
-      // engine towards their contact page, which is where the address lives.
-      // The old "<kw> in <place> contact" phrasing read as a question and
-      // pulled in explainer articles, so it's gone.
-      const variants = lv ? [`${kw} ${lv}`, `${kw} ${lv} contact`, `"${kw}" ${lv} email`] : [kw, `${kw} contact`];
-      for (const v of variants) {
-        const key = v.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        for (const offset of SEARCH_PAGES) plan.push({ q: v, offset });
-      }
+  const push = (v: string) => {
+    const key = v.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    for (const offset of SEARCH_PAGES) plan.push({ q: v, offset });
+  };
+
+  const tld = COUNTRY_TLD[normCountry(loc)];
+  for (const kw of keywords) {
+    if (!loc) { push(kw); push(`${kw} contact`); continue; }
+
+    // Country-wide. "<trade> <place>" finds the firms; "… contact" pushes the
+    // engine towards their contact page, which is where the address lives.
+    push(`${kw} ${loc}`);
+    push(`${kw} ${loc} contact`);
+    // The country's own TLD — every result is in-country by definition.
+    if (tld) push(`${kw} site:.${tld}`);
+
+    // Per city. The city ALWAYS carries its country: half the Gulf's city names
+    // are also American towns, so "MEP contractor Medina" returned contractors
+    // in Medina, Ohio, and "steel fabrication Hail" returned hail-damage repair
+    // firms in Texas. "… Medina Saudi Arabia" cannot be misread.
+    for (const city of cities) {
+      push(`${kw} ${city} ${loc}`);
+      push(`${kw} ${city} ${loc} contact`);
     }
   }
   return plan.slice(0, 800);
@@ -843,7 +864,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       blocked = true; // don't advance the cursor past a query we never ran
       break;
     }
-    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey).catch(() => ({ companies: [], blocked: true }));
+    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location).catch(() => ({ companies: [], blocked: true }));
     if (r.blocked) {
       blocked = true;
       err = "web search was blocked (add a free JINA key in Settings → Crawler to search at full speed)";
