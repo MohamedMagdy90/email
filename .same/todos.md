@@ -195,8 +195,58 @@ listicles and company-formation agencies.
       "List of 15,506 Registered Companies" → "List of 15". Now requires a space
 - [x] Validated: 20/20 junk titles rejected, 11/11 real companies kept
 
+## Unmailable addresses: markup glued to the local part
+Seen in the pool: `//info@rumaillahgroup.com`, `//sales@sagarsteel.net`,
+`%20info@mepeqatar.com`. All three were saved as "likely" contacts.
+- Root cause: RFC 5321 permits `/`, `%`, `!`, `=` in a local part, so the old
+  `EMAIL_RE` charset and `isValidEmail()` both accepted them. Two sources:
+  1. `mailto://info@x.com` — a common authoring slip. `mailto:([^"'>\s?]+)`
+     captured the slashes; the text regex did too, since `/` was legal.
+  2. `mailto:%20info@x.com` — URL-encoded padding, never decoded.
+- [x] `decodeEntities()` decodes `%00`–`%20`/`%7f` to a space before matching
+- [x] `EMAIL_RE` local part narrowed to `[a-z0-9._+'-]`, must start/end
+      alphanumeric, plus a lookbehind so a match can't start mid-token
+- [x] mailto regex skips stray slashes (`mailto:\/*`)
+- [x] `cleanEmail()` peels repeated/malformed schemes, percent-decodes, and cuts
+      the local part at the last markup separator; domain side sanitised too
+- [x] `isValidEmail()` now stricter than RFC on purpose — glue can't pass
+- [x] `repairEscapedEmails()` widened from JSON-escapes to every mangled row;
+      clashes → duplicate, unsalvageable → email cleared and lead re-queued
+- [x] Approve / bulk / manual contact inserts validate before writing to
+      `contacts`, so junk can never reach the sender
+- [x] Verified: 4 mangled rows repaired, clash deduped, unsalvageable re-queued;
+      `first.last+tag@`, `sales_2@steel-works.com.sa`, multi-label ccTLDs intact
+
+## Search source stalled for 16h on one step (rate limit + cursor bug)
+Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
+08:43. Steps 25, 34, 37, 40, 43 stalled the same way. ~21 plan steps in 2 days.
+- ROOT CAUSE: `runBatch` only saved the cursor when `r.okish` was true. A batch
+  that ran 2 queries fine and got rate-limited on the 3rd threw away ALL of it.
+  Next hour it re-ran the same 2 queries (`+0 new` both), hit the same limit on
+  the 3rd, and never moved. `runSearchSource` had computed the right cursor the
+  whole time — the caller discarded it.
+- Compounding: p2 requests are ~half of all traffic and nearly always `+0 new`,
+  and they're what trips the limiter. Blocks were also punished with the
+  source's FULL interval (60m) when the engine's ceiling is per-minute.
+- [x] Cursor advances by queries actually covered, even on a block; the blocked
+      query stays next up (`covered` counter, separate from pages fetched)
+- [x] Block backoff 3 → 6 → 12 → 24 → 30m, reset by any progress (`block_streak`
+      column added via idempotent migration)
+- [x] p2 skipped when p1 returned zero NEW sites — halves request volume
+- [x] `SEARCH_BLOCK_SKIP_AFTER=5`: a query refused 5× with zero progress is
+      stepped over, so one poisoned entry can't hold a pass hostage
+- [x] Switched-off mid-batch no longer shares the `blocked` path (no fake backoff)
+- [x] Block message no longer says "add a free JINA key" when one is configured
+- [x] Verified by replaying step 46 with p2 permanently blocked: partial progress
+      kept (47→48), backoff escalated 3/6/12/24m, step-over fired on the 5th,
+      then a clean run covered 3 entries with 2 requests (47→50)
+
 ### Still open
 - Geographic drift: Gulf city names matching US homonyms (Medina OH, Hail TX)
 - OSM map source still sweeping micro-businesses with no websites
 - Web search has a structural ceiling (~10 results/query); Directory sources are
   the higher-yield path for volume
+- Crawler give-ups are dominated by Cloudflare; a scraping proxy is the only
+  real fix for those (`vymaps`, `datanyze`, `muqawil`, `arablocal` …)
+- Local dev SQLite corrupts if the bun process is SIGKILLed while holding the
+  WAL. Shut the dev server down with plain `kill`, never `kill -9`.

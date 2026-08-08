@@ -22,22 +22,62 @@ const JUNK_DOMAINS =
 const ROLE_RE =
   /^(info|sales|contact|support|admin|hello|hi|team|office|enquir(y|ies)|inquir(y|ies)|marketing|hr|jobs|careers|recruit(ment)?|help|helpdesk|service|services|account|accounts|billing|finance|orders?|order|booking|bookings|reservation|reservations|general|mail|webmaster|no-?reply|do-?not-?reply|newsletter|press|media|partnership|partners?)@/i;
 
+// Prefixes that pages glue onto an address and that RFC 5321 unfortunately
+// tolerates inside a local part, so a naive syntax check waves them through:
+//   <a href="mailto://info@x.com">   → "//info@x.com"
+//   <a href="mailto:%20info@x.com">  → "%20info@x.com"
+//   <a href="mailto:mailto:info@x">  → "mailto:info@x.com"
+// All three were filed as real contacts and are unmailable.
+const SCHEME_RE = /^(?:(?:mailto|e-?mail|mail|url|href|to)\s*:+|https?:\/\/|\/{1,}|\\+)\s*/i;
+// Characters that can only be markup/URL glue, never part of a local part.
+const LOCAL_CUT = /[\s/\\:<>"(){}\[\],;|@=#&?!*^~$]+/;
+const DOMAIN_CUT = /[\s/\\?#:<>"'(){}\[\],;|]+/;
+
+// Keep only the trailing run of address-legal characters ("//info" → "info").
+function cleanLocal(local: string): string {
+  let l = local;
+  // Percent-encoded padding/newlines left behind by mailto: links.
+  l = l.replace(/%[0-9a-f]{2}/gi, " ");
+  // JS/JSON escapes that survived undecoded ("\u003einfo" → "3einfo").
+  l = l.replace(/^(?:u00[0-9a-f]{2}|x[0-9a-f]{2})+/i, "");
+  l = l.split(LOCAL_CUT).pop() || "";
+  // A local part never opens or closes on punctuation.
+  return l.replace(/^[^a-z0-9]+/i, "").replace(/[^a-z0-9]+$/i, "");
+}
+
+function cleanDomain(domain: string): string {
+  let d = (domain.split(DOMAIN_CUT)[0] || "").replace(/%[0-9a-f]{2}[\s\S]*$/i, "");
+  return d.replace(/^[^a-z0-9]+/i, "").replace(/[^a-z0-9]+$/i, "");
+}
+
 export function cleanEmail(raw: string): string | null {
   if (!raw) return null;
   let e = raw.trim().toLowerCase();
-  e = e.replace(/^mailto:/, "");
+  // Peel repeated / malformed schemes ("mailto://", "mailto:mailto:").
+  for (let i = 0; i < 4; i++) {
+    const before = e;
+    e = e.replace(SCHEME_RE, "").trim();
+    if (e === before) break;
+  }
   e = e.split("?")[0]; // drop mailto query params
-  e = e.replace(/^[<("'\s]+/, "");
-  e = e.replace(/[)>.,;:'"\]\s]+$/g, "");
   // strip zero-width & control chars
   e = e.replace(/[\u200b-\u200d\uFEFF]/g, "");
-  if (!e.includes("@")) return null;
-  return e;
+  e = e.replace(/^[<("'\s]+/, "");
+  e = e.replace(/[)>.,;:'"\]\s]+$/g, "");
+  const at = e.lastIndexOf("@");
+  if (at < 1) return null;
+  const local = cleanLocal(e.slice(0, at));
+  const domain = cleanDomain(e.slice(at + 1));
+  if (!local || !domain || !domain.includes(".")) return null;
+  return `${local}@${domain}`;
 }
 
 export function isValidEmail(e: string): boolean {
   if (!e || e.length > 254) return false;
-  if (!/^[a-z0-9!#$%&'*+/=?^_`{|}~.-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(e)) return false;
+  // Deliberately stricter than RFC 5321: "/", "%", "!" and friends are legal in
+  // a local part but in scraped text they only ever mean the address picked up
+  // surrounding markup. Also force alphanumeric first/last characters.
+  if (!/^[a-z0-9](?:[a-z0-9._+'-]*[a-z0-9])?@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(e)) return false;
   const at = e.split("@");
   if (at.length !== 2) return false;
   const [local, domain] = at;

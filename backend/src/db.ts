@@ -159,6 +159,10 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN cursor INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN empty_streak INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  // Consecutive rate-limit blocks, so the pause escalates (3 → 6 → 12 → 24 → 30
+  // min) instead of jumping straight to the source's full interval. A search
+  // that hit a per-minute ceiling recovers in minutes, not an hour.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN block_streak INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   // A 'search' source runs free-text web searches (keywords × cities), walking a
   // generated query plan by `cursor`. Optional custom keywords live here; when
   // blank the bot derives them from the category.

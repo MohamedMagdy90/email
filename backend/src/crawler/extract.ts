@@ -27,6 +27,10 @@ export function decodeEntities(s: string): string {
     // unmailable contact. Seen in production on companydata.com.
     .replace(/\\u([0-9a-f]{4})/gi, (_, h) => safeChar(parseInt(h, 16)))
     .replace(/\\x([0-9a-f]{2})/gi, (_, h) => safeChar(parseInt(h, 16)))
+    // Percent-encoded whitespace/control characters. "mailto:%20info@x.com" is
+    // a common authoring slip; left encoded, the padding reads as part of the
+    // local part and "%20info@x.com" gets filed as a contact.
+    .replace(/%(?:0[0-9a-f]|1[0-9a-f]|20|7f)/gi, " ")
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeChar(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => safeChar(parseInt(d, 10)))
     .replace(/&commat;/gi, "@")
@@ -53,8 +57,13 @@ export function decodeCfEmail(hex: string): string | null {
   }
 }
 
+// The local part is deliberately narrower than RFC 5321 allows. "/", "%", "!"
+// and the rest are legal in an address, but in scraped text they only ever mean
+// the match ran into surrounding markup: "mailto://info@x.com" used to yield
+// the unmailable "//info@x.com". The lookbehind keeps a match from starting
+// mid-token, so we never store a truncated local part either.
 const EMAIL_RE =
-  /([a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24})/gi;
+  /(?<![a-z0-9._%+@-])([a-z0-9](?:[a-z0-9._+'-]{0,62}[a-z0-9])?)@((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24})/gi;
 
 // name [at] domain [dot] tld  — with optional brackets and "at"/"dot" words.
 const OBF_RE =
@@ -82,8 +91,9 @@ export function extractEmails(rawHtml: string): EmailHit[] {
 
   const decoded = decodeEntities(rawHtml);
 
-  // 2) mailto: links (most reliable explicit signal)
-  const mailto = /mailto:([^"'>\s?]+)/gi;
+  // 2) mailto: links (most reliable explicit signal). "mailto://info@x.com" is
+  //    malformed but common, so the slashes are skipped rather than captured.
+  const mailto = /mailto:\/*\s*([^"'>\s?]+)/gi;
   let mm: RegExpExecArray | null;
   while ((mm = mailto.exec(decoded))) {
     let addr = mm[1].split(",")[0];

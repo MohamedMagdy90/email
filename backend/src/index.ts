@@ -13,6 +13,7 @@ import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
 import { fetchViaProxy, fetchViaReader, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
+import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
@@ -266,8 +267,10 @@ app.get("/api/contacts", async (c) => {
 
 app.post("/api/contacts", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const email = String(b.email || "").trim().toLowerCase();
-  if (!email || !email.includes("@")) return c.json({ error: "valid email required" }, 400);
+  // Normalise first: pasted addresses arrive wrapped in markup ("<a@b.com>"),
+  // with a mailto: scheme, or with URL-encoded padding.
+  const email = cleanEmail(String(b.email || "")) || "";
+  if (!email || !isValidEmail(email)) return c.json({ error: "valid email required" }, 400);
   const rows = await q(
     `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
      VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING *`,
@@ -287,8 +290,8 @@ app.post("/api/contacts/bulk", async (c) => {
   const upsert = b.upsert === true;
   let added = 0, updated = 0, skipped = 0;
   for (const it of items) {
-    const email = String(it.email || "").trim().toLowerCase();
-    if (!email || !email.includes("@")) { skipped++; continue; }
+    const email = cleanEmail(String(it.email || "")) || "";
+    if (!email || !isValidEmail(email)) { skipped++; continue; }
 
     const ins = await q(
       `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
@@ -1531,9 +1534,11 @@ app.post("/api/discovery/leads/approve", async (c) => {
   const approvedIds: string[] = [];
   const seenEmails = new Set<string>(); // guards against the same email twice in one batch
   for (const l of leads) {
-    const email = String(l.email || "").trim().toLowerCase();
+    const email = cleanEmail(String(l.email || "")) || "";
     approvedIds.push(l.id); // approving marks it handled even if it has no email
-    if (!email || !email.includes("@")) { skipped++; continue; }
+    // A malformed address ("//info@x.com", "%20info@x.com") is unmailable —
+    // approve the lead but never promote the junk into Contacts.
+    if (!email || !isValidEmail(email)) { skipped++; continue; }
     // Never attempt the same email twice in one request. The contacts.email
     // UNIQUE constraint (ON CONFLICT DO NOTHING) is the hard guarantee; this just
     // keeps the counts honest and avoids redundant inserts.

@@ -24,6 +24,7 @@ import { registrableDomain, hostOf } from "./crawler/urls";
 import { resolveLeadCountry } from "./country";
 import { getReaderStats } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
+import { cleanEmail, isValidEmail } from "./crawler/validate";
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -106,6 +107,15 @@ const SEARCH_QUERIES_PER_RUN = 3;
 const SEARCH_PAGES = [0, 30];
 const SEARCH_PACING_MS = 1200;
 const SEARCH_EMPTY_STREAK_LIMIT = 6;
+// Rate-limit backoff for a search source. The engine's ceiling is per-minute,
+// so a blocked query recovers in minutes — sleeping for the source's full
+// interval (often 60m) wastes most of the day. Escalate only on repeats.
+const SEARCH_BLOCK_BASE_MIN = 3;
+const SEARCH_BLOCK_MAX_MIN = 30;
+// If a single plan entry blocks this many times in a row without ANY of the
+// batch getting through, step over it. A pass must never be held hostage by one
+// query the engine refuses to serve.
+const SEARCH_BLOCK_SKIP_AFTER = 5;
 // Enrichment retry policy: a BLOCKED / errored crawl is transient (Cloudflare
 // wall, reader rate-limit, timeout) — retry with growing backoff instead of
 // discarding the lead. Only give up after this many tries.
@@ -823,8 +833,10 @@ interface SearchRunResult {
   found: number;      // NEW company leads inserted this batch
   extracted: number;  // company sites seen this batch (new OR already-known)
   searches: number;   // result pages actually fetched this batch
+  covered: number;    // plan entries consumed (fetched OR deliberately skipped)
   error?: string;
   okish: boolean;     // the search engine responded (not blocked)
+  blocked: boolean;   // stopped on a rate limit, not a real failure
   nextCursor: number; // where to resume in the plan
   exhausted: boolean; // walked to the end of the plan (a full pass finished)
   planLen: number;
@@ -838,7 +850,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   const plan = buildSearchPlan(keywords, location);
   const planLen = plan.length;
   if (!planLen) {
-    return { found: 0, extracted: 0, searches: 0, error: "Add a country/city or some keywords", okish: false, nextCursor: 1, exhausted: true, planLen: 0 };
+    return { found: 0, extracted: 0, searches: 0, covered: 0, error: "Add a country/city or some keywords", okish: false, blocked: false, nextCursor: 1, exhausted: true, planLen: 0 };
   }
 
   // Resume from the cursor; when a previous pass finished (or the plan shrank),
@@ -856,22 +868,34 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   const how = readerKey ? "web search (reader, keyed)" : "web search (free reader)";
   dlog("search", `${label} — step ${cursor}/${planLen} · ${batch.length} quer${batch.length === 1 ? "y" : "ies"} · ${how}`);
 
-  let found = 0, extracted = 0, ok = 0, blocked = false, err: string | undefined;
+  let found = 0, extracted = 0, ok = 0, covered = 0, blocked = false, stopped = false, err: string | undefined;
+  // Page 2 of a query whose page 1 was entirely already-known sites is almost
+  // always more of the same. Skipping it halves the request rate — which is what
+  // trips the search engine's limiter in the first place.
+  let prevQuery = "", prevNew = 0, prevRan = false;
   for (const item of batch) {
     // Deleted / archived / switched off mid-batch? Stop, keeping the position.
     if (await shouldStop(src.id)) {
-      dlog("search", `${label}: stopped at step ${cursor + ok} — the source was removed or switched off`);
-      blocked = true; // don't advance the cursor past a query we never ran
+      dlog("search", `${label}: stopped at step ${cursor + covered} — the source was removed or switched off`);
+      stopped = true; // not a rate limit — no backoff, and nothing to resume
       break;
+    }
+    if (item.offset > 0 && prevRan && item.q === prevQuery && prevNew === 0) {
+      covered++;
+      dlog("search", `  · "${item.q}" p${item.offset / 30 + 1} skipped — page 1 was all sites we already have`);
+      continue;
     }
     const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location).catch(() => ({ companies: [], blocked: true }));
     if (r.blocked) {
       blocked = true;
-      err = "web search was blocked (add a free JINA key in Settings → Crawler to search at full speed)";
-      dwarn("search", `  ✗ "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} — blocked, will retry`);
+      err = readerKey
+        ? "the search engine rate-limited us — pausing, then resuming from this exact query"
+        : "web search was blocked (add a free JINA key in Settings → Crawler to search at full speed)";
+      dwarn("search", `  ✗ "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} — rate-limited, will resume here`);
       break;
     }
     ok++;
+    covered++;
     let batchFound = 0;
     for (const co of r.companies) {
       const website = (co.website || "").trim();
@@ -889,13 +913,14 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       }, dedup);
       if (added) { found++; batchFound++; }
     }
+    prevQuery = item.q; prevNew = batchFound; prevRan = true;
     dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} → ${r.companies.length} site(s), +${batchFound} new`);
     await sleep(SEARCH_PACING_MS);
   }
 
-  const nextCursor = cursor + ok;
-  const exhausted = !blocked && ok > 0 && nextCursor > planLen;
-  return { found, extracted, searches: ok, error: err, okish: !blocked, nextCursor, exhausted, planLen };
+  const nextCursor = cursor + covered;
+  const exhausted = !blocked && !stopped && covered > 0 && nextCursor > planLen;
+  return { found, extracted, searches: ok, covered, error: err, okish: !blocked && !stopped, blocked, nextCursor, exhausted, planLen };
 }
 
 /* ------------------------------ scheduling ---------------------------- */
@@ -989,28 +1014,50 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     try {
       r = await runSearchSource(src);
     } catch (e: any) {
-      r = { found: 0, extracted: 0, searches: 0, error: String(e?.message || e), okish: false, nextCursor: Number(src.cursor) || 1, exhausted: false, planLen: 0 };
+      r = { found: 0, extracted: 0, searches: 0, covered: 0, error: String(e?.message || e), okish: false, blocked: false, nextCursor: Number(src.cursor) || 1, exhausted: false, planLen: 0 };
     }
     const productive = r.found > 0;
     let streak = Number(src.empty_streak) || 0;
     let cursor = Number(src.cursor) || 1;
     let exhausted = false;
+    // KEEP THE GROUND THIS BATCH COVERED, even if it ended on a rate limit.
+    // runSearchSource only advances past queries that actually ran, so the
+    // blocked query is still next up. Discarding the cursor here meant a source
+    // re-ran the two queries that had already succeeded, hit the same limit on
+    // the third, and never moved — it sat on one step for 16 hours.
+    if (r.covered > 0) cursor = r.nextCursor;
     if (!r.error && r.okish) {
-      cursor = r.nextCursor;                                  // advance through the plan
       streak = productive ? 0 : streak + 1;
       exhausted = r.exhausted || streak >= SEARCH_EMPTY_STREAK_LIMIT; // full pass, or all-dupes
     }
+    // A rate limit clears in minutes, so back off in minutes and escalate only
+    // if it keeps happening. Any progress at all resets the escalation.
+    let blockStreak = Number(src.block_streak) || 0;
+    let steppedOver = false;
+    if (r.blocked) {
+      blockStreak = r.covered > 0 ? 1 : blockStreak + 1;
+      if (r.covered === 0 && blockStreak >= SEARCH_BLOCK_SKIP_AFTER) {
+        cursor = r.nextCursor + 1; // r.nextCursor == the query that keeps failing
+        blockStreak = 0;
+        steppedOver = true;
+      }
+    } else if (!r.error) blockStreak = 0;
+    const pauseMin = r.blocked && !steppedOver
+      ? Math.min(SEARCH_BLOCK_MAX_MIN, SEARCH_BLOCK_BASE_MIN * 2 ** Math.max(0, blockStreak - 1))
+      : interval;
     const cont = !r.error && !exhausted;
-    const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+    const next = cont ? nowIso() : new Date(Date.now() + (steppedOver ? SEARCH_BLOCK_BASE_MIN : pauseMin) * 60000).toISOString();
     const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, block_streak=?
        WHERE id=?`,
-      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, src.id]
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, blockStreak, src.id]
     );
-    if (r.error) derr("search", `${srcLabel(src)}: ${r.error} (retry in ${interval}m)`);
+    if (steppedOver) dwarn("search", `${srcLabel(src)}: step ${r.nextCursor} was refused ${SEARCH_BLOCK_SKIP_AFTER} times running — skipping it and resuming at step ${cursor}${r.planLen ? `/${r.planLen}` : ""} in ${SEARCH_BLOCK_BASE_MIN}m`);
+    else if (r.blocked) dwarn("search", `${srcLabel(src)}: ${r.error}${r.covered ? ` — kept the ${r.covered} quer${r.covered === 1 ? "y" : "ies"} it did cover (now at step ${cursor}${r.planLen ? `/${r.planLen}` : ""})` : ""} · resuming in ${pauseMin}m`);
+    else if (r.error) derr("search", `${srcLabel(src)}: ${r.error} (retry in ${interval}m)`);
     else if (exhausted) dlog("search", `${srcLabel(src)}: FINISHED a full pass${r.planLen ? ` (${r.planLen} queries)` : ""} — re-searching in ${interval}m for newly-published sites. Click "Run now" to re-search now.`);
     else if (cont) dlog("search", `${srcLabel(src)}: +${r.found} new · continuing (step ${cursor}${r.planLen ? `/${r.planLen}` : ""}) in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
     return { found: r.found, error: r.error, continue: cont };
@@ -1500,26 +1547,64 @@ export async function rejectContentLeads(): Promise<number> {
   return ids.length;
 }
 
-// "u003einfo@company.com" — a JSON-escaped ">" the extractor read as part of the
-// address before escapes were decoded. Strip the prefix so the lead is mailable
-// again instead of silently sitting in the pool with a dead address.
+// Addresses that picked up the markup they were scraped from and are therefore
+// unmailable. RFC 5321 allows "/" and "%" in a local part, so these all passed
+// the old syntax check and were filed as real contacts:
+//   mailto://info@x.com    → "//info@x.com"
+//   mailto:%20info@x.com   → "%20info@x.com"
+//   \u003einfo@x.com       → "u003einfo@x.com"
+// cleanEmail() now strips the glue at extraction time; this un-mangles the rows
+// that were saved before it did. Anything that cannot be salvaged is retired
+// rather than left in the pool pretending to be a contact.
 export async function repairEscapedEmails(): Promise<number> {
   const rows = await q(
-    `SELECT id, email FROM discovered_leads WHERE email LIKE 'u003e%' OR email LIKE 'u0026%' OR email LIKE 'x3e%'`
+    `SELECT id, email FROM discovered_leads
+      WHERE email IS NOT NULL AND email <> ''
+        AND (email LIKE '%/%'
+          OR email LIKE '%$\\%' ESCAPE '$'
+          OR email LIKE '%$%%' ESCAPE '$'
+          OR email LIKE '% %'
+          OR email LIKE '%<%'
+          OR email LIKE '%>%'
+          OR email LIKE '%"%'
+          OR email LIKE '%=%'
+          OR email LIKE '%:%'
+          OR email LIKE '.%'
+          OR email LIKE '-%'
+          OR email LIKE 'u003e%'
+          OR email LIKE 'u0026%'
+          OR email LIKE 'x3e%')`
   );
   let fixed = 0;
+  let dropped = 0;
   for (const r of rows as any[]) {
-    const cleaned = String(r.email || "").replace(/^(?:u00[0-9a-f]{2}|x[0-9a-f]{2})+/i, "").trim();
-    if (!cleaned || cleaned === r.email || !cleaned.includes("@")) continue;
+    const original = String(r.email || "");
+    const cleaned = cleanEmail(original);
+    if (cleaned && cleaned === original) continue; // already fine
+    if (!cleaned || !isValidEmail(cleaned)) {
+      // Nothing mailable in there — clear the address and send the lead back
+      // through enrichment instead of keeping a dead contact.
+      await q(
+        `UPDATE discovered_leads SET email=NULL, confidence=NULL, enriched=0,
+             retry_count=0, enrich_status=NULL, next_enrich_at=NULL,
+             status=CASE WHEN status='found' THEN 'pending' ELSE status END
+           WHERE id=?`,
+        [r.id]
+      );
+      dropped++;
+      dlog("", `  email: "${original}" is unsalvageable — cleared, lead re-queued`);
+      continue;
+    }
     // The cleaned address may already be on another row; drop this one if so.
     const clash = (await q(`SELECT id FROM discovered_leads WHERE email=? AND id<>? LIMIT 1`, [cleaned, r.id]))[0];
     if (clash) { await q(`UPDATE discovered_leads SET status='duplicate' WHERE id=?`, [r.id]); continue; }
     await q(`UPDATE discovered_leads SET email=?, dedup_key=? WHERE id=?`, [cleaned, "e:" + cleaned, r.id]);
     fixed++;
-    dlog("", `  email: "${r.email}" → "${cleaned}"`);
+    dlog("", `  email: "${original}" → "${cleaned}"`);
   }
-  if (fixed) dlog("", `repaired ${fixed} email(s) mangled by JSON escapes`);
-  return fixed;
+  if (fixed) dlog("", `repaired ${fixed} email(s) that had markup glued to the address`);
+  if (dropped) dlog("", `cleared ${dropped} unsalvageable address(es)`);
+  return fixed + dropped;
 }
 
 // Leads saved before result titles were parsed still carry the raw page
