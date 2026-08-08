@@ -443,16 +443,31 @@ async function fetchSearchPage(
   const rd = await fetchViaReader(url, 45000, readerKey).catch(() => null);
   if (rd?.ok && rd.html && !isBlocked(rd.html) && /uddg=|result__a/.test(rd.html)) return { html: rd.html, blocked: false };
 
-  // 3) Scraping proxy — last resort, because it costs credits. The search engine
+  // 3) Scraping proxy — last resort, because it costs credits. The engine
   //    rate-limits a datacenter IP within a few requests no matter how politely
-  //    we pace, and the proxy rotates IPs, so this is what keeps a pass moving
-  //    once the first two tiers are walled.
+  //    we pace, and the proxy rotates IPs, so this is what keeps a pass moving.
+  //    The results page is plain server-rendered HTML: it needs a different IP,
+  //    NOT JS rendering or a stealth proxy. Asking for those costs ~75 credits a
+  //    call on ScrapingBee instead of ~1, so the cheap tier goes first and
+  //    stealth is only tried if the cheap one is walled too.
   if (proxy) {
-    const px = await fetchViaProxy(url, proxy).catch(() => null);
-    if (px?.ok && px.html && !isBlocked(px.html) && /uddg=|result__a/.test(px.html)) return { html: px.html, blocked: false };
+    const cheap = await proxyHtml(url, { ...proxy, renderJs: false, premium: false });
+    if (cheap) return { html: cheap, blocked: false };
+    // Only worth the stealth surcharge if the plain IP swap was walled too.
+    if (proxy.premium !== false) {
+      const stealth = await proxyHtml(url, { ...proxy, renderJs: false, premium: true });
+      if (stealth) return { html: stealth, blocked: false };
+    }
   }
 
   return { html: "", blocked: true };
+}
+
+// One proxy attempt: usable results HTML, or null if it was walled.
+async function proxyHtml(url: string, cfg: ProxyConfig): Promise<string | null> {
+  const r = await fetchViaProxy(url, cfg).catch(() => null);
+  if (r?.ok && r.html && !isBlocked(r.html) && /uddg=|result__a/.test(r.html)) return r.html;
+  return null;
 }
 
 // One page of company results for a query. Filters out social/marketplaces
