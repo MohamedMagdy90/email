@@ -105,7 +105,12 @@ const OSM_TILES_PER_RUN = 6;
 const OSM_TILE_PACING_MS = 1_200;
 const SEARCH_QUERIES_PER_RUN = 3;
 const SEARCH_PAGES = [0, 30];
-const SEARCH_PACING_MS = 1200;
+// The search engine walls a datacenter IP after a couple of quick requests, so
+// throughput is capped by politeness, not by our loop speed. Pacing requests
+// ~4s apart (and batches ~8s apart) keeps a pass moving instead of spending it
+// in backoff. Both were 1.2s/1.5s, which tripped the limiter every third query.
+const SEARCH_PACING_MS = 4_000;
+const SEARCH_CONTINUE_MS = 8_000;
 const SEARCH_EMPTY_STREAK_LIMIT = 6;
 // Rate-limit backoff for a search source. The engine's ceiling is per-minute,
 // so a blocked query recovers in minutes — sleeping for the source's full
@@ -861,6 +866,9 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   const batch = plan.slice(start, start + SEARCH_QUERIES_PER_RUN);
 
   const readerKey = await getReaderKey();
+  // Routed to only when the direct fetch AND the reader are both walled — the
+  // proxy rotates IPs, so it turns a dead pass into a moving one.
+  const proxy = await getProxyConfig();
   const dedup = await loadContactDedup();
   const label = src.category && src.category !== "Companies (general)"
     ? `${location || "web"} · ${src.category}`
@@ -885,7 +893,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       dlog("search", `  · "${item.q}" p${item.offset / 30 + 1} skipped — page 1 was all sites we already have`);
       continue;
     }
-    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location).catch(() => ({ companies: [], blocked: true }));
+    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location, proxy).catch(() => ({ companies: [], blocked: true }));
     if (r.blocked) {
       blocked = true;
       err = readerKey
@@ -927,7 +935,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
 
 // Run + persist the outcome for a single source. `continue` = run again on the
 // very next tick (directory sources stream continuously until exhausted).
-async function executeSource(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
+async function executeSource(src: any): Promise<{ found: number; error?: string; continue: boolean; continueMs?: number }> {
   try {
     return await runBatch(src);
   } finally {
@@ -937,7 +945,7 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
   }
 }
 
-async function runBatch(src: any): Promise<{ found: number; error?: string; continue: boolean }> {
+async function runBatch(src: any): Promise<{ found: number; error?: string; continue: boolean; continueMs?: number }> {
   // Never start a batch for a source that's already gone. Between the tick's
   // SELECT and here, it may have been deleted, archived or switched off.
   if (await shouldStop(src.id)) {
@@ -1059,8 +1067,8 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     else if (r.blocked) dwarn("search", `${srcLabel(src)}: ${r.error}${r.covered ? ` — kept the ${r.covered} quer${r.covered === 1 ? "y" : "ies"} it did cover (now at step ${cursor}${r.planLen ? `/${r.planLen}` : ""})` : ""} · resuming in ${pauseMin}m`);
     else if (r.error) derr("search", `${srcLabel(src)}: ${r.error} (retry in ${interval}m)`);
     else if (exhausted) dlog("search", `${srcLabel(src)}: FINISHED a full pass${r.planLen ? ` (${r.planLen} queries)` : ""} — re-searching in ${interval}m for newly-published sites. Click "Run now" to re-search now.`);
-    else if (cont) dlog("search", `${srcLabel(src)}: +${r.found} new · continuing (step ${cursor}${r.planLen ? `/${r.planLen}` : ""}) in ${Math.round(DIRECTORY_CONTINUE_MS / 1000)}s`);
-    return { found: r.found, error: r.error, continue: cont };
+    else if (cont) dlog("search", `${srcLabel(src)}: +${r.found} new · continuing (step ${cursor}${r.planLen ? `/${r.planLen}` : ""}) in ${Math.round(SEARCH_CONTINUE_MS / 1000)}s`);
+    return { found: r.found, error: r.error, continue: cont, continueMs: SEARCH_CONTINUE_MS };
   }
 
   // Map-area (OSM) source — sweeps its grid a few tiles per batch, chaining
@@ -1140,7 +1148,7 @@ export async function runSourceNow(id: string): Promise<{ found: number; error?:
   }
   const r = await executeSource(src);
   // Keep streaming a directory in the background after a manual kick.
-  if (r.continue) setTimeout(() => discoveryTick().catch(() => {}), DIRECTORY_CONTINUE_MS);
+  if (r.continue) setTimeout(() => discoveryTick().catch(() => {}), r.continueMs ?? DIRECTORY_CONTINUE_MS);
   return { found: r.found, error: r.error };
 }
 
@@ -1207,6 +1215,7 @@ async function discoveryTick(): Promise<void> {
   if (!(await isBotEnabled())) return;
   discovering = true;
   let keepStreaming = false;
+  let chainMs = DIRECTORY_CONTINUE_MS;
   try {
     const now = nowIso();
     // Most-overdue enabled source (a null next_run_at = never run = due now).
@@ -1221,12 +1230,14 @@ async function discoveryTick(): Promise<void> {
     if (!src) return;
     const r = await executeSource(src);
     keepStreaming = r.continue;
+    chainMs = r.continueMs ?? DIRECTORY_CONTINUE_MS;
   } finally {
     discovering = false;
   }
   // Directory sources stream continuously: chain the next batch quickly instead
   // of waiting the full tick, so a big directory pours in fast (but politely).
-  if (keepStreaming) setTimeout(() => discoveryTick().catch((e) => derr("", `discovery tick failed: ${String(e?.message || e)}`)), DIRECTORY_CONTINUE_MS);
+  // Search sources chain slower — the engine's limiter, not our loop, is the cap.
+  if (keepStreaming) setTimeout(() => discoveryTick().catch((e) => derr("", `discovery tick failed: ${String(e?.message || e)}`)), chainMs);
 }
 
 async function enrichTick(): Promise<void> {

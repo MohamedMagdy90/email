@@ -11,7 +11,7 @@
 
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { isProfileHost, isJunkHost } from "./crawler/profiles";
-import { fetchViaReader } from "./crawler/fetcher";
+import { fetchViaReader, fetchViaProxy, type ProxyConfig } from "./crawler/fetcher";
 import type { Company } from "./leads";
 
 const UAS = [
@@ -413,7 +413,12 @@ function ddgUrl(query: string, offset: number): string {
 // Fetch ONE results page. Try a plain fetch first (free); if the engine blocks it
 // (the "anomaly" wall on datacenter IPs) fall back to the reader, which renders
 // the page and returns real HTML. `blocked` = we couldn't get a real page at all.
-async function fetchSearchPage(query: string, offset: number, readerKey?: string): Promise<{ html: string; blocked: boolean }> {
+async function fetchSearchPage(
+  query: string,
+  offset: number,
+  readerKey?: string,
+  proxy?: ProxyConfig
+): Promise<{ html: string; blocked: boolean }> {
   const url = ddgUrl(query, offset);
 
   // 1) Direct — cheap, and works when NOT on a flagged datacenter IP.
@@ -438,6 +443,15 @@ async function fetchSearchPage(query: string, offset: number, readerKey?: string
   const rd = await fetchViaReader(url, 45000, readerKey).catch(() => null);
   if (rd?.ok && rd.html && !isBlocked(rd.html) && /uddg=|result__a/.test(rd.html)) return { html: rd.html, blocked: false };
 
+  // 3) Scraping proxy — last resort, because it costs credits. The search engine
+  //    rate-limits a datacenter IP within a few requests no matter how politely
+  //    we pace, and the proxy rotates IPs, so this is what keeps a pass moving
+  //    once the first two tiers are walled.
+  if (proxy) {
+    const px = await fetchViaProxy(url, proxy).catch(() => null);
+    if (px?.ok && px.html && !isBlocked(px.html) && /uddg=|result__a/.test(px.html)) return { html: px.html, blocked: false };
+  }
+
   return { html: "", blocked: true };
 }
 
@@ -450,9 +464,10 @@ export async function searchCompaniesPaged(
   offset: number,
   limit: number,
   readerKey?: string,
-  expectCountry?: string
+  expectCountry?: string,
+  proxy?: ProxyConfig
 ): Promise<{ companies: Company[]; blocked: boolean }> {
-  const { html, blocked } = await fetchSearchPage(query, offset, readerKey);
+  const { html, blocked } = await fetchSearchPage(query, offset, readerKey, proxy);
   if (blocked) return { companies: [], blocked: true };
 
   const byDomain = new Map<string, Company>();
