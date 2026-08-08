@@ -39,13 +39,37 @@ async function reserveReaderSlot(keyed: boolean): Promise<void> {
   return wait;
 }
 
+// A key that is out of tokens (Jina answers 401/402) is WORSE than no key: every
+// call fails, and we pace at the keyed 120/min as if it worked. The free keyless
+// tier still serves ~20/min, so once the key is rejected we stop sending it and
+// fall back — re-testing occasionally in case it gets topped up.
+const READER_KEY_RECHECK_MS = 30 * 60_000;
+let readerKeyRejected = false;
+let readerKeyRejectedAt = 0;
+let readerKeyRejectStatus = 0;
+function readerKeyUsable(key: string): boolean {
+  if (!key) return false;
+  if (!readerKeyRejected) return true;
+  if (Date.now() - readerKeyRejectedAt > READER_KEY_RECHECK_MS) {
+    readerKeyRejected = false; // give a topped-up key another chance
+    return true;
+  }
+  return false;
+}
+
 // Reader health, surfaced in the Discovery UI so the operator knows when the
 // free tier is saturated and it's time to add a free key or a scraping proxy.
 let readerCalls = 0;
 let reader429s = 0;
 let reader429At = 0;
-export function getReaderStats(): { calls: number; rateLimited: number; lastRateLimitedAt: string | null } {
-  return { calls: readerCalls, rateLimited: reader429s, lastRateLimitedAt: reader429At ? new Date(reader429At).toISOString() : null };
+export function getReaderStats(): { calls: number; rateLimited: number; lastRateLimitedAt: string | null; keyRejected: boolean; keyRejectedStatus: number } {
+  return {
+    calls: readerCalls,
+    rateLimited: reader429s,
+    lastRateLimitedAt: reader429At ? new Date(reader429At).toISOString() : null,
+    keyRejected: readerKeyRejected,
+    keyRejectedStatus: readerKeyRejectStatus,
+  };
 }
 
 export type BlockReason = "cloudflare" | "rate-limited" | "forbidden" | "blocked";
@@ -241,21 +265,35 @@ const READER_ENABLED = process.env.DISABLE_READER !== "1";
 const READER_KEY = process.env.JINA_API_KEY || "";
 
 export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS, apiKey?: string): Promise<FetchResult> {
-  const key = (apiKey || READER_KEY || "").trim();
-  await reserveReaderSlot(!!key); // pace calls under the free rate limit (queue, don't 429)
-  readerCalls++;
-  const headers: Record<string, string> = {
-    "X-Return-Format": "html", // give us HTML so the existing extractors work
-    "X-Timeout": "30", // tell Jina to cap its own render time
-    Accept: "text/html,*/*;q=0.8",
+  const rawKey = (apiKey || READER_KEY || "").trim();
+  const key = readerKeyUsable(rawKey) ? rawKey : "";
+  const call = async (withKey: string): Promise<FetchResult> => {
+    await reserveReaderSlot(!!withKey); // pace calls under the rate limit (queue, don't 429)
+    readerCalls++;
+    const headers: Record<string, string> = {
+      "X-Return-Format": "html", // give us HTML so the existing extractors work
+      "X-Timeout": "30", // tell Jina to cap its own render time
+      Accept: "text/html,*/*;q=0.8",
+    };
+    if (withKey) headers.Authorization = `Bearer ${withKey}`;
+    return rawFetch(`https://r.jina.ai/${target}`, { timeoutMs, headers, reportUrl: target, via: "reader" });
   };
-  if (key) headers.Authorization = `Bearer ${key}`;
-  const r = await rawFetch(`https://r.jina.ai/${target}`, {
-    timeoutMs,
-    headers,
-    reportUrl: target,
-    via: "reader",
-  });
+
+  let r = await call(key);
+  // 401 = bad key, 402 = out of tokens. Either way the key is dead weight: drop
+  // it and retry this same call on the free tier rather than reporting a block.
+  if (!r.ok && key && (r.status === 401 || r.status === 402)) {
+    if (!readerKeyRejected) {
+      readerKeyRejected = true;
+      readerKeyRejectedAt = Date.now();
+      readerKeyRejectStatus = r.status;
+      console.warn(
+        `[reader] Jina key rejected (HTTP ${r.status}${r.status === 402 ? " — out of tokens" : " — invalid"}). ` +
+          `Falling back to the free tier (~${READER_RPM_NOKEY}/min). Top up or remove the key in Settings → Crawler.`
+      );
+    }
+    r = await call("");
+  }
   if (!r.ok && (r.status === 401 || r.status === 402 || r.status === 429)) {
     if (r.status === 429) { reader429s++; reader429At = Date.now(); }
     r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit — add a free JINA_API_KEY or a scraping proxy)" : "");

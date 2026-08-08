@@ -1701,11 +1701,14 @@ export function startDiscoveryWorker(): void {
       // Say plainly whether the reader is keyed. Without this line the only way
       // to know whether a Jina key took effect is to guess from block messages.
       const [key, prox] = await Promise.all([getReaderKey(), getProxyConfig()]);
+      const rejected = getReaderStats().keyRejected;
       dlog(
         "",
-        key
+        key && !rejected
           ? `reader → Jina key ACTIVE (${READER_RPM_KEYED_HINT}/min, 25x the free tier)${prox ? ` · scraping proxy: ${prox.provider}` : ""}`
-          : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
+          : key && rejected
+            ? `reader → Jina key REJECTED (out of tokens) — running on the free tier (20/min). Top up at jina.ai/api-dashboard or clear the key.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
+            : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
       );
       if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");
       else if (!active) dwarn("", "bot is ON but no sources are enabled — enable a source in the Discovery screen.");
