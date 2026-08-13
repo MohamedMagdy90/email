@@ -130,6 +130,15 @@ export function Spinner({ className }: { className?: string }) {
   );
 }
 
+/* ------------------------------ Navigation -------------------------- */
+
+// The app is a single screen with tab state, so a deep link from one screen to
+// another (e.g. Discovery → Settings → Automation) goes through an event the
+// shell listens for. Keeps screens decoupled without pulling in a router.
+export function goTo(tab: string) {
+  window.dispatchEvent(new CustomEvent("dna-navigate", { detail: tab }));
+}
+
 /* -------------------------------- Modal ----------------------------- */
 
 export function Modal({

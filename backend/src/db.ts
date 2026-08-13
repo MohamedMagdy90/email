@@ -268,6 +268,30 @@ export async function ensureSchema() {
     updated_at TEXT NOT NULL,
     PRIMARY KEY (source_id, q, offset_n)
   )`);
+
+  /* --------------------------- Automation ledger ------------------------ */
+  // Every automation run (auto-approve a batch of emailable leads → email them)
+  // is written here, so "when did it last run, and what did it do?" is always
+  // answerable — including the runs that were skipped, and why.
+  await q(`CREATE TABLE IF NOT EXISTS automation_runs (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    trigger TEXT NOT NULL DEFAULT 'auto',
+    status TEXT NOT NULL DEFAULT 'running',
+    threshold INTEGER NOT NULL DEFAULT 0,
+    pool_count INTEGER NOT NULL DEFAULT 0,
+    approved INTEGER NOT NULL DEFAULT 0,
+    contacts_added INTEGER NOT NULL DEFAULT 0,
+    sent INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    template_names TEXT,
+    job_id TEXT,
+    note TEXT,
+    error TEXT
+  )`);
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at)`); } catch { /* ignore */ }
 }
 
 /* ---------------------- Search query saturation ------------------------ */

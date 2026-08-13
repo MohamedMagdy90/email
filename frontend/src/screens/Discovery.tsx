@@ -4,9 +4,10 @@ import {
   type DiscoveryStatus,
   type DiscoverySource,
   type DiscoveredLead,
+  type AutomationStatus,
   type Place,
 } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, toast, cn } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, Select, Spinner, toast, cn, goTo } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
 
 const FALLBACK_CATS = [
@@ -35,6 +36,7 @@ const countryLabel = (c: string) => (c === NO_COUNTRY ? "No country" : c);
 
 export default function Discovery() {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
+  const [automation, setAutomation] = useState<AutomationStatus | null>(null);
   const [sources, setSources] = useState<DiscoverySource[]>([]);
   const [archived, setArchived] = useState<DiscoverySource[]>([]);
   const [archivedCount, setArchivedCount] = useState(0);
@@ -73,6 +75,9 @@ export default function Discovery() {
   /* ------------------------------- load ------------------------------ */
   async function refreshStatus() {
     try { setStatus(await api.getDiscoveryStatus()); } catch { /* ignore */ }
+  }
+  async function refreshAutomation() {
+    try { setAutomation(await api.getAutomation()); } catch { /* ignore */ }
   }
   async function refreshSources() {
     try {
@@ -141,13 +146,14 @@ export default function Discovery() {
 
   useEffect(() => {
     refreshStatus();
+    refreshAutomation();
     refreshSources();
     refreshArchived();
     refreshBadNames();
     api.getLeadCategories().then((r) => r.categories?.length && setCats(r.categories)).catch(() => {});
     api.getCategories().then((r) => setContactCats(r.categories || [])).catch(() => {});
     // Live status + sources while the bot works in the background.
-    pollRef.current = window.setInterval(() => { refreshStatus(); refreshSources(); refreshBadNames(); }, 5000);
+    pollRef.current = window.setInterval(() => { refreshStatus(); refreshAutomation(); refreshSources(); refreshBadNames(); }, 5000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
@@ -310,6 +316,9 @@ export default function Discovery() {
         <Stat label="Approved → Contacts" value={counts.approved} />
         <Stat label="Finding emails" value={status?.pendingEnrich ?? 0} hint={status?.autoEnrich ? "queued" : "off"} />
       </div>
+
+      {/* What happens to this pool — automation state + progress to its trigger. */}
+      <AutomationStrip a={automation} />
 
       {/* Bad-name repair */}
       {badNames && (badNames.leads > 0 || badNames.contacts > 0) && (
@@ -712,6 +721,73 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
             <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium text-ink/70 underline">get a free key</a>
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------- Automation strip --------------------------- */
+
+// Answers the question this screen inevitably raises: "so what happens to all
+// these leads?" — either the automation takes the next batch by itself (and
+// here's how close it is), or nothing happens until you approve them yourself.
+function AutomationStrip({ a }: { a: AutomationStatus | null }) {
+  if (!a) return null;
+  const { enabled, threshold } = a.config;
+  const ready = a.ready;
+  const pct = Math.min(100, Math.round((ready / Math.max(1, threshold)) * 100));
+  const sending = a.running || a.lastRun?.status === "running";
+  const blocked = enabled && a.blockers.length > 0;
+
+  if (!enabled) {
+    return (
+      <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-ink/[0.06]">
+            <span className="h-2 w-2 rounded-full bg-ink/25" />
+          </span>
+          <div className="text-[13px] leading-relaxed">
+            <span className="font-medium text-ink">Automation is off</span>
+            <span className="text-muted"> — these leads wait here until you approve them. Turn it on and every {threshold.toLocaleString()} leads with an email get approved and emailed on their own.</span>
+          </div>
+        </div>
+        <Button size="sm" variant="outline" className="shrink-0" onClick={() => goTo("settings")}>Set up automation</Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("rounded-2xl border px-5 py-4", blocked ? "border-[#e0b354]/50 bg-[#fdf6e7]" : "border-good/40 bg-good/[0.06]")}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <span className={cn("relative mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg", blocked ? "bg-[#e0b354]/25" : "bg-good/15")}>
+            <span className={cn("h-2 w-2 rounded-full", blocked ? "bg-[#b06b16]" : "bg-good")} />
+            {!blocked && <span className="absolute h-2 w-2 animate-ping rounded-full bg-good/60" />}
+          </span>
+          <div className="text-[13px] leading-relaxed">
+            <span className="font-medium text-ink">
+              {sending
+                ? "Automation is emailing a batch right now"
+                : blocked
+                ? "Automation is on, but it can’t run yet"
+                : ready >= threshold
+                ? `Automation is about to take the next ${threshold.toLocaleString()}`
+                : "Automation is watching this pool"}
+            </span>
+            <span className="text-muted">
+              {blocked
+                ? ` — ${a.blockers[0]}`
+                : ` — ${ready.toLocaleString()} of ${threshold.toLocaleString()} leads with an email ready${ready < threshold ? ` · ${(threshold - ready).toLocaleString()} to go` : ""}. Approved automatically, then emailed.`}
+            </span>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-3">
+          {a.sentToday > 0 && <span className="text-[11px] text-muted">{a.sentToday.toLocaleString()} sent today</span>}
+          <Button size="sm" variant="ghost" onClick={() => goTo("settings")}>Settings</Button>
+        </div>
+      </div>
+      <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-ink/[0.07]">
+        <div className={cn("h-full rounded-full transition-all", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
       </div>
     </div>
   );

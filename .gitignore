@@ -6,6 +6,8 @@ dist/
 **/.pgdata/
 data.sqlite
 **/data.sqlite*
+.backup/
+**/.backup/
 *.log
 .env
 .env.*

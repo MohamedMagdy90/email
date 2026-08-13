@@ -204,6 +204,61 @@ export interface DiscoveredLead {
   enrich_status?: string | null; // found | empty | blocked | error
 }
 
+/* ------------------------------ Automation ----------------------------- */
+
+export interface AutomationConfig {
+  enabled: boolean;
+  /** Trigger point AND batch size: approve + email this many at a time. */
+  threshold: number;
+  /** Template(s) the automation sends — several rotate. */
+  templateIds: string[];
+  /** rotate = one template per run · split = alternate per recipient. */
+  templateMode: "rotate" | "split";
+  category: string;
+  country: string;
+  perMinute: number;
+  /** Max emails the automation may send per day (0 = no ceiling). */
+  dailyLimit: number;
+  /** Minimum gap between two automated runs. */
+  cooldownMinutes: number;
+  /** Refuse to run without a Resend key (never auto-"dry-run"). */
+  requireResend: boolean;
+}
+
+export interface AutomationRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  trigger: string;   // auto | manual
+  status: string;    // running | done | error | skipped
+  threshold: number;
+  pool_count: number;
+  approved: number;
+  contacts_added: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  template_names: string | null;
+  job_id: string | null;
+  note: string | null;
+  error: string | null;
+}
+
+export interface AutomationStatus {
+  config: AutomationConfig;
+  /** Pending leads that already have an email — what counts toward the trigger. */
+  ready: number;
+  remaining: number;
+  running: boolean;
+  sentToday: number;
+  dailyRemaining: number | null;
+  nextEligibleAt: string | null;
+  lastRun: AutomationRun | null;
+  runs: AutomationRun[];
+  templates: { id: string; name: string; type: string }[];
+  blockers: string[];
+}
+
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
@@ -413,6 +468,16 @@ export const api = {
   // send
   startSend: (body: any) => req<{ jobId: string }>(`/api/send`, { method: "POST", body: JSON.stringify(body) }),
   getSend: (id: string) => req<Job>(`/api/send/${id}`),
+
+  // automation — auto-approve a full pool, then auto-send
+  getAutomation: () => req<AutomationStatus>(`/api/automation`),
+  saveAutomation: (cfg: Partial<AutomationConfig>) =>
+    req<AutomationStatus>(`/api/automation`, { method: "POST", body: JSON.stringify(cfg) }),
+  runAutomation: () =>
+    req<{ started: boolean; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
+      `/api/automation/run`,
+      { method: "POST", body: "{}" }
+    ),
 
   // lead finder
   getLeadCategories: () => req<{ categories: string[] }>(`/api/leads/categories`),

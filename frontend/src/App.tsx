@@ -40,7 +40,16 @@ export default function App() {
     })();
     const onUnauth = () => setAuthed(false);
     window.addEventListener("dna-unauthorized", onUnauth);
-    return () => window.removeEventListener("dna-unauthorized", onUnauth);
+    // Screens deep-link to each other (Discovery → Settings) via this event.
+    const onNavigate = (e: Event) => {
+      const next = (e as CustomEvent).detail as Tab;
+      if (NAV.some((n) => n.id === next)) setTab(next);
+    };
+    window.addEventListener("dna-navigate", onNavigate);
+    return () => {
+      window.removeEventListener("dna-unauthorized", onUnauth);
+      window.removeEventListener("dna-navigate", onNavigate);
+    };
   }, []);
 
   function logout() {

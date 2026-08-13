@@ -16,8 +16,16 @@ import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
+import { runSendJob, buildFrom, isEmail } from "./send";
+import { discoveredWhere, approveLeads, NO_COUNTRY } from "./pool";
+import {
+  startAutomationWorker,
+  getAutomationStatus,
+  setAutomationConfig,
+  startAutomationRun,
+} from "./automation";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
-import { backfillCountries, normalizeCountry } from "./country";
+import { backfillCountries } from "./country";
 import { searchCompanies } from "./search";
 import { SCRAPE_PROVIDERS, getProxyConfig, getReaderKey } from "./config";
 import {
@@ -49,6 +57,7 @@ import {
 await ensureSchema();
 await seedAuthFromEnv();
 startDiscoveryWorker(); // always-on company discovery (browser-independent)
+startAutomationWorker(); // auto-approve a full pool → auto-send (browser-independent)
 
 // Give every lead and contact one canonical country. Rows saved before the
 // country was resolved properly are blank (the source's Country box was left
@@ -957,10 +966,13 @@ app.post("/api/import/pdf", async (c) => {
 
 app.post("/api/send", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const templateId = String(b.templateId || "");
+  // One template, or several that rotate across the recipients.
+  const templateIds: string[] = (Array.isArray(b.templateIds) ? b.templateIds : [b.templateId])
+    .map((x: any) => String(x || "").trim())
+    .filter(Boolean);
   let contactIds: string[] = Array.isArray(b.contactIds) ? b.contactIds : [];
   const perMinute = clamp(Number(b.perMinute) || 20, 1, 120);
-  if (!templateId) return c.json({ error: "templateId required" }, 400);
+  if (!templateIds.length) return c.json({ error: "templateId required" }, 400);
 
   // "Send to all matching" — resolve recipients server-side from the same filter
   // the recipient list uses, so you can target 100k+ without shipping every id.
@@ -982,7 +994,7 @@ app.post("/api/send", async (c) => {
 
   (async () => {
     try {
-      await runSendJob(job, templateId, contactIds, perMinute);
+      await runSendJob(job, templateIds, contactIds, perMinute);
       // Don't override an error status that runSendJob set intentionally.
       if (job.status === "running") { job.status = "done"; job.progress = 1; }
     } catch (e: any) {
@@ -1000,95 +1012,9 @@ app.get("/api/send/:id", (c) => {
   return c.json(serializeJob(job));
 });
 
-async function runSendJob(job: Job, templateId: string, contactIds: string[], perMinute: number) {
-  const tpl = (await q(`SELECT * FROM templates WHERE id=?`, [templateId]))[0];
-  if (!tpl) { job.status = "error"; job.error = "template not found"; return; }
-
-  const activeDomains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
-  const appUrl = ((await getSetting("app_url")) || process.env.APP_URL || "").replace(/\/+$/, "");
-  const replyTo = (await getSetting("reply_to")) || "";
-  const dryRun = !(await getResendKey());
-  if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
-
-  // Validate each active domain's sender up front so a misconfigured "From email"
-  // gives a clear, actionable error instead of a cryptic Resend rejection per email.
-  const domains: any[] = [];
-  for (const d of activeDomains) {
-    const r = buildFrom(d);
-    if ("error" in r) log(job, { level: "warn", msg: r.error });
-    else { d.__from = r.from; domains.push(d); }
-  }
-  if (!dryRun && activeDomains.length && !domains.length) {
-    job.status = "error";
-    job.error = "Every active sending domain has an invalid \"From email\". Fix it in Settings → Sending domains (use a full address like outreach@yourdomain.com), then try again.";
-    log(job, { level: "fail", msg: job.error });
-    return;
-  }
-  if (!activeDomains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend's test sender (onboarding@resend.dev)." });
-  if (!dryRun && !appUrl) log(job, { level: "warn", msg: "App URL not set in Settings — unsubscribe & open-tracking links will not work. Add it before real sends." });
-
-  const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
-  let di = 0;
-
-  for (const cid of contactIds) {
-    if (job.status === "error") break;
-    const contact = (await q(`SELECT * FROM contacts WHERE id=?`, [cid]))[0];
-    if (!contact) { job.result.skipped++; job.processed++; continue; }
-    if (contact.status === "unsubscribed" || contact.status === "bounced") {
-      job.result.skipped++;
-      job.processed++;
-      job.progress = job.total ? job.processed / job.total : 1;
-      log(job, { level: "skip", msg: `Skipped ${contact.email} (${contact.status})` });
-      continue;
-    }
-
-    let domain: any = null;
-    if (domains.length) {
-      for (let k = 0; k < domains.length; k++) {
-        const cand = domains[(di + k) % domains.length];
-        if (cand.sent_today < cand.daily_cap) { domain = cand; di = (di + k + 1) % domains.length; break; }
-      }
-      if (!domain) { log(job, { level: "warn", msg: "All domains hit their daily cap — stopping." }); break; }
-    }
-
-    const from = domain ? domain.__from : "DNA Outreach <onboarding@resend.dev>";
-    const subject = renderTemplate(tpl.subject, contact);
-    const sendId = uid();
-    const unsub = appUrl ? `${appUrl}/api/unsubscribe?c=${contact.id}` : "";
-    const pixel = appUrl ? `${appUrl}/api/open?s=${sendId}` : "";
-    const clickBase = appUrl ? `${appUrl}/api/click?s=${sendId}` : "";
-    const html = wrapHtml(renderTemplate(tpl.body, contact), unsub, pixel, clickBase);
-
-    const result = await sendEmail({
-      from, to: contact.email, subject, html,
-      replyTo: replyTo || undefined,
-      headers: unsub
-        ? { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }
-        : undefined,
-    });
-
-    const status = result.ok ? (result.dryRun ? "sent (dry-run)" : "sent") : "failed";
-    await q(
-      `INSERT INTO sends (id,contact_id,contact_email,template_id,domain_id,subject,status,error,sent_at,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [sendId, contact.id, contact.email, tpl.id, domain?.id ?? null, subject, status, result.error ?? null, nowIso(), nowIso()]
-    );
-
-    if (result.ok) {
-      job.result.sent++;
-      await q(`UPDATE contacts SET status='sent' WHERE id=? AND status='new'`, [contact.id]);
-      if (domain) { await q(`UPDATE domains SET sent_today = sent_today + 1 WHERE id=?`, [domain.id]); domain.sent_today++; }
-      log(job, { level: "sent", msg: `${status} → ${contact.email}` });
-    } else {
-      job.result.failed++;
-      log(job, { level: "fail", msg: `failed → ${contact.email}: ${result.error}` });
-    }
-
-    job.processed++;
-    job.progress = job.total ? job.processed / job.total : 1;
-    if (job.processed < job.total) await sleep(delayMs);
-  }
-}
+// The send pipeline (domain rotation, caps, pacing, tracking links, the sends
+// ledger) lives in ./send so the manual sender and the automation are the
+// same code path.
 
 /* --------------------------- Tracking / opt-out --------------------- */
 
@@ -1470,31 +1396,8 @@ app.post("/api/discovery/sources/:id/run", async (c) => {
 
 // ---- The review pool ----
 
-// Portable WHERE builder for the pool (status + country + free-text search).
-// Every bulk action reuses this, so "Approve all" acts on EXACTLY the rows the
-// table is showing — including the country filter.
-function discoveredWhere(opts: { status?: string | null; q?: string | null; hasEmail?: boolean; country?: string | null }) {
-  const where: string[] = [];
-  const params: any[] = [];
-  const status = opts.status;
-  const search = opts.q;
-  const country = String(opts.country || "").trim();
-  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
-  if (opts.hasEmail) where.push(`(email IS NOT NULL AND email <> '')`);
-  if (country) {
-    // "—" is the explicit "no country on file" bucket, so those leads are
-    // reviewable rather than invisible.
-    if (country === NO_COUNTRY) where.push(`(country IS NULL OR country = '')`);
-    else { where.push(`lower(country) = ?`); params.push(country.toLowerCase()); }
-  }
-  if (search) {
-    const like = `%${String(search).toLowerCase()}%`;
-    where.push(`(lower(name) LIKE ? OR lower(email) LIKE ? OR lower(domain) LIKE ? OR lower(category) LIKE ?)`);
-    params.push(like, like, like, like);
-  }
-  return { where, params, clause: where.length ? `WHERE ${where.join(" AND ")}` : "" };
-}
-const NO_COUNTRY = "__none__";
+// `discoveredWhere` / `approveLeads` / `NO_COUNTRY` / `ROLE_RE` live in ./pool,
+// so the buttons below and the automation approve through ONE path.
 
 app.get("/api/discovery/leads", async (c) => {
   const status = c.req.query("status") || "pending";
@@ -1545,56 +1448,19 @@ app.get("/api/discovery/leads", async (c) => {
   return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown });
 });
 
-const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|mail|team|marketing|hr|jobs|career|reception)/i;
-
 // Approve leads → create Contacts (only ones with an email) and mark 'approved'.
 // Accepts an explicit id list, or every matching pending lead (`all:true`).
 app.post("/api/discovery/leads/approve", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const category = String(b.category ?? "").trim() || null;
-  // Optional country override applied to every approved contact (blank = keep
-  // each lead's own). Normalised so an override always matches the spelling the
-  // filter and the Contacts list use.
-  const rawCountry = String(b.country ?? "").trim();
-  const country = normalizeCountry(rawCountry) || rawCountry || null;
-
-  let leads: any[];
-  if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, hasEmail: true, country: b.filterCountry });
-    leads = await q(`SELECT * FROM discovered_leads ${clause} LIMIT 5000`, params);
-  } else {
-    const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
-    if (!ids.length) return c.json({ added: 0, skipped: 0 });
-    const ph = ids.map(() => "?").join(",");
-    leads = await q(`SELECT * FROM discovered_leads WHERE id IN (${ph})`, ids);
-  }
-
-  let added = 0, skipped = 0;
-  const approvedIds: string[] = [];
-  const seenEmails = new Set<string>(); // guards against the same email twice in one batch
-  for (const l of leads) {
-    const email = cleanEmail(String(l.email || "")) || "";
-    approvedIds.push(l.id); // approving marks it handled even if it has no email
-    // A malformed address ("//info@x.com", "%20info@x.com") is unmailable —
-    // approve the lead but never promote the junk into Contacts.
-    if (!email || !isValidEmail(email)) { skipped++; continue; }
-    // Never attempt the same email twice in one request. The contacts.email
-    // UNIQUE constraint (ON CONFLICT DO NOTHING) is the hard guarantee; this just
-    // keeps the counts honest and avoids redundant inserts.
-    if (seenEmails.has(email)) { skipped++; continue; }
-    seenEmails.add(email);
-    const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, l.name || l.domain || null, country || l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
-    );
-    if (ins.length) added++; else skipped++; // skipped = already an existing Contact
-  }
-  if (approvedIds.length) {
-    const ph = approvedIds.map(() => "?").join(",");
-    await q(`UPDATE discovered_leads SET status='approved' WHERE id IN (${ph})`, approvedIds);
-  }
-  return c.json({ added, skipped });
+  const r = await approveLeads({
+    ids: Array.isArray(b.ids) ? b.ids : undefined,
+    all: b.all === true,
+    q: b.q,
+    filterCountry: b.filterCountry,
+    category: b.category,
+    country: b.country,
+  });
+  return c.json({ added: r.added, skipped: r.skipped });
 });
 
 // Reject leads (dismiss from the pool) — by ids or every matching pending lead.
@@ -1627,6 +1493,40 @@ app.post("/api/discovery/leads/delete", async (c) => {
   const ph = ids.map(() => "?").join(",");
   await q(`DELETE FROM discovered_leads WHERE id IN (${ph})`, ids);
   return c.json({ deleted: ids.length });
+});
+
+/* ----------------------------- Automation --------------------------- */
+// Hands-free outreach: when the review pool holds N leads that have an email,
+// approve that batch into Contacts and email them with the chosen template(s).
+// Config + live status + the run ledger come back in one call so the Settings
+// screen renders the whole panel from a single poll.
+
+app.get("/api/automation", async (c) => c.json(await getAutomationStatus()));
+
+app.post("/api/automation", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  await setAutomationConfig({
+    enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
+    threshold: b.threshold != null ? Number(b.threshold) : undefined,
+    templateIds: Array.isArray(b.templateIds) ? b.templateIds.map((x: any) => String(x)) : undefined,
+    templateMode: b.templateMode === "split" ? "split" : b.templateMode === "rotate" ? "rotate" : undefined,
+    category: typeof b.category === "string" ? b.category : undefined,
+    country: typeof b.country === "string" ? b.country : undefined,
+    perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
+    dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
+    cooldownMinutes: b.cooldownMinutes != null ? Number(b.cooldownMinutes) : undefined,
+    requireResend: typeof b.requireResend === "boolean" ? b.requireResend : undefined,
+  });
+  return c.json(await getAutomationStatus());
+});
+
+// Run right now — ignores the trigger count and the cooldown (that's the point
+// of a manual run) but still respects every safety check: a template must be
+// chosen, Resend must be connected, and the daily ceiling still applies.
+app.post("/api/automation/run", async (c) => {
+  const r = await startAutomationRun("manual");
+  if (!r.started) return c.json({ error: r.error || r.note || "Nothing to do right now" }, 400);
+  return c.json({ ...r, status: await getAutomationStatus() });
 });
 
 /* ------------------------------ History ----------------------------- */
@@ -1697,8 +1597,8 @@ app.get("/api/overview", async (c) => {
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
 function shorten(u: string) { try { const x = new URL(u); return x.hostname + x.pathname; } catch { return u; } }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-function isEmail(s: string) { return EMAIL_RE.test(String(s || "").trim()); }
+// `isEmail` / `buildFrom` live in ./send — the send pipeline owns them, so the
+// manual sender, the test email and the automation agree on a valid sender.
 
 // Clean a domain input: strip protocol, path, and leading www.
 function normalizeDomain(s: string) {
@@ -1710,24 +1610,6 @@ function resolveFromEmail(input: string, domain: string) {
   let v = String(input || "").trim();
   if (v && !v.includes("@") && domain) v = `${v}@${domain}`;
   return v.toLowerCase();
-}
-
-// Build an RFC-5322-safe "Name <email>" sender from a domain row.
-// Returns { from } on success or { error } with a clear, actionable message.
-function buildFrom(domain: any): { from: string } | { error: string } {
-  const email = String(domain?.from_email || "").trim();
-  if (!isEmail(email)) {
-    return {
-      error:
-        `Sending domain "${domain?.domain || "?"}" has an invalid "From email" (${email ? `"${email}"` : "empty"}). ` +
-        `It must be a full address like outreach@yourdomain.com. Fix it in Settings → Sending domains.`,
-    };
-  }
-  let name = String(domain?.from_name || "").trim();
-  if (!name) return { from: email };
-  // Quote the display name when it contains characters that would break the header.
-  if (/[",:;<>@\\]/.test(name)) name = `"${name.replace(/["\\]/g, "").trim()}"`;
-  return { from: `${name} <${email}>` };
 }
 
 function csvCell(v: any): string {

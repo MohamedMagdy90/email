@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type Domain } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
+import AutomationCard from "./Automation";
 
 export default function Settings() {
   const [resendKey, setResendKey] = useState("");
@@ -64,7 +65,12 @@ export default function Settings() {
 
   return (
     <div>
-      <Header title="Settings" subtitle="Connect Resend and manage your sending domains." />
+      <Header title="Settings" subtitle="Connect Resend, automate your outreach, and manage your sending domains." />
+
+      {/* Automation — auto-approve a full pool of leads, then auto-send */}
+      <div className="mb-8">
+        <AutomationCard />
+      </div>
 
       <div className="grid gap-5 lg:grid-cols-2">
         {/* Resend */}

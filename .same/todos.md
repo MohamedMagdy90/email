@@ -1,3 +1,71 @@
+# Automation — auto-approve at N emails → auto-send ✅ shipped & verified
+
+## What it does
+When the discovery pool holds N (default 100) PENDING leads that have an email,
+the server approves that batch into Contacts and emails them with the configured
+template(s) — no clicking Approve, no picking recipients, no Send. Configurable
+in Settings → Automation, and every run (including the ones it refuses) is
+written to a ledger you can read back.
+
+## Backend
+- [x] `db.ts`: `automation_runs` table (trigger, status, pool_count, approved,
+      contacts_added, sent/failed/skipped, template names, job id, note, error,
+      timings) + `idx_automation_runs_started`.
+- [x] `pool.ts` (new): `discoveredWhere` + `approveLeads()` moved out of index.ts,
+      so the Approve buttons AND the automation share ONE path — same country
+      filter (incl. the `__none__` bucket), same `cleanEmail`/`isValidEmail`
+      guard, same `normalizeCountry` override. Returns the new contact ids (how
+      the automation knows exactly who to email) and takes `limit` +
+      `oldestFirst` so the pool drains FIFO in fixed batches.
+- [x] `send.ts` (new): `runSendJob` (+ `buildFrom` / `isEmail`) moved out of
+      index.ts; now accepts MULTIPLE template ids and rotates them per recipient.
+      `/api/send` accepts `templateIds` as well as `templateId`.
+- [x] `automation.ts` (new): config read/write, threshold watcher tick (60s), run
+      executor (approve → send), cooldown + daily ceiling + safety checks, history.
+- [x] `index.ts`: `/api/automation` (GET config+status+runs, POST save,
+      POST /run manual); automation worker started on boot.
+
+## Frontend
+- [x] `api.ts`: `AutomationConfig` / `AutomationRun` / `AutomationStatus` +
+      `getAutomation` / `saveAutomation` / `runAutomation`.
+- [x] Settings → **Automation** card: on/off, trigger size, multi-template picker
+      with rotate-vs-split, category + country, send rate, daily ceiling,
+      cooldown, progress-to-trigger bar, live batch progress, blockers panel,
+      run history, **Run now**.
+- [x] Discovery → **automation strip** under the stat row: off ⇒ "these leads
+      wait until you approve them" + Set up automation; on ⇒ live progress to the
+      trigger, "emailing a batch right now", the first blocker if it can't run,
+      and sent-today. Deep-links to Settings through a `dna-navigate` event
+      handled by the app shell (`goTo()` in `lib/ui`), so screens stay decoupled.
+
+## Safety rails (all verified)
+- A batch is never bigger than the trigger size, nor than what's left of the
+  daily ceiling — leftovers wait for the next batch.
+- Cooldown between runs, counted from the last run that did work, so a refusal
+  can't keep pushing the next real run away.
+- Refuses to run with no Resend key (`requireResend`), so a dry run can't
+  silently mark a whole pool as emailed.
+- Leads without an email never count toward the trigger and are never approved.
+
+## Verified
+- **38/38 in-process checks** on a throwaway DB: trigger counting · no-Resend
+  refusal (+ ledger row + UI blocker) · batch = threshold · FIFO order ·
+  category/country applied · contacts marked sent · merge tags rendered ·
+  dry-run sends labelled `sent (dry-run)` · rotate advances the template · daily
+  ceiling exact (partial batch of 2 to land on 12/12) · empty pool refused
+  without spamming the ledger · no run left hanging in `running`.
+- **Live over HTTP**: `/api/automation` 401 without a token; GET/POST config;
+  `POST /run` on an empty pool → 400 (not 500); then with 4 leads and a threshold
+  of 3 the **worker fired on its own** — "pool reached 4/3 … approved 3 → sent 3",
+  leftover 1 left waiting.
+- backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+
+## Housekeeping
+- `frontend/tsconfig.json`: dropped the removed `baseUrl` option (TS 5.9 errors
+  on it); `paths` still resolves `@/*` relative to the config.
+
+---
+
 # Infinite-scroll directory (tdv.motc.gov.qa) + archive sources
 
 ## Verified root cause — tdv.motc.gov.qa/business-directory (1,318 companies, only 1 harvested)
