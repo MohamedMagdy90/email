@@ -89,6 +89,26 @@ function markKeyRejected(key: string, status: number): void {
   keyState.set(key, { rejectedAt: Date.now(), status });
 }
 
+/**
+ * A short, non-secret fingerprint for a key, so the UI can list and delete
+ * individual keys without ever displaying one in full.
+ * "jina_1a2b3c4d5e6f7g8h" → "jina_1a2…7g8h"
+ */
+export function maskReaderKey(key: string): string {
+  const k = String(key || "").trim();
+  if (k.length <= 12) return k.replace(/.(?=.{3})/g, "•");
+  return `${k.slice(0, 8)}…${k.slice(-4)}`;
+}
+
+/** Per-key health, for the Settings list. Never returns the key itself. */
+export function readerKeyHealth(keys: string[]): { masked: string; live: boolean; status: number }[] {
+  return keys.map((k) => ({
+    masked: maskReaderKey(k),
+    live: keyIsUsable(k),
+    status: keyState.get(k)?.status ?? 0,
+  }));
+}
+
 // Reader health, surfaced in the Discovery UI so the operator knows when the
 // free tier is saturated and it's time to add a free key or a scraping proxy.
 let readerCalls = 0;

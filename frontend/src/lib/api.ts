@@ -350,8 +350,26 @@ export const api = {
       appUrl: string;
       replyTo: string;
       scrape: { configured: boolean; provider: string; mode: "blocked" | "always"; premium: boolean };
-      reader: { configured: boolean; fromEnv: boolean; savedKeys: number };
+      reader: {
+        configured: boolean;
+        fromEnv: boolean;
+        savedKeys: number;
+        // One entry per key in the pool. `masked` is a fingerprint, never the
+        // key itself — it is also the handle used to delete one.
+        keys: { masked: string; live: boolean; status: number }[];
+      };
     }>(`/api/settings`),
+  // Add ONE key to the pool. Appends — it never replaces what is stored.
+  addReaderKey: (key: string) =>
+    req<{ ok: boolean; added: number; duplicates: number; total: number }>(`/api/settings/reader-key`, {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  removeReaderKey: (masked: string) =>
+    req<{ ok: boolean; total: number }>(`/api/settings/reader-key`, {
+      method: "DELETE",
+      body: JSON.stringify({ masked }),
+    }),
   saveSettings: (s: {
     resend_api_key?: string;
     app_url?: string;

@@ -11,7 +11,7 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import { fetchViaProxy, fetchViaReader, parseReaderKeys, type ScrapeProvider } from "./crawler/fetcher";
+import { fetchViaProxy, fetchViaReader, parseReaderKeys, readerKeyHealth, maskReaderKey, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
@@ -507,12 +507,47 @@ app.get("/api/settings", async (c) => {
       // Free crawler is always on; a key just raises the free rate limit.
       configured: !!(await getSetting("jina_api_key")),
       fromEnv: !!process.env.JINA_API_KEY,
-      // How many keys are in the pool. Several free keys can be saved
-      // comma-separated; the crawler rotates through them so one running out of
-      // tokens no longer drops the whole bot to the 20/min free tier.
+      // The pool, one entry per key. Keys are added and removed individually,
+      // so the UI never has to show or re-send one that is already stored —
+      // and each is listed only as a masked fingerprint.
+      keys: readerKeyHealth(parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "")),
       savedKeys: parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").length,
     },
   });
+});
+
+/* ----------------------- Reader key pool (add/remove) ------------------- */
+// Deliberately append/remove rather than "save the whole field". The single
+// text box replaced everything it held, and because it was a password input
+// that cleared itself, adding a second key silently destroyed the first.
+
+app.post("/api/settings/reader-key", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const incoming = parseReaderKeys(String(b.key || ""));
+  if (!incoming.length) return c.json({ error: "Paste a key first." }, 400);
+
+  const existing = parseReaderKeys((await getSetting("jina_api_key")) || "");
+  const merged = [...existing];
+  let added = 0;
+  let duplicates = 0;
+  for (const k of incoming) {
+    if (merged.includes(k)) { duplicates++; continue; }
+    merged.push(k);
+    added++;
+  }
+  await setSetting("jina_api_key", merged.join(","));
+  return c.json({ ok: true, added, duplicates, total: merged.length });
+});
+
+app.delete("/api/settings/reader-key", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const masked = String(b.masked || "");
+  if (!masked) return c.json({ error: "Which key?" }, 400);
+  const existing = parseReaderKeys((await getSetting("jina_api_key")) || "");
+  const kept = existing.filter((k) => maskReaderKey(k) !== masked);
+  if (kept.length === existing.length) return c.json({ error: "That key is no longer saved." }, 404);
+  await setSetting("jina_api_key", kept.join(","));
+  return c.json({ ok: true, total: kept.length });
 });
 
 app.post("/api/settings", async (c) => {

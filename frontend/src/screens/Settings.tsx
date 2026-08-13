@@ -277,30 +277,51 @@ function ReaderCard() {
   const [apiKey, setApiKey] = useState("");
   const [configured, setConfigured] = useState(false);
   const [fromEnv, setFromEnv] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [adding, setAdding] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [savedKeyCount, setSavedKeyCount] = useState(0);
+  const [keys, setKeys] = useState<{ masked: string; live: boolean; status: number }[]>([]);
+  const [removing, setRemoving] = useState("");
+
   async function load() {
     try {
       const s = await api.getSettings();
       setConfigured(s.reader.configured);
       setFromEnv(s.reader.fromEnv);
-      setSavedKeyCount(s.reader.savedKeys || 0);
+      setKeys(s.reader.keys || []);
     } catch { /* ignore */ }
   }
   useEffect(() => { load(); }, []);
   const keyed = configured || fromEnv;
-  async function save() {
-    setSaving(true);
+  const liveCount = keys.filter((k) => k.live).length;
+
+  // Append, never replace. Pasting a second key used to wipe the first,
+  // because the field saved its whole contents and cleared itself afterwards.
+  async function add() {
+    if (!apiKey.trim()) return;
+    setAdding(true);
     try {
-      await api.saveSettings({ jina_api_key: apiKey });
-      toast(apiKey ? "Reader key saved" : "Reader key cleared", "success");
+      const r = await api.addReaderKey(apiKey);
       setApiKey("");
-      load();
+      await load();
+      if (r.added && r.duplicates) toast(`Added ${r.added} key — ${r.duplicates} already saved`, "success");
+      else if (r.added) toast(r.total > 1 ? `Key added — ${r.total} in the pool` : "Key added", "success");
+      else toast("That key is already saved", "info");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
-      setSaving(false);
+      setAdding(false);
+    }
+  }
+  async function remove(masked: string) {
+    setRemoving(masked);
+    try {
+      await api.removeReaderKey(masked);
+      await load();
+      toast("Key removed", "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setRemoving("");
     }
   }
   async function test() {
@@ -308,49 +329,90 @@ function ReaderCard() {
     try {
       const r = await api.testReader();
       toast(`Free reader works — rendered ${r.bytes.toLocaleString()} bytes${r.keyed ? " (with your key)" : ""}`, "success");
+      load(); // a 402 during the test retires the key — reflect that immediately
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
       setTesting(false);
     }
   }
+
   return (
     <Card className="space-y-4 p-5">
       <div className="flex items-center justify-between">
         <div className="font-clash text-lg font-semibold">Free reader <span className="text-muted">(no payment)</span></div>
-        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">{keyed ? "on · keyed" : "on · free"}</Badge>
+        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">
+          {liveCount > 0 ? `on · ${liveCount} key${liveCount > 1 ? "s" : ""}` : keyed ? "on · keys spent" : "on · free"}
+        </Badge>
       </div>
       <p className="text-[13px] text-muted">
         The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
         built-in reader — <b>no scraping proxy needed</b>. When a site still won't open, it falls back to the{" "}
-        <b>Wayback Machine</b>, which is also free and unlimited. Adding free API keys from{" "}
+        <b>Wayback Machine</b>, which is also free and unlimited. Each free key from{" "}
         <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a>{" "}
-        raises the reader's rate limit from 20 to 120 pages/min.
-        {fromEnv && <span className="text-good"> A key is set via the server environment.</span>}
+        carries its own token allowance and its own rate limit, so <b>adding a second and third key multiplies both</b> —
+        the crawler rotates through them and only slows down if every key runs dry.
+        {fromEnv && <span className="text-good"> A key is also set via the server environment.</span>}
       </p>
+
+      {/* The saved pool. Keys are listed as fingerprints, never in full, and are
+          removed one at a time — so adding a key can't destroy the others. */}
+      {keys.length > 0 && (
+        <div className="space-y-1.5">
+          {keys.map((k) => (
+            <div
+              key={k.masked}
+              className={cn(
+                "flex items-center justify-between rounded-xl border px-3 py-2",
+                k.live ? "border-line bg-paper" : "border-bad/30 bg-bad/[0.04]"
+              )}
+            >
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", k.live ? "bg-good" : "bg-bad")} />
+                <code className="truncate font-mono text-[12px] text-ink/75">{k.masked}</code>
+                {!k.live && (
+                  <span className="shrink-0 text-[11px] text-bad">
+                    {k.status === 402 ? "out of tokens" : k.status === 401 ? "invalid" : "not working"}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => remove(k.masked)}
+                disabled={removing === k.masked}
+                className="shrink-0 text-[11px] font-medium text-muted underline transition-colors hover:text-bad disabled:opacity-40"
+              >
+                {removing === k.masked ? "removing…" : "remove"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <Field
-        label="Jina Reader API key(s)"
+        label={keys.length ? "Add another key" : "Jina Reader API key"}
         hint={
-          savedKeyCount > 1
-            ? `${savedKeyCount} keys saved — the crawler rotates through them, so one running out of tokens no longer slows anything down.`
-            : configured
-              ? "One key saved. Paste a second and third (comma-separated) so running out of tokens can't drop you to 20 pages/min."
-              : "Optional. Paste several separated by commas — each free key carries its own token allowance."
+          keys.length
+            ? "Paste one key and press Add. Your existing keys are kept."
+            : "Optional — the reader works without one at 20 pages/min. With a key it does 120."
         }
       >
-        <Input
-          type="password"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder={configured ? "•••••••• (saved)" : "jina_abc…, jina_def…"}
-        />
+        <div className="flex gap-2">
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+            placeholder="jina_…"
+            className="flex-1"
+          />
+          <Button loading={adding} onClick={add} disabled={!apiKey.trim()}>Add</Button>
+        </div>
       </Field>
+
       <div className="flex items-center justify-between border-t border-line pt-4">
         <span className="text-xs text-muted">Used automatically before any paid proxy.</span>
-        <div className="flex gap-2">
-          <Button variant="outline" loading={testing} onClick={test}>Test</Button>
-          <Button loading={saving} onClick={save}>Save</Button>
-        </div>
+        <Button variant="outline" loading={testing} onClick={test}>Test</Button>
       </div>
     </Card>
   );
