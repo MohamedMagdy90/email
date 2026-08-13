@@ -250,3 +250,65 @@ Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
   real fix for those (`vymaps`, `datanyze`, `muqawil`, `arablocal` …)
 - Local dev SQLite corrupts if the bun process is SIGKILLed while holding the
   WAL. Shut the dev server down with plain `kill`, never `kill -9`.
+
+## Crawler efficiency rollout (agreed 2026-08-13)
+
+Diagnosis: search is healthy; enrichment collapsed when the Jina key hit HTTP 402
+at 07:45:12 (~10 blocks/21min before → ~56 blocks/7min after). On top of that
+~1 in 5 crawls is a re-crawl of a domain we already resolved.
+
+### Phase 2 — recover wasted capacity (free, needs nothing from the user)
+- [x] 4. Domain tombstone: new `pool_domains` ledger claims a domain atomically on
+      insert and never releases it, so promoting `dedup_key` to `e:<email>` can no
+      longer let the same site be re-discovered and re-crawled. Backfilled on boot.
+- [x] 5. Split retry ladder: `blockReason` now surfaces on `SiteResult`;
+      cloudflare/403 → 2 tries (30m, 6h) then parked, transient → full 6-try ladder
+- [x] 6. `isNonProspectHost()` in search.ts is now the single gate, applied at
+      insert, at enrich, and in a boot sweep (`sweepNonProspectLeads`). Added
+      `AGGREGATOR_BLOCK` + `.directory`-style TLD guard + `domainLooksForeign()`
+- [x] 7. robots.txt + sitemap deferred until the seed answers; a walled site now
+      costs 1 request instead of 7, and a hard block stops the crawl immediately
+- [x] 8. Enrich batch de-duplicated by registrable domain (`more` measured on the
+      pre-filter list so the chain doesn't stall)
+
+Verified end-to-end on a scratch DB: 8 seeded leads → backfill claimed 8, sweep
+retired 6 junk (nascar/datanyze/ohio/.directory/herecareers/muqawil), the two real
+companies survived, and a resolved domain could no longer be re-claimed.
+
+NOTE: local `backend/data.sqlite` was already corrupt at 07:51 (pre-existing WAL
+issue, identical backup in .same/corrupt-db-backup). Moved to
+.same/corrupt-db-backup-2 and recreated empty. Production is Postgres — unaffected.
+
+### Phase 1 — free bypass capacity
+- [x] 1. UI/logs no longer lie: `bypass.readerKeys{Configured,Live}` + `readerKeyRejected`
+      come from the fetcher's real observations, badge turns RED on exhaustion
+- [x] 2. Multi-key rotation: comma/newline separated keys, per-key rejection with a
+      30m re-test, round-robin. One key dying no longer drops the bot to 20/min.
+- [x] 3. Wayback tier (`web.archive.org/web/2id_/…`) inserted between the reader and
+      the paid proxy. Budgeted to 2 calls/site (≈11s each), and the sitemap is
+      skipped when the seed only arrived via reader/archive/proxy.
+
+Live-tested Wayback against the 5 sites that hard-blocked in the log:
+  qgcontracting.com  → quantumcont14@gmail.com
+  benzcontracting.ae → info@benzcontracting.ae
+  kon-uae.com        → info@kon-uae.com
+  qmic.com           → business@qmic.com
+  baobabtrading.com  → archive 403 (the only miss)
+Key pool tested with 3 bogus keys: rotated 1→2→3, fell through to the free tier,
+still returned the page, and flipped keyRejected=true so the UI goes red.
+
+### Phase 3 — email quality
+- [x] 9. `PLACEHOLDER_LOCAL` catches yoursite@ / youremail@ / example@ on any domain
+- [x] 10. `roleRank()` orders info/sales > support > finance > person > hr > abuse
+      /no-reply, and BOTH pickers now use it (discovery.ts previously preferred
+      personal addresses while enrich.ts preferred role ones — they disagreed)
+- [x] 11. `MAILTO_ARTIFACT` rejects mailoinfo@ / mailtoinfo@ while keeping
+      mail@, mailbox@, mailroom@
+- [x] 12. Query saturation: new `search_query_stats` table. Two consecutive
+      zero-yield passes cools a query off for 6h, doubling to 72h max; ANY yield
+      resets it. Deliberately a cool-off, not a permanent skip.
+
+INCIDENT: the apply model duplicated ~900 lines of discovery.ts and invented two
+bogus helpers during item 12. Repaired by deleting lines 1851-2702 and 2749-2779;
+verified all 17 exports still present and typecheck clean. No git repo here, so
+/tmp/discovery.broken.ts was kept until the repair was confirmed, then removed.

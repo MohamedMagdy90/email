@@ -62,7 +62,7 @@ export default function Discovery() {
   const [reEnriching, setReEnriching] = useState(false);
   const [badNames, setBadNames] = useState<{ leads: number; contacts: number } | null>(null);
   const [repairing, setRepairing] = useState(false);
-  const [repairLog, setRepairLog] = useState<string>("");
+  const [repairLog, setRepairLog] = useState("");
 
   // add / edit source
   const [modalOpen, setModalOpen] = useState(false);
@@ -297,6 +297,9 @@ export default function Discovery() {
           onToggle={toggleBot}
           readerKeyed={status?.bypass?.readerKeyed}
           proxied={status?.bypass?.proxy}
+          keysLive={status?.bypass?.readerKeysLive}
+          keysConfigured={status?.bypass?.readerKeysConfigured}
+          keyRejected={status?.bypass?.readerKeyRejected}
         />
       </div>
 
@@ -657,7 +660,9 @@ export default function Discovery() {
 
 /* ------------------------------ Bot switch ----------------------------- */
 
-function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean }) {
+function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied, keysLive, keysConfigured, keyRejected }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean; keysLive?: number; keysConfigured?: number; keyRejected?: boolean }) {
+  const live = keysLive ?? 0;
+  const configured = keysConfigured ?? 0;
   return (
     <div className={cn("w-full shrink-0 rounded-2xl border p-4 sm:w-[300px]", running ? "border-good/40 bg-good/[0.06]" : "border-line bg-paper")}>
       <div className="flex items-center justify-between">
@@ -677,12 +682,28 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
         </div>
         <Switch checked={running} onChange={onToggle} />
       </div>
-      {/* Whether the crawler is keyed decides how many sites it can actually
-          read. Stating it here means never having to infer it from a log. */}
-      <div className="mt-3 flex items-center gap-1.5 border-t border-line/60 pt-2.5 text-[11px]">
-        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", readerKeyed || proxied ? "bg-good" : "bg-ink/25")} />
-        {readerKeyed ? (
-          <span className="text-ink/60">Jina key active · <span className="font-medium text-ink/75">120 pages/min</span></span>
+      {/* How much bypass capacity the crawler ACTUALLY has. This used to read
+          "Jina key active · 120 pages/min" whenever a key string existed in
+          Settings — so when the key ran out of tokens the header kept claiming
+          full speed while the crawler crawled at 15/min for hours. It now
+          reports what the fetcher observed on its last call. */}
+      <div className="mt-3 flex items-start gap-1.5 border-t border-line/60 pt-2.5 text-[11px]">
+        <span className={cn(
+          "mt-1 h-1.5 w-1.5 shrink-0 rounded-full",
+          keyRejected ? "bg-bad" : live > 0 || proxied ? "bg-good" : "bg-ink/25"
+        )} />
+        {keyRejected ? (
+          <span className="text-bad">
+            <span className="font-medium">
+              {configured > 1 ? `All ${configured} Jina keys are out of tokens` : "Jina key is out of tokens"}
+            </span>
+            {" "}— crawling at 20 pages/min.{" "}
+            <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium underline">get another free key</a>
+          </span>
+        ) : live > 0 ? (
+          <span className="text-ink/60">
+            {live > 1 ? `${live} Jina keys active` : "Jina key active"} · <span className="font-medium text-ink/75">120 pages/min</span>
+          </span>
         ) : proxied ? (
           <span className="text-ink/60">Scraping proxy active</span>
         ) : (

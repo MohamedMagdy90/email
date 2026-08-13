@@ -279,11 +279,13 @@ function ReaderCard() {
   const [fromEnv, setFromEnv] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [savedKeyCount, setSavedKeyCount] = useState(0);
   async function load() {
     try {
       const s = await api.getSettings();
       setConfigured(s.reader.configured);
       setFromEnv(s.reader.fromEnv);
+      setSavedKeyCount(s.reader.savedKeys || 0);
     } catch { /* ignore */ }
   }
   useEffect(() => { load(); }, []);
@@ -320,20 +322,27 @@ function ReaderCard() {
       </div>
       <p className="text-[13px] text-muted">
         The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
-        built-in reader — <b>no scraping proxy needed</b>. Adding a free API key from{" "}
-        <a href="https://jina.ai/reader" target="_blank" rel="noreferrer" className="underline">jina.ai/reader</a>{" "}
-        just raises the rate limit for large PDF imports. It works fine without one.
+        built-in reader — <b>no scraping proxy needed</b>. When a site still won't open, it falls back to the{" "}
+        <b>Wayback Machine</b>, which is also free and unlimited. Adding free API keys from{" "}
+        <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a>{" "}
+        raises the reader's rate limit from 20 to 120 pages/min.
         {fromEnv && <span className="text-good"> A key is set via the server environment.</span>}
       </p>
       <Field
-        label="Jina Reader API key (optional)"
-        hint={configured ? "A key is saved. Enter a new one to replace it, or clear the box and save to remove." : "Leave empty to use the free tier."}
+        label="Jina Reader API key(s)"
+        hint={
+          savedKeyCount > 1
+            ? `${savedKeyCount} keys saved — the crawler rotates through them, so one running out of tokens no longer slows anything down.`
+            : configured
+              ? "One key saved. Paste a second and third (comma-separated) so running out of tokens can't drop you to 20 pages/min."
+              : "Optional. Paste several separated by commas — each free key carries its own token allowance."
+        }
       >
         <Input
           type="password"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
-          placeholder={configured ? "•••••••• (saved)" : "jina_… (optional)"}
+          placeholder={configured ? "•••••••• (saved)" : "jina_abc…, jina_def…"}
         />
       </Field>
       <div className="flex items-center justify-between border-t border-line pt-4">

@@ -222,6 +222,160 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN enrich_status TEXT`); } catch { /* exists */ }
   // Due-lead scan hits (enriched=0, next_enrich_at) on every enrich tick.
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
+  // Domain lookups (the pool-domain backfill + junk sweeps scan by domain).
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_domain ON discovered_leads(domain)`); } catch { /* ignore */ }
+
+  /* ------------------------- Pool domain ledger ------------------------ */
+
+  // ONE permanent row per domain the discovery pool has ever considered.
+  //
+  // discovered_leads.dedup_key cannot do this job on its own: when enrichment
+  // finds an address we promote the key from "d:<domain>" to "e:<email>" (so a
+  // future lead carrying that address collides). That promotion FREES the
+  // domain key — so the next search query re-inserts the very same site and we
+  // crawl all six of its pages again. In production roughly one crawl in five
+  // was a re-crawl of a domain we had already resolved.
+  //
+  // This ledger is the durable claim. It outlives the lead row, so approving,
+  // deleting or retiring a lead can never make its domain crawlable again.
+  //   outcome: seen | found | empty | blocked | junk
+  await q(`CREATE TABLE IF NOT EXISTS pool_domains (
+    domain TEXT PRIMARY KEY,
+    outcome TEXT NOT NULL DEFAULT 'seen',
+    first_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+
+  /* ---------------------- Search query saturation ---------------------- */
+
+  // Per (source, query, page): how many consecutive passes it produced nothing
+  // new, and the earliest time it is worth asking again.
+  //
+  // A country/city/keyword pair saturates — after a few passes "civil
+  // contractor Fujairah UAE" has surfaced everything the engine will show us,
+  // and in the production log whole batches came back "+0 new" while still
+  // costing a request each and counting against the engine's rate limit.
+  //
+  // Deliberately a COOL-OFF, not a permanent skip: sites get published, so a
+  // saturated query becomes useful again later. The wait doubles (6h → 72h max)
+  // and resets to zero the moment the query yields anything.
+  await q(`CREATE TABLE IF NOT EXISTS search_query_stats (
+    source_id TEXT NOT NULL,
+    q TEXT NOT NULL,
+    offset_n INTEGER NOT NULL DEFAULT 0,
+    zero_streak INTEGER NOT NULL DEFAULT 0,
+    retry_after TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, q, offset_n)
+  )`);
+}
+
+/* ---------------------- Search query saturation ------------------------ */
+
+const ZERO_STREAK_BEFORE_COOLOFF = 2;
+const COOLOFF_BASE_H = 6;
+const COOLOFF_MAX_H = 72;
+
+/** Queries for this source that are still cooling off right now. */
+export async function loadSaturatedQueries(sourceId: string): Promise<Set<string>> {
+  const rows = await q(
+    `SELECT q, offset_n FROM search_query_stats
+      WHERE source_id=? AND retry_after IS NOT NULL AND retry_after > ?`,
+    [sourceId, nowIso()]
+  );
+  return new Set(rows.map((r) => `${r.q}|${r.offset_n}`));
+}
+
+/**
+ * Record what a query produced. Anything above zero clears the streak
+ * immediately, so a query only cools off while it is genuinely exhausted.
+ */
+export async function recordQueryYield(
+  sourceId: string,
+  queryText: string,
+  offset: number,
+  foundNew: number
+): Promise<void> {
+  const now = nowIso();
+  if (foundNew > 0) {
+    await q(
+      `INSERT INTO search_query_stats (source_id,q,offset_n,zero_streak,retry_after,updated_at)
+       VALUES (?,?,?,0,NULL,?)
+       ON CONFLICT (source_id,q,offset_n) DO UPDATE SET zero_streak=0, retry_after=NULL, updated_at=?`,
+      [sourceId, queryText, offset, now, now]
+    );
+    return;
+  }
+  const prev = (await q(
+    `SELECT zero_streak FROM search_query_stats WHERE source_id=? AND q=? AND offset_n=?`,
+    [sourceId, queryText, offset]
+  ))[0];
+  const streak = (Number(prev?.zero_streak) || 0) + 1;
+  let retryAfter: string | null = null;
+  if (streak >= ZERO_STREAK_BEFORE_COOLOFF) {
+    const hours = Math.min(COOLOFF_MAX_H, COOLOFF_BASE_H * 2 ** (streak - ZERO_STREAK_BEFORE_COOLOFF));
+    retryAfter = new Date(Date.now() + hours * 3_600_000).toISOString();
+  }
+  await q(
+    `INSERT INTO search_query_stats (source_id,q,offset_n,zero_streak,retry_after,updated_at)
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT (source_id,q,offset_n) DO UPDATE SET zero_streak=?, retry_after=?, updated_at=?`,
+    [sourceId, queryText, offset, streak, retryAfter, now, streak, retryAfter, now]
+  );
+}
+
+/* -------------------------- Pool domain ledger ------------------------- */
+
+/**
+ * Atomically CLAIM a domain for the discovery pool.
+ *
+ * Returns true only for the caller that inserted the row. Two search sources
+ * running concurrently can hand us the same domain in the same millisecond, so
+ * a SELECT-then-INSERT would let both through; the unique PK makes the insert
+ * itself the arbiter.
+ */
+export async function claimPoolDomain(domain: string, outcome = "seen"): Promise<boolean> {
+  const d = (domain || "").trim().toLowerCase();
+  if (!d) return false;
+  const now = nowIso();
+  const rows = await q(
+    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
+     VALUES (?,?,?,?)
+     ON CONFLICT (domain) DO NOTHING RETURNING domain`,
+    [d, outcome, now, now]
+  );
+  return rows.length > 0;
+}
+
+/** Record how a domain ended up (found / empty / blocked / junk). Never unclaims. */
+export async function closePoolDomain(domain: string, outcome: string): Promise<void> {
+  const d = (domain || "").trim().toLowerCase();
+  if (!d) return;
+  const now = nowIso();
+  await q(
+    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
+     VALUES (?,?,?,?)
+     ON CONFLICT (domain) DO UPDATE SET outcome = ?, updated_at = ?`,
+    [d, outcome, now, now, outcome, now]
+  );
+}
+
+/**
+ * Seed the ledger from what the pool already holds. Runs on every boot and is
+ * idempotent — without it, the ~9k domains discovered before this table existed
+ * would all be treated as brand new and re-crawled once each.
+ */
+export async function backfillPoolDomains(): Promise<number> {
+  const now = nowIso();
+  const rows = await q(
+    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
+     SELECT DISTINCT lower(domain), 'seen', ?, ?
+       FROM discovered_leads
+      WHERE domain IS NOT NULL AND domain <> ''
+     ON CONFLICT (domain) DO NOTHING RETURNING domain`,
+    [now, now]
+  );
+  return rows.length;
 }
 
 /* ---------------------------- Crawl ledger ---------------------------- */

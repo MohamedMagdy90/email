@@ -304,6 +304,67 @@ const US_MARKERS: RegExp[] = [
 ];
 const US_COUNTRY = /^(usa?|united states( of america)?|u\.s\.a?\.?|america|canada)$/i;
 
+// A US state or state-abbreviation baked into the DOMAIN itself
+// ("blackoakconstructionohio.com", "texassteelworks.com"). The title guard
+// below only sees the page headline, and a site whose headline is
+// "General Contractor Medina, OH" is caught — but one that simply says
+// "Black Oak Construction" is not, even though its domain says Ohio.
+const US_IN_DOMAIN = new RegExp(`(?:${US_STATE})(?:[a-z]*)?$|^(?:${US_STATE})`, "i");
+
+/**
+ * True when a registrable DOMAIN is plainly American and the search wasn't.
+ * Deliberately domain-only (never the full host) so "ohio.ae" style false
+ * positives on a ccTLD can't happen — we check the domain's first label.
+ */
+export function domainLooksForeign(domain: string, expectCountry: string): boolean {
+  const want = (expectCountry || "").trim();
+  if (!want || US_COUNTRY.test(want)) return false;
+  const core = (domain || "").toLowerCase().split(".")[0] || "";
+  if (core.length < 8) return false; // too short to contain a state name meaningfully
+  return US_IN_DOMAIN.test(core);
+}
+
+// Aggregators, data brokers, map-scrapers, job boards and B2B lead sites that
+// the existing lists miss. Every host named here appeared in a production log
+// being crawled as if it were a lead — each one is a guaranteed dead end AND
+// sits behind Cloudflare, so it costs a full six-page crawl plus six retries to
+// learn nothing at all.
+export const AGGREGATOR_BLOCK =
+  /(^|\.)(datanyze|salaryexpert|payscale|glassdoor|levels\.fyi|mapcarta|vymaps|wikimapia|openstreetmap|mapquest|waze|foursquare|tradeford|exporthub|projectsuppliers|go4worldbusiness|b2brazil|tradewheel|muqawil|everlist|emaratfinder|arablocal|yoys|epageuae|herecareers|consultancy-me|jusmundi|lawyers?\w*directory|hailspectrum|weather\w*|nascar|espn)\.[a-z.]+$/i;
+
+// A whole TLD that only ever hosts listings/blogs, never a trading company.
+// "emarat.directory" slipped past DIRECTORY_HOST_RE because that pattern looks
+// for "directory" in a LABEL, and here it is the top-level domain itself.
+const LISTING_TLD = /\.(?:directory|wiki|blog|news|review|reviews|guide|info)$/i;
+
+/**
+ * The single "this host can NEVER be a prospect" gate.
+ *
+ * Every blocklist in this file already runs when a search result is inserted —
+ * but they only ran at INSERT time, so the thousands of rows discovered under
+ * older, weaker rules were never re-examined and kept getting crawled. Those
+ * legacy rows are the worst possible work: aggregators, job boards, hotel
+ * chains and news sites are never leads AND carry the heaviest bot protection,
+ * so each one burns a full multi-page crawl and six retries to learn nothing.
+ *
+ * Exported so enrichment and the boot sweep apply exactly the same rules the
+ * search inserter does — one definition, no drift.
+ */
+export function isNonProspectHost(host: string): boolean {
+  const h = (host || "").trim().toLowerCase().replace(/^www\./, "");
+  if (!h) return true;
+  return (
+    BLOCK.test(h) ||
+    CONTENT_BLOCK.test(h) ||
+    SETUP_BLOCK.test(h) ||
+    OFFICIAL_BLOCK.test(h) ||
+    AGGREGATOR_BLOCK.test(h) ||
+    LISTING_TLD.test(h) ||
+    isProfileHost(h) ||
+    isJunkHost(h)
+  );
+}
+
 /** True when a result is plainly in the US and the search wasn't. */
 export function looksForeign(title: string, expectCountry: string): boolean {
   const want = (expectCountry || "").trim();
@@ -325,6 +386,7 @@ export function isContentTitle(title: string): boolean {
     CATEGORY_PHRASE.test(t)
   );
 }
+
 // Bidi/zero-width marks wrap Arabic phone numbers and break plain matching.
 const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
@@ -489,8 +551,7 @@ export async function searchCompaniesPaged(
   for (const h of parseHits(html)) {
     let host = "";
     try { host = hostOf(h.url); } catch { continue; }
-    if (!host || BLOCK.test(host) || CONTENT_BLOCK.test(host) || isProfileHost(host)) continue;
-    if (SETUP_BLOCK.test(host) || OFFICIAL_BLOCK.test(host)) continue; // formation agencies, regulators
+    if (!host || isNonProspectHost(host)) continue; // social, brokers, directories, regulators
     if (LISTICLE_TITLE.test(h.title || "")) continue; // "Top 20 …", "Best …", "10 Leading …"
     if (looksForeign(h.title || "", expectCountry || "")) continue; // "Medina, Ohio"
     let path = "/";
@@ -498,6 +559,9 @@ export async function searchCompaniesPaged(
     if (LISTICLE_PATH.test(path)) continue;
     const domain = registrableDomain(host);
     if (!domain || byDomain.has(domain)) continue;
+    // "blackoakconstructionohio.com" — the headline said nothing American, but
+    // the domain plainly does.
+    if (domainLooksForeign(domain, expectCountry || "")) continue;
     // The title has to yield a usable business name, or this isn't a company page.
     const name = companyNameFromTitle(h.title || "", domain);
     if (!name) continue;

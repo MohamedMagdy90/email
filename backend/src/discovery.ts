@@ -6,7 +6,11 @@
 // drops them into a reviewable pool (discovered_leads). You approve → they
 // become Contacts. All state lives in the DB, so it survives restarts.
 
-import { q, nowIso, getSetting, setSetting, getContactEmails } from "./db";
+import {
+  q, nowIso, getSetting, setSetting, getContactEmails,
+  claimPoolDomain, closePoolDomain, backfillPoolDomains,
+  loadSaturatedQueries, recordQueryYield,
+} from "./db";
 import { findLeadsIn, resolveArea, tilesFor, countAvailable, isCompanySite as isCompanySiteHost, type Company, type Tile } from "./leads";
 import {
   searchCompaniesPaged,
@@ -15,6 +19,8 @@ import {
   OFFICIAL_BLOCK,
   isContentTitle,
   companyNameFromTitle,
+  isNonProspectHost,
+  domainLooksForeign,
 } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
@@ -22,9 +28,9 @@ import { isBadName } from "./repair";
 import { resolveWebsite } from "./enrich";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { resolveLeadCountry } from "./country";
-import { getReaderStats } from "./crawler/fetcher";
+import { getReaderStats, parseReaderKeys } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
-import { cleanEmail, isValidEmail } from "./crawler/validate";
+import { cleanEmail, isValidEmail, roleRank } from "./crawler/validate";
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -126,6 +132,16 @@ const SEARCH_BLOCK_SKIP_AFTER = 5;
 // discarding the lead. Only give up after this many tries.
 const ENRICH_MAX_RETRIES = 6;
 const ENRICH_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 2 * 3_600_000, 6 * 3_600_000, 24 * 3_600_000, 72 * 3_600_000];
+// A HARD wall is not transient. A Cloudflare managed challenge or a 403 WAF
+// will refuse a plain datacenter fetch today, in five minutes and in three
+// days — retrying it on the full ladder is six guaranteed-wasted multi-page
+// crawls each. In one production hour that was the single largest consumer of
+// the crawl budget. Two attempts is enough to rule out a blip; after that the
+// lead is parked as 'blocked', which loses nothing: "Re-check" resurrects
+// exactly these rows the moment a working key or a proxy is added.
+const ENRICH_HARD_MAX_RETRIES = 2;
+const ENRICH_HARD_BACKOFF_MS = [30 * 60_000, 6 * 3_600_000];
+const HARD_BLOCK_REASONS = new Set(["cloudflare", "forbidden"]);
 function fmtBackoff(ms: number): string {
   const m = Math.round(ms / 60_000);
   if (m < 60) return `in ~${m}m`;
@@ -212,7 +228,18 @@ export interface DiscoveryStatus {
   recoverable: number;
   // Whether a scalable Cloudflare bypass is configured, + how often the free
   // reader has been rate-limited — drives the "add a key/proxy" nudge in the UI.
-  bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
+  bypass: {
+    readerKeyed: boolean;
+    proxy: boolean;
+    readerRateLimited: number;
+    // A key STRING in settings is not the same as a WORKING key. Production
+    // ran for hours on the 15/min free tier while the header still read
+    // "Jina key active · 120 pages/min", because the badge only tested whether
+    // the setting was non-empty. These report what the fetcher actually knows.
+    readerKeysConfigured: number;
+    readerKeysLive: number;
+    readerKeyRejected: boolean;
+  };
   nextRunAt: string | null;
   lastLeadAt: string | null;
 }
@@ -256,7 +283,7 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
   for (const r of statusRows) map[String(r.status)] = Number(r.n);
 
   const [proxy, readerKey] = await Promise.all([getProxyConfig(), getReaderKey()]);
-  const rstats = getReaderStats();
+  const rstats = getReaderStats(parseReaderKeys(readerKey));
 
   return {
     enabled: await isBotEnabled(),
@@ -273,7 +300,18 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
     pendingEnrich,
     blocked,
     recoverable,
-    bypass: { readerKeyed: !!readerKey, proxy: !!proxy, readerRateLimited: rstats.rateLimited },
+    bypass: {
+      readerKeyed: !!readerKey,
+      proxy: !!proxy,
+      readerRateLimited: rstats.rateLimited,
+      // A key STRING in settings is not the same as a WORKING key. Production
+      // ran for hours on the 15/min free tier while the header still read
+      // "Jina key active · 120 pages/min", because the badge only tested whether
+      // the setting was non-empty. These report what the fetcher actually knows.
+      readerKeysConfigured: rstats.keysConfigured,
+      readerKeysLive: rstats.keysLive,
+      readerKeyRejected: rstats.keyRejected,
+    },
     nextRunAt,
     lastLeadAt,
   };
@@ -365,6 +403,23 @@ async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; doma
       return false;
     }
   }
+  // A host that can never be a prospect (aggregator, job board, regulator,
+  // data broker) must not enter the pool at all — it costs a full crawl plus
+  // six retries to discover what this one regex already knows.
+  if (row.website) {
+    const host = hostOf(row.website).replace(/^www\./i, "");
+    if (host && isNonProspectHost(host)) return false;
+  }
+  if (domain && domainLooksForeign(domain, String(row.country || ""))) return false;
+
+  // CLAIM the domain permanently. dedup_key can't hold this line on its own:
+  // once enrichment finds an address we promote the key to "e:<email>", which
+  // frees "d:<domain>" and lets the very next search re-insert the same site.
+  // That single gap made roughly one crawl in five a re-crawl of a domain we
+  // had already resolved. The claim outlives the lead row, so approving or
+  // retiring a lead can never make its domain crawlable again.
+  if (domain && !(await claimPoolDomain(domain))) return false;
+
   const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
   const rows = await q(
     `INSERT INTO discovered_leads
@@ -870,6 +925,8 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   // proxy rotates IPs, so it turns a dead pass into a moving one.
   const proxy = await getProxyConfig();
   const dedup = await loadContactDedup();
+  // Queries that produced nothing new on their last two passes are cooling off.
+  const saturated = await loadSaturatedQueries(src.id);
   const label = src.category && src.category !== "Companies (general)"
     ? `${location || "web"} · ${src.category}`
     : (location || "web search");
@@ -891,6 +948,14 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
     if (item.offset > 0 && prevRan && item.q === prevQuery && prevNew === 0) {
       covered++;
       dlog("search", `  · "${item.q}" p${item.offset / 30 + 1} skipped — page 1 was all sites we already have`);
+      continue;
+    }
+    // Saturated: this exact query has stopped producing anything new. Step over
+    // it without spending a request — it comes back automatically once its
+    // cool-off expires, because sites do get published.
+    if (saturated.has(`${item.q}|${item.offset}`)) {
+      covered++;
+      dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} skipped — exhausted, will retry it later`);
       continue;
     }
     const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location, proxy).catch(() => ({ companies: [], blocked: true }));
@@ -922,6 +987,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       if (added) { found++; batchFound++; }
     }
     prevQuery = item.q; prevNew = batchFound; prevRan = true;
+    await recordQueryYield(src.id, item.q, item.offset, batchFound);
     dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} → ${r.companies.length} site(s), +${batchFound} new`);
     await sleep(SEARCH_PACING_MS);
   }
@@ -1204,7 +1270,13 @@ export function pickSiteEmail(emails: FoundEmail[], siteDomain?: string | null):
     ranked.push({ e, rank });
   }
   if (!ranked.length) return null;
-  ranked.sort((a, b) => a.rank - b.rank || Number(a.e.role_based) - Number(b.e.role_based));
+  // Within the same domain tier, prefer the inbox most likely to be READ by
+  // someone who can reply: a named individual first, then info/sales, then the
+  // service desk, and administrative mailboxes last. The old tiebreak only
+  // asked "is this a role address?", which is how "reportscam@fujairah
+  // refinery.ae" and several "hr@" addresses became the saved contact for
+  // companies that also published a person's address.
+  ranked.sort((a, b) => a.rank - b.rank || roleRank(a.e.email) - roleRank(b.e.email) || a.e.email.localeCompare(b.e.email));
   return { email: ranked[0].e.email, role_based: ranked[0].e.role_based };
 }
 
@@ -1285,10 +1357,25 @@ async function enrichTick(): Promise<void> {
           )) as any[])
         : [];
 
-    const batch = [
+    const picked = [
       ...withSite.map((lead) => ({ lead, needsSite: false })),
       ...noSite.map((lead) => ({ lead, needsSite: true })),
     ];
+
+    // One host per batch. The legacy pool still holds several rows pointing at
+    // the same domain (they predate the pool-domain claim), and the workers run
+    // four wide — so without this, two or three of them hammer the same server
+    // at once. That is a rate-limit we inflict on ourselves, and the loser is
+    // recorded as "blocked" for a site that was perfectly willing to answer.
+    // The skipped rows aren't lost; they're simply picked up next tick.
+    const seenHosts = new Set<string>();
+    const batch = picked.filter(({ lead }) => {
+      const host = registrableDomain(hostOf(String(lead.website || ""))) || "";
+      if (!host) return true; // no site yet (tier 2) — nothing to collide with
+      if (seenHosts.has(host)) return false;
+      seenHosts.add(host);
+      return true;
+    });
     if (!batch.length) return;
 
     // Read the shared settings once per batch, not once per lead.
@@ -1313,7 +1400,10 @@ async function enrichTick(): Promise<void> {
     await Promise.all(
       Array.from({ length: Math.min(ENRICH_CONCURRENCY, batch.length) }, () => worker())
     );
-    more = batch.length >= ENRICH_BATCH;
+    // Measured on what the DB HANDED US, not on the de-duplicated batch: rows
+    // skipped for sharing a host are still queued work, so testing `batch`
+    // here would stall the chain and leave them until the next timer tick.
+    more = picked.length >= ENRICH_BATCH;
   } finally {
     enriching = false;
   }
@@ -1378,6 +1468,21 @@ async function enrichOne(
     return;
   }
 
+  // An aggregator / job board / data broker / regulator can never yield a
+  // company address. These rows entered the pool under older, weaker rules and
+  // are the most expensive thing in the queue: never a lead, and almost always
+  // behind Cloudflare, so each burns a full crawl and six retries to learn
+  // nothing. Retire on sight and close the domain so it can't come back.
+  if (leadHost && isNonProspectHost(leadHost)) {
+    await q(
+      `UPDATE discovered_leads SET status='duplicate', enriched=1, enrich_status='junk', next_enrich_at=NULL WHERE id=?`,
+      [lead.id]
+    );
+    if (lead.domain) await closePoolDomain(String(lead.domain), "junk");
+    dlog("enrich", `  ~ retired ${leadHost} — a directory/aggregator, never a company we can email`);
+    return;
+  }
+
   const attempt = (Number(lead.retry_count) || 0) + 1;
   dlog("enrich", `crawling ${shortUrl(lead.website)} for an email — "${lead.name || lead.domain}"${attempt > 1 ? ` (try ${attempt})` : ""}`);
   let email: string | null = null;
@@ -1390,12 +1495,18 @@ async function enrichOne(
   //   error  → fetch failure / exception (transient — retry)
   let outcome: "found" | "empty" | "blocked" | "error" = "error";
   let note = "";
+  // Cloudflare/403 = the wall never moves; 429/timeout = come back later.
+  let hardWall = false;
   try {
     const site = await crawlSite(lead.website, opts);
     if (site.phone && !phone) phone = site.phone;
     const best = pickSiteEmail(site.emails, lead.domain);
     if (best) { email = best.email.trim().toLowerCase(); confidence = "likely"; outcome = "found"; }
-    else if (site.status === "blocked") { outcome = "blocked"; note = site.note || "blocked"; }
+    else if (site.status === "blocked") {
+      outcome = "blocked";
+      note = site.note || "blocked";
+      hardWall = !!site.blockReason && HARD_BLOCK_REASONS.has(site.blockReason);
+    }
     else if (site.status === "error") { outcome = "error"; note = site.note || "could not open site"; }
     else { outcome = "empty"; } // site loaded, genuinely no email present
   } catch (e: any) {
@@ -1431,6 +1542,7 @@ async function enrichOne(
       return;
     }
     dlog("enrich", `  ✓ found ${email} for "${lead.name || lead.domain}"`);
+    if (lead.domain) await closePoolDomain(String(lead.domain), "found");
     return;
   }
 
@@ -1442,28 +1554,43 @@ async function enrichOne(
       `UPDATE discovered_leads SET enriched=1, phone=?, confidence=NULL, enrich_status='empty', next_enrich_at=NULL WHERE id=?`,
       [phone, lead.id]
     );
+    if (lead.domain) await closePoolDomain(String(lead.domain), "empty");
     dlog("enrich", `  ✗ no email on ${shortUrl(lead.website)} (site loaded fine) — "${lead.name || lead.domain}"`);
     return;
   }
 
-  // Blocked / errored → transient. Back off and retry later, up to the cap.
-  if (attempt >= ENRICH_MAX_RETRIES) {
+  // Blocked / errored → back off and retry later. WHICH ladder depends on
+  // whether the wall can realistically move:
+  //   hard  (Cloudflare challenge, 403 WAF) → 2 tries. It refused a datacenter
+  //         IP and will keep refusing one; more attempts buy nothing.
+  //   soft  (429, timeout, DNS, 5xx)        → the full 6-try ladder, because
+  //         these genuinely do clear on their own.
+  const maxTries = hardWall ? ENRICH_HARD_MAX_RETRIES : ENRICH_MAX_RETRIES;
+  const ladder = hardWall ? ENRICH_HARD_BACKOFF_MS : ENRICH_BACKOFF_MS;
+
+  if (attempt >= maxTries) {
     // Give up for now, but record WHY (enrich_status) so "Re-check blocked"
     // (or adding a Jina key / proxy later) can resurrect exactly these.
     await q(
       `UPDATE discovered_leads SET enriched=1, phone=?, retry_count=?, enrich_status=?, next_enrich_at=NULL WHERE id=?`,
       [phone, attempt, outcome, lead.id]
     );
-    dwarn("enrich", `  ⚠ giving up on "${lead.name || lead.domain}" after ${attempt} tries — ${note || outcome}. Add a free Jina key or a scraping proxy in Settings, then click "Re-check blocked".`);
+    if (lead.domain) await closePoolDomain(String(lead.domain), outcome);
+    dwarn(
+      "enrich",
+      `  ⚠ parked "${lead.name || lead.domain}" after ${attempt} tr${attempt === 1 ? "y" : "ies"} — ${note || outcome}.` +
+        (hardWall ? ` This wall won't open to a plain crawl.` : "") +
+        ` Add a working Jina key or a scraping proxy in Settings, then click "Re-check blocked".`
+    );
     return;
   }
-  const backoffMs = ENRICH_BACKOFF_MS[Math.min(attempt - 1, ENRICH_BACKOFF_MS.length - 1)];
+  const backoffMs = ladder[Math.min(attempt - 1, ladder.length - 1)];
   const nextAt = new Date(Date.now() + backoffMs).toISOString();
   await q(
     `UPDATE discovered_leads SET enriched=0, phone=?, retry_count=?, enrich_status=?, next_enrich_at=? WHERE id=?`,
     [phone, attempt, outcome, nextAt, lead.id]
   );
-  dlog("enrich", `  ↻ ${outcome} on "${lead.name || lead.domain}" (try ${attempt}/${ENRICH_MAX_RETRIES}) — retrying ${fmtBackoff(backoffMs)}${note ? ` · ${note}` : ""}`);
+  dlog("enrich", `  ↻ ${outcome} on "${lead.name || lead.domain}" (try ${attempt}/${maxTries}) — retrying ${fmtBackoff(backoffMs)}${note ? ` · ${note}` : ""}`);
 }
 
 // DON'T delete a duplicate. Deleting frees the dedup_key, so the source that
@@ -1484,6 +1611,74 @@ async function retireDuplicate(lead: any, phone: string | null, email: string): 
     [phone, lead.id]
   );
   dlog("enrich", `  = ${email} already in your list — retired "${lead.name || lead.domain}" so it stops being re-found`);
+}
+
+/* ------------------------- legacy backlog sweep ------------------------ */
+
+/**
+ * Retire pool rows whose host can never be a prospect.
+ *
+ * The host blocklists only ever ran when a SEARCH RESULT was inserted, so every
+ * row discovered under an older, weaker rule set is still in the queue waiting
+ * to be crawled — aggregators, job boards, data brokers, hotel chains, news
+ * sites. They are the most expensive rows we own: guaranteed not to yield an
+ * address, and almost all sitting behind Cloudflare, so each one costs a
+ * multi-page crawl plus a retry ladder to prove it.
+ *
+ * Runs once per boot. Idempotent: a swept row is status='duplicate', which the
+ * WHERE clause excludes next time.
+ */
+export async function sweepNonProspectLeads(): Promise<number> {
+  const rows = (await q(
+    `SELECT id, domain, website, country FROM discovered_leads
+      WHERE status='pending' AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''`
+  )) as any[];
+
+  let swept = 0;
+  for (const r of rows) {
+    const host = hostOf(String(r.website || "")).replace(/^www\./i, "");
+    if (!host) continue;
+    const domain = String(r.domain || "") || registrableDomain(host) || "";
+    const junk = isNonProspectHost(host) || domainLooksForeign(domain, String(r.country || ""));
+    if (!junk) continue;
+    await q(
+      `UPDATE discovered_leads SET status='duplicate', enriched=1, enrich_status='junk', next_enrich_at=NULL WHERE id=?`,
+      [r.id]
+    );
+    if (domain) await closePoolDomain(domain, "junk");
+    swept++;
+  }
+  if (swept) {
+    dlog("", `swept ${swept.toLocaleString()} lead(s) that can never yield an email (directories, job boards, data brokers, US look-alikes) — they will not be crawled again`);
+  }
+  return swept;
+}
+
+/* ---------------------------- bulk recovery ---------------------------- */
+
+// One-click recovery for the historical "no email" pool. Resets pending,
+// email-less leads that have a website so enrichTick re-attempts them. Targets
+// the ones that were BLOCKED/errored or predate retry-tracking (enrich_status
+// NULL); leaves genuinely-empty sites (enrich_status='empty') alone so we don't
+// pointlessly re-crawl sites we already confirmed have no email.
+export async function reEnrichBlocked(): Promise<{ reset: number }> {
+  const rows = await q(
+    `UPDATE discovered_leads
+        SET enriched=0, retry_count=0, next_enrich_at=NULL, enrich_status=NULL
+      WHERE status='pending'
+        AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''
+        AND enriched=1
+        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))
+      RETURNING id`
+  );
+  const reset = rows.length;
+  dlog("enrich", `re-check requested → re-queued ${reset} blocked/untried lead(s) to find emails again`);
+  // Nudge the enrich loop so recovery starts immediately (respecting the bot's
+  // on/off + auto-enrich switches inside the tick).
+  if (reset > 0) setTimeout(() => { enrichTick().catch(() => {}); }, 500);
+  return { reset };
 }
 
 /* --------------------------- one-off cleanups -------------------------- */
@@ -1653,32 +1848,6 @@ export async function repairPageTitleNames(): Promise<number> {
   return fixed;
 }
 
-/* ---------------------------- bulk recovery ---------------------------- */
-
-// One-click recovery for the historical "no email" pool. Resets pending,
-// email-less leads that have a website so enrichTick re-attempts them. Targets
-// the ones that were BLOCKED/errored or predate retry-tracking (enrich_status
-// NULL); leaves genuinely-empty sites (enrich_status='empty') alone so we don't
-// pointlessly re-crawl sites we already confirmed have no email.
-export async function reEnrichBlocked(): Promise<{ reset: number }> {
-  const rows = await q(
-    `UPDATE discovered_leads
-        SET enriched=0, retry_count=0, next_enrich_at=NULL, enrich_status=NULL
-      WHERE status='pending'
-        AND (email IS NULL OR email='')
-        AND website IS NOT NULL AND website<>''
-        AND enriched=1
-        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))
-      RETURNING id`
-  );
-  const reset = rows.length;
-  dlog("enrich", `re-check requested → re-queued ${reset} blocked/untried lead(s) to find emails again`);
-  // Nudge the enrich loop so recovery starts immediately (respecting the bot's
-  // on/off + auto-enrich switches inside the tick).
-  if (reset > 0) setTimeout(() => { enrichTick().catch(() => {}); }, 500);
-  return { reset };
-}
-
 /* --------------------------------- boot -------------------------------- */
 
 export function startDiscoveryWorker(): void {
@@ -1694,22 +1863,31 @@ export function startDiscoveryWorker(): void {
   // bot will actually do anything (the #1 support question).
   (async () => {
     try {
+      // Claim every domain the pool already holds, or the ledger would treat
+      // thousands of known sites as brand new and re-crawl each one once.
+      const claimed = await backfillPoolDomains();
+      if (claimed) dlog("", `domain ledger → registered ${claimed.toLocaleString()} domain(s) already in the pool, so none of them can be re-discovered and re-crawled`);
+      await sweepNonProspectLeads();
+
       const on = await isBotEnabled();
       const active = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.n ?? 0;
       const auto = await autoEnrichOn();
       dlog("", `state → bot ${on ? "ON" : "OFF"} · ${active} enabled source(s) · auto-find-emails ${auto ? "ON" : "OFF"}`);
-      // Say plainly whether the reader is keyed. Without this line the only way
-      // to know whether a Jina key took effect is to guess from block messages.
+      // Say plainly what bypass capacity the crawler actually has. Without this
+      // the only way to know a key took effect is to guess from block messages.
       const [key, prox] = await Promise.all([getReaderKey(), getProxyConfig()]);
-      const rejected = getReaderStats().keyRejected;
+      const keys = parseReaderKeys(key);
+      const st = getReaderStats(keys);
+      const proxNote = prox ? ` · scraping proxy: ${prox.provider}` : "";
       dlog(
         "",
-        key && !rejected
-          ? `reader → Jina key ACTIVE (${READER_RPM_KEYED_HINT}/min, 25x the free tier)${prox ? ` · scraping proxy: ${prox.provider}` : ""}`
-          : key && rejected
-            ? `reader → Jina key REJECTED (out of tokens) — running on the free tier (20/min). Top up at jina.ai/api-dashboard or clear the key.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
-            : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${prox ? ` Scraping proxy: ${prox.provider}` : ""}`
+        st.keysLive > 0
+          ? `reader → ${st.keysLive}/${st.keysConfigured} Jina key(s) live (${READER_RPM_KEYED_HINT}/min, 8x the free tier)${proxNote}`
+          : st.keysConfigured > 0
+            ? `reader → all ${st.keysConfigured} Jina key(s) REJECTED (out of tokens) — on the free tier (20/min). Top up or add another free key at jina.ai/api-dashboard → Settings → Crawler.${proxNote}`
+            : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${proxNote}`
       );
+      dlog("", `bypass tiers → direct · Jina reader · Wayback archive (free, unlimited)${prox ? ` · ${prox.provider}` : " · no paid proxy"}`);
       if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");
       else if (!active) dwarn("", "bot is ON but no sources are enabled — enable a source in the Discovery screen.");
     } catch { /* ignore */ }

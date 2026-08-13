@@ -137,7 +137,16 @@ export interface DiscoveryStatus {
   recoverable: number;
   // Is a scalable Cloudflare bypass configured, and how often has the free reader
   // been rate-limited — drives the "add a key/proxy" nudge.
-  bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
+  bypass: {
+    readerKeyed: boolean;
+    proxy: boolean;
+    readerRateLimited: number;
+    // Key health as the fetcher actually observed it — a key saved in Settings
+    // is not necessarily a key that still has tokens.
+    readerKeysConfigured: number;
+    readerKeysLive: number;
+    readerKeyRejected: boolean;
+  };
   nextRunAt: string | null;
   lastLeadAt: string | null;
 }
@@ -341,7 +350,7 @@ export const api = {
       appUrl: string;
       replyTo: string;
       scrape: { configured: boolean; provider: string; mode: "blocked" | "always"; premium: boolean };
-      reader: { configured: boolean; fromEnv: boolean };
+      reader: { configured: boolean; fromEnv: boolean; savedKeys: number };
     }>(`/api/settings`),
   saveSettings: (s: {
     resend_api_key?: string;

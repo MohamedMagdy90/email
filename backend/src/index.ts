@@ -11,7 +11,7 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import { fetchViaProxy, fetchViaReader, type ScrapeProvider } from "./crawler/fetcher";
+import { fetchViaProxy, fetchViaReader, parseReaderKeys, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
@@ -507,6 +507,10 @@ app.get("/api/settings", async (c) => {
       // Free crawler is always on; a key just raises the free rate limit.
       configured: !!(await getSetting("jina_api_key")),
       fromEnv: !!process.env.JINA_API_KEY,
+      // How many keys are in the pool. Several free keys can be saved
+      // comma-separated; the crawler rotates through them so one running out of
+      // tokens no longer drops the whole bot to the 20/min free tier.
+      savedKeys: parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").length,
     },
   });
 });

@@ -14,7 +14,7 @@ import { searchCompanies, searchRaw, type RawHit } from "./search";
 import { crawlSite, type CrawlOptions } from "./crawler";
 import { fetchPage, fetchViaProxy, fetchViaReader, type ProxyConfig } from "./crawler/fetcher";
 import { extractContactFromProfile, isProfileHost, isJunkHost } from "./crawler/profiles";
-import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./crawler/validate";
+import { cleanEmail, isValidEmail, isJunk, isRole, roleRank, hasMx } from "./crawler/validate";
 import { registrableDomain, hostOf } from "./crawler/urls";
 
 // An email that belongs to the COMPANY, not to a platform it's listed on. A
@@ -254,7 +254,10 @@ function pickEmail(emails: string[]): { email: string; role: boolean } | null {
     if (e && isValidEmail(e) && !isJunk(e) && isCompanyEmail(e)) good.push(e);
   }
   if (!good.length) return null;
-  good.sort((a, b) => Number(isRole(b)) - Number(isRole(a)) || a.localeCompare(b));
+  // Best-quality inbox first: a named individual, then info/sales, then the
+  // service desk, with hr@ and abuse@/no-reply@ last — rather than treating
+  // every role address as equivalent.
+  good.sort((a, b) => roleRank(a) - roleRank(b) || a.localeCompare(b));
   return { email: good[0], role: isRole(good[0]) };
 }
 

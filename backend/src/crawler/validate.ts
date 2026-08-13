@@ -15,6 +15,18 @@ const PLACEHOLDERS = new Set([
   "someone@example.com", "first.last@example.com", "abc@abc.com", "mail@example.com",
 ]);
 
+// Placeholder LOCAL parts. Themes ship with these and the site owner never
+// replaces them — "yoursite@mail.com" was filed as a real lead in production.
+// Matched on the local part so any domain is covered, not just example.com.
+const PLACEHOLDER_LOCAL =
+  /^(?:your\s*(?:site|name|email|company|mail)|my(?:site|email|name)|username|user|firstname|lastname|first\.last|someone|somebody|anyone|sample|example|demo|dummy|placeholder|changeme|replaceme|enter[-_]?your[-_]?email|youremail|emailaddress)$/i;
+
+// A local part that is really a mangled "mailto:" prefix the page glued on.
+// Real production leak: "mailoinfo@dmxlogistics.ae" — the scheme survived the
+// extractor with a character dropped, so the peel in cleanEmail() (which needs
+// the colon) never fired. No legitimate inbox begins this way.
+const MAILTO_ARTIFACT = /^(?:e?mail|mail)(?:t?o)(?=[a-z0-9])/i;
+
 // Domains that are almost always tooling/asset noise, not real inboxes.
 const JUNK_DOMAINS =
   /(^|\.)(example\.(com|org|net)|domain\.com|yourdomain\.com|email\.com|test\.com|sentry\.io|sentry-next\.wixpress\.com|wixpress\.com|wix\.com|schema\.org|w3\.org|googleapis\.com|gstatic\.com|cloudflare\.com|jsdelivr\.net|unpkg\.com|gravatar\.com|sentry\.wixpress\.com|placeholder\.com|lorempixel\.com|2x|3x)$/i;
@@ -95,7 +107,10 @@ export function isValidEmail(e: string): boolean {
 
 export function isJunk(e: string): boolean {
   if (PLACEHOLDERS.has(e)) return true;
+  const local = e.split("@")[0] || "";
   const domain = e.split("@")[1] || "";
+  if (PLACEHOLDER_LOCAL.test(local)) return true; // yoursite@…, youremail@…
+  if (MAILTO_ARTIFACT.test(local)) return true;   // mailoinfo@…, mailtoinfo@…
   if (JUNK_DOMAINS.test(domain)) return true;
   if (ASSET_EXT.test(e)) return true;
   if (/@\d+x$/.test(e)) return true; // retina asset leftovers like foo@2x
@@ -106,6 +121,43 @@ export function isJunk(e: string): boolean {
 
 export function isRole(e: string): boolean {
   return ROLE_RE.test(e);
+}
+
+/* ------------------------- inbox preference ---------------------------- */
+// A named individual outranks every shared inbox: a person reads their own
+// mail and can reply, whereas info@ is a queue that may be triaged by nobody.
+// Among the shared inboxes it still matters which one — a site exposing both
+// info@ and hr@ must not be filed under hr@, and fujairahrefinery.ae must never
+// be saved as "reportscam@". Lower rank wins.
+const ROLE_TIERS: [RegExp, number][] = [
+  [/^(?:info|sales|contact|enquir(?:y|ies)|inquir(?:y|ies)|hello|office|mail|general|business|marketing)@/i, 1],
+  [/^(?:support|help|helpdesk|service|services|admin|team|reception|orders?|booking|bookings|reservations?)@/i, 2],
+  [/^(?:accounts?|account|billing|finance|purchase|procurement|tender|tenders|projects?)@/i, 3],
+  [/^(?:hr|jobs|careers?|recruit(?:ment)?|cv|apply|hiring)@/i, 4],
+  [/^(?:press|media|newsletter|partnership|partners?|webmaster|postmaster|hostmaster|abuse|spam|phishing|reportscam|report|fraud|security|privacy|legal|dpo|unsubscribe|no-?reply|do-?not-?reply|bounce|mailer-daemon)@/i, 5],
+];
+
+// Does the local part read like a PERSON — "adil", "m.saleh", "mubarak.ahmed"?
+// Letters and single separators only. The digit rule is what keeps the
+// preference safe: "abdullahalmamun9145855@gmail.com" and "quantumcont14@" are
+// not people, they're throwaway mailboxes, and promoting those above a
+// company's info@ would be a clear downgrade.
+const PERSON_LOCAL = /^[a-z]+(?:[._-][a-z]+)*$/i;
+
+/**
+ * How desirable an address is (0 = best).
+ *
+ *   0  a named individual          adil@, m.saleh@, prabal@
+ *   1  primary shared inbox        info@, sales@, contact@
+ *   2  service desk                support@, admin@, bookings@
+ *   3  finance / unrecognised      accounts@, tender@, xyz123@
+ *   4  recruitment                 hr@, careers@
+ *   5  administrative / automated  webmaster@, abuse@, no-reply@
+ */
+export function roleRank(e: string): number {
+  for (const [re, rank] of ROLE_TIERS) if (re.test(e)) return rank;
+  const local = e.split("@")[0] || "";
+  return local.length >= 3 && PERSON_LOCAL.test(local) ? 0 : 3;
 }
 
 const mxCache = new Map<string, boolean>();
