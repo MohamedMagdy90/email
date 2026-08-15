@@ -3,6 +3,7 @@ import { api, type Domain } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
 import AutomationCard from "./Automation";
+import FollowUpCard from "./FollowUp";
 
 export default function Settings() {
   const [resendKey, setResendKey] = useState("");
@@ -70,6 +71,12 @@ export default function Settings() {
       {/* Automation — auto-approve a full pool of leads, then auto-send */}
       <div className="mb-8">
         <AutomationCard />
+      </div>
+
+      {/* Follow-up ladder — chase whoever didn't open, and whoever opened but
+          didn't click, up to a hard ceiling of 3 emails per contact. */}
+      <div className="mb-8">
+        <FollowUpCard />
       </div>
 
       <div className="grid gap-5 lg:grid-cols-2">

@@ -1,3 +1,102 @@
+# Follow-up ladder — retry non-openers / non-clickers ✅ shipped & verified
+
+## What it does
+Every email the app sends (campaign OR automation) starts a sequence, and what
+the recipient DID with it decides what happens next:
+
+  never opened      → after N hours, retry with a DIFFERENT template
+                      still not opened → after M hours, the second retry
+  opened, no click  → after N hours, its own retry template
+                      still no click → after M hours, the second one
+  clicked           → sequence over. They engaged; chasing costs goodwill.
+
+Hard ceiling of 3 emails per sequence (the original + two retries), configured
+in Settings → **Follow-up ladder**, with a template AND a wait per rung.
+
+## Backend
+- [x] `db.ts`: `sends.followup_step` (0 = original, 1/2 = retries) +
+      `sends.followup_branch` ('no_open' | 'no_click'), `idx_sends_contact`,
+      `idx_sends_sent_at`, and the `followup_runs` ledger (+ its index).
+- [x] `send.ts`: split into `runSendJob` (rotation → a plan) and **`runSendPlan`**,
+      one row per recipient carrying its OWN template + rung. A follow-up batch
+      can't use one template — every contact is on a different rung. A plan row
+      whose template was deleted mid-batch is skipped, not fatal. The rung is
+      written onto the send and into the job log ("· retry 1 (no open)").
+- [x] `followup.ts` (new): config, the sequence scan, the run executor, a
+      5-minute worker and the ledger.
+- [x] `index.ts`: `/api/followup` (GET status+config+ledger, POST save),
+      `POST /api/followup/run`; worker started on boot.
+
+## The scan is DERIVED, never queued
+State is read back out of `sends` on every pass instead of being written to a
+schedule. An open that lands late, a bounce, an unsubscribe, a deleted template,
+a crashed run — all of it is simply the next scan's input, so nothing can fall
+out of sync. A "sequence" = the contact's most recent ORIGINAL email
+(`followup_step = 0`) and everything sent at-or-after it, which is what lets a
+contact who was mailed months ago be re-campaigned and followed up again today.
+
+## Safety rails (all verified)
+- 3 emails per sequence is a hard ceiling; `maxEmails: 2` stops after one retry.
+- A CLICK ends the sequence in both branches (`SUM(click_count) = 0` is the
+  universal continue condition).
+- `lookbackDays` (30): switching the ladder on does NOT blast every contact ever
+  emailed and never opened — only sequences whose last email is recent.
+- Refuses to run without an **App URL**: with no pixel and no wrapped links,
+  nothing is ever recorded as opened, so every contact would look like a
+  non-opener and get all three emails. That one matters most.
+- Refuses to run without a Resend key (`requireResend`), so a dry run can't walk
+  a whole list up the ladder without a single real email going out.
+- Daily ceiling + per-pass batch size + send rate; unsubscribed/bounced are
+  never chased; a failed send never starts a sequence.
+- A rung with no template = that rung is off (and is reported as
+  `unconfigured`); a rung pointing at a DELETED template becomes a loud blocker
+  instead of silently ending the ladder.
+
+## Frontend
+- [x] `api.ts`: `FollowUpConfig` / `FollowUpRun` / `FollowUpRung` /
+      `FollowUpStatus` + `getFollowUp` / `saveFollowUp` / `runFollowUp`;
+      `SendRow` gained `followup_step` / `followup_branch`.
+- [x] `FollowUp.tsx` (new): the ladder drawn as a ladder — email 1 at the top,
+      then two branch columns ("They never opened it" / "They opened, but never
+      clicked"), each with a numbered rung, a template picker and a wait (preset
+      dropdown + free-text hours). Rungs above the ceiling grey out with a
+      dashed border instead of disappearing. Per-rung live counts (N due · N
+      waiting) and lifetime performance (sent / opened / clicked / next due),
+      "see who's next" preview, blockers panel, live send progress, pass
+      history, **Send due now**.
+- [x] `Settings.tsx`: rendered directly under the Automation card.
+- [x] `History.tsx`: a `retry 1` / `retry 2` badge next to the recipient (with a
+      tooltip naming the branch), so the same address twice never reads as a
+      duplicate send.
+
+## Verified
+- **49/49 in-process checks** on a throwaway DB (`SQLITE_PATH`): who is due ·
+  branch selection · a click ends it · the 3-email ceiling · lookback ·
+  unsubscribed/bounced/failed excluded · sequence-from-last-original (an old
+  completed ladder does not block a new campaign) · unconfigured rungs ·
+  `maxEmails` 2 vs 3 · all four refusals + their ledger rows · a real pass
+  (tagged sends, per-rung templates, branch/rung counts) · the ladder ADVANCES
+  rather than looping · an open mid-ladder switches branch · batch size · daily
+  ceiling · status payload · deleted-template blocker.
+- **Live over HTTP**: 401 without a token · GET/POST config round-trip ·
+  `POST /run` with nothing due → 400 with a readable reason (not a 500) ·
+  values clamped server-side (99 → 3, 9999/min → 120) · a garbage ladder
+  payload (`"noOpen": "nonsense"`) → 200, no crash · automation/settings/
+  templates/history all still 200.
+- backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+
+## Housekeeping
+- `frontend/node_modules` was empty in this container, so the web half of the
+  dev server had been dead — `bun install` in `frontend/`, dev server restarted.
+- Local `backend/data.sqlite` was corrupt AGAIN at boot ("database disk image is
+  malformed"), which is why the API wasn't listening. Parked in
+  `.same/corrupt-db-backup-4` and recreated. Production is Postgres — unaffected.
+  Login had to be re-created: **admin / dna-outreach** (change it in
+  Settings → Account). Three retry templates were seeded so the ladder pickers
+  have something to point at; delete them on the Templates tab if unwanted.
+
+---
+
 # Automation — auto-approve at N emails → auto-send ✅ shipped & verified
 
 ## What it does
@@ -380,3 +479,46 @@ INCIDENT: the apply model duplicated ~900 lines of discovery.ts and invented two
 bogus helpers during item 12. Repaired by deleting lines 1851-2702 and 2749-2779;
 verified all 17 exports still present and typecheck clean. No git repo here, so
 /tmp/discovery.broken.ts was kept until the repair was confirmed, then removed.
+
+# Discovery sources — collapsible container ✅ shipped
+
+The sources list sat between the stat strip and the review pool, so on a screen
+with several sources the pool (the thing you actually work) started below the
+fold. The card now folds away.
+
+- [x] `Discovery.tsx`: the card header is the toggle, using the accordion
+      pattern — `<h2>` WRAPS the `<button>`, so the whole title is clickable
+      without putting block elements inside a button. `aria-expanded` on the
+      button; chevron rotates 180°.
+- [x] Body animates with `grid-rows-[1fr] ⇄ [0fr]` + an `overflow-hidden` child,
+      so it opens to the content's real height — no hard-coded max, and a source
+      that starts streaming mid-open still fits.
+- [x] Collapsed header carries a live summary (`N active · N paused · N archived
+      · N found`) plus a green **"N scanning"** pill with a spinner, so folding
+      the list away can never hide the fact that a batch is running.
+- [x] Count badge next to the title; the empty state keeps its own copy.
+- [x] **Add source** expands the card as well as opening the modal — you always
+      see the row you just created.
+- [x] Past 6 sources the list scrolls inside the card (`max-h-[26rem]`) so the
+      review pool stays reachable even when expanded.
+- [x] Open/closed persisted in `localStorage` (`dna-discovery-sources-open`),
+      read/written through try/catch because storage can throw in an iframe.
+- [x] The Archived drawer nests inside the collapsible body and keeps its own
+      independent toggle.
+
+Verified: frontend `tsc` clean · `vite build` clean · Tailwind emitted
+`grid-rows-[0fr]` / `grid-rows-[1fr]` / `transition-[grid-template-rows]` /
+`max-h-[26rem]` · all 21 original declarations and all 7 section banners intact.
+
+INCIDENT: the apply model stripped ~30 explanatory comments across the whole
+file (and flattened two typographic apostrophes) while making this edit. The
+file was rebuilt from the original and every comment restored; there is no git
+repo here, so this was verified by diffing declaration-by-declaration.
+
+NOTE: local `backend/data.sqlite` was corrupt again on boot — THREE dev servers
+had stacked up, two of them backends writing the same WAL, which is exactly the
+documented corruption cause. All were shut down with SIGTERM (never `kill -9`),
+the corrupt file moved to `.same/corrupt-db-backup-3`, and a single dev server
+restarted. Production is Postgres — unaffected.
+
+---

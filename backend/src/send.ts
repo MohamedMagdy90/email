@@ -31,18 +31,43 @@ export function buildFrom(domain: any): { from: string } | { error: string } {
   return { from: `${name} <${email}>` };
 }
 
+// One line of a batch: who to email, and with which template.
+//
+// A campaign hands over the same template (or a rotating set) for everyone, but
+// a follow-up pass can't — every contact is on a different rung of the ladder,
+// so each row carries its OWN template plus the rung it belongs to, which is
+// stored on the send so the next pass can read the sequence back.
+export interface SendPlanItem {
+  contactId: string;
+  templateId: string;
+  followupStep?: number;               // 0 = original email, 1 / 2 = retries
+  followupBranch?: string | null;      // 'no_open' | 'no_click'
+}
+
 // Send `templateIds` to `contactIds`, pacing at `perMinute`.
 // More than one template = they rotate per recipient, which varies the content
 // of a batch (better for deliverability than 500 identical emails).
 export async function runSendJob(job: Job, templateIds: string[], contactIds: string[], perMinute: number) {
   const ids = [...new Set(templateIds.filter(Boolean))];
-  const tpls: any[] = [];
-  for (const tid of ids) {
+  if (ids.length > 1) log(job, { level: "info", msg: `Rotating ${ids.length} templates across recipients.` });
+  // Rotation is just a plan where the template advances one recipient at a time.
+  const plan: SendPlanItem[] = contactIds.map((contactId, i) => ({
+    contactId,
+    templateId: ids[i % Math.max(1, ids.length)],
+  }));
+  return runSendPlan(job, plan, perMinute);
+}
+
+// The actual sender: domain rotation, daily caps, pacing, tracking links and the
+// sends ledger. Everything that emails anyone goes through here.
+export async function runSendPlan(job: Job, plan: SendPlanItem[], perMinute: number) {
+  // Load every distinct template the plan references, once.
+  const tplById = new Map<string, any>();
+  for (const tid of [...new Set(plan.map((p) => p.templateId).filter(Boolean))]) {
     const t = (await q(`SELECT * FROM templates WHERE id=?`, [tid]))[0];
-    if (t) tpls.push(t);
+    if (t) tplById.set(String(tid), t);
   }
-  if (!tpls.length) { job.status = "error"; job.error = "template not found"; return; }
-  if (tpls.length > 1) log(job, { level: "info", msg: `Rotating ${tpls.length} templates across recipients.` });
+  if (!tplById.size) { job.status = "error"; job.error = "template not found"; return; }
 
   const activeDomains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
   const appUrl = ((await getSetting("app_url")) || process.env.APP_URL || "").replace(/\/+$/, "");
@@ -69,10 +94,10 @@ export async function runSendJob(job: Job, templateIds: string[], contactIds: st
 
   const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
   let di = 0;
-  let ti = 0;
 
-  for (const cid of contactIds) {
+  for (const item of plan) {
     if (job.status === "error") break;
+    const cid = item.contactId;
     const contact = (await q(`SELECT * FROM contacts WHERE id=?`, [cid]))[0];
     if (!contact) { job.result.skipped++; job.processed++; continue; }
     if (contact.status === "unsubscribed" || contact.status === "bounced") {
@@ -92,8 +117,16 @@ export async function runSendJob(job: Job, templateIds: string[], contactIds: st
       if (!domain) { log(job, { level: "warn", msg: "All domains hit their daily cap — stopping." }); break; }
     }
 
-    const tpl = tpls[ti % tpls.length];
-    ti++;
+    const tpl = tplById.get(String(item.templateId));
+    // A plan row whose template was deleted mid-batch is skipped, not fatal —
+    // the rest of the batch still goes out.
+    if (!tpl) {
+      job.result.skipped++;
+      job.processed++;
+      job.progress = job.total ? job.processed / job.total : 1;
+      log(job, { level: "skip", msg: `Skipped ${contact.email} — its template no longer exists.` });
+      continue;
+    }
     const from = domain ? domain.__from : "DNA Outreach <onboarding@resend.dev>";
     const subject = renderTemplate(tpl.subject, contact);
     const sendId = uid();
@@ -112,16 +145,25 @@ export async function runSendJob(job: Job, templateIds: string[], contactIds: st
 
     const status = result.ok ? (result.dryRun ? "sent (dry-run)" : "sent") : "failed";
     await q(
-      `INSERT INTO sends (id,contact_id,contact_email,template_id,domain_id,subject,status,error,sent_at,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [sendId, contact.id, contact.email, tpl.id, domain?.id ?? null, subject, status, result.error ?? null, nowIso(), nowIso()]
+      `INSERT INTO sends (id,contact_id,contact_email,template_id,domain_id,subject,status,error,followup_step,followup_branch,sent_at,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        sendId, contact.id, contact.email, tpl.id, domain?.id ?? null, subject, status, result.error ?? null,
+        Number(item.followupStep || 0), item.followupBranch ?? null, nowIso(), nowIso(),
+      ]
     );
+
+    // "· retry 1 (no open)" so a follow-up pass reads as a ladder in the log,
+    // not as an unexplained second email to the same address.
+    const rung = item.followupStep
+      ? ` · retry ${item.followupStep}${item.followupBranch === "no_click" ? " (opened, no click)" : " (no open)"}`
+      : "";
 
     if (result.ok) {
       job.result.sent++;
       await q(`UPDATE contacts SET status='sent' WHERE id=? AND status='new'`, [contact.id]);
       if (domain) { await q(`UPDATE domains SET sent_today = sent_today + 1 WHERE id=?`, [domain.id]); domain.sent_today++; }
-      log(job, { level: "sent", msg: `${status} → ${contact.email}` });
+      log(job, { level: "sent", msg: `${status} → ${contact.email}${rung}` });
     } else {
       job.result.failed++;
       log(job, { level: "fail", msg: `failed → ${contact.email}: ${result.error}` });

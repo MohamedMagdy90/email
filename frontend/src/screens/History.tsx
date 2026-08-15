@@ -137,7 +137,26 @@ export default function History() {
               <tbody>
                 {filtered.map((s) => (
                   <tr key={s.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
-                    <td className="px-4 py-2.5 font-medium">{s.contact_email}</td>
+                    <td className="px-4 py-2.5 font-medium">
+                      <span className="flex items-center gap-1.5">
+                        <span className="truncate">{s.contact_email}</span>
+                        {/* A second or third email is a retry — say which rung
+                            and why, so the same address twice never looks like
+                            a duplicate send. */}
+                        {!!s.followup_step && (
+                          <span
+                            className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/50"
+                            title={
+                              s.followup_branch === "no_click"
+                                ? "Follow-up: they opened the previous email but didn't click"
+                                : "Follow-up: they never opened the previous email"
+                            }
+                          >
+                            retry {s.followup_step}
+                          </span>
+                        )}
+                      </span>
+                    </td>
                     <td className="max-w-[280px] truncate px-2 py-2.5 text-ink/70" title={s.subject}>{s.subject}</td>
                     <td className="px-2 py-2.5"><StatusPill status={s.status} /></td>
                     <td className="px-2 py-2.5">

@@ -114,6 +114,19 @@ export async function ensureSchema() {
   // Backfill: legacy opened rows had no counter — treat as one open.
   try { await q(`UPDATE sends SET open_count = 1 WHERE opened = 1 AND open_count = 0`); } catch { /* ignore */ }
 
+  // Follow-up ladder: which rung of a sequence a send belongs to.
+  //   followup_step   0 = the original email · 1 = first retry · 2 = second retry
+  //   followup_branch why the retry went out — 'no_open' | 'no_click'
+  // Step 0 is what makes a send the START of a sequence, so the engine can count
+  // "emails in THIS sequence" instead of every email the contact has ever had
+  // (a contact mailed in an old campaign must still be followable-up today).
+  try { await q(`ALTER TABLE sends ADD COLUMN followup_step INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE sends ADD COLUMN followup_branch TEXT`); } catch { /* exists */ }
+  // The follow-up scan groups the whole sends table by contact, so both of these
+  // are on its hot path.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_contact ON sends(contact_id)`); } catch { /* ignore */ }
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_sent_at ON sends(sent_at)`); } catch { /* ignore */ }
+
   await q(`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -292,6 +305,32 @@ export async function ensureSchema() {
     error TEXT
   )`);
   try { await q(`CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at)`); } catch { /* ignore */ }
+
+  /* -------------------------- Follow-up ledger ------------------------- */
+  // One row per follow-up pass (the sweep that emails everyone whose retry is
+  // due). Mirrors automation_runs on purpose: same shape, same reasoning —
+  // "what did it do, and why did it refuse?" must always be answerable.
+  await q(`CREATE TABLE IF NOT EXISTS followup_runs (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    trigger TEXT NOT NULL DEFAULT 'auto',
+    status TEXT NOT NULL DEFAULT 'running',
+    due_count INTEGER NOT NULL DEFAULT 0,
+    queued INTEGER NOT NULL DEFAULT 0,
+    sent INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    no_open INTEGER NOT NULL DEFAULT 0,
+    no_click INTEGER NOT NULL DEFAULT 0,
+    retry1 INTEGER NOT NULL DEFAULT 0,
+    retry2 INTEGER NOT NULL DEFAULT 0,
+    template_names TEXT,
+    job_id TEXT,
+    note TEXT,
+    error TEXT
+  )`);
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_followup_runs_started ON followup_runs(started_at)`); } catch { /* ignore */ }
 }
 
 /* ---------------------- Search query saturation ------------------------ */

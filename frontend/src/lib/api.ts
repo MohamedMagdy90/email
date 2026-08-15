@@ -69,6 +69,9 @@ export interface SendRow {
   click_count?: number;
   first_clicked_at?: string | null;
   last_clicked_at?: string | null;
+  // Which rung of the follow-up ladder this send was (0 / absent = the original).
+  followup_step?: number;
+  followup_branch?: string | null; // no_open | no_click
   sent_at?: string;
   created_at: string;
 }
@@ -257,6 +260,87 @@ export interface AutomationStatus {
   runs: AutomationRun[];
   templates: { id: string; name: string; type: string }[];
   blockers: string[];
+}
+
+/* ---------------------------- Follow-up ladder ------------------------- */
+
+export type FollowUpBranch = "no_open" | "no_click";
+
+export interface FollowUpStepConfig {
+  /** Template sent at this rung. Blank = the rung is off. */
+  templateId: string;
+  /** Hours to wait after the PREVIOUS email before this one goes out. */
+  delayHours: number;
+}
+
+export interface FollowUpConfig {
+  enabled: boolean;
+  /** Ceiling per sequence, including the original email (2 or 3). */
+  maxEmails: number;
+  noOpen: FollowUpStepConfig[];  // [first retry, second retry]
+  noClick: FollowUpStepConfig[];
+  perMinute: number;
+  dailyLimit: number;
+  batchSize: number;
+  /** Sequences whose last email is older than this are abandoned. */
+  lookbackDays: number;
+  requireResend: boolean;
+}
+
+export interface FollowUpRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  trigger: string;   // auto | manual
+  status: string;    // running | done | error | skipped
+  due_count: number;
+  queued: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  no_open: number;
+  no_click: number;
+  retry1: number;
+  retry2: number;
+  template_names: string | null;
+  job_id: string | null;
+  note: string | null;
+  error: string | null;
+}
+
+export interface FollowUpRung {
+  branch: FollowUpBranch;
+  step: number;                  // 1 = first retry, 2 = second
+  templateId: string;
+  templateName: string | null;   // null = the template was deleted
+  delayHours: number;
+  due: number;
+  waiting: number;
+  nextDueAt: string | null;
+  // What this rung has produced so far, all time.
+  sent: number;
+  opened: number;
+  clicked: number;
+}
+
+export interface FollowUpStatus {
+  config: FollowUpConfig;
+  running: boolean;
+  dueNow: number;
+  waiting: number;
+  /** In a sequence, but the rung they'd take has no template. */
+  unconfigured: number;
+  sentToday: number;
+  dailyRemaining: number | null;
+  /** App URL set = opens/clicks are actually tracked. */
+  trackingReady: boolean;
+  lastRun: FollowUpRun | null;
+  runs: FollowUpRun[];
+  rungs: FollowUpRung[];
+  totals: { retries: number; opened: number; clicked: number };
+  templates: { id: string; name: string; type: string }[];
+  blockers: string[];
+  dueSample: { email: string; branch: FollowUpBranch; step: number; dueAt: string }[];
 }
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -476,6 +560,16 @@ export const api = {
   runAutomation: () =>
     req<{ started: boolean; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
       `/api/automation/run`,
+      { method: "POST", body: "{}" }
+    ),
+
+  // follow-up ladder — retry whoever didn't open / didn't click
+  getFollowUp: () => req<FollowUpStatus>(`/api/followup`),
+  saveFollowUp: (cfg: Partial<FollowUpConfig>) =>
+    req<FollowUpStatus>(`/api/followup`, { method: "POST", body: JSON.stringify(cfg) }),
+  runFollowUp: () =>
+    req<{ started: boolean; runId?: string; jobId?: string; queued?: number; status: FollowUpStatus }>(
+      `/api/followup/run`,
       { method: "POST", body: "{}" }
     ),
 

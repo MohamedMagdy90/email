@@ -24,6 +24,13 @@ import {
   setAutomationConfig,
   startAutomationRun,
 } from "./automation";
+import {
+  startFollowUpWorker,
+  getFollowUpStatus,
+  setFollowUpConfig,
+  startFollowUpRun,
+  MAX_STEPS,
+} from "./followup";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
 import { backfillCountries } from "./country";
 import { searchCompanies } from "./search";
@@ -58,6 +65,7 @@ await ensureSchema();
 await seedAuthFromEnv();
 startDiscoveryWorker(); // always-on company discovery (browser-independent)
 startAutomationWorker(); // auto-approve a full pool → auto-send (browser-independent)
+startFollowUpWorker(); // retry ladder — nobody gets one email and silence
 
 // Give every lead and contact one canonical country. Rows saved before the
 // country was resolved properly are blank (the source's Country box was left
@@ -1527,6 +1535,50 @@ app.post("/api/automation/run", async (c) => {
   const r = await startAutomationRun("manual");
   if (!r.started) return c.json({ error: r.error || r.note || "Nothing to do right now" }, 400);
   return c.json({ ...r, status: await getAutomationStatus() });
+});
+
+/* ---------------------------- Follow-up ladder ---------------------- */
+// Retries: a contact who never opened gets a different email a few hours later,
+// and a contact who opened but never clicked gets another angle — up to a hard
+// ceiling of 3 emails per sequence. Config + who's due + the ledger come back in
+// one call so the Settings card renders from a single poll.
+
+// Normalise a ladder posted by the UI: exactly MAX_STEPS rungs, numbers as
+// numbers, ids as strings. The engine clamps the values again on save.
+function parseLadder(input: any): { templateId: string; delayHours: number }[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const out: { templateId: string; delayHours: number }[] = [];
+  for (let i = 0; i < MAX_STEPS; i++) {
+    const s = input[i] || {};
+    out.push({ templateId: String(s.templateId || ""), delayHours: Number(s.delayHours) || 0 });
+  }
+  return out;
+}
+
+app.get("/api/followup", async (c) => c.json(await getFollowUpStatus()));
+
+app.post("/api/followup", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  await setFollowUpConfig({
+    enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
+    maxEmails: b.maxEmails != null ? Number(b.maxEmails) : undefined,
+    noOpen: parseLadder(b.noOpen),
+    noClick: parseLadder(b.noClick),
+    perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
+    dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
+    batchSize: b.batchSize != null ? Number(b.batchSize) : undefined,
+    lookbackDays: b.lookbackDays != null ? Number(b.lookbackDays) : undefined,
+    requireResend: typeof b.requireResend === "boolean" ? b.requireResend : undefined,
+  });
+  return c.json(await getFollowUpStatus());
+});
+
+// Send everything that is due right now, without waiting for the next tick.
+// It can't "skip ahead" — a retry that isn't due yet is still not due.
+app.post("/api/followup/run", async (c) => {
+  const r = await startFollowUpRun("manual");
+  if (!r.started) return c.json({ error: r.error || r.note || "Nothing is due right now" }, 400);
+  return c.json({ ...r, status: await getFollowUpStatus() });
 });
 
 /* ------------------------------ History ----------------------------- */
