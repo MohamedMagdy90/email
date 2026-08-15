@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type FollowUpStatus, type FollowUpRun, type FollowUpRung, type FollowUpStepConfig, type Template, type Job } from "../lib/api";
 import { Button, Card, Field, Input, Select, Spinner, toast, cn } from "../lib/ui";
+import { RETRY_STARTERS, type RetryRung } from "../lib/starters";
 
 /* ------------------------------- shape --------------------------------- */
 
@@ -74,6 +75,8 @@ export default function FollowUpCard() {
   const [starting, setStarting] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [showDue, setShowDue] = useState(false);
+  const [loadingPack, setLoadingPack] = useState(false);
+  const [packVoice, setPackVoice] = useState<"customer" | "partner">("customer");
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
 
@@ -130,6 +133,58 @@ export default function FollowUpCard() {
       return { ...f, [key]: next };
     });
     setDirty(true);
+  }
+
+  // Write the eight ready-made retry emails into Templates (skipping any that
+  // are already there by name), then drop them into the rungs that are still
+  // empty. It never overwrites a template you chose yourself, and it leaves the
+  // form dirty so nothing is saved until you've looked at it.
+  async function loadPack() {
+    setLoadingPack(true);
+    try {
+      const byName = new Map((await api.getTemplates()).templates.map((t) => [t.name, t]));
+      let created = 0;
+      for (const s of RETRY_STARTERS) {
+        if (byName.has(s.name)) continue;
+        const r = await api.saveTemplate({ type: s.type, name: s.name, subject: s.subject, body: s.body });
+        byName.set(s.name, r.template);
+        created++;
+      }
+      const fresh = (await api.getTemplates()).templates;
+      setTemplates(fresh);
+
+      const idFor = (rung: RetryRung) => {
+        const s = RETRY_STARTERS.find((x) => x.rung === rung && x.type === packVoice);
+        return (s && byName.get(s.name)?.id) || "";
+      };
+      let wired = 0;
+      const fill = (cur: FollowUpStepConfig, rung: RetryRung): FollowUpStepConfig => {
+        if (cur.templateId) return cur;
+        const id = idFor(rung);
+        if (!id) return cur;
+        wired++;
+        return { ...cur, templateId: id };
+      };
+      setForm((f) => ({
+        ...f,
+        noOpen: [fill(f.noOpen[0], "no_open_1"), fill(f.noOpen[1], "no_open_2")],
+        noClick: [fill(f.noClick[0], "no_click_1"), fill(f.noClick[1], "no_click_2")],
+      }));
+      if (wired) setDirty(true);
+
+      toast(
+        created
+          ? `${created} template(s) added${wired ? ` · ${wired} rung(s) filled — press Save ladder` : ""}`
+          : wired
+          ? `Templates were already there · ${wired} rung(s) filled — press Save ladder`
+          : "All eight are already loaded and every rung is set",
+        "success"
+      );
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setLoadingPack(false);
+    }
   }
 
   async function save() {
@@ -313,6 +368,38 @@ export default function FollowUpCard() {
           <div className="min-w-0">
             <div className="text-[13px] font-medium">The email you already send</div>
             <div className="text-[12px] text-muted">Any campaign or automated send. What happens next depends on what they do with it.</div>
+          </div>
+        </div>
+
+        {/* Ready-made copy. Writing four retries that don't repeat the first
+            email is most of the work in setting this up, so the pack ships with
+            the app rather than being something to author from scratch. */}
+        <div className="rounded-xl border border-dashed border-line bg-cream/40 px-3.5 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium">Don't write four emails from scratch</div>
+              <div className="text-[12px] leading-relaxed text-muted">
+                Eight ready retries in your existing house style — one per rung, in both voices. Each rung gets
+                lighter: the second retry drops the images entirely, which is what gets replies.
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <div className="flex rounded-full border border-line bg-white p-0.5 text-[11px]">
+                {(["customer", "partner"] as const).map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    onClick={() => setPackVoice(v)}
+                    className={cn("rounded-full px-2.5 py-1 font-medium capitalize transition-colors", packVoice === v ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
+                  >
+                    {v}
+                  </button>
+                ))}
+              </div>
+              <Button size="sm" variant="outline" loading={loadingPack} onClick={loadPack}>
+                Load the retry pack
+              </Button>
+            </div>
           </div>
         </div>
 
