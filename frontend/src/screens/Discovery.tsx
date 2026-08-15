@@ -34,6 +34,17 @@ type LeadTab = "pending" | "approved" | "rejected";
 const NO_COUNTRY = "__none__";
 const countryLabel = (c: string) => (c === NO_COUNTRY ? "No country" : c);
 
+// Whether the sources list is expanded. Persisted, because once your sources
+// are set up you come to this screen to work the review pool, not to edit them —
+// and wrapped in try/catch because storage can be unavailable inside an iframe.
+const SOURCES_OPEN_KEY = "dna-discovery-sources-open";
+function readSourcesOpen(): boolean {
+  try { return localStorage.getItem(SOURCES_OPEN_KEY) !== "0"; } catch { return true; }
+}
+function writeSourcesOpen(open: boolean) {
+  try { localStorage.setItem(SOURCES_OPEN_KEY, open ? "1" : "0"); } catch { /* ignore */ }
+}
+
 export default function Discovery() {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
   const [automation, setAutomation] = useState<AutomationStatus | null>(null);
@@ -69,6 +80,8 @@ export default function Discovery() {
   // add / edit source
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<DiscoverySource | null>(null);
+  // Sources list open/closed — remembered across visits.
+  const [showSources, setSourcesOpen] = useState(readSourcesOpen);
 
   const pollRef = useRef<number | null>(null);
 
@@ -283,6 +296,24 @@ export default function Discovery() {
   const running = !!status?.enabled;
   const counts = { pending: status?.leads.pending ?? 0, approved: status?.leads.approved ?? 0, rejected: status?.leads.rejected ?? 0 };
 
+  function toggleSourcesOpen() {
+    setSourcesOpen((v) => { writeSourcesOpen(!v); return !v; });
+  }
+
+  // What the collapsed header has to convey on its own: that work is happening,
+  // and how much of it. Closing the list must never hide a running scan.
+  const scanningNow = sources.filter((s) => s.enabled && s.last_status === "running").length;
+  const activeCount = sources.filter((s) => s.enabled).length;
+  const foundTotal = sources.reduce((n, s) => n + (s.total_found || 0), 0);
+  const sourcesSummary = (() => {
+    if (!sources.length) return "None yet — add one to start discovering companies.";
+    const parts = [`${activeCount} active`];
+    if (sources.length - activeCount > 0) parts.push(`${sources.length - activeCount} paused`);
+    if (archivedCount > 0) parts.push(`${archivedCount} archived`);
+    if (foundTotal > 0) parts.push(`${foundTotal.toLocaleString()} found`);
+    return parts.join(" · ");
+  })();
+
   return (
     <div className="space-y-8">
       {/* Header + master switch */}
@@ -388,69 +419,131 @@ export default function Discovery() {
         </div>
       )}
 
-      {/* Sources */}
+      {/* Sources — collapsible. Once they're configured this list is reference
+          material, while the review pool underneath is the daily work; folding it
+          away puts the pool on screen without scrolling past every source. */}
       <Card className="overflow-hidden">
-        <div className="flex items-center justify-between border-b border-line px-5 py-4">
-          <div>
-            <h2 className="font-clash text-lg font-semibold">Discovery sources</h2>
-            <p className="text-xs text-muted">Web search finds thousands like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped.</p>
-          </div>
-          <Button size="sm" onClick={() => { setEditing(null); setModalOpen(true); }}>Add source</Button>
-        </div>
-
-        {sources.length === 0 ? (
-          <div className="px-5 py-12 text-center">
-            <p className="text-sm font-medium">No sources yet</p>
-            <p className="mx-auto mt-1 max-w-md text-xs text-muted">
-              Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
-            </p>
-            <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
-          </div>
-        ) : (
-          <div className="divide-y divide-line-soft">
-            {sources.map((s) => (
-              <SourceRow
-                key={s.id}
-                s={s}
-                onToggle={() => toggleSource(s)}
-                onRun={() => runSource(s)}
-                onEdit={() => { setEditing(s); setModalOpen(true); }}
-                onArchive={() => archiveSource(s)}
-                onDelete={() => removeSource(s)}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* Archived drawer — retired sources, kept intact and restorable. */}
-        {archivedCount > 0 && (
-          <div className="border-t border-line bg-cream/40">
+        <div className="flex items-center justify-between gap-3 px-5 py-4">
+          {/* The heading WRAPS the toggle (the accordion pattern) so the whole
+              title is clickable without putting block elements inside a button.
+              The summary line is what keeps a closed card honest — it still
+              reports what's active and what's scanning. */}
+          <h2 className="min-w-0 flex-1">
             <button
               type="button"
-              onClick={() => { setShowArchived((v) => !v); if (!showArchived) refreshArchived(); }}
-              className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-ink/[0.03]"
+              onClick={toggleSourcesOpen}
+              aria-expanded={showSources}
+              className="group flex w-full min-w-0 items-start gap-2.5 text-left"
             >
-              <span className="flex items-center gap-2 text-[13px] font-medium text-ink/70">
-                <span className="grid h-5 w-5 place-items-center rounded-md bg-ink/[0.07] text-[10px] font-semibold tabular-nums text-ink/55">
-                  {archivedCount}
-                </span>
-                Archived source{archivedCount === 1 ? "" : "s"}
+              <span
+                className={cn(
+                  "mt-1 grid h-5 w-5 shrink-0 place-items-center rounded-md text-[11px] text-ink/40 transition-all duration-200",
+                  "group-hover:bg-ink/[0.07] group-hover:text-ink",
+                  showSources && "rotate-180"
+                )}
+              >
+                ▾
               </span>
-              <span className={cn("text-xs text-ink/40 transition-transform", showArchived && "rotate-180")}>▾</span>
+              <span className="min-w-0 flex-1">
+                <span className="flex flex-wrap items-center gap-2">
+                  <span className="font-clash text-lg font-semibold">Discovery sources</span>
+                  {sources.length > 0 && (
+                    <span className="rounded-full bg-ink/[0.07] px-2 py-0.5 text-[11px] font-semibold tabular-nums text-ink/55">
+                      {sources.length}
+                    </span>
+                  )}
+                  {scanningNow > 0 && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-good/15 px-2 py-0.5 text-[11px] font-medium text-good">
+                      <Spinner className="h-2.5 w-2.5" />
+                      {scanningNow} scanning
+                    </span>
+                  )}
+                </span>
+                <span className="mt-0.5 block truncate text-xs font-normal text-muted">
+                  {showSources
+                    ? "Web search finds thousands like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped."
+                    : sourcesSummary}
+                </span>
+              </span>
             </button>
-            {showArchived && (
-              archived.length === 0 ? (
-                <div className="px-5 pb-4 text-xs text-muted">Loading…</div>
+          </h2>
+          <Button
+            size="sm"
+            className="shrink-0"
+            onClick={() => { setEditing(null); setModalOpen(true); if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); } }}
+          >
+            Add source
+          </Button>
+        </div>
+
+        {/* grid-rows animates to the content's real height, so the list can grow
+            (or a source can start streaming) without a hard-coded max-height. */}
+        <div
+          className={cn(
+            "grid transition-[grid-template-rows] duration-300 ease-out",
+            showSources ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+          )}
+        >
+          <div className="overflow-hidden">
+            <div className="border-t border-line">
+              {sources.length === 0 ? (
+                <div className="px-5 py-12 text-center">
+                  <p className="text-sm font-medium">No sources yet</p>
+                  <p className="mx-auto mt-1 max-w-md text-xs text-muted">
+                    Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
+                  </p>
+                  <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
+                </div>
               ) : (
-                <div className="divide-y divide-line-soft border-t border-line-soft">
-                  {archived.map((s) => (
-                    <ArchivedRow key={s.id} s={s} onRestore={() => restoreSource(s)} onDelete={() => removeSource(s)} />
+                // Past a handful of sources the list scrolls inside the card, so
+                // the review pool stays reachable even with it expanded.
+                <div className={cn("divide-y divide-line-soft", sources.length > 6 && "max-h-[26rem] overflow-y-auto")}>
+                  {sources.map((s) => (
+                    <SourceRow
+                      key={s.id}
+                      s={s}
+                      onToggle={() => toggleSource(s)}
+                      onRun={() => runSource(s)}
+                      onEdit={() => { setEditing(s); setModalOpen(true); }}
+                      onArchive={() => archiveSource(s)}
+                      onDelete={() => removeSource(s)}
+                    />
                   ))}
                 </div>
-              )
-            )}
+              )}
+
+              {/* Archived drawer — retired sources, kept intact and restorable. */}
+              {archivedCount > 0 && (
+                <div className="border-t border-line bg-cream/40">
+                  <button
+                    type="button"
+                    onClick={() => { setShowArchived((v) => !v); if (!showArchived) refreshArchived(); }}
+                    className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-ink/[0.03]"
+                  >
+                    <span className="flex items-center gap-2 text-[13px] font-medium text-ink/70">
+                      <span className="grid h-5 w-5 place-items-center rounded-md bg-ink/[0.07] text-[10px] font-semibold tabular-nums text-ink/55">
+                        {archivedCount}
+                      </span>
+                      Archived source{archivedCount === 1 ? "" : "s"}
+                    </span>
+                    <span className={cn("text-xs text-ink/40 transition-transform", showArchived && "rotate-180")}>▾</span>
+                  </button>
+                  {showArchived && (
+                    archived.length === 0 ? (
+                      <div className="px-5 pb-4 text-xs text-muted">Loading…</div>
+                    ) : (
+                      <div className="divide-y divide-line-soft border-t border-line-soft">
+                        {archived.map((s) => (
+                          <ArchivedRow key={s.id} s={s} onRestore={() => restoreSource(s)} onDelete={() => removeSource(s)} />
+                        ))}
+                      </div>
+                    )
+                  )}
+                </div>
+              )}
+            </div>
           </div>
-        )}
+        </div>
       </Card>
 
       {/* Review pool */}
@@ -666,6 +759,7 @@ export default function Discovery() {
     </div>
   );
 }
+
 
 /* ------------------------------ Bot switch ----------------------------- */
 
