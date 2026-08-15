@@ -77,6 +77,22 @@ const EMPTY: Form = {
   requireResend: true,
 };
 
+// Read one lane out of whatever the server sent. A backend mid-redeploy (or an
+// older one) has no lanes at all, and the card must show its defaults rather
+// than blow up on `undefined.templateIds` — the whole Settings screen would go
+// with it.
+function readLane(v: AutomationLaneConfig | undefined, fallback: LaneForm): LaneForm {
+  if (!v) return { ...fallback, templateIds: [...fallback.templateIds] };
+  return {
+    enabled: typeof v.enabled === "boolean" ? v.enabled : fallback.enabled,
+    threshold: Number(v.threshold) || fallback.threshold,
+    templateIds: Array.isArray(v.templateIds) ? [...v.templateIds] : [],
+    templateMode: v.templateMode === "split" ? "split" : "rotate",
+    category: v.category || "",
+    country: v.country || "",
+  };
+}
+
 export default function AutomationCard() {
   const [status, setStatus] = useState<AutomationStatus | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -91,12 +107,12 @@ export default function AutomationCard() {
 
   function syncForm(s: AutomationStatus) {
     setForm({
-      customer: { ...s.config.customer, templateIds: [...s.config.customer.templateIds] },
-      partner: { ...s.config.partner, templateIds: [...s.config.partner.templateIds] },
-      perMinute: s.config.perMinute,
-      dailyLimit: s.config.dailyLimit,
-      cooldownMinutes: s.config.cooldownMinutes,
-      requireResend: s.config.requireResend,
+      customer: readLane(s.config.customer, EMPTY.customer),
+      partner: readLane(s.config.partner, EMPTY.partner),
+      perMinute: s.config.perMinute ?? EMPTY.perMinute,
+      dailyLimit: s.config.dailyLimit ?? EMPTY.dailyLimit,
+      cooldownMinutes: s.config.cooldownMinutes ?? EMPTY.cooldownMinutes,
+      requireResend: s.config.requireResend ?? EMPTY.requireResend,
     });
   }
 

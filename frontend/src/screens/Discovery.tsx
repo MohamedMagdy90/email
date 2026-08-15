@@ -870,7 +870,9 @@ function AutomationStrip({ a }: { a: AutomationStatus | null }) {
   const live = lanes.filter((l) => l.config.enabled);
 
   if (!enabled) {
-    const trigger = lanes.find((l) => l.config.enabled)?.config.threshold ?? a.config.customer.threshold;
+    // `?? 100` covers a backend that predates the lanes (or one mid-redeploy):
+    // the strip still reads sensibly instead of throwing on the whole screen.
+    const trigger = lanes.find((l) => l.config.enabled)?.config.threshold ?? a.config.customer?.threshold ?? 100;
     return (
       <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-start gap-3">
