@@ -1255,6 +1255,10 @@ app.post("/api/discovery/sources", async (c) => {
   const category = String(b.category || "Companies (general)").trim();
   const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
   const enabled = b.enabled === false ? 0 : 1;
+  // Who this source is hunting. Every lead it files inherits the tag, and the
+  // automation runs a separate lane per audience — so a partner directory can
+  // never be emailed the customer pitch.
+  const audience = String(b.audience || "").trim().toLowerCase() === "partner" ? "partner" : "customer";
 
   // Web-search source: runs free-text searches (industry × the country and its
   // cities), pages through the results, and streams every company site into the
@@ -1266,9 +1270,9 @@ app.post("/api/discovery/sources", async (c) => {
     const limit = clamp(Number(b.limit) || 100, 20, 300);
     const rows = await q(
       `INSERT INTO discovery_sources
-        (id,type,location,keywords,category,limit_n,interval_minutes,enabled,cursor,next_run_at,created_at)
-       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING *`,
-      [uid(), location, keywords || null, category, limit, interval, enabled, nowIso(), nowIso()]
+        (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,next_run_at,created_at)
+       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING *`,
+      [uid(), location, keywords || null, category, audience, limit, interval, enabled, nowIso(), nowIso()]
     );
     return c.json({ source: rows[0] });
   }
@@ -1283,9 +1287,9 @@ app.post("/api/discovery/sources", async (c) => {
     const limit = clamp(Number(b.limit) || 100, 20, 300); // leads per batch
     const rows = await q(
       `INSERT INTO discovery_sources
-        (id,type,base_url,cursor,exhausted,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
-       VALUES (?, 'directory', ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      [uid(), url, initialCursor(url), country, category, limit, interval, enabled, nowIso(), nowIso()]
+        (id,type,base_url,cursor,exhausted,location,place_json,category,audience,limit_n,interval_minutes,enabled,next_run_at,created_at)
+       VALUES (?, 'directory', ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      [uid(), url, initialCursor(url), country, category, audience, limit, interval, enabled, nowIso(), nowIso()]
     );
     return c.json({ source: rows[0] });
   }
@@ -1297,9 +1301,9 @@ app.post("/api/discovery/sources", async (c) => {
   const placeJson = b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null;
   const rows = await q(
     `INSERT INTO discovery_sources
-      (id,type,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
-     VALUES (?, 'osm', ?,?,?,?,?,?,?,?) RETURNING *`,
-    [uid(), location, placeJson, category, limit, interval, enabled, nowIso(), nowIso()]
+      (id,type,location,place_json,category,audience,limit_n,interval_minutes,enabled,next_run_at,created_at)
+     VALUES (?, 'osm', ?,?,?,?,?,?,?,?,?) RETURNING *`,
+    [uid(), location, placeJson, category, audience, limit, interval, enabled, nowIso(), nowIso()]
   );
   return c.json({ source: rows[0] });
 });
@@ -1312,6 +1316,13 @@ app.put("/api/discovery/sources/:id", async (c) => {
   const location = b.location != null ? String(b.location).trim() : existing.location;
   const category = b.category != null ? String(b.category).trim() : existing.category;
   const keywords = b.keywords != null ? String(b.keywords).trim() : existing.keywords;
+  // Re-tagging a source only changes what it files FROM NOW ON — leads it has
+  // already put in the pool keep the tag they were found under, which is right:
+  // they were found by a search aimed at that audience.
+  const audience =
+    b.audience != null
+      ? (String(b.audience).trim().toLowerCase() === "partner" ? "partner" : "customer")
+      : (existing.audience || "customer");
   const limit = b.limit != null ? clamp(Number(b.limit), 5, 500) : existing.limit_n;
   const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
   const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
@@ -1346,9 +1357,9 @@ app.put("/api/discovery/sources/:id", async (c) => {
 
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
+       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
+    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
   );
   return c.json({ source: rows[0] });
 });
@@ -1411,22 +1422,35 @@ app.get("/api/discovery/leads", async (c) => {
   const status = c.req.query("status") || "pending";
   const search = c.req.query("q");
   const country = c.req.query("country");
+  // customer | partner | "" (both). Applied server-side so every bulk button
+  // acts on exactly the rows on screen.
+  const audience = c.req.query("audience");
   const hasEmail = c.req.query("hasEmail") === "1";
   const limit = clamp(Number(c.req.query("limit") || 100), 1, 500);
-  const { clause, params } = discoveredWhere({ status, q: search, hasEmail, country });
+  const { clause, params } = discoveredWhere({ status, q: search, hasEmail, country, audience });
   const leads = await q(
     `SELECT * FROM discovered_leads ${clause} ORDER BY created_at DESC LIMIT ?`,
     [...params, limit]
   );
   const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
   const filteredTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
-  // How many leads in the CURRENT tab + country + search are approvable — that
-  // is exactly what the "Approve all" button will act on.
-  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true, country });
+  // How many leads in the CURRENT tab + country + audience + search are
+  // approvable — that is exactly what the "Approve all" button will act on.
+  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true, country, audience });
   const approvableTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${ap.clause}`, ap.params))[0]?.n ?? 0;
+  // How the whole tab splits between the two pitches, so the filter can show
+  // real counts rather than making you click to find out.
+  const aw = discoveredWhere({ status, q: search, hasEmail, country });
+  const audienceRows = await q(
+    `SELECT CASE WHEN lower(COALESCE(audience,'customer')) = 'partner' THEN 'partner' ELSE 'customer' END AS audience,
+            CAST(count(*) AS INTEGER) AS n
+       FROM discovered_leads ${aw.clause}
+      GROUP BY CASE WHEN lower(COALESCE(audience,'customer')) = 'partner' THEN 'partner' ELSE 'customer' END`,
+    aw.params
+  );
   // Every country present in this tab, with counts, so the filter lists real
   // options for the WHOLE pool — not just the page that happens to be loaded.
-  const cw = discoveredWhere({ status });
+  const cw = discoveredWhere({ status, audience });
   const countries = await q(
     `SELECT COALESCE(NULLIF(country, ''), '${NO_COUNTRY}') AS country, CAST(count(*) AS INTEGER) AS n
        FROM discovered_leads ${cw.clause}
@@ -1437,7 +1461,7 @@ app.get("/api/discovery/leads", async (c) => {
   // Where the leads in this exact view stand. Without this, a pool of 1,387 that
   // shows 107 "with email only" looks like the bot found 107 — when it actually
   // found 1,387 and is still turning the rest into email addresses.
-  const bw = discoveredWhere({ status, q: search, country });
+  const bw = discoveredWhere({ status, q: search, country, audience });
   const b = (await q(
     `SELECT
         CAST(SUM(CASE WHEN email IS NOT NULL AND email <> '' THEN 1 ELSE 0 END) AS INTEGER) AS withEmail,
@@ -1453,11 +1477,13 @@ app.get("/api/discovery/leads", async (c) => {
     queued: Number(b.queued) || 0,         // no site yet — we'll search the web for one
     noEmail: Number(b.noEmail) || 0,       // looked everywhere, none published
   };
-  return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown });
+  return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown, audiences: audienceRows });
 });
 
 // Approve leads → create Contacts (only ones with an email) and mark 'approved'.
 // Accepts an explicit id list, or every matching pending lead (`all:true`).
+// Each new contact is filed under the audience of the lead it came from, so the
+// customer / partner split survives approval.
 app.post("/api/discovery/leads/approve", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const r = await approveLeads({
@@ -1465,6 +1491,7 @@ app.post("/api/discovery/leads/approve", async (c) => {
     all: b.all === true,
     q: b.q,
     filterCountry: b.filterCountry,
+    filterAudience: b.filterAudience ?? b.audience,
     category: b.category,
     country: b.country,
   });
@@ -1475,7 +1502,7 @@ app.post("/api/discovery/leads/approve", async (c) => {
 app.post("/api/discovery/leads/reject", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, country: b.filterCountry });
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, country: b.filterCountry, audience: b.filterAudience ?? b.audience });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`UPDATE discovered_leads SET status='rejected' ${clause}`, params);
     return c.json({ rejected: before });
@@ -1491,7 +1518,7 @@ app.post("/api/discovery/leads/reject", async (c) => {
 app.post("/api/discovery/leads/delete", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: b.status, q: b.q, country: b.filterCountry });
+    const { clause, params } = discoveredWhere({ status: b.status, q: b.q, country: b.filterCountry, audience: b.filterAudience ?? b.audience });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`DELETE FROM discovered_leads ${clause}`, params);
     return c.json({ deleted: before });
@@ -1513,13 +1540,23 @@ app.get("/api/automation", async (c) => c.json(await getAutomationStatus()));
 
 app.post("/api/automation", async (c) => {
   const b = await c.req.json().catch(() => ({}));
+  // One lane's worth of settings. Anything absent is left exactly as it is, so
+  // the UI can save a single field of a single lane without touching the other.
+  const lane = (v: any) => {
+    if (!v || typeof v !== "object") return undefined;
+    return {
+      enabled: typeof v.enabled === "boolean" ? v.enabled : undefined,
+      threshold: v.threshold != null ? Number(v.threshold) : undefined,
+      templateIds: Array.isArray(v.templateIds) ? v.templateIds.map((x: any) => String(x)) : undefined,
+      templateMode: v.templateMode === "split" ? "split" as const : v.templateMode === "rotate" ? "rotate" as const : undefined,
+      category: typeof v.category === "string" ? v.category : undefined,
+      country: typeof v.country === "string" ? v.country : undefined,
+    };
+  };
   await setAutomationConfig({
     enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
-    threshold: b.threshold != null ? Number(b.threshold) : undefined,
-    templateIds: Array.isArray(b.templateIds) ? b.templateIds.map((x: any) => String(x)) : undefined,
-    templateMode: b.templateMode === "split" ? "split" : b.templateMode === "rotate" ? "rotate" : undefined,
-    category: typeof b.category === "string" ? b.category : undefined,
-    country: typeof b.country === "string" ? b.country : undefined,
+    customer: lane(b.customer),
+    partner: lane(b.partner),
     perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
     dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
     cooldownMinutes: b.cooldownMinutes != null ? Number(b.cooldownMinutes) : undefined,
@@ -1528,11 +1565,12 @@ app.post("/api/automation", async (c) => {
   return c.json(await getAutomationStatus());
 });
 
-// Run right now — ignores the trigger count and the cooldown (that's the point
-// of a manual run) but still respects every safety check: a template must be
-// chosen, Resend must be connected, and the daily ceiling still applies.
+// Run one lane right now — ignores the trigger count and the cooldown (that's
+// the point of a manual run) but still respects every safety check: a template
+// must be chosen, Resend must be connected, and the daily ceiling still applies.
 app.post("/api/automation/run", async (c) => {
-  const r = await startAutomationRun("manual");
+  const b = await c.req.json().catch(() => ({}));
+  const r = await startAutomationRun("manual", String(b.audience || "customer"));
   if (!r.started) return c.json({ error: r.error || r.note || "Nothing to do right now" }, 400);
   return c.json({ ...r, status: await getAutomationStatus() });
 });

@@ -63,6 +63,12 @@ export async function ensureSchema() {
   // error is swallowed, so this is idempotent.
   try { await q(`ALTER TABLE contacts ADD COLUMN category TEXT`); } catch { /* already exists */ }
   try { await q(`ALTER TABLE contacts ADD COLUMN phone TEXT`); } catch { /* already exists */ }
+  // WHO this contact is: a prospective 'customer' (we sell them DNA ERP) or a
+  // prospective 'partner' (we sell them the Makers program). It rides in from
+  // the discovery source that found them, and it decides which automation lane
+  // — and which email — they get. NULL on every pre-existing row, and every
+  // read treats NULL as 'customer', which is what the app was before this.
+  try { await q(`ALTER TABLE contacts ADD COLUMN audience TEXT`); } catch { /* already exists */ }
 
   await q(`CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
@@ -196,6 +202,11 @@ export async function ensureSchema() {
   // instead of leaving a finished source looking stuck.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_tiles INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_available INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  // WHO this source is hunting: 'customer' (companies we sell DNA ERP to) or
+  // 'partner' (accounting firms, VARs, consultancies we sell the Makers program
+  // to). Every lead it files inherits the tag, so the two audiences can never be
+  // emailed the same pitch by accident. Existing sources default to 'customer'.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being
@@ -237,6 +248,12 @@ export async function ensureSchema() {
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
   // Domain lookups (the pool-domain backfill + junk sweeps scan by domain).
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_domain ON discovered_leads(domain)`); } catch { /* ignore */ }
+  // Customer or partner — copied from the source that found this lead, and
+  // carried onto the contact when it's approved. NULL = discovered before the
+  // tag existed, and is read everywhere as 'customer'.
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN audience TEXT`); } catch { /* exists */ }
+  // The automation counts and drains the pool one audience at a time.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_audience ON discovered_leads(audience)`); } catch { /* ignore */ }
 
   /* ------------------------- Pool domain ledger ------------------------ */
 
@@ -305,6 +322,10 @@ export async function ensureSchema() {
     error TEXT
   )`);
   try { await q(`CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at)`); } catch { /* ignore */ }
+  // Which lane the run belongs to — 'customer' or 'partner'. The two lanes have
+  // their own trigger, templates and cooldown, so every run has to say which one
+  // it was, or the ledger (and the cooldown that reads it) mixes them up.
+  try { await q(`ALTER TABLE automation_runs ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
 
   /* -------------------------- Follow-up ledger ------------------------- */
   // One row per follow-up pass (the sweep that emails everyone whose retry is

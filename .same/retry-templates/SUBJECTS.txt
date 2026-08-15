@@ -1,0 +1,54 @@
+RETRY TEMPLATES — copy each .html file into the Body box on the Templates tab.
+The subject for each one is below. Paste the file contents exactly as they are.
+
+CUSTOMER
+------------------------------------------------------------
+file    : 01-customer-no-open-1.html
+name    : Customer · Retry 1 — never opened
+subject : How long does your month-end close take?
+rung    : never opened · retry 1
+type    : customer
+
+file    : 02-customer-no-open-2.html
+name    : Customer · Retry 2 — last note
+subject : Closing the file — or worth a look later?
+rung    : never opened · retry 2
+type    : customer
+
+file    : 03-customer-no-click-1.html
+name    : Customer · Nudge 1 — opened, no click
+subject : The three numbers most owners ask us for first
+rung    : opened, no click · retry 1
+type    : customer
+
+file    : 04-customer-no-click-2.html
+name    : Customer · Nudge 2 — opened, no click
+subject : One question, then we will stop
+rung    : opened, no click · retry 2
+type    : customer
+
+PARTNER
+------------------------------------------------------------
+file    : 05-partner-no-open-1.html
+name    : Partner · Retry 1 — never opened
+subject : What margin do you keep on an ERP implementation?
+rung    : never opened · retry 1
+type    : partner
+
+file    : 06-partner-no-open-2.html
+name    : Partner · Retry 2 — last note
+subject : Closing the loop on the Makers programme
+rung    : never opened · retry 2
+type    : partner
+
+file    : 07-partner-no-click-1.html
+name    : Partner · Nudge 1 — opened, no click
+subject : 35% recurring, or 15% for just the introduction?
+rung    : opened, no click · retry 1
+type    : partner
+
+file    : 08-partner-no-click-2.html
+name    : Partner · Nudge 2 — opened, no click
+subject : Worth fifteen minutes, or shall I stop here?
+rung    : opened, no click · retry 2
+type    : partner

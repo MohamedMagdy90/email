@@ -14,3 +14,7 @@ data.sqlite
 .DS_Store
 .same-test/
 .commit-msg.txt
+
+# Build artifacts from the deploy tool
+output/
+**/output/

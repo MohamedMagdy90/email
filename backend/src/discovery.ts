@@ -58,9 +58,17 @@ function shortUrl(u?: string | null): string {
   try { const x = new URL(u); return x.host.replace(/^www\./, "") + x.pathname + (x.search || ""); } catch { return String(u); }
 }
 function srcLabel(src: any): string {
-  if (src?.type === "directory") return shortUrl(src.base_url) || "directory";
-  if (src?.type === "search") return `search · ${src?.location || "web"} · ${src?.category || "?"}`;
-  return `${src?.location || "?"} · ${src?.category || "?"}`;
+  const who = audienceOf(src) === "partner" ? " [partner]" : "";
+  if (src?.type === "directory") return (shortUrl(src.base_url) || "directory") + who;
+  if (src?.type === "search") return `search · ${src?.location || "web"} · ${src?.category || "?"}${who}`;
+  return `${src?.location || "?"} · ${src?.category || "?"}${who}`;
+}
+
+// Who this source is hunting. Sources created before the tag existed have no
+// value stored, and the app has always been customer-first — so they stay
+// customers rather than silently becoming partner prospects.
+function audienceOf(src: any): "customer" | "partner" {
+  return String(src?.audience || "").trim().toLowerCase() === "partner" ? "partner" : "customer";
 }
 // One-line "what we found": name · email · phone (email/phone omitted if absent).
 function leadLine(name?: string | null, email?: string | null, phone?: string | null): string {
@@ -375,6 +383,9 @@ interface LeadRow {
   name: string; website: string | null; domain: string | null; email: string | null;
   phone: string | null; city: string | null; country: string | null; category: string;
   sourceId: string; label: string; enriched: number; confidence: string | null;
+  // 'customer' | 'partner' — copied from the source, so the lead already knows
+  // which pitch it will get long before anybody approves it.
+  audience: string;
 }
 
 // Insert one lead if it's genuinely new (not an existing contact, not already in
@@ -423,14 +434,14 @@ async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; doma
   const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
   const rows = await q(
     `INSERT INTO discovered_leads
-      (id,dedup_key,name,website,domain,email,phone,city,country,category,source_id,source_label,status,enriched,confidence,via,created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?)
+      (id,dedup_key,name,website,domain,email,phone,city,country,category,audience,source_id,source_label,status,enriched,confidence,via,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?)
      ON CONFLICT (dedup_key) DO NOTHING RETURNING id`,
     [
       uid(), key,
       row.name || domain || email || "Unknown",
       row.website, domain || null, email || null,
-      row.phone, row.city, row.country, row.category,
+      row.phone, row.city, row.country, row.category, row.audience || "customer",
       row.sourceId, row.label, row.enriched, row.confidence, nowIso(),
     ]
   );
@@ -586,6 +597,7 @@ async function runOsmSource(src: any): Promise<OsmRunResult> {
         phone: co.phone || null, city: co.city || null,
         country: resolveLeadCountry({ sourceCountry: src.location, domain, website: co.website, phone: co.phone }),
         category: src.category,
+        audience: audienceOf(src),
         sourceId: src.id, label,
         enriched: email ? 1 : 0,          // listed email → no enrichment needed
         confidence: email ? "listed" : null,
@@ -714,6 +726,7 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
       phone: co.phone || null, city: null,
       country: resolveLeadCountry({ sourceCountry: src.location, domain, website, phone: co.phone }),
       category: src.category || "",
+      audience: audienceOf(src),
       sourceId: src.id, label,
       // A listing with an inline email is complete. One that only exposes a
       // WEBSITE still needs a crawl to find the email — leave it un-enriched so
@@ -980,6 +993,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
         phone: null, city: null,
         country: resolveLeadCountry({ sourceCountry: location, domain, website }),
         category: src.category || "",
+        audience: audienceOf(src),
         sourceId: src.id, label,
         enriched: 0,            // web search gives the site, not the email → enrich it
         confidence: null,

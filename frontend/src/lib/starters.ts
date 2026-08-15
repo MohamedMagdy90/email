@@ -146,19 +146,19 @@ export const RETRY_STARTERS: RetryStarter[] = [
     rung: "no_open_1",
     type: "customer",
     name: "Customer · Retry 1 — never opened",
-    why: "New subject, no hero image, one small ask. The first subject line didn't land, so nothing about this one repeats it.",
-    subject: "How long does your month-end close take?",
+    why: "Leads on cash owed, which is the owner's problem, and names the 'my accountant handles that' objection instead of walking into it.",
+    subject: "Who owes you money right now?",
     body: `${WRAP_OPEN}${LOGO_BAR}
   <tr>
     <td style="background:#ffffff;padding:34px 40px 8px 40px;">
-      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">Most of that time goes into making two systems agree</h1>
+      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">The books tell you what happened. Not who owes you today.</h1>
       <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi there,</p>
-      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">For most of the companies we speak to the answer is days rather than hours, and the bulk of it is reconciliation: finance exports one number, the stock system says another, and someone spends the first week of the month making the two agree.</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">Your accountant closes the month and tells you how it went. That is history, and it is their job. It is a different question from the one you have to answer on a Tuesday: who is late paying, which job is quietly running over, and how much cash is sitting in stock you have already bought.</p>
     </td>
   </tr>
   <tr>
     <td style="background:#ffffff;padding:18px 40px 4px 40px;">
-      <table cellpadding="0" cellspacing="0" border="0" width="100%">${tick("One set of numbers", "Finance, stock and sales read from the same live data.")}${tick("The close runs itself", "Approvals, invoicing and reporting stop waiting on someone.")}${tick("See it on your own data", "There is a 14-day free trial, so you can look before committing to anything.")}</table>
+      <table cellpadding="0" cellspacing="0" border="0" width="100%">${tick("Answers without asking anyone", "Open it and see what is owed, what is in stock and what is on order, as it stands this minute.")}${tick("You find out while you can still act", "A job running over shows up in week two, not in the final account.")}${tick("See it on your own data", "There is a 14-day free trial, so you can look before committing to anything.")}</table>
     </td>
   </tr>
   <tr>
@@ -168,7 +168,7 @@ export const RETRY_STARTERS: RetryStarter[] = [
   </tr>
   <tr>
     <td style="background:#ffffff;padding:4px 40px 20px 40px;text-align:center;">
-      <p style="font-size:13px;color:#6a6a6a;margin:0;line-height:1.6;">Or just reply with your biggest month-end headache — it reaches us directly.</p>
+      <p style="font-size:13px;color:#6a6a6a;margin:0;line-height:1.6;">Or just reply and tell us the one number you wish you had on a Monday morning — it reaches us directly.</p>
     </td>
   </tr>${sig("The DNA Systems Team", "DNA ERP — all-in-one business platform", "https://www.dna.systems")}${FOOTER}${WRAP_CLOSE}`,
   },

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   api,
+  type Audience,
   type DiscoveryStatus,
   type DiscoverySource,
   type DiscoveredLead,
@@ -28,6 +29,12 @@ const INTERVALS: { v: number; label: string }[] = [
 ];
 
 type LeadTab = "pending" | "approved" | "rejected";
+
+// Which pitch a lead belongs to. "" = show both. The tag comes from the
+// discovery source that found it, and it decides which automation lane emails
+// them — so it's a first-class filter here, not a cosmetic label.
+type AudienceFilter = "" | Audience;
+const AUDIENCE_LABEL: Record<Audience, string> = { customer: "Customer", partner: "Partner" };
 
 // The server's bucket for leads with no country on file — kept reviewable
 // rather than hidden, so nothing silently falls out of the pool.
@@ -69,6 +76,10 @@ export default function Discovery() {
   // on exactly the rows on screen — "Approve all" included.
   const [country, setCountry] = useState("");
   const [countries, setCountries] = useState<{ country: string; n: number }[]>([]);
+  // Same idea for the pitch: work the customer pool and the partner pool
+  // separately, because they get completely different emails.
+  const [audience, setAudience] = useState<AudienceFilter>("");
+  const [audienceCounts, setAudienceCounts] = useState<{ audience: string; n: number }[]>([]);
   const [breakdown, setBreakdown] = useState<{ withEmail: number; crawling: number; queued: number; noEmail: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
@@ -112,11 +123,12 @@ export default function Discovery() {
   async function refreshLeads() {
     setLoadingLeads(true);
     try {
-      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200, country: country || undefined });
+      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200, country: country || undefined, audience: audience || undefined });
       setLeads(r.leads);
       setFilteredTotal(r.filteredTotal);
       setApprovableTotal(r.approvableTotal);
       setCountries(r.countries || []);
+      setAudienceCounts(r.audiences || []);
       setBreakdown(r.breakdown || null);
       setPicked(new Set());
     } catch (e: any) {
@@ -171,7 +183,7 @@ export default function Discovery() {
   }, []);
 
   // Reload the pool whenever the filters change.
-  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail, country]);
+  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail, country, audience]);
 
   /* ------------------------------ bot ops ---------------------------- */
   async function toggleBot(on: boolean) {
@@ -261,17 +273,17 @@ export default function Discovery() {
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
   }
   // Approve every pending lead with an email that matches the CURRENT view —
-  // search *and* country filter — not just the loaded page. Drains a large pool
-  // one country at a time, in one action.
+  // search, country *and* audience filter — not just the loaded page. Drains a
+  // large pool one slice at a time, in one action.
   async function approveAll() {
     if (!approvableTotal) return;
-    const scope = country ? ` in ${countryLabel(country)}` : "";
+    const scope = [country ? ` in ${countryLabel(country)}` : "", audience ? ` (${AUDIENCE_LABEL[audience]})` : ""].join("");
     const tags = [saveCategory && `category "${saveCategory}"`, saveCountry.trim() && `country "${saveCountry.trim()}"`].filter(Boolean);
     const suffix = tags.length ? `\nThey'll be saved under ${tags.join(" and ")}.` : "";
     if (!confirm(`Approve all ${approvableTotal.toLocaleString()} lead${approvableTotal === 1 ? "" : "s"}${scope} into Contacts?${suffix}`)) return;
     setBusy(true);
     try {
-      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined, filterCountry: country || undefined });
+      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined, filterCountry: country || undefined, filterAudience: audience || undefined });
       toast(`Approved ${r.added.toLocaleString()}${scope} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
@@ -562,6 +574,27 @@ export default function Discovery() {
               ))}
             </div>
             <div className="flex items-center gap-2">
+              {/* Which pitch. The two pools are drained separately, because the
+                  automation emails them completely different templates. */}
+              <div className="flex rounded-full border border-line bg-cream p-0.5 text-[12px]">
+                {([["", "All"], ["customer", "Customers"], ["partner", "Partners"]] as const).map(([v, label]) => {
+                  const n = v ? audienceCounts.find((a) => a.audience === v)?.n : audienceCounts.reduce((s, a) => s + a.n, 0);
+                  return (
+                    <button
+                      key={v || "all"}
+                      type="button"
+                      onClick={() => setAudience(v as AudienceFilter)}
+                      title={v === "partner" ? "Leads found by sources tagged Partner — the Makers program pitch" : v === "customer" ? "Leads found by sources tagged Customer — the DNA ERP pitch" : "Both pitches"}
+                      className={cn(
+                        "rounded-full px-2.5 py-1.5 font-medium transition-colors",
+                        audience === v ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+                      )}
+                    >
+                      {label}{n ? ` · ${n.toLocaleString()}` : ""}
+                    </button>
+                  );
+                })}
+              </div>
               {countries.length > 0 && (
                 <Select
                   value={country}
@@ -702,7 +735,10 @@ export default function Discovery() {
                       <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="accent-ink" />
                     </td>
                     <td className="px-1 py-2.5">
-                      <div className="font-medium leading-tight">{l.name || l.domain}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate font-medium leading-tight">{l.name || l.domain}</span>
+                        <AudienceTag a={l.audience} />
+                      </div>
                       <div className="flex items-center gap-1.5 text-xs text-muted">
                         <span className="truncate"><EmailCell lead={l} /></span>
                         <ConfidenceTag c={l.confidence} />
@@ -824,16 +860,17 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
 
 // Answers the question this screen inevitably raises: "so what happens to all
 // these leads?" — either the automation takes the next batch by itself (and
-// here's how close it is), or nothing happens until you approve them yourself.
+// here's how close each lane is), or nothing happens until you approve them.
 function AutomationStrip({ a }: { a: AutomationStatus | null }) {
   if (!a) return null;
-  const { enabled, threshold } = a.config;
-  const ready = a.ready;
-  const pct = Math.min(100, Math.round((ready / Math.max(1, threshold)) * 100));
+  const enabled = a.config.enabled;
   const sending = a.running || a.lastRun?.status === "running";
   const blocked = enabled && a.blockers.length > 0;
+  const lanes = a.lanes ?? [];
+  const live = lanes.filter((l) => l.config.enabled);
 
   if (!enabled) {
+    const trigger = lanes.find((l) => l.config.enabled)?.config.threshold ?? a.config.customer.threshold;
     return (
       <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-start gap-3">
@@ -842,7 +879,7 @@ function AutomationStrip({ a }: { a: AutomationStatus | null }) {
           </span>
           <div className="text-[13px] leading-relaxed">
             <span className="font-medium text-ink">Automation is off</span>
-            <span className="text-muted"> — these leads wait here until you approve them. Turn it on and every {threshold.toLocaleString()} leads with an email get approved and emailed on their own.</span>
+            <span className="text-muted"> — these leads wait here until you approve them. Turn it on and every {trigger.toLocaleString()} leads with an email get approved and emailed on their own, customers and partners in their own lane.</span>
           </div>
         </div>
         <Button size="sm" variant="outline" className="shrink-0" onClick={() => goTo("settings")}>Set up automation</Button>
@@ -863,15 +900,17 @@ function AutomationStrip({ a }: { a: AutomationStatus | null }) {
               {sending
                 ? "Automation is emailing a batch right now"
                 : blocked
-                ? "Automation is on, but it can’t run yet"
-                : ready >= threshold
-                ? `Automation is about to take the next ${threshold.toLocaleString()}`
+                ? "Automation is on, but it can't run yet"
+                : !live.length
+                ? "Automation is on, but both lanes are switched off"
                 : "Automation is watching this pool"}
             </span>
             <span className="text-muted">
               {blocked
                 ? ` — ${a.blockers[0]}`
-                : ` — ${ready.toLocaleString()} of ${threshold.toLocaleString()} leads with an email ready${ready < threshold ? ` · ${(threshold - ready).toLocaleString()} to go` : ""}. Approved automatically, then emailed.`}
+                : !live.length
+                ? " — switch on the customer or partner lane in Settings."
+                : " — approved automatically, then emailed, one lane per pitch."}
             </span>
           </div>
         </div>
@@ -880,9 +919,37 @@ function AutomationStrip({ a }: { a: AutomationStatus | null }) {
           <Button size="sm" variant="ghost" onClick={() => goTo("settings")}>Settings</Button>
         </div>
       </div>
-      <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-ink/[0.07]">
-        <div className={cn("h-full rounded-full transition-all", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
-      </div>
+
+      {/* One row per live lane, so "how close is it?" is answered per pitch. */}
+      {live.length > 0 && (
+        <div className="mt-3 space-y-2.5">
+          {live.map((l) => {
+            const threshold = Math.max(1, l.config.threshold);
+            const pct = Math.min(100, Math.round((l.ready / threshold) * 100));
+            const partner = l.audience === "partner";
+            return (
+              <div key={l.audience}>
+                <div className="flex flex-wrap items-baseline justify-between gap-2 text-[11px]">
+                  <span className="flex items-center gap-1.5">
+                    <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide", partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]")}>
+                      {partner ? "partner" : "customer"}
+                    </span>
+                    <span className="text-muted">
+                      <b className="text-ink/70">{l.ready.toLocaleString()}</b> of {threshold.toLocaleString()} with an email
+                    </span>
+                  </span>
+                  <span className={cn(l.ready >= threshold ? "font-medium text-good" : "text-muted")}>
+                    {l.running ? "sending now" : l.ready >= threshold ? "batch is full" : `${(threshold - l.ready).toLocaleString()} to go`}
+                  </span>
+                </div>
+                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-ink/[0.07]">
+                  <div className={cn("h-full rounded-full transition-all", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -907,6 +974,7 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
+          <AudienceTag a={s.audience} />
           <span className="truncate font-medium">{title}</span>
           {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
             <>
@@ -981,6 +1049,10 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   const [url, setUrl] = useState("");
   const [keywords, setKeywords] = useState("");
   const [category, setCategory] = useState(cats[0] || "Companies (general)");
+  // Who this source is hunting. Every lead it files inherits it, and the
+  // automation has one lane per audience — so this is the single most
+  // consequential field in the form.
+  const [audience, setAudience] = useState<Audience>("customer");
   const [limit, setLimit] = useState(100);
   const [interval, setInterval] = useState(360);
   const [saving, setSaving] = useState(false);
@@ -994,11 +1066,12 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
       setKeywords(editing.keywords || "");
       setPlace(null);
       setCategory(editing.category);
+      setAudience(audienceOf(editing.audience));
       setLimit(editing.limit_n);
       setInterval(editing.interval_minutes);
     } else {
       setType("search"); setLocation(""); setUrl(""); setKeywords(""); setPlace(null);
-      setCategory(cats[0] || "Companies (general)"); setLimit(100); setInterval(360);
+      setCategory(cats[0] || "Companies (general)"); setAudience("customer"); setLimit(100); setInterval(360);
     }
   }, [open, editing, cats]);
 
@@ -1012,9 +1085,9 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
     setSaving(true);
     try {
       const body =
-        type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, limit, intervalMinutes: interval } :
-        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, limit, intervalMinutes: interval } :
-        { type: "osm" as const, location: location.trim(), category, limit, intervalMinutes: interval, place };
+        type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, audience, limit, intervalMinutes: interval } :
+        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, audience, limit, intervalMinutes: interval } :
+        { type: "osm" as const, location: location.trim(), category, audience, limit, intervalMinutes: interval, place };
       if (editing) {
         await api.updateDiscoverySource(editing.id, body);
         toast("Source updated", "success");
@@ -1048,6 +1121,35 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               {label}
             </button>
           ))}
+        </div>
+
+        {/* WHO this source is for. Decides the pitch every lead it finds will
+            eventually get, so it sits above the details, not buried in them. */}
+        <div className="rounded-2xl border border-line bg-paper p-3">
+          <div className="text-[13px] font-medium text-ink/80">These companies are…</div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            {([
+              ["customer", "Customers", "You sell them DNA ERP", "border-[#ff5a36] bg-[#fdeae6]"],
+              ["partner", "Partners", "Firms, VARs & consultancies for the Makers program", "border-[#1c8a68] bg-[#e4f3ec]"],
+            ] as const).map(([v, label, hint, on]) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setAudience(v)}
+                className={cn(
+                  "rounded-xl border px-3 py-2.5 text-left transition-all",
+                  audience === v ? on : "border-line bg-white hover:border-ink/30"
+                )}
+              >
+                <div className="text-[13px] font-semibold">{label}</div>
+                <div className="mt-0.5 text-[11px] leading-snug text-muted">{hint}</div>
+              </button>
+            ))}
+          </div>
+          <div className="mt-2 text-[11px] leading-relaxed text-muted">
+            Every lead this source finds is tagged with it, all the way into Contacts — and the automation runs a
+            separate lane per audience, so the two pitches never cross.
+          </div>
         </div>
 
         {type === "search" ? (
@@ -1179,6 +1281,27 @@ function EmailCell({ lead }: { lead: DiscoveredLead }) {
     return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn’t read site</span>;
   }
   return <span className="italic">no email found</span>;
+}
+
+// Customer or partner, at a glance. Anything found before the tag existed has
+// no value stored and reads as a customer — the app's original behaviour — so
+// the chip only ever needs to shout about the exception.
+function audienceOf(a?: string | null): Audience {
+  return String(a || "").toLowerCase() === "partner" ? "partner" : "customer";
+}
+function AudienceTag({ a }: { a?: string | null }) {
+  const partner = audienceOf(a) === "partner";
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+        partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]"
+      )}
+      title={partner ? "Partner — pitched the Makers program by the partner automation lane" : "Customer — pitched DNA ERP by the customer automation lane"}
+    >
+      {partner ? "partner" : "customer"}
+    </span>
+  );
 }
 
 function ConfidenceTag({ c }: { c?: string | null }) {

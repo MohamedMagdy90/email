@@ -21,6 +21,26 @@ export const ROLE_RE =
 // instead of being invisible to every country filter.
 export const NO_COUNTRY = "__none__";
 
+/* ------------------------------ audience ------------------------------ */
+
+// Who a lead / contact is: someone we sell DNA ERP to, or someone we sell the
+// Makers program to. The tag comes from the discovery source that found them.
+export type Audience = "customer" | "partner";
+
+/** Anything that isn't literally 'partner' is a customer — including NULL. */
+export function normalizeAudience(v: unknown): Audience {
+  return String(v || "").trim().toLowerCase() === "partner" ? "partner" : "customer";
+}
+
+// SQL for "this row belongs to <audience>". Rows discovered before the tag
+// existed have audience NULL, and the app has always been customer-first, so
+// they count as customers rather than falling out of both lanes.
+function audienceClause(a: Audience): string {
+  return a === "partner"
+    ? `lower(COALESCE(audience,'customer')) = 'partner'`
+    : `lower(COALESCE(audience,'customer')) <> 'partner'`;
+}
+
 /* ----------------------------- filtering ------------------------------ */
 
 // Portable WHERE builder for the pool (status + country + free-text search).
@@ -31,14 +51,18 @@ export function discoveredWhere(opts: {
   q?: string | null;
   hasEmail?: boolean;
   country?: string | null;
+  /** Blank / omitted = both audiences. */
+  audience?: string | null;
 }) {
   const where: string[] = [];
   const params: any[] = [];
   const status = opts.status;
   const search = opts.q;
   const country = String(opts.country || "").trim();
+  const audience = String(opts.audience || "").trim();
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
   if (opts.hasEmail) where.push(`(email IS NOT NULL AND email <> '')`);
+  if (audience && audience !== "all") where.push(audienceClause(normalizeAudience(audience)));
   if (country) {
     if (country === NO_COUNTRY) where.push(`(country IS NULL OR country = '')`);
     else { where.push(`lower(country) = ?`); params.push(country.toLowerCase()); }
@@ -52,9 +76,14 @@ export function discoveredWhere(opts: {
 }
 
 // How many pending leads currently hold a usable email — the number the
-// automation watches, and the one the UI counts down to the trigger.
-export async function countApprovableLeads(search?: string | null, country?: string | null): Promise<number> {
-  const { clause, params } = discoveredWhere({ status: "pending", q: search, hasEmail: true, country });
+// automation watches, and the one the UI counts down to the trigger. Each
+// automation lane counts only its own audience.
+export async function countApprovableLeads(
+  search?: string | null,
+  country?: string | null,
+  audience?: string | null
+): Promise<number> {
+  const { clause, params } = discoveredWhere({ status: "pending", q: search, hasEmail: true, country, audience });
   const r = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params);
   return Number(r[0]?.n ?? 0);
 }
@@ -73,6 +102,7 @@ export interface ApproveOptions {
   all?: boolean;
   q?: string | null;
   filterCountry?: string | null; // which rows to act on (matches the table's filter)
+  filterAudience?: string | null; // customer | partner (blank = both)
   category?: string | null;      // contact category to save them under
   country?: string | null;       // country override (blank = keep the lead's own)
   limit?: number;                // cap the batch (the automation approves N at a time)
@@ -93,7 +123,7 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
   let leads: any[];
   if (opts.all === true) {
     const { clause, params } = discoveredWhere({
-      status: "pending", q: opts.q, hasEmail: true, country: opts.filterCountry,
+      status: "pending", q: opts.q, hasEmail: true, country: opts.filterCountry, audience: opts.filterAudience,
     });
     const limit = Math.max(1, Math.min(Number(opts.limit) || 5000, 20000));
     const order = opts.oldestFirst ? `ORDER BY created_at ASC, id ASC` : "";
@@ -123,11 +153,14 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
     seenEmails.add(email);
     const id = uid();
     const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,audience,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
       [
         id, email, l.name || l.domain || null, country || l.country || null, l.category || null,
-        category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso(),
+        category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery",
+        // The pitch this company gets is decided by the source that found them —
+        // never by whoever happens to click Approve.
+        normalizeAudience(l.audience), nowIso(),
       ]
     );
     if (ins.length) { added++; contactIds.push(String(ins[0].id ?? id)); }

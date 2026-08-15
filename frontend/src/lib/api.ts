@@ -16,6 +16,14 @@ function onUnauthorized() {
   window.dispatchEvent(new Event("dna-unauthorized"));
 }
 
+/* ------------------------------ audience ------------------------------- */
+
+// Who a company is to us: someone we sell DNA ERP to ('customer'), or someone
+// we sell the Makers program to ('partner'). It's set on the discovery source,
+// rides the lead into Contacts, and decides which automation lane emails them.
+// Anything discovered before the tag existed reads as 'customer'.
+export type Audience = "customer" | "partner";
+
 export interface Contact {
   id: string;
   email: string;
@@ -26,6 +34,8 @@ export interface Contact {
   phone?: string;
   role_based?: boolean;
   source?: string;
+  /** customer | partner — inherited from the discovery source that found them. */
+  audience?: string | null;
   status: string;
   created_at: string;
   // Engagement (rolled up across all sends to this contact)
@@ -159,6 +169,8 @@ export interface DiscoverySource {
   type?: "osm" | "directory" | "search";
   base_url?: string | null;
   keywords?: string | null; // web-search sources: custom keywords (blank = from category)
+  /** customer | partner — every lead this source files inherits it. */
+  audience?: string | null;
   cursor?: number;
   exhausted?: number; // 0 | 1
   // Directory sources: the exact URL the next batch resumes from (any pager shape).
@@ -196,6 +208,8 @@ export interface DiscoveredLead {
   city?: string | null;
   country?: string | null;
   category?: string | null;
+  /** customer | partner — copied from the source that found it. */
+  audience?: string | null;
   source_label?: string | null;
   status: string;
   enriched: number;
@@ -209,20 +223,32 @@ export interface DiscoveredLead {
 
 /* ------------------------------ Automation ----------------------------- */
 
-export interface AutomationConfig {
+// The automation runs as TWO independent lanes — customer and partner — fed by
+// the audience tag on each discovery source. Each lane has its own switch,
+// trigger count, templates and cooldown; the guard rails below them (rate,
+// daily ceiling, gap, Resend) are shared, because the sending domains are.
+
+export interface AutomationLaneConfig {
   enabled: boolean;
   /** Trigger point AND batch size: approve + email this many at a time. */
   threshold: number;
-  /** Template(s) the automation sends — several rotate. */
+  /** Template(s) this lane sends — several rotate. */
   templateIds: string[];
   /** rotate = one template per run · split = alternate per recipient. */
   templateMode: "rotate" | "split";
   category: string;
   country: string;
+}
+
+export interface AutomationConfig {
+  /** Master switch — off means neither lane runs. */
+  enabled: boolean;
+  customer: AutomationLaneConfig;
+  partner: AutomationLaneConfig;
   perMinute: number;
-  /** Max emails the automation may send per day (0 = no ceiling). */
+  /** Max emails per day across both lanes (0 = no ceiling). */
   dailyLimit: number;
-  /** Minimum gap between two automated runs. */
+  /** Minimum gap between two runs of the SAME lane. */
   cooldownMinutes: number;
   /** Refuse to run without a Resend key (never auto-"dry-run"). */
   requireResend: boolean;
@@ -234,6 +260,7 @@ export interface AutomationRun {
   finished_at: string | null;
   trigger: string;   // auto | manual
   status: string;    // running | done | error | skipped
+  audience?: string; // customer | partner
   threshold: number;
   pool_count: number;
   approved: number;
@@ -247,18 +274,31 @@ export interface AutomationRun {
   error: string | null;
 }
 
-export interface AutomationStatus {
-  config: AutomationConfig;
-  /** Pending leads that already have an email — what counts toward the trigger. */
+export interface AutomationLaneStatus {
+  audience: Audience;
+  config: AutomationLaneConfig;
+  /** Pending leads of this audience that already have an email. */
   ready: number;
   remaining: number;
   running: boolean;
   sentToday: number;
-  dailyRemaining: number | null;
   nextEligibleAt: string | null;
   lastRun: AutomationRun | null;
-  runs: AutomationRun[];
   templates: { id: string; name: string; type: string }[];
+  blockers: string[];
+}
+
+export interface AutomationStatus {
+  config: AutomationConfig;
+  lanes: AutomationLaneStatus[]; // [customer, partner]
+  /** Both lanes combined. */
+  ready: number;
+  running: boolean;
+  sentToday: number;
+  dailyRemaining: number | null;
+  lastRun: AutomationRun | null;
+  runs: AutomationRun[];
+  /** Blockers that stop both lanes. */
   blockers: string[];
 }
 
@@ -555,12 +595,15 @@ export const api = {
 
   // automation — auto-approve a full pool, then auto-send
   getAutomation: () => req<AutomationStatus>(`/api/automation`),
-  saveAutomation: (cfg: Partial<AutomationConfig>) =>
-    req<AutomationStatus>(`/api/automation`, { method: "POST", body: JSON.stringify(cfg) }),
-  runAutomation: () =>
-    req<{ started: boolean; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
+  // Lanes are patched independently: send only the one you changed.
+  saveAutomation: (cfg: Partial<Omit<AutomationConfig, "customer" | "partner">> & {
+    customer?: Partial<AutomationLaneConfig>;
+    partner?: Partial<AutomationLaneConfig>;
+  }) => req<AutomationStatus>(`/api/automation`, { method: "POST", body: JSON.stringify(cfg) }),
+  runAutomation: (audience: Audience = "customer") =>
+    req<{ started: boolean; audience?: Audience; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
       `/api/automation/run`,
-      { method: "POST", body: "{}" }
+      { method: "POST", body: JSON.stringify({ audience }) }
     ),
 
   // follow-up ladder — retry whoever didn't open / didn't click
@@ -622,23 +665,25 @@ export const api = {
     url?: string;
     keywords?: string;
     category?: string;
+    audience?: Audience;
     limit?: number;
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>
     req<{ started?: boolean; found?: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
-  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number; country?: string } = {}) => {
+  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number; country?: string; audience?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.hasEmail) qs.set("hasEmail", "1");
     if (params.limit) qs.set("limit", String(params.limit));
     if (params.country) qs.set("country", params.country);
+    if (params.audience) qs.set("audience", params.audience);
     return req<{
       leads: DiscoveredLead[];
       counts: { status: string; n: number }[];
@@ -647,15 +692,17 @@ export const api = {
       // Every country present in the current tab, with a count — "__none__" is
       // the bucket for leads with no country on file.
       countries: { country: string; n: number }[];
+      // How this tab splits between the two pitches.
+      audiences: { audience: string; n: number }[];
       // Where the leads in this exact view stand on their way to an email.
       breakdown: { withEmail: number; crawling: number; queued: number; noEmail: number };
     }>(`/api/discovery/leads?${qs.toString()}`);
   },
-  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string }) =>
+  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string; filterAudience?: string }) =>
     req<{ added: number; skipped: number }>(`/api/discovery/leads/approve`, { method: "POST", body: JSON.stringify(body) }),
-  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; filterCountry?: string }) =>
+  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; filterCountry?: string; filterAudience?: string }) =>
     req<{ rejected: number }>(`/api/discovery/leads/reject`, { method: "POST", body: JSON.stringify(body) }),
-  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string; filterCountry?: string }) =>
+  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string; filterCountry?: string; filterAudience?: string }) =>
     req<{ deleted: number }>(`/api/discovery/leads/delete`, { method: "POST", body: JSON.stringify(body) }),
 
   // export

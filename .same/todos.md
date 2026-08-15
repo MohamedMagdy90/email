@@ -1,3 +1,58 @@
+# Audience — Customer vs Partner ✅ shipped & verified
+
+Every discovery source is tagged **Customer** or **Partner**. The tag rides the
+lead into Contacts, and the auto-approve/auto-email automation runs as two
+independent lanes, so the two pitches can never cross.
+
+**Rule for existing data:** `audience` is NULL on everything that predates this,
+and every read treats NULL as **customer** — the app's original behaviour.
+
+## Backend
+- [x] `db.ts` — `discovery_sources.audience` (NOT NULL DEFAULT 'customer'),
+      `discovered_leads.audience` (+ index), `contacts.audience`,
+      `automation_runs.audience`.
+- [x] `pool.ts` — `Audience` + `normalizeAudience`, audience clause in
+      `discoveredWhere`, `countApprovableLeads(q, country, audience)`,
+      `approveLeads({ filterAudience })`; each contact keeps the tag of the LEAD
+      it came from, never a global override.
+- [x] `discovery.ts` — `audienceOf(src)`; every inserted lead inherits it.
+- [x] `automation.ts` — two lanes. Per lane: switch, trigger/batch size,
+      templates, rotate-vs-split, category, country, cooldown, rotation cursor,
+      ledger rows. Shared: send rate, daily ceiling, gap, the Resend guard. The
+      tick tries customer then partner, one run at a time. Legacy
+      `automation_*` settings are read as the CUSTOMER lane's fallback.
+- [x] `index.ts` — sources accept `audience`; pool list/approve/reject/delete
+      take an audience filter (list also returns the split); `/api/automation`
+      takes nested lane patches; `/api/automation/run` takes an audience.
+
+## Frontend
+- [x] `api.ts` — lane-shaped automation types, audience on Contact /
+      DiscoverySource / DiscoveredLead, audience params on pool + source calls.
+- [x] `Discovery.tsx` — Customer/Partner chooser at the top of the Add-source
+      modal, badge on every source row and pool row, All/Customers/Partners
+      filter with live counts that every bulk action respects, and a lane-aware
+      automation strip (one progress bar per live lane).
+- [x] `Automation.tsx` — two lane cards (Customers, Partners), each with its own
+      switch, progress-to-trigger, batch size, template picker (own-audience copy
+      first, foreign copy flagged), category, country and Run now; shared guard
+      rails underneath; run history rows carry a lane chip.
+
+## Verified
+30/30 in-process checks on a throwaway DB (tag normalising · per-lane counts ·
+untagged = customer · approving one lane leaves the other untouched · the
+contact keeps the lead's tag · lanes save independently · clamping · legacy
+fallback hits only the customer lane · runs tagged + recorded per lane · second
+run refused mid-flight), the exact 18-column worker INSERT replayed, plus live
+HTTP checks. backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+
+## Housekeeping (local dev only)
+- `backend/data.sqlite` was corrupt at boot again → parked in
+  `.same/corrupt-db-backup-5`, recreated. Production is Postgres, unaffected.
+  Local login re-seeded from env: **admin / dna-outreach**.
+- `frontend/node_modules` was empty again → `bun install`.
+
+---
+
 # Follow-up ladder — retry non-openers / non-clickers ✅ shipped & verified
 
 ## What it does
@@ -14,86 +69,49 @@ Hard ceiling of 3 emails per sequence (the original + two retries), configured
 in Settings → **Follow-up ladder**, with a template AND a wait per rung.
 
 ## Backend
-- [x] `db.ts`: `sends.followup_step` (0 = original, 1/2 = retries) +
-      `sends.followup_branch` ('no_open' | 'no_click'), `idx_sends_contact`,
-      `idx_sends_sent_at`, and the `followup_runs` ledger (+ its index).
-- [x] `send.ts`: split into `runSendJob` (rotation → a plan) and **`runSendPlan`**,
-      one row per recipient carrying its OWN template + rung. A follow-up batch
-      can't use one template — every contact is on a different rung. A plan row
-      whose template was deleted mid-batch is skipped, not fatal. The rung is
-      written onto the send and into the job log ("· retry 1 (no open)").
-- [x] `followup.ts` (new): config, the sequence scan, the run executor, a
-      5-minute worker and the ledger.
-- [x] `index.ts`: `/api/followup` (GET status+config+ledger, POST save),
-      `POST /api/followup/run`; worker started on boot.
+- `db.ts`: `sends.followup_step` (0 = original, 1/2 = retries) +
+  `sends.followup_branch` ('no_open' | 'no_click'), `idx_sends_contact`,
+  `idx_sends_sent_at`, and the `followup_runs` ledger (+ its index).
+- `send.ts`: split into `runSendJob` (rotation → a plan) and **`runSendPlan`**,
+  one row per recipient carrying its OWN template + rung.
+- `followup.ts`: config, the sequence scan, the run executor, a 5-minute worker
+  and the ledger. State is DERIVED from `sends` on every pass, never queued.
+- `index.ts`: `/api/followup` (GET status+config+ledger, POST save),
+  `POST /api/followup/run`; worker started on boot.
 
-## The scan is DERIVED, never queued
-State is read back out of `sends` on every pass instead of being written to a
-schedule. An open that lands late, a bounce, an unsubscribe, a deleted template,
-a crashed run — all of it is simply the next scan's input, so nothing can fall
-out of sync. A "sequence" = the contact's most recent ORIGINAL email
-(`followup_step = 0`) and everything sent at-or-after it, which is what lets a
-contact who was mailed months ago be re-campaigned and followed up again today.
-
-## Safety rails (all verified)
-- 3 emails per sequence is a hard ceiling; `maxEmails: 2` stops after one retry.
-- A CLICK ends the sequence in both branches (`SUM(click_count) = 0` is the
-  universal continue condition).
-- `lookbackDays` (30): switching the ladder on does NOT blast every contact ever
-  emailed and never opened — only sequences whose last email is recent.
-- Refuses to run without an **App URL**: with no pixel and no wrapped links,
-  nothing is ever recorded as opened, so every contact would look like a
-  non-opener and get all three emails. That one matters most.
-- Refuses to run without a Resend key (`requireResend`), so a dry run can't walk
-  a whole list up the ladder without a single real email going out.
+## Safety rails
+- 3 emails per sequence is a hard ceiling; a CLICK ends the sequence.
+- `lookbackDays` (30) — switching it on doesn't blast every contact ever mailed.
+- Refuses to run without an **App URL** (no pixel = everyone looks like a
+  non-opener) or without a Resend key.
 - Daily ceiling + per-pass batch size + send rate; unsubscribed/bounced are
-  never chased; a failed send never starts a sequence.
-- A rung with no template = that rung is off (and is reported as
-  `unconfigured`); a rung pointing at a DELETED template becomes a loud blocker
-  instead of silently ending the ladder.
+  never chased; a rung with no template is simply off.
 
 ## Frontend
-- [x] `api.ts`: `FollowUpConfig` / `FollowUpRun` / `FollowUpRung` /
-      `FollowUpStatus` + `getFollowUp` / `saveFollowUp` / `runFollowUp`;
-      `SendRow` gained `followup_step` / `followup_branch`.
-- [x] `FollowUp.tsx` (new): the ladder drawn as a ladder — email 1 at the top,
-      then two branch columns ("They never opened it" / "They opened, but never
-      clicked"), each with a numbered rung, a template picker and a wait (preset
-      dropdown + free-text hours). Rungs above the ceiling grey out with a
-      dashed border instead of disappearing. Per-rung live counts (N due · N
-      waiting) and lifetime performance (sent / opened / clicked / next due),
-      "see who's next" preview, blockers panel, live send progress, pass
-      history, **Send due now**.
-- [x] `Settings.tsx`: rendered directly under the Automation card.
-- [x] `History.tsx`: a `retry 1` / `retry 2` badge next to the recipient (with a
-      tooltip naming the branch), so the same address twice never reads as a
-      duplicate send.
+- `FollowUp.tsx`: the ladder drawn as a ladder — email 1, then the two branch
+  columns, a template + wait per rung, live due/waiting counts, blockers, pass
+  history and **Send due now**. Mounted in Settings under Automation.
+- `History.tsx`: `retry 1` / `retry 2` badges so the same address twice never
+  reads as a duplicate send.
+- Retry starter pack in `lib/starters.ts` (8 templates, both voices), also
+  exported as HTML in `.same/retry-templates/`.
 
 ## Verified
-- **49/49 in-process checks** on a throwaway DB (`SQLITE_PATH`): who is due ·
-  branch selection · a click ends it · the 3-email ceiling · lookback ·
-  unsubscribed/bounced/failed excluded · sequence-from-last-original (an old
-  completed ladder does not block a new campaign) · unconfigured rungs ·
-  `maxEmails` 2 vs 3 · all four refusals + their ledger rows · a real pass
-  (tagged sends, per-rung templates, branch/rung counts) · the ladder ADVANCES
-  rather than looping · an open mid-ladder switches branch · batch size · daily
-  ceiling · status payload · deleted-template blocker.
-- **Live over HTTP**: 401 without a token · GET/POST config round-trip ·
-  `POST /run` with nothing due → 400 with a readable reason (not a 500) ·
-  values clamped server-side (99 → 3, 9999/min → 120) · a garbage ladder
-  payload (`"noOpen": "nonsense"`) → 200, no crash · automation/settings/
-  templates/history all still 200.
-- backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+49/49 in-process checks plus a live HTTP pass (config round-trip, refusals,
+clamping, garbage payloads) — all green.
 
-## Housekeeping
-- `frontend/node_modules` was empty in this container, so the web half of the
-  dev server had been dead — `bun install` in `frontend/`, dev server restarted.
-- Local `backend/data.sqlite` was corrupt AGAIN at boot ("database disk image is
-  malformed"), which is why the API wasn't listening. Parked in
-  `.same/corrupt-db-backup-4` and recreated. Production is Postgres — unaffected.
-  Login had to be re-created: **admin / dna-outreach** (change it in
-  Settings → Account). Three retry templates were seeded so the ladder pickers
-  have something to point at; delete them on the Templates tab if unwanted.
+---
+
+# Done earlier
+
+## Follow-up ladder (retry automation)
+- Retry ladder derived from `sends` (no queue): no-open branch + opened/no-click
+  branch, up to 3 emails total, a click ends the sequence.
+- `backend/src/followup.ts` engine + worker, `/api/followup*` routes.
+- `frontend/src/screens/FollowUp.tsx` card, mounted in Settings under Automation.
+- Retry starter pack in `frontend/src/lib/starters.ts` (8 templates, both voices),
+  exported as HTML in `.same/retry-templates/`.
+- History rows show `retry 1` / `retry 2` badges with the branch in the tooltip.
 
 ---
 
