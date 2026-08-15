@@ -151,14 +151,14 @@ export const RETRY_STARTERS: RetryStarter[] = [
     body: `${WRAP_OPEN}${LOGO_BAR}
   <tr>
     <td style="background:#ffffff;padding:34px 40px 8px 40px;">
-      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">If the answer is "days", it isn't your team's fault</h1>
-      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi {{company}},</p>
-      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">It's the spreadsheets between your systems. Finance exports one thing, inventory says another, and somebody spends the first week of every month making the two agree.</p>
+      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">Most of that time goes into making two systems agree</h1>
+      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi there,</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">For most of the companies we speak to the answer is days rather than hours, and the bulk of it is reconciliation: finance exports one number, the stock system says another, and someone spends the first week of the month making the two agree.</p>
     </td>
   </tr>
   <tr>
     <td style="background:#ffffff;padding:18px 40px 4px 40px;">
-      <table cellpadding="0" cellspacing="0" border="0" width="100%">${tick("One set of numbers", "Finance, stock and sales read from the same live data.")}${tick("The close runs itself", "Approvals, invoicing and reporting stop waiting on someone.")}${tick("Nothing to migrate first", "It runs alongside what you have while you try it.")}</table>
+      <table cellpadding="0" cellspacing="0" border="0" width="100%">${tick("One set of numbers", "Finance, stock and sales read from the same live data.")}${tick("The close runs itself", "Approvals, invoicing and reporting stop waiting on someone.")}${tick("See it on your own data", "There is a 14-day free trial, so you can look before committing to anything.")}</table>
     </td>
   </tr>
   <tr>
@@ -178,8 +178,8 @@ export const RETRY_STARTERS: RetryStarter[] = [
     name: "Customer · Retry 2 — last note",
     why: "The break-up. No images, no branding, sixty words. It reads like a person, so it lands in the inbox and gets replies the designed one never will.",
     subject: "Closing the file — or worth a look later?",
-    body: plain(`<p style="margin:0 0 14px 0;">Hi {{company}},</p>
-<p style="margin:0 0 14px 0;">I've written twice about DNA ERP and haven't heard back, which usually means the timing is wrong rather than the idea. So this is my last note — I won't keep filling your inbox.</p>
+    body: plain(`<p style="margin:0 0 14px 0;">Hi there,</p>
+<p style="margin:0 0 14px 0;">We have written twice about DNA ERP without hearing back, which usually means the timing is wrong rather than the idea. So this is our last note — we will not keep filling your inbox.</p>
 <p style="margin:0 0 14px 0;">If it's worth a look later, everything is on <a href="https://www.dna.systems" style="color:#f3350c;font-weight:600;text-decoration:none;">dna.systems</a>, and replying to this email reaches a person, not a mailbox.</p>
 <p style="margin:0 0 14px 0;">Either way, good luck with the rest of the year.</p>
 <p style="margin:0;color:#1a1a1a;"><strong>The DNA Systems Team</strong><br/>
@@ -194,9 +194,9 @@ export const RETRY_STARTERS: RetryStarter[] = [
     body: `${WRAP_OPEN}${LOGO_BAR}
   <tr>
     <td style="background:#ffffff;padding:34px 40px 8px 40px;">
-      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">Skip the tour — here's what people actually log in for</h1>
-      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi {{company}},</p>
-      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">You had a look at my last note, so I'll skip the overview. In practice, three questions are why people keep the dashboard open all day:</p>
+      <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">Three questions DNA ERP usually gets bought to answer</h1>
+      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi there,</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">Thanks for taking a look at the last one. Rather than repeat the overview, here are the three questions people actually keep the dashboard open for:</p>
     </td>
   </tr>
   <tr>
@@ -206,7 +206,7 @@ export const RETRY_STARTERS: RetryStarter[] = [
   </tr>
   <tr>
     <td style="background:#f8f7f3;padding:20px 40px;">
-      <p style="font-size:14px;color:#4a4a4a;margin:0;line-height:1.6;">Most teams are live inside two weeks, and it runs next to your current tools while you decide.</p>
+      <p style="font-size:14px;color:#4a4a4a;margin:0;line-height:1.6;">If any of those three is currently a spreadsheet, that is the part worth seeing first.</p>
     </td>
   </tr>
   <tr>
@@ -225,12 +225,12 @@ export const RETRY_STARTERS: RetryStarter[] = [
     type: "customer",
     name: "Customer · Nudge 2 — opened, no click",
     why: "Last rung. One question, answerable with one word — the smallest ask in the ladder, and the one that gets a reply.",
-    subject: "One question, then I'll stop",
-    body: plain(`<p style="margin:0 0 14px 0;">Hi {{company}},</p>
-<p style="margin:0 0 14px 0;">You've opened my last couple of emails, so something in there was close — but nothing since, which usually means one of two things.</p>
+    subject: "One question, then we will stop",
+    body: plain(`<p style="margin:0 0 14px 0;">Hi there,</p>
+<p style="margin:0 0 14px 0;">You opened the last couple of emails, so something in there was close, but nothing since. That usually means one of two things.</p>
 <p style="margin:0 0 14px 0;">Would you reply with a single word?</p>
-<p style="margin:0 0 6px 0;"><strong>Later</strong> — good idea, wrong quarter. I'll come back once and leave it there.<br/>
-<strong>No</strong> — not a fit. I'll close the file today and you'll hear nothing more from us.</p>
+<p style="margin:0 0 6px 0;"><strong>Later</strong> — right idea, wrong quarter. We will come back once and leave it there.<br/>
+<strong>No</strong> — not a fit. We will close the file today and you will hear nothing more from us.</p>
 <p style="margin:14px 0 14px 0;">If it's neither and you'd rather just see it, <a href="https://www.dna.systems/contact" style="color:#f3350c;font-weight:600;text-decoration:none;">pick any 15 minutes here</a>.</p>
 <p style="margin:0;color:#1a1a1a;"><strong>The DNA Systems Team</strong><br/>
 <span style="color:#6a6a6a;font-size:13px;">inquiry@dna.systems &middot; dna.systems</span></p>`),
@@ -247,7 +247,7 @@ export const RETRY_STARTERS: RetryStarter[] = [
   <tr>
     <td style="background:#ffffff;padding:34px 40px 8px 40px;">
       <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">With us it's 100% of services, plus a share of the licence for life</h1>
-      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi {{company}},</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi there,</p>
       <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">Most vendors take a cut of your implementation work, then start selling direct to the client you introduced. The DNA Makers programme is built the other way round.</p>
     </td>
   </tr>
@@ -273,8 +273,8 @@ export const RETRY_STARTERS: RetryStarter[] = [
     name: "Partner · Retry 2 — last note",
     why: "The break-up, partner voice. Plain text, one link, and a door left open — firms change ERP vendor on their own timetable, not yours.",
     subject: "Closing the loop on the Makers programme",
-    body: plain(`<p style="margin:0 0 14px 0;">Hi {{company}},</p>
-<p style="margin:0 0 14px 0;">I've written twice about the DNA Makers programme without hearing back, so I'll assume it isn't the right moment and stop there.</p>
+    body: plain(`<p style="margin:0 0 14px 0;">Hi there,</p>
+<p style="margin:0 0 14px 0;">We have written twice about the DNA Makers programme without hearing back, so we will assume it is not the right moment and stop there.</p>
 <p style="margin:0 0 14px 0;">If your margins get squeezed again at renewal — or a client asks for something your current platform can't do in {{country}} — the terms are on <a href="https://www.dna.systems/become-a-partner" style="color:#f3350c;font-weight:600;text-decoration:none;">dna.systems/become-a-partner</a> and they don't expire.</p>
 <p style="margin:0 0 14px 0;">Replying to this reaches our partnerships team directly.</p>
 <p style="margin:0;color:#1a1a1a;"><strong>The DNA Systems Partnerships Team</strong><br/>
@@ -290,8 +290,8 @@ export const RETRY_STARTERS: RetryStarter[] = [
   <tr>
     <td style="background:#ffffff;padding:34px 40px 8px 40px;">
       <h1 style="font-size:24px;line-height:1.25;font-weight:800;color:#0f0f10;margin:0 0 18px 0;letter-spacing:-0.4px;">Two ways in — one needs no technical work at all</h1>
-      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi {{company}},</p>
-      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">You had a look at my last note. If what stopped you was "we don't have capacity to implement another platform", the second option below exists for exactly that.</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0 0 14px 0;line-height:1.65;">Hi there,</p>
+      <p style="font-size:15px;color:#4a4a4a;margin:0;line-height:1.65;">Thanks for taking a look at the last one. If what stopped you was capacity — no room to implement another platform — the second option below exists for exactly that.</p>
     </td>
   </tr>
   <tr>
@@ -323,7 +323,7 @@ export const RETRY_STARTERS: RetryStarter[] = [
   </tr>
   <tr>
     <td style="background:#ffffff;padding:24px 40px 20px 40px;text-align:center;">
-      <a href="https://www.dna.systems/become-a-partner" style="display:inline-block;background:#f3350c;color:#ffffff;padding:14px 34px;text-decoration:none;font-weight:700;font-size:15px;border-radius:10px;">Apply — about five minutes &rarr;</a>
+      <a href="https://www.dna.systems/become-a-partner" style="display:inline-block;background:#f3350c;color:#ffffff;padding:14px 34px;text-decoration:none;font-weight:700;font-size:15px;border-radius:10px;">Apply to the programme &rarr;</a>
     </td>
   </tr>${sig("The DNA Systems Partnerships Team", "DNA ERP — Makers Network", "https://www.dna.systems/become-a-partner")}${FOOTER}${WRAP_CLOSE}`,
   },
@@ -333,11 +333,11 @@ export const RETRY_STARTERS: RetryStarter[] = [
     name: "Partner · Nudge 2 — opened, no click",
     why: "Final rung. Gives them an easy no, which is what makes the yes worth having.",
     subject: "Worth fifteen minutes, or shall I stop here?",
-    body: plain(`<p style="margin:0 0 14px 0;">Hi {{company}},</p>
-<p style="margin:0 0 14px 0;">You've opened the last couple of emails about the Makers programme, so I don't think the idea is the problem — but I'd rather have a clear no than keep guessing.</p>
+    body: plain(`<p style="margin:0 0 14px 0;">Hi there,</p>
+<p style="margin:0 0 14px 0;">You opened the last couple of emails about the Makers programme, so the idea probably is not the problem — but a clear no is more useful to us than a guess.</p>
 <p style="margin:0 0 6px 0;">One word back is plenty:</p>
-<p style="margin:0 0 6px 0;"><strong>Send it</strong> — I'll email the commission terms and the certification path, nothing else.<br/>
-<strong>No</strong> — I'll close the file today.</p>
+<p style="margin:0 0 6px 0;"><strong>Send it</strong> — we will email the commission terms and the certification path, nothing else.<br/>
+<strong>No</strong> — we will close the file today.</p>
 <p style="margin:14px 0 14px 0;">Or if it's easier to talk it through, <a href="https://www.dna.systems/contact" style="color:#f3350c;font-weight:600;text-decoration:none;">take any 15 minutes here</a>.</p>
 <p style="margin:0;color:#1a1a1a;"><strong>The DNA Systems Partnerships Team</strong><br/>
 <span style="color:#6a6a6a;font-size:13px;">inquiry@dna.systems &middot; dna.systems</span></p>`),
