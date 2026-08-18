@@ -841,14 +841,19 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
           </span>
         ) : live > 0 ? (
           <span className="text-ink/60">
-            {live > 1 ? `${live} Jina keys active` : "Jina key active"} · <span className="font-medium text-ink/75">120 pages/min</span>
+            Free archives + {live > 1 ? `${live} Jina keys` : "a Jina key"} · <span className="font-medium text-ink/75">120 pages/min</span>
           </span>
         ) : proxied ? (
-          <span className="text-ink/60">Scraping proxy active</span>
+          <span className="text-ink/60">Free archives + scraping proxy</span>
         ) : (
+          // No key is a normal, supported state now: Common Crawl and the
+          // Wayback Machine do the walled pages for nothing. Nudging for a key
+          // here read as "you are broken", which was never true and is now
+          // actively misleading.
           <span className="text-muted">
-            Free reader · 20 pages/min ·{" "}
-            <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium text-ink/70 underline">get a free key</a>
+            Free sources only ·{" "}
+            <span className="font-medium text-ink/70">Common Crawl + Wayback</span>{" "}
+            handle blocked sites
           </span>
         )}
       </div>

@@ -12,7 +12,7 @@
 
 import { searchCompanies, searchRaw, type RawHit } from "./search";
 import { crawlSite, type CrawlOptions } from "./crawler";
-import { fetchPage, fetchViaProxy, fetchViaReader, type ProxyConfig } from "./crawler/fetcher";
+import { fetchPage, fetchViaProxy, fetchViaReader, fetchViaArchives, type ProxyConfig } from "./crawler/fetcher";
 import { extractContactFromProfile, isProfileHost, isJunkHost } from "./crawler/profiles";
 import { cleanEmail, isValidEmail, isJunk, isRole, roleRank, hasMx } from "./crawler/validate";
 import { registrableDomain, hostOf } from "./crawler/urls";
@@ -285,10 +285,16 @@ async function fetchProfileHtml(url: string, proxy?: ProxyConfig, readerKey?: st
   // 1) Plain direct fetch — free, works for most directory pages.
   const d = await fetchPage(url, 15000).catch(() => null);
   if (d?.ok && d.html && !d.blocked) return d.html;
-  // 2) FREE reader (renders JS) — good for JS-heavy directories/listings.
+  // 2) The free archives — Common Crawl and the Wayback Machine have very
+  //    likely already stored this page, and reading their copy costs nothing.
+  //    Ahead of the reader deliberately: the reader is metered.
+  const arc = await fetchViaArchives(url).catch(() => null);
+  if (arc?.ok && arc.html) return arc.html;
+  // 3) Jina reader (renders JS) — good for JS-heavy directories/listings, but
+  //    it spends tokens, so it only runs when the free tiers came up empty.
   const rd = await fetchViaReader(url, undefined, readerKey).catch(() => null);
   if (rd?.ok && rd.html) return rd.html;
-  // 3) Paid scraping proxy, only if the user configured one.
+  // 4) Paid scraping proxy, only if the user configured one.
   if (proxy) {
     const p = await fetchViaProxy(url, proxy).catch(() => null);
     if (p?.ok && p.html) return p.html;

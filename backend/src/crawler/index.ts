@@ -1,4 +1,4 @@
-import { fetchWithRetry, type ProxyConfig, type BlockReason } from "./fetcher";
+import { fetchWithRetry, archivedPagesFor, type ProxyConfig, type BlockReason } from "./fetcher";
 import {
   normalizeSeed,
   hostOf,
@@ -164,11 +164,14 @@ export async function crawlSite(
   let pagesCrawled = 0;
   let blockedHits = 0;
   let lastBlockReason: BlockReason | undefined;
-  // The free reader that gets us past Cloudflare is rate-limited, so cap how many
-  // blocked pages we escalate per site — and spend that budget on the pages most
-  // likely to hold the email (the homepage's footer + contact/about pages).
-  let readerBudget = 2;
-  let archiveBudget = 2;
+  // The reader COSTS MONEY per page, so it gets the tightest budget of the lot:
+  // one page per site, spent on the single most promising one. The free archives
+  // are what should be doing this work, and they are tried first.
+  let readerBudget = 1;
+  let archiveBudget = 3;
+  // Set when an address had to come out of an archive rather than the live site
+  // — worth saying out loud, because a snapshot can be out of date.
+  let archivedFrom: "commoncrawl" | "archive" | null = null;
 
   while (queue.length && pagesCrawled < maxPages) {
     // Crawl the most promising (contact-like, shallow) pages first.
@@ -260,6 +263,51 @@ export async function crawlSite(
     await sleep(politenessMs);
   }
 
+  /* ---------------------- last free resort: the archives ------------------
+   * The live crawl came back with nothing AND we were walled. No amount of
+   * re-asking changes that — the refusal is about our IP, not the page. But
+   * Common Crawl or the Wayback Machine has very likely already stored this
+   * company's contact page, and reading their copy needs no key, costs no
+   * tokens and answers exactly the same question.
+   *
+   * This is also the only path that can reach a page we were never able to
+   * LINK to: the archives are indexes, so they can hand us /contact directly
+   * without the walled homepage ever telling us it exists.
+   */
+  if (!emailMap.size && (blockedHits > 0 || pagesCrawled === 0) && siteDomain) {
+    const archived = await archivedPagesFor(siteDomain, 4).catch(() => []);
+    let read = 0;
+    for (const page of archived) {
+      if (read >= 3 || emailMap.size) break;
+      const res = await page.fetch().catch(() => null);
+      if (!res?.ok || !res.html) continue;
+      read++;
+      pagesCrawled++;
+
+      for (const ph of extractPhones(res.html, { defaultCountry: region, hostname: siteHost })) {
+        const prev = sitePhones.get(ph.number);
+        if (!prev || (ph.isMobile && !prev.isMobile)) sitePhones.set(ph.number, ph);
+      }
+
+      let found = 0;
+      for (const h of extractEmails(res.html)) {
+        const c = cleanEmail(h.email);
+        if (!c || !isValidEmail(c) || isJunk(c) || emailMap.has(c)) continue;
+        emailMap.set(c, {
+          email: c,
+          role_based: isRole(c),
+          method: h.method,
+          confidence: METHOD_CONFIDENCE[h.method] ?? "low",
+          source: page.url,
+          domain: siteDomain,
+        });
+        found++;
+      }
+      if (found) archivedFrom = page.source;
+      onPage?.({ url: page.url, found, status: 200 });
+    }
+  }
+
   let emails = [...emailMap.values()];
 
   // Smart inbox inference: if the site exposed no address but its mail domain
@@ -325,13 +373,17 @@ export async function crawlSite(
   // A short reason, so the caller can tell a recoverable block (retry later, or
   // add a key/proxy) from a site that simply lists no email.
   let note: string | undefined;
-  if (status === "blocked") {
+  if (archivedFrom && emails.length) {
+    // Say it plainly. The site never answered us — this address came out of a
+    // stored copy, so it is real but it can be out of date.
+    note = `site blocked the crawler — address recovered from ${archivedFrom === "commoncrawl" ? "Common Crawl" : "the Wayback Machine"}`;
+  } else if (status === "blocked") {
     // Only suggest a key when there isn't one. Advising "try a Jina key" to
     // someone who already added one reads like the key isn't working, when in
     // fact this site simply blocks the reader too.
-    const advice = readerKey || proxy ? "" : " (try a free Jina key or a scraping proxy)";
+    const advice = readerKey || proxy ? "" : " (a scraping proxy is the only thing that opens these)";
     note =
-      lastBlockReason === "cloudflare" ? `Cloudflare challenge blocked the crawler${advice}` :
+      lastBlockReason === "cloudflare" ? `Cloudflare challenge blocked the crawler, and no archive holds the page${advice}` :
       lastBlockReason === "rate-limited" ? "site rate-limited the crawler (HTTP 429)" :
       lastBlockReason === "forbidden" ? "site refused the crawler (HTTP 403 bot protection)" :
       "blocked by bot protection";

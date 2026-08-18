@@ -11,7 +11,10 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import { fetchViaProxy, fetchViaReader, parseReaderKeys, readerKeyHealth, maskReaderKey, type ScrapeProvider } from "./crawler/fetcher";
+import {
+  fetchViaProxy, fetchViaReader, parseReaderKeys, readerKeyHealth, maskReaderKey,
+  getTransportStats, archiveHealth, type ScrapeProvider,
+} from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
@@ -33,7 +36,7 @@ import {
 } from "./followup";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
 import { backfillCountries } from "./country";
-import { searchCompanies } from "./search";
+import { searchCompanies, searchEngineHealth } from "./search";
 import { SCRAPE_PROVIDERS, getProxyConfig, getReaderKey } from "./config";
 import {
   startDiscoveryWorker,
@@ -529,6 +532,14 @@ app.get("/api/settings", async (c) => {
       // and each is listed only as a masked fingerprint.
       keys: readerKeyHealth(parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "")),
       savedKeys: parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").length,
+    },
+    // Where the crawler's pages ACTUALLY came from since this process booted.
+    // Without it, "is the reader still doing all the work?" was unanswerable —
+    // and that question is the whole point of the free tiers.
+    transports: {
+      pages: getTransportStats(),
+      archives: archiveHealth(),
+      searchEngines: searchEngineHealth(),
     },
   });
 });

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type Domain } from "../lib/api";
+import { api, PAID_TRANSPORTS, type Domain, type TransportName } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
 import AutomationCard from "./Automation";
@@ -124,9 +124,10 @@ export default function Settings() {
         </Card>
       </div>
 
-      {/* Crawler — free reader + optional paid proxy */}
+      {/* Crawler — where pages come from, then the two optional paid tiers */}
       <div className="mt-8 space-y-3">
         <div className="mb-3 font-clash text-lg font-semibold">Crawler — page fetching</div>
+        <PageSourcesCard />
         <ReaderCard />
         <ScrapeProxyCard />
       </div>
@@ -286,6 +287,129 @@ const PROVIDERS: { value: string; label: string; hint: string }[] = [
   { value: "zenrows", label: "ZenRows", hint: "zenrows.com" },
 ];
 
+
+/* --------------------------- where pages come from --------------------------- */
+
+// The tiers, in the order the crawler actually tries them.
+const TIERS: { key: TransportName; label: string; note: string; paid: boolean }[] = [
+  { key: "direct", label: "Direct fetch", note: "the site answered us", paid: false },
+  { key: "commoncrawl", label: "Common Crawl", note: "already crawled by the public archive", paid: false },
+  { key: "archive", label: "Wayback Machine", note: "already archived", paid: false },
+  { key: "reader", label: "Jina reader", note: "renders JavaScript · costs tokens", paid: true },
+  { key: "proxy", label: "Scraping proxy", note: "residential IPs · costs credits", paid: true },
+];
+
+/**
+ * The answer to "why is the Jina bill so high?".
+ *
+ * Before this panel existed there was no way to see which tier was doing the
+ * work, so the reader quietly absorbed every blocked page and the keys kept
+ * running dry. The bar makes the split obvious at a glance: as long as the
+ * paid slice stays thin, the archives are earning their keep.
+ */
+function PageSourcesCard() {
+  const [pages, setPages] = useState<Record<string, { calls: number; ok: number }>>({});
+  const [archives, setArchives] = useState<{ source: string; fails: number; downForMs: number }[]>([]);
+  const [engines, setEngines] = useState<{ engine: string; live: boolean; restingForMs: number }[]>([]);
+
+  async function load() {
+    try {
+      const s = await api.getSettings();
+      setPages(s.transports?.pages || {});
+      setArchives(s.transports?.archives || []);
+      setEngines(s.transports?.searchEngines || []);
+    } catch { /* ignore — the poller retries */ }
+  }
+  useEffect(() => {
+    load();
+    const t = window.setInterval(load, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Count only pages a tier actually DELIVERED. Attempts would flatter the
+  // free tiers (a Common Crawl miss is cheap but useless) and unfairly punish
+  // the reader, which is only ever asked for the hard ones.
+  const got = (k: TransportName) => pages[k]?.ok ?? 0;
+  const total = TIERS.reduce((n, t) => n + got(t.key), 0);
+  const paid = PAID_TRANSPORTS.reduce((n, k) => n + got(k), 0);
+  const freeShare = total ? Math.round(((total - paid) / total) * 100) : 0;
+  const liveEngines = engines.filter((e) => e.live).length;
+
+  return (
+    <Card className="space-y-4 p-5">
+      <div className="flex items-center justify-between">
+        <div className="font-clash text-lg font-semibold">Where pages come from</div>
+        {total > 0 && (
+          <Badge className={freeShare >= 80 ? "bg-[#e7f6ec] text-[#1f8b4c]" : freeShare >= 50 ? "bg-[#fdf6ea] text-[#8a5a12]" : "bg-[#fde8e8] text-[#c0392b]"}>
+            {freeShare}% free
+          </Badge>
+        )}
+      </div>
+      <p className="text-[13px] leading-relaxed text-muted">
+        A Cloudflare wall isn't a property of the page — it's a property of us asking for it from a datacenter IP.
+        Somebody else already fetched that page and wrote it down, so the crawler reads <b>their</b> copy first:
+        Common Crawl and the Wayback Machine are free, unlimited and need no key. The metered tiers below are only
+        reached when neither archive holds the page.
+      </p>
+
+      {total === 0 ? (
+        <div className="rounded-xl border border-dashed border-line px-4 py-5 text-center text-[12px] text-muted">
+          Nothing fetched yet this run. Turn the discovery bot on and the split appears here.
+        </div>
+      ) : (
+        <>
+          {/* free vs paid, at a glance */}
+          <div className="flex h-2 overflow-hidden rounded-full bg-ink/[0.07]">
+            {TIERS.filter((t) => got(t.key) > 0).map((t) => (
+              <div
+                key={t.key}
+                title={`${t.label}: ${got(t.key).toLocaleString()} page(s)`}
+                className={cn("h-full", t.paid ? (t.key === "reader" ? "bg-[#e6a33c]" : "bg-[#c0392b]") : t.key === "direct" ? "bg-ink/70" : "bg-good")}
+                style={{ width: `${(got(t.key) / total) * 100}%` }}
+              />
+            ))}
+          </div>
+
+          <div className="space-y-1">
+            {TIERS.map((t) => {
+              const n = got(t.key);
+              const tried = pages[t.key]?.calls ?? 0;
+              return (
+                <div key={t.key} className={cn("flex items-baseline justify-between gap-3 text-[12px]", !n && "opacity-45")}>
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", t.paid ? (t.key === "reader" ? "bg-[#e6a33c]" : "bg-[#c0392b]") : t.key === "direct" ? "bg-ink/70" : "bg-good")} />
+                    <span className="font-medium text-ink/80">{t.label}</span>
+                    {t.paid && <span className="rounded bg-[#fdf6ea] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-[#8a5a12]">paid</span>}
+                    <span className="truncate text-muted">{t.note}</span>
+                  </span>
+                  <span className="shrink-0 tabular-nums text-ink/70">
+                    <b>{n.toLocaleString()}</b>
+                    <span className="text-muted"> / {tried.toLocaleString()} tried</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line pt-3 text-[11px] text-muted">
+        <span>
+          Search engines: <b className="text-ink/70">{liveEngines}/{engines.length || 4}</b> answering
+          {engines.filter((e) => !e.live).length > 0 && (
+            <> · resting: {engines.filter((e) => !e.live).map((e) => e.engine).join(", ")}</>
+          )}
+        </span>
+        {archives.length > 0 && (
+          <span className="text-[#8a5a12]">
+            Archive backing off: {archives.map((a) => `${a.source} (${Math.ceil(a.downForMs / 60000)}m)`).join(", ")}
+          </span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 function ReaderCard() {
   const [apiKey, setApiKey] = useState("");
   const [configured, setConfigured] = useState(false);
@@ -353,18 +477,19 @@ function ReaderCard() {
   return (
     <Card className="space-y-4 p-5">
       <div className="flex items-center justify-between">
-        <div className="font-clash text-lg font-semibold">Free reader <span className="text-muted">(no payment)</span></div>
-        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">
-          {liveCount > 0 ? `on · ${liveCount} key${liveCount > 1 ? "s" : ""}` : keyed ? "on · keys spent" : "on · free"}
+        <div className="font-clash text-lg font-semibold">Jina reader <span className="text-muted">(metered fallback)</span></div>
+        <Badge className={liveCount > 0 ? "bg-[#e7f6ec] text-[#1f8b4c]" : keyed ? "bg-[#fde8e8] text-[#c0392b]" : "bg-ink/[0.06] text-ink/55"}>
+          {liveCount > 0 ? `${liveCount} key${liveCount > 1 ? "s" : ""} live` : keyed ? "keys spent" : "no key · optional"}
         </Badge>
       </div>
-      <p className="text-[13px] text-muted">
-        The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
-        built-in reader — <b>no scraping proxy needed</b>. When a site still won't open, it falls back to the{" "}
-        <b>Wayback Machine</b>, which is also free and unlimited. Each free key from{" "}
-        <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a>{" "}
-        carries its own token allowance and its own rate limit, so <b>adding a second and third key multiplies both</b> —
-        the crawler rotates through them and only slows down if every key runs dry.
+      <p className="text-[13px] leading-relaxed text-muted">
+        Renders JavaScript, which is the one thing the free archives can't do. It now sits <b>below</b> them in the
+        ladder, so it is only asked for pages that Common Crawl and the Wayback Machine don't hold — that is what
+        stops the keys burning through tokens. <b>You do not need a key for the crawler to work</b>; without one it
+        simply runs slower on that last slice of pages.{" "}
+        {keyed
+          ? <>Each key from <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a> carries its own allowance, and the crawler rotates through them.</>
+          : <>If you do add one, get it free at <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a>.</>}
         {fromEnv && <span className="text-good"> A key is also set via the server environment.</span>}
       </p>
 
@@ -407,7 +532,7 @@ function ReaderCard() {
         hint={
           keys.length
             ? "Paste one key and press Add. Your existing keys are kept."
-            : "Optional — the reader works without one at 20 pages/min. With a key it does 120."
+            : "Optional. Without a key the reader still runs at 20 pages/min — and it is the last tier tried, so that is rarely the bottleneck."
         }
       >
         <div className="flex gap-2">
@@ -424,7 +549,7 @@ function ReaderCard() {
       </Field>
 
       <div className="flex items-center justify-between border-t border-line pt-4">
-        <span className="text-xs text-muted">Used automatically before any paid proxy.</span>
+        <span className="text-xs text-muted">Tried after the free archives, before any paid proxy.</span>
         <Button variant="outline" loading={testing} onClick={test}>Test</Button>
       </div>
     </Card>

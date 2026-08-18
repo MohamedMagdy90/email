@@ -5,9 +5,10 @@
 // partner", "spare parts distributor") in a location. Any business whose site
 // mentions those words is fair game — exactly what OSM can't do.
 //
-// Source: DuckDuckGo HTML/Lite endpoints (no API key). To stay reliable we
-// rotate user-agents, retry with backoff, fall back between endpoints, and
-// cache results briefly so repeat searches don't re-hit the engine.
+// Sources: a POOL of keyless engines (DuckDuckGo html + lite, Brave, Bing's RSS
+// endpoint). Each walls a datacenter IP after a few queries, so we rotate
+// between them and rest whichever one refuses us; only when all four are
+// resting do we spend a metered reader call.
 
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { isProfileHost, isJunkHost } from "./crawler/profiles";
@@ -68,35 +69,169 @@ function parseHits(html: string): Hit[] {
 
 const isBlocked = (html: string) => /anomaly|unusual traffic|are you a robot|captcha/i.test(html);
 
-// Fetch one DDG results page, retrying across endpoints + UAs with backoff.
-async function fetchResultsPage(q: string, offset: number): Promise<Hit[]> {
-  const endpoints = [
-    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}${offset ? `&s=${offset}&dc=${offset + 1}` : ""}`,
-    `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}${offset ? `&s=${offset}&dc=${offset + 1}` : ""}`,
-  ];
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const url = endpoints[attempt % endpoints.length];
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": pickUA(),
-          "Accept-Language": "en-US,en;q=0.9",
-          Accept: "text/html,application/xhtml+xml",
-          Referer: "https://duckduckgo.com/",
-        },
-        signal: controller.signal,
-      });
-      const html = await res.text();
-      if (res.ok && !isBlocked(html)) {
-        const hits = parseHits(html);
-        if (hits.length) return hits;
-      }
-    } catch { /* retry */ } finally {
-      clearTimeout(timer);
+/* ─────────────────────────── free engine pool ───────────────────────────
+ * Every free search engine walls a datacenter IP eventually — DuckDuckGo after
+ * a handful of queries, Brave much the same. That USED to mean every walled
+ * results page went straight to the Jina reader, which is metered, and is what
+ * kept running the keys out of tokens: a search pass is thousands of pages.
+ *
+ * The fix isn't finding a better engine, it's using more of them. Each engine
+ * has its own independent quota, so rotating across four multiplies the free
+ * budget and thins the load enough that any one of them sees a query only every
+ * fourth request. A walled engine is RESTED, not retried, and the paid reader
+ * is what happens when all four are resting at once.
+ *
+ * Measured from a datacenter IP: Bing's RSS endpoint answered 10/10 queries
+ * while DuckDuckGo and Brave were both walled — but its results skew
+ * encyclopedic, so it is ranked last and used as the safety net rather than
+ * the workhorse.
+ */
+
+interface Engine {
+  id: string;
+  /** null = this engine can't serve that result page (most only do page 1). */
+  build: (q: string, offset: number) => string | null;
+  parse: (body: string) => Hit[];
+  referer?: string;
+}
+
+// Brave renders results into `.snippet` blocks; the outbound link is the anchor
+// carrying the `l1` class, and the headline is that anchor's text once the
+// favicon / site-name furniture is stripped out.
+function parseBrave(html: string): Hit[] {
+  const hits: Hit[] = [];
+  for (const block of html.split(/<div class="snippet\b/).slice(1)) {
+    const url = block.match(/<a[^>]+href="(https?:\/\/[^"]+)"[^>]*class="[^"]*\bl1\b/)?.[1];
+    if (!url) continue;
+    const anchor = block.match(/<a[^>]+class="[^"]*\bl1\b[^"]*"[\s\S]*?<\/a>/)?.[0] || "";
+    const title = stripTags(anchor.replace(/<div class="site-name-wrapper[\s\S]*?<\/div>\s*<\/div>/, ""));
+    hits.push({ url, title: title.slice(0, 160) });
+  }
+  return hits;
+}
+
+// Bing will hand its result list back as RSS, which needs no HTML parsing and
+// is a twentieth of the bytes of the real results page.
+function parseBingRss(xml: string): Hit[] {
+  const hits: Hit[] = [];
+  for (const m of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+    const url = (m[1].match(/<link>([\s\S]*?)<\/link>/)?.[1] || "").trim();
+    const title = stripTags(m[1].match(/<title>([\s\S]*?)<\/title>/)?.[1] || "");
+    if (/^https?:\/\//i.test(url)) hits.push({ url, title });
+  }
+  return hits;
+}
+
+const ddgSuffix = (offset: number) => (offset ? `&s=${offset}&dc=${offset + 1}` : "");
+
+const ENGINES: Engine[] = [
+  {
+    id: "duckduckgo",
+    build: (q, o) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}${ddgSuffix(o)}`,
+    parse: parseHits,
+    referer: "https://duckduckgo.com/",
+  },
+  {
+    id: "duckduckgo-lite",
+    build: (q, o) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}${ddgSuffix(o)}`,
+    parse: parseHits,
+    referer: "https://duckduckgo.com/",
+  },
+  {
+    // Brave paginates by page index, but a second page comes back empty for a
+    // datacenter IP, so it only ever serves the first.
+    id: "brave",
+    build: (q, o) => (o ? null : `https://search.brave.com/search?q=${encodeURIComponent(q)}`),
+    parse: parseBrave,
+  },
+  {
+    // Ignores count/first entirely — always ~8 results, always page one.
+    id: "bing-rss",
+    build: (q, o) => (o ? null : `https://www.bing.com/search?q=${encodeURIComponent(q)}&format=rss&count=30`),
+    parse: parseBingRss,
+  },
+];
+
+const ENGINE_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000, 60 * 60_000];
+const engineHealth = new Map<string, { fails: number; until: number }>();
+let engineCursor = 0;
+
+function engineUsable(id: string): boolean {
+  const h = engineHealth.get(id);
+  return !h || Date.now() >= h.until;
+}
+function engineOk(id: string): void {
+  engineHealth.delete(id);
+}
+function engineWalled(id: string): void {
+  const h = engineHealth.get(id) || { fails: 0, until: 0 };
+  h.fails++;
+  h.until = Date.now() + ENGINE_BACKOFF_MS[Math.min(h.fails - 1, ENGINE_BACKOFF_MS.length - 1)];
+  engineHealth.set(id, h);
+}
+
+/** Which engines are answering and which are resting — for the health panel. */
+export function searchEngineHealth(): { engine: string; live: boolean; restingForMs: number }[] {
+  const now = Date.now();
+  return ENGINES.map((e) => {
+    const h = engineHealth.get(e.id);
+    return { engine: e.id, live: !h || now >= h.until, restingForMs: h ? Math.max(0, h.until - now) : 0 };
+  });
+}
+
+async function askEngine(engine: Engine, q: string, offset: number): Promise<Hit[] | null> {
+  const url = engine.build(q, offset);
+  if (!url) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": pickUA(),
+        "Accept-Language": "en-US,en;q=0.9",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...(engine.referer ? { Referer: engine.referer } : {}),
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const body = await res.text();
+    if (isBlocked(body)) return null;
+    const hits = engine.parse(body);
+    return hits.length ? hits : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Ask the free engines, rotating so no single one carries the whole load.
+ * Returns null only when every engine is walled or resting.
+ */
+async function freeSerp(q: string, offset: number): Promise<{ hits: Hit[]; engine: string } | null> {
+  const order = ENGINES.map((_, i) => ENGINES[(engineCursor + i) % ENGINES.length]);
+  engineCursor = (engineCursor + 1) % ENGINES.length;
+  for (const engine of order) {
+    if (!engineUsable(engine.id)) continue;
+    if (!engine.build(q, offset)) continue; // can't serve this page — not a failure
+    const hits = await askEngine(engine, q, offset);
+    if (hits) {
+      engineOk(engine.id);
+      return { hits, engine: engine.id };
     }
-    await sleep(1200 * (attempt + 1)); // backoff before next endpoint/UA
+    engineWalled(engine.id);
+  }
+  return null;
+}
+
+// Fetch one results page for the interactive search, across the free pool.
+async function fetchResultsPage(q: string, offset: number): Promise<Hit[]> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await freeSerp(q, offset);
+    if (r) return r.hits;
+    await sleep(1200 * (attempt + 1)); // let a just-walled engine settle
   }
   return [];
 }
@@ -216,13 +351,13 @@ export async function searchRaw(
 }
 
 /* ========================================================================== *
- *  Reader-backed, paginated search — for the always-on discovery bot.        *
+ *  Paginated search — for the always-on discovery bot.                       *
  *                                                                            *
- *  A datacenter IP (Railway) is reliably served DuckDuckGo's "anomaly" bot   *
- *  wall on a plain fetch, so search returns nothing. The FREE Jina reader    *
- *  (r.jina.ai) renders the results page and returns the real HTML — verified *
- *  to bypass the wall — so the bot can search the web at scale. One page at a *
- *  time (the bot walks many queries × pages via a cursor).                    *
+ *  A datacenter IP (Railway) is reliably served DuckDuckGo's "anomaly" bot    *
+ *  wall on a plain fetch. The engine POOL above is the answer: three other    *
+ *  engines with their own quotas, rotated, so a walled DuckDuckGo costs       *
+ *  nothing. Only when the whole pool is resting do we spend a metered reader  *
+ *  call, and only then a proxy credit.                                       *
  * ========================================================================== */
 
 // SEO/listicle/data-broker hosts that show up in company searches but are NOT
@@ -241,6 +376,17 @@ export const SETUP_BLOCK =
 // Government, regulators and exchanges — real organisations, but not prospects.
 export const OFFICIAL_BLOCK =
   /(^|\.)(qfc|qe|qatarchamber|moci|mofa|mol|gov|edu|ministry\w*|chamber\w*|customs|centralbank|\w*stockexchange|\w*bourse)\.[a-z.]*$|\.(gov|gov\.[a-z]{2}|edu|edu\.[a-z]{2}|mil)$/i;
+
+// Dictionaries, encyclopedias and reference sites.
+//
+// These never appeared while DuckDuckGo was the only engine, because DuckDuckGo
+// reads "electromechanical company Riyadh" as a business intent. Bing's RSS
+// endpoint — the one engine that never rate-limits us, so the one we lean on
+// when the others are resting — reads the same query as a vocabulary question
+// and returns Merriam-Webster, Cambridge and The Free Dictionary. They are
+// obviously not prospects, and each one costs a full crawl to prove it.
+const REFERENCE_BLOCK =
+  /(^|\.)(merriam-webster|dictionary|thefreedictionary|collinsdictionary|oxfordlearnersdictionaries|vocabulary|wordnik|thesaurus|yourdictionary|definitions|wiktionary|investopedia|howstuffworks|study|coursera|udemy|khanacademy|byjus|geeksforgeeks|tutorialspoint|w3schools|stackexchange|stackoverflow|answers|wikihow|sciencedirect|springer|nature|jstor|arxiv|nist|bls|census|worldbank|imf|oecd|un|who)\.[a-z.]+$/i;
 
 /* ------------------------ result title → company ------------------------ */
 // A search result's <title> is a page headline, not a company name. Saved
@@ -359,6 +505,7 @@ export function isNonProspectHost(host: string): boolean {
     SETUP_BLOCK.test(h) ||
     OFFICIAL_BLOCK.test(h) ||
     AGGREGATOR_BLOCK.test(h) ||
+    REFERENCE_BLOCK.test(h) ||
     LISTING_TLD.test(h) ||
     isProfileHost(h) ||
     isJunkHost(h)
@@ -472,64 +619,55 @@ function ddgUrl(query: string, offset: number): string {
   return offset ? `${base}&s=${offset}&dc=${offset + 1}` : base;
 }
 
-// Fetch ONE results page. Try a plain fetch first (free); if the engine blocks it
-// (the "anomaly" wall on datacenter IPs) fall back to the reader, which renders
-// the page and returns real HTML. `blocked` = we couldn't get a real page at all.
+// Fetch ONE results page for the bot, cheapest source first.
+//   1. the free engine pool (four engines, rotated, rested when walled)
+//   2. the Jina reader on DuckDuckGo — metered, so only when the pool is spent
+//   3. the scraping proxy — costs credits, so last
+// `blocked` = we couldn't get a real page from ANY of them.
 async function fetchSearchPage(
   query: string,
   offset: number,
   readerKey?: string,
   proxy?: ProxyConfig
-): Promise<{ html: string; blocked: boolean }> {
+): Promise<{ hits: Hit[]; blocked: boolean; engine: string }> {
+  // 1) The free pool. This is what keeps the reader bill near zero.
+  const free = await freeSerp(query, offset);
+  if (free) return { hits: free.hits, blocked: false, engine: free.engine };
+
   const url = ddgUrl(query, offset);
 
-  // 1) Direct — cheap, and works when NOT on a flagged datacenter IP.
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": pickUA(),
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept: "text/html,application/xhtml+xml",
-        Referer: "https://duckduckgo.com/",
-      },
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timer));
-    const html = await res.text();
-    if (res.ok && !isBlocked(html) && /uddg=|result__a/.test(html)) return { html, blocked: false };
-  } catch { /* fall through to reader */ }
-
-  // 2) FREE reader — bypasses the anomaly wall (verified). Rate-limited, so it's
-  //    serialized by the reader limiter; an optional JINA key raises the ceiling.
+  // 2) The reader renders the results page and returns real HTML — verified to
+  //    bypass the anomaly wall. It costs tokens, hence its position here.
   const rd = await fetchViaReader(url, 45000, readerKey).catch(() => null);
-  if (rd?.ok && rd.html && !isBlocked(rd.html) && /uddg=|result__a/.test(rd.html)) return { html: rd.html, blocked: false };
+  if (rd?.ok && rd.html && !isBlocked(rd.html)) {
+    const hits = parseHits(rd.html);
+    if (hits.length) return { hits, blocked: false, engine: "reader" };
+  }
 
-  // 3) Scraping proxy — last resort, because it costs credits. The engine
-  //    rate-limits a datacenter IP within a few requests no matter how politely
-  //    we pace, and the proxy rotates IPs, so this is what keeps a pass moving.
-  //    The results page is plain server-rendered HTML: it needs a different IP,
-  //    NOT JS rendering or a stealth proxy. Asking for those costs ~75 credits a
-  //    call on ScrapingBee instead of ~1, so the cheap tier goes first and
-  //    stealth is only tried if the cheap one is walled too.
+  // 3) Scraping proxy — last, because it costs credits. The results page is
+  //    plain server-rendered HTML: it needs a different IP, NOT JS rendering or
+  //    a stealth proxy. Asking for those costs ~75 credits a call on
+  //    ScrapingBee instead of ~1, so the cheap tier goes first and stealth is
+  //    only tried if the cheap one is walled too.
   if (proxy) {
-    const cheap = await proxyHtml(url, { ...proxy, renderJs: false, premium: false });
-    if (cheap) return { html: cheap, blocked: false };
+    const cheap = await proxyHits(url, { ...proxy, renderJs: false, premium: false });
+    if (cheap) return { hits: cheap, blocked: false, engine: "proxy" };
     // Only worth the stealth surcharge if the plain IP swap was walled too.
     if (proxy.premium !== false) {
-      const stealth = await proxyHtml(url, { ...proxy, renderJs: false, premium: true });
-      if (stealth) return { html: stealth, blocked: false };
+      const stealth = await proxyHits(url, { ...proxy, renderJs: false, premium: true });
+      if (stealth) return { hits: stealth, blocked: false, engine: "proxy" };
     }
   }
 
-  return { html: "", blocked: true };
+  return { hits: [], blocked: true, engine: "none" };
 }
 
-// One proxy attempt: usable results HTML, or null if it was walled.
-async function proxyHtml(url: string, cfg: ProxyConfig): Promise<string | null> {
+// One proxy attempt: parsed results, or null if it was walled.
+async function proxyHits(url: string, cfg: ProxyConfig): Promise<Hit[] | null> {
   const r = await fetchViaProxy(url, cfg).catch(() => null);
-  if (r?.ok && r.html && !isBlocked(r.html) && /uddg=|result__a/.test(r.html)) return r.html;
-  return null;
+  if (!r?.ok || !r.html || isBlocked(r.html)) return null;
+  const hits = parseHits(r.html);
+  return hits.length ? hits : null;
 }
 
 // One page of company results for a query. Filters out social/marketplaces
@@ -543,12 +681,12 @@ export async function searchCompaniesPaged(
   readerKey?: string,
   expectCountry?: string,
   proxy?: ProxyConfig
-): Promise<{ companies: Company[]; blocked: boolean }> {
-  const { html, blocked } = await fetchSearchPage(query, offset, readerKey, proxy);
+): Promise<{ companies: Company[]; blocked: boolean; engine?: string }> {
+  const { hits, blocked, engine } = await fetchSearchPage(query, offset, readerKey, proxy);
   if (blocked) return { companies: [], blocked: true };
 
   const byDomain = new Map<string, Company>();
-  for (const h of parseHits(html)) {
+  for (const h of hits) {
     let host = "";
     try { host = hostOf(h.url); } catch { continue; }
     if (!host || isNonProspectHost(host)) continue; // social, brokers, directories, regulators
@@ -577,5 +715,5 @@ export async function searchCompaniesPaged(
     });
     if (byDomain.size >= limit) break;
   }
-  return { companies: [...byDomain.values()], blocked: false };
+  return { companies: [...byDomain.values()], blocked: false, engine };
 }

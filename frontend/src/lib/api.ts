@@ -24,6 +24,12 @@ function onUnauthorized() {
 // Anything discovered before the tag existed reads as 'customer'.
 export type Audience = "customer" | "partner";
 
+// How the crawler got a page. The first three are free and unlimited-ish; the
+// last two are metered, and keeping their share small is the whole game.
+export type TransportName = "direct" | "commoncrawl" | "archive" | "reader" | "proxy";
+export const FREE_TRANSPORTS: TransportName[] = ["direct", "commoncrawl", "archive"];
+export const PAID_TRANSPORTS: TransportName[] = ["reader", "proxy"];
+
 export interface Contact {
   id: string;
   email: string;
@@ -537,7 +543,16 @@ export const api = {
         // key itself — it is also the handle used to delete one.
         keys: { masked: string; live: boolean; status: number }[];
       };
+      // Where the crawler's pages actually came from since the server booted.
+      // `direct`, `commoncrawl` and `archive` are free; `reader` and `proxy`
+      // cost money — which is the whole point of reporting the split.
+      transports: {
+        pages: Record<TransportName, { calls: number; ok: number }>;
+        archives: { source: string; fails: number; downForMs: number }[];
+        searchEngines: { engine: string; live: boolean; restingForMs: number }[];
+      };
     }>(`/api/settings`),
+
   // Add ONE key to the pool. Appends — it never replaces what is stored.
   addReaderKey: (key: string) =>
     req<{ ok: boolean; added: number; duplicates: number; total: number }>(`/api/settings/reader-key`, {

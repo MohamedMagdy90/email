@@ -1,3 +1,116 @@
+# Cut the Jina bill — free page sources instead of paid reader tokens ✅ shipped & verified
+
+## Problem
+Jina keys kept hitting HTTP 402 (out of tokens) and topping them up was getting
+expensive. The cause was not volume, it was ORDER: the reader was the FIRST
+escalation everywhere, so it absorbed essentially every blocked fetch.
+
+Reader call sites before this:
+- `search.ts` — every walled results page (the big one: DuckDuckGo walls a
+  datacenter IP within ~3 queries, so nearly every search page became a token)
+- `crawler/index.ts` — first escalation on a blocked page, 2 per site
+- `enrich.ts` — website resolution
+
+## The new ladder (cheapest first, stop at the first real page)
+```
+1. direct fetch     free, unlimited      browser-shaped request, rotating UA
+2. Common Crawl     free, unlimited      someone already crawled it
+3. Wayback          free, rate-limited   someone already archived it
+4. Jina reader      PAID (tokens)        renders JS — only what the archives miss
+5. scraping proxy   PAID (credits)       residential IPs — last resort
+```
+A Cloudflare wall is not a property of the page, it is a property of us asking
+from a datacenter IP. Somebody already fetched that page and wrote it down, so
+we read their copy — free, no key, no signup.
+
+## What was measured before building (5 probe rounds, from this container)
+| source | verdict |
+|---|---|
+| Common Crawl index + WARC range + gunzip | **WORKS** ~1.2s · free · no key |
+| CC coverage varies per crawl | kon-uae.com held 0 / 1 / 6 / 40 rows across 4 indexes → must query several |
+| Wayback CDX + `id_` snapshots | 429 from this IP; proven in production earlier → kept, with backoff |
+| Bing RSS (`&format=rss`) | **10/10 queries** while everything else was walled · 5 KB · ~100ms |
+| Brave HTML | great results, walls after ~10 queries |
+| DDG html / lite | good results, walls fastest |
+| allorigins · codetabs · corsproxy · cors.lol · whateverorigin · thingproxy | all dead / 403 / key-gated → **not used** |
+| Marginalia | non-commercial index, returns no companies → dropped |
+| SERP snippet → email | 1 of 5 domains → not worth a tier |
+
+## Built
+- [x] `crawler/http.ts` (new) — shared `rawFetch`/`rawBytes`, realistic browser
+      headers incl. client hints + `Sec-Fetch-*`, UA rotation per attempt, block
+      detection, and per-transport counters. Exists so transports can share the
+      floor without a circular import.
+- [x] `crawler/archives.ts` (new) — Common Crawl (collinfo → multi-index CDX →
+      WARC byte-range → gunzip) and Wayback (CDX page index + `id_` snapshots),
+      each with per-domain caching, global pacing and tolerant backoff.
+      `archivedPagesFor(domain)` ranks a domain's archived contact pages.
+- [x] `crawler/fetcher.ts` — re-ordered the ladder; re-exports the shared types
+      so every existing import keeps working. Reader demoted to tier 4.
+- [x] `crawler/index.ts` — when a live crawl ends walled with no email, sweep the
+      domain's archived contact pages. This is the part that cracks a site we can
+      never open: the archive is an INDEX, so it hands us `/contact` without the
+      walled homepage ever linking to it. Reader budget 2 → 1, archives 2 → 3.
+- [x] `search.ts` — rotating pool of four keyless engines (DDG html, DDG lite,
+      Brave, Bing RSS) with per-engine parsers and cooldowns, ahead of the
+      reader. Plus `REFERENCE_BLOCK` — Bing reads "electromechanical company
+      Riyadh" as a vocabulary question and returns Merriam-Webster.
+- [x] `enrich.ts` — archives inserted ahead of the reader.
+- [x] `/api/settings` → `transports` (per-tier pages, archive health, engine
+      health); Settings → **Where pages come from** card shows the free/paid
+      split; reader + Discovery copy rewritten (a missing key is now a normal,
+      supported state, not a warning).
+
+## Verified
+- **Walled sites cracked from free archives alone:** `kon-uae.com` →
+  `info@kon-uae.com`, `qmic.com` → `business@qmic.com`. Both had previously only
+  ever been reachable via the paid tiers. `qgcontracting.com` is in neither
+  archive and now says so honestly ("a scraping proxy is the only thing that
+  opens these") instead of burning tokens to find out.
+- **Live discovery pass** (Qatar · Construction, real run against the dev
+  server): 149 pages delivered — 145 direct, 4 reader → **97% free**. Real leads
+  found: `info@city-stars.qa`, `contraco@contraco.com.qa`, `info@pscc.sa`,
+  `info@kobraish.com.sa`, `info@amadconstructions.com`.
+- **Walled-only run:** direct delivered 0 of 15 attempts, Common Crawl delivered
+  8 — i.e. 100% of the emails on walled sites came from a free archive.
+- Search pool served 6/6 queries with 0 reader calls; engine rotation and
+  resting confirmed (`duckduckgo`, `duckduckgo-lite`, `brave` resting,
+  `bing-rss` live).
+- backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+
+## Bugs found and fixed while building
+- `rawFetch`'s content-type gate rejected `text/x-ndjson`, which is what the
+  Common Crawl CDX server returns — every lookup looked like a failure and
+  backed the whole source off. Added `anyContentType` for index calls.
+- The archive backoff fired after ONE failure, so a single 502 from one CC shard
+  disabled Common Crawl for every domain that followed. Now only a run of 4
+  failures with no success in between counts.
+- `fetchViaWayback` asked for timestamp `2`, i.e. the snapshot nearest the year
+  2 — the OLDEST capture on file. For an email that is the wrong end of the
+  history; it now asks for `3000` (the newest).
+
+## Notes
+- Wayback 429s this container's IP on every call, so its contribution could not
+  be measured here. It cracked 4 of these 5 domains from the Railway IP in the
+  earlier session, and the code paces it at 2s with a single 429 retry.
+- Env kill-switches: `DISABLE_COMMONCRAWL=1`, `DISABLE_WAYBACK=1`,
+  `DISABLE_READER=1`.
+
+## Housekeeping (local dev only)
+- `backend/data.sqlite` was corrupt at boot again → parked in
+  `.same/corrupt-db-backup-6`, recreated. Production is Postgres, unaffected.
+- `frontend/node_modules` was missing its binaries again → `bun install`.
+- Local login re-seeded from env: **admin / dna-outreach**.
+
+## Incident
+- The apply model replaced the WHOLE of `search.ts` with the new engine pool,
+  deleting ~430 lines (every blocklist, `companyNameFromTitle`,
+  `searchCompanies`, `searchRaw`, `searchCompaniesPaged`). Rebuilt from the diff
+  and verified declaration-by-declaration: all 13 original exports present, plus
+  the new `searchEngineHealth`. There is no git repo here, so this was checked
+  by hand.
+
+---
 # Audience — Customer vs Partner ✅ shipped & verified
 
 Every discovery source is tagged **Customer** or **Partner**. The tag rides the
@@ -99,19 +212,6 @@ in Settings → **Follow-up ladder**, with a template AND a wait per rung.
 ## Verified
 49/49 in-process checks plus a live HTTP pass (config round-trip, refusals,
 clamping, garbage payloads) — all green.
-
----
-
-# Done earlier
-
-## Follow-up ladder (retry automation)
-- Retry ladder derived from `sends` (no queue): no-open branch + opened/no-click
-  branch, up to 3 emails total, a click ends the sequence.
-- `backend/src/followup.ts` engine + worker, `/api/followup*` routes.
-- `frontend/src/screens/FollowUp.tsx` card, mounted in Settings under Automation.
-- Retry starter pack in `frontend/src/lib/starters.ts` (8 templates, both voices),
-  exported as HTML in `.same/retry-templates/`.
-- History rows show `retry 1` / `retry 2` badges with the branch in the tooltip.
 
 ---
 
@@ -431,8 +531,6 @@ Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
 - OSM map source still sweeping micro-businesses with no websites
 - Web search has a structural ceiling (~10 results/query); Directory sources are
   the higher-yield path for volume
-- Crawler give-ups are dominated by Cloudflare; a scraping proxy is the only
-  real fix for those (`vymaps`, `datanyze`, `muqawil`, `arablocal` …)
 - Local dev SQLite corrupts if the bun process is SIGKILLed while holding the
   WAL. Shut the dev server down with plain `kill`, never `kill -9`.
 
@@ -498,6 +596,8 @@ bogus helpers during item 12. Repaired by deleting lines 1851-2702 and 2749-2779
 verified all 17 exports still present and typecheck clean. No git repo here, so
 /tmp/discovery.broken.ts was kept until the repair was confirmed, then removed.
 
+---
+
 # Discovery sources — collapsible container ✅ shipped
 
 The sources list sat between the stat strip and the review pool, so on a screen
@@ -538,5 +638,3 @@ had stacked up, two of them backends writing the same WAL, which is exactly the
 documented corruption cause. All were shut down with SIGTERM (never `kill -9`),
 the corrupt file moved to `.same/corrupt-db-backup-3`, and a single dev server
 restarted. Production is Postgres — unaffected.
-
----

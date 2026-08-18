@@ -943,7 +943,9 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   const label = src.category && src.category !== "Companies (general)"
     ? `${location || "web"} · ${src.category}`
     : (location || "web search");
-  const how = readerKey ? "web search (reader, keyed)" : "web search (free reader)";
+  // The engine pool is what serves these now; the reader is only reached when
+  // every free engine is resting, so saying "free reader" up front was wrong.
+  const how = `free engine pool${readerKey ? " → reader" : ""}${proxy ? " → proxy" : ""}`;
   dlog("search", `${label} — step ${cursor}/${planLen} · ${batch.length} quer${batch.length === 1 ? "y" : "ies"} · ${how}`);
 
   let found = 0, extracted = 0, ok = 0, covered = 0, blocked = false, stopped = false, err: string | undefined;
@@ -1892,16 +1894,16 @@ export function startDiscoveryWorker(): void {
       const [key, prox] = await Promise.all([getReaderKey(), getProxyConfig()]);
       const keys = parseReaderKeys(key);
       const st = getReaderStats(keys);
-      const proxNote = prox ? ` · scraping proxy: ${prox.provider}` : "";
+
       dlog(
         "",
         st.keysLive > 0
-          ? `reader → ${st.keysLive}/${st.keysConfigured} Jina key(s) live (${READER_RPM_KEYED_HINT}/min, 8x the free tier)${proxNote}`
+          ? `reader → ${st.keysLive}/${st.keysConfigured} Jina key(s) live (${READER_RPM_KEYED_HINT}/min). Only used when the free tiers can't serve a page.`
           : st.keysConfigured > 0
-            ? `reader → all ${st.keysConfigured} Jina key(s) REJECTED (out of tokens) — on the free tier (20/min). Top up or add another free key at jina.ai/api-dashboard → Settings → Crawler.${proxNote}`
-            : `reader → free tier, NO Jina key (20/min). Add one free at jina.ai/api-dashboard → Settings → Crawler.${proxNote}`
+            ? `reader → all ${st.keysConfigured} Jina key(s) REJECTED (out of tokens). Crawling continues on the free tiers; the reader is only a fallback now.`
+            : `reader → no Jina key. Not required — the free tiers below carry the crawl; a key only adds JS rendering for the pages they miss.`
       );
-      dlog("", `bypass tiers → direct · Jina reader · Wayback archive (free, unlimited)${prox ? ` · ${prox.provider}` : " · no paid proxy"}`);
+      dlog("", `bypass tiers → direct fetch · Common Crawl (free, unlimited) · Wayback archive (free) · Jina reader (metered)${prox ? ` · ${prox.provider} proxy` : " · no paid proxy"}`);
       if (!on) dwarn("", "bot is OFF — turn it on in the Discovery screen to start scanning.");
       else if (!active) dwarn("", "bot is ON but no sources are enabled — enable a source in the Discovery screen.");
     } catch { /* ignore */ }
