@@ -459,3 +459,175 @@ export async function fetchViaArchives(target: string): Promise<FetchResult> {
   }
   return { ok: false, status: 404, url: target, html: "", contentType: "", error: "not archived", via: "archive" };
 }
+
+/* ==================== Common Crawl as a COUNTRY INDEX ====================
+ *
+ * Everything above treats Common Crawl as a way to read ONE page we already
+ * know about. It is also the opposite thing: a list of every page it has ever
+ * crawled, queryable by URL pattern — and `*.qa` is "the Qatari web".
+ *
+ * That matters because a keyword search has a hard ceiling. Measured from this
+ * container, the free engines return 10-20 results per query and only one of
+ * them paginates at all, so a country sweep tops out in the low thousands of
+ * results however many queries you write. The index has no such ceiling:
+ *
+ *     *.qa   23 index pages · ~13,800 records/page · ~220 NEW hosts per page
+ *     *.sa   73 pages        *.ae  161 pages        *.jo  24 pages
+ *
+ * — about 8 seconds per page, free, keyless, and with no rate limit worth the
+ * name. That is the difference between "some of the companies that rank for a
+ * phrase" and "the companies that have a website in this country".
+ *
+ * A `*.qa` query returns `foo.com.qa` as well as `foo.qa` (the index is sorted
+ * by reversed domain, so the second-level suffixes simply appear on later
+ * pages) — so one pattern per country is enough.
+ *
+ * WARNING: the CDX server's `filter=` parameter 404s on this endpoint (measured
+ * with `~url:contract`), so any narrowing has to happen on our side, on the
+ * URLs the index hands back. That is why this returns the URLs it saw per host
+ * rather than just the hostnames.
+ */
+
+// A sweep page is a MULTI-MEGABYTE response (~12,000 index rows), not the
+// 60-row lookup the rest of this file makes. Fifteen of them in quick
+// succession was enough to make index.commoncrawl.org close the connection on
+// this IP for several minutes while building the feature — so the sweep gets
+// its own, much slower pacer, and the plan interleaves sweep steps between
+// queries rather than running them back to back.
+const CC_SWEEP_GAP_MS = 6_000;
+
+// Used only when collinfo.json cannot be reached. Everything in the sweep
+// depends on knowing ONE valid index id, and collinfo is a single point of
+// failure for that — it refuses a hot IP exactly when a sweep has been busy,
+// which is the moment the sweep still has pages to walk. These ids either
+// answer or they do not; a stale one costs a single 404 and the next is tried.
+const CC_FALLBACK_INDEXES = [
+  "CC-MAIN-2026-30", "CC-MAIN-2026-22", "CC-MAIN-2026-13", "CC-MAIN-2026-05",
+  "CC-MAIN-2025-38", "CC-MAIN-2025-30", "CC-MAIN-2025-21", "CC-MAIN-2025-13", "CC-MAIN-2025-05",
+];
+const ccFallbackApis = () => CC_FALLBACK_INDEXES.map((id) => `https://index.commoncrawl.org/${id}-index`);
+
+/** One host the country index knows about, and the URLs it was seen at. */
+export interface CcHost {
+  host: string;
+  urls: string[];
+}
+
+export interface CcHostPage {
+  hosts: CcHost[];
+  /** The index answered — distinguishes "no hosts here" from "we never asked". */
+  ok: boolean;
+  /** True when the page index is past the end of this pattern's results. */
+  pastEnd: boolean;
+  records: number;
+}
+
+/** The live index list, or the static fallback when collinfo is refusing us. */
+async function ccSweepApis(): Promise<string[]> {
+  const live = await ccIndexes().catch(() => []);
+  return live.length ? live : ccFallbackApis();
+}
+
+const ccPageCountCache = new Map<string, Cached<number>>();
+
+/**
+ * How many index pages this pattern has. Cached for half a day: a Common Crawl
+ * index is immutable once published, and the count only moves when a new crawl
+ * is released.
+ *
+ * Returns 0 when the index cannot be reached, which callers must read as "no
+ * sweep this pass" rather than "no pages" — a sweep that silently became empty
+ * is exactly the kind of thing that looks like it is working.
+ */
+export async function ccPageCount(pattern: string): Promise<number> {
+  if (!CC_ENABLED) return 0;
+  const key = pattern.toLowerCase();
+  const hit = fresh(ccPageCountCache.get(key), 12 * 60 * 60 * 1000);
+  if (hit !== undefined) return hit;
+  const apis = await ccSweepApis();
+  if (!apis.length) return 0;
+  const url = `${apis[0]}?url=${encodeURIComponent(pattern)}&output=json&showNumPages=true`;
+  const r = await paced("commoncrawl-index", CC_SWEEP_GAP_MS, () =>
+    rawFetch(url, { timeoutMs: 30_000, headers: browserHeaders(), via: "commoncrawl", trustBody: true, anyContentType: true })
+  );
+  if (!r.ok) { noteFail("commoncrawl", `numpages ${r.status}`); return 0; }
+  try {
+    const n = Number(JSON.parse(r.html.trim()).pages) || 0;
+    noteOk("commoncrawl");
+    ccPageCountCache.set(key, { at: Date.now(), data: n });
+    return n;
+  } catch {
+    noteFail("commoncrawl", "numpages parse");
+    return 0;
+  }
+}
+
+/**
+ * One page of the country index, collapsed to hosts.
+ *
+ * A page is ~14,000 URL records covering ~220 distinct hosts, so the collapse
+ * happens here — handing 14,000 rows back to the caller would make every
+ * consumer re-do the same grouping.
+ */
+export async function ccHostsForPattern(pattern: string, page: number): Promise<CcHostPage> {
+  const empty: CcHostPage = { hosts: [], ok: false, pastEnd: false, records: 0 };
+  if (!CC_ENABLED || !usable("commoncrawl")) return empty;
+  const apis = await ccSweepApis();
+  if (!apis.length) return empty;
+
+  const url = `${apis[0]}?url=${encodeURIComponent(pattern)}&output=json&page=${page}`;
+  const r = await paced("commoncrawl-index", CC_SWEEP_GAP_MS, () =>
+    rawFetch(url, { timeoutMs: 60_000, headers: browserHeaders(), via: "commoncrawl", trustBody: true, anyContentType: true })
+  );
+  // Past the last page the server answers **400**, not 404, with a body of
+  //   {"message": "Page 17 invalid: First Page is 0, Last Page is 16"}
+  // That is an ANSWER — it is how a sweep learns it has finished — and it must
+  // not count towards the backoff. Getting this wrong would be expensive well
+  // beyond the sweep: four of them in a row trips `noteFail`, which rests
+  // Common Crawl for EVERY caller, including the archive fetch tier the crawler
+  // leans on to crack walled sites. That is the same shape as the bug an
+  // earlier wave already fixed once ("a single 502 from one shard disabled
+  // Common Crawl for every domain that followed").
+  // (The body would say so in words, but `rawFetch` deliberately discards the
+  // body on a non-OK status, so the code is all we get. We build this query
+  // ourselves and it is always well formed, so a 400 can only mean the page
+  // index is out of range.)
+  if (r.status === 404 || r.status === 400) {
+    noteOk("commoncrawl");
+    return { hosts: [], ok: true, pastEnd: true, records: 0 };
+  }
+  if (!r.ok) { noteFail("commoncrawl", `sweep ${r.status}`); return empty; }
+
+  const byHost = new Map<string, string[]>();
+  let records = 0;
+  for (const line of r.html.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    let rec: any;
+    try { rec = JSON.parse(t); } catch { continue; }
+    if (rec.status && rec.status !== "200") continue;
+    const mime = String(rec.mime || rec["mime-detected"] || "");
+    if (mime && !/html/i.test(mime)) continue;
+    const u = String(rec.url || "");
+    if (!u) continue;
+    records++;
+    let host = "";
+    try { host = hostOf(u); } catch { continue; }
+    if (!host) continue;
+    const list = byHost.get(host);
+    // A handful of sample URLs per host is enough for a caller to decide
+    // whether it looks relevant; a busy host can hold thousands of rows on a
+    // single index page and keeping them all would balloon the memory for
+    // nothing.
+    if (list) { if (list.length < 8) list.push(u); }
+    else byHost.set(host, [u]);
+  }
+
+  noteOk("commoncrawl");
+  return {
+    hosts: [...byHost.entries()].map(([host, urls]) => ({ host, urls })),
+    ok: true,
+    pastEnd: records === 0,
+    records,
+  };
+}

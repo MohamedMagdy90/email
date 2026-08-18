@@ -175,6 +175,9 @@ export interface DiscoverySource {
   type?: "osm" | "directory" | "search";
   base_url?: string | null;
   keywords?: string | null; // web-search sources: custom keywords (blank = from category)
+  // Web-search sources: also walk Common Crawl's index of the country's own
+  // ccTLD, not just the keyword queries. 1 = on (the default).
+  sweep_country?: number;
   /** customer | partner — every lead this source files inherits it. */
   audience?: string | null;
   cursor?: number;
@@ -685,8 +688,9 @@ export const api = {
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
+    sweepCountry?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null; sweepCountry: boolean }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>

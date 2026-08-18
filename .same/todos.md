@@ -638,3 +638,34 @@ had stacked up, two of them backends writing the same WAL, which is exactly the
 documented corruption cause. All were shut down with SIGTERM (never `kill -9`),
 the corrupt file moved to `.same/corrupt-db-backup-3`, and a single dev server
 restarted. Production is Postgres — unaffected.
+
+---
+
+# Web search yield — "only a handful of leads per source" ✅ shipped & verified
+
+Full record: **`.same/web-search-yield.md`**.
+
+Headline: **half of every query plan was a result page that no engine serves.**
+DuckDuckGo's `&s=30` and Bing's `&first=` both return page one again, and Brave
+— the only engine that really paginates (69 unique domains over 4 pages against
+20 for one) — was capped at page one in code. When the two page-one engines were
+resting the whole pool declined, and that was recorded as a rate limit: a 3-30
+minute backoff for a page that never existed. The `" contact"` query variants,
+another half of the plan, were measured to return **zero** new domains on Bing.
+
+Fixed, plus a **Common Crawl country sweep** that reads the index as "every host
+under `.qa`" — the thing that actually scales past what happens to rank for a
+phrase. Plus a `FINANCE_BLOCK`, because in the Gulf a "trading company" sells
+goods and on the open web "trading" means forex (a live pass had returned
+trading212, etrade, metatrader5 and olymptrade as Qatari leads).
+
+Verified end to end on a scratch DB (`cd backend && bun run verify`):
+- 5 keyword steps → **+31 leads in 9s**, all country-resolved, no duplicates
+- one index step → **+106 leads in 15s**
+- Qatar · general plan: **577 steps (560 queries + 17 index pages)**, was ~150
+  real queries of which half were dead
+
+Also root-caused the **recurring `data.sqlite` corruption** (eight parked copies
+in `.same/`): WAL mode on this container's overlay filesystem. Now
+`journal_mode=TRUNCATE`, one handle pinned across `bun --watch` reloads, and a
+corrupt file parks itself instead of crash-looping — proven to survive a SIGKILL.

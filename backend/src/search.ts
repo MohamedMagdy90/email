@@ -25,7 +25,7 @@ const pickUA = () => UAS[Math.floor(Math.random() * UAS.length)];
 
 // Domains that are aggregators/social/marketplaces, not the company itself.
 const BLOCK =
-  /(^|\.)(facebook|instagram|twitter|x|linkedin|youtube|tiktok|pinterest|snapchat|whatsapp|telegram|wikipedia|wikimedia|yelp|tripadvisor|trustpilot|amazon|ebay|aliexpress|alibaba|made-in-china|indiamart|exportersindia|tradeindia|indeed|glassdoor|bayt|naukri|yellowpages|yello|yalwa|justdial|foursquare|google|goo\.gl|apple|microsoft|bing|duckduckgo|yahoo|baidu|reddit|quora|medium|blogspot|wordpress|wixsite|weebly|godaddy|t\.co|bit\.ly|tinyurl|booking|expedia|craigslist|dnb|zoominfo|crunchbase|opencorporates|bloomberg|gov|edu|int)\.[a-z.]+$/i;
+  /(^|\.)(facebook|instagram|twitter|x|linkedin|youtube|tiktok|pinterest|snapchat|whatsapp|telegram|wikipedia|wikimedia|yelp|tripadvisor|trustpilot|amazon|ebay|aliexpress|alibaba|made-in-china|indiamart|exportersindia|tradeindia|indeed|glassdoor|bayt|naukri|yellowpages|yello|yalwa|justdial|foursquare|google|goo\.gl|apple|microsoft|bing|duckduckgo|yahoo|baidu|yandex|naver|seznam|ecosia|brave|startpage|qwant|reddit|quora|medium|blogspot|wordpress|wixsite|weebly|godaddy|t\.co|bit\.ly|tinyurl|booking|expedia|craigslist|dnb|zoominfo|crunchbase|opencorporates|bloomberg|gov|edu|int)\.[a-z.]+$/i;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -89,10 +89,27 @@ const isBlocked = (html: string) => /anomaly|unusual traffic|are you a robot|cap
 
 interface Engine {
   id: string;
-  /** null = this engine can't serve that result page (most only do page 1). */
-  build: (q: string, offset: number) => string | null;
+  /** null = this engine cannot serve a result page that deep. */
+  build: (q: string, page: number) => string | null;
   parse: (body: string) => Hit[];
   referer?: string;
+  /**
+   * Deepest 0-based page this engine returns DIFFERENT results for.
+   *
+   * Measured, not assumed — and only one of the four is above zero. Both
+   * DuckDuckGo's `&s=30&dc=31` and Bing's `&first=31` look like pagination and
+   * are not: each returns page one again, verbatim. Asking for them spent half
+   * of every query plan re-fetching results we already had, and taught the
+   * saturation table to cool the query off for being "unproductive".
+   */
+  maxPage: number;
+  /**
+   * Minimum gap between two calls to THIS engine. One global pacer was wrong:
+   * Bing's RSS endpoint answered ~40 probe calls at 140ms without a single
+   * limit, while Brave walls at about five. Pacing them together means the
+   * engine that always answers waits for the quota of the one that doesn't.
+   */
+  gapMs: number;
 }
 
 // Brave renders results into `.snippet` blocks; the outbound link is the anchor
@@ -122,35 +139,78 @@ function parseBingRss(xml: string): Hit[] {
   return hits;
 }
 
-const ddgSuffix = (offset: number) => (offset ? `&s=${offset}&dc=${offset + 1}` : "");
-
 const ENGINES: Engine[] = [
   {
+    // The ONLY engine in the pool that genuinely paginates. Measured against a
+    // datacenter IP: `&offset=1/2/3` returned 20 / 19 / 20 / 19 hosts and
+    // **69 unique domains across four pages against 20 for page one alone**.
+    //
+    // It also has the smallest quota (~5 requests before a 429), and that is
+    // precisely why DEPTH beats breadth here: four pages of one query cost the
+    // same five-request quota as four separate queries and return 3.4x the
+    // domains. The old code hard-capped it at page one.
+    id: "brave",
+    build: (q, p) =>
+      p > 3 ? null : `https://search.brave.com/search?q=${encodeURIComponent(q)}${p ? `&offset=${p}` : ""}`,
+    parse: parseBrave,
+    maxPage: 3,
+    gapMs: 2_500,
+  },
+  {
+    // The workhorse: never rate-limited across ~40 probe calls at ~140ms each,
+    // and a twentieth of the bytes of a real results page. It ignores `count`
+    // and `first` entirely — always ~10 results, always page one.
+    id: "bing-rss",
+    build: (q, p) => (p ? null : `https://www.bing.com/search?q=${encodeURIComponent(q)}&format=rss&count=30`),
+    parse: parseBingRss,
+    maxPage: 0,
+    gapMs: 1_000,
+  },
+  {
     id: "duckduckgo",
-    build: (q, o) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}${ddgSuffix(o)}`,
+    build: (q, p) => (p ? null : `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`),
     parse: parseHits,
     referer: "https://duckduckgo.com/",
+    maxPage: 0,
+    gapMs: 4_000,
   },
   {
     id: "duckduckgo-lite",
-    build: (q, o) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}${ddgSuffix(o)}`,
+    build: (q, p) => (p ? null : `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`),
     parse: parseHits,
     referer: "https://duckduckgo.com/",
-  },
-  {
-    // Brave paginates by page index, but a second page comes back empty for a
-    // datacenter IP, so it only ever serves the first.
-    id: "brave",
-    build: (q, o) => (o ? null : `https://search.brave.com/search?q=${encodeURIComponent(q)}`),
-    parse: parseBrave,
-  },
-  {
-    // Ignores count/first entirely — always ~8 results, always page one.
-    id: "bing-rss",
-    build: (q, o) => (o ? null : `https://www.bing.com/search?q=${encodeURIComponent(q)}&format=rss&count=30`),
-    parse: parseBingRss,
+    maxPage: 0,
+    gapMs: 4_000,
   },
 ];
+
+/** The deepest page ANY engine in the pool can serve. */
+export const MAX_RESULT_PAGE = ENGINES.reduce((m, e) => Math.max(m, e.maxPage), 0);
+
+/* ----------------------------- per-engine pacing -----------------------------
+ * A serialised, spaced queue per engine. Politeness is what keeps a free engine
+ * answering us, but it has to be measured per engine or the fast one inherits
+ * the slow one's problem.
+ */
+const engineChain = new Map<string, Promise<void>>();
+const engineNextAt = new Map<string, number>();
+
+async function pacedEngine<T>(id: string, gapMs: number, fn: () => Promise<T>): Promise<T> {
+  const prev = engineChain.get(id) || Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  engineChain.set(id, prev.then(() => gate));
+  await prev.catch(() => {});
+  const now = Date.now();
+  const at = Math.max(now, engineNextAt.get(id) || 0);
+  engineNextAt.set(id, at + gapMs);
+  if (at > now) await sleep(at - now);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 const ENGINE_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000, 60 * 60_000];
 const engineHealth = new Map<string, { fails: number; until: number }>();
@@ -179,58 +239,79 @@ export function searchEngineHealth(): { engine: string; live: boolean; restingFo
   });
 }
 
-async function askEngine(engine: Engine, q: string, offset: number): Promise<Hit[] | null> {
-  const url = engine.build(q, offset);
+async function askEngine(engine: Engine, q: string, page: number): Promise<Hit[] | null> {
+  const url = engine.build(q, page);
   if (!url) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": pickUA(),
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ...(engine.referer ? { Referer: engine.referer } : {}),
-      },
-      signal: controller.signal,
-    });
-    if (!res.ok) return null;
-    const body = await res.text();
-    if (isBlocked(body)) return null;
-    const hits = engine.parse(body);
-    return hits.length ? hits : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  return pacedEngine(engine.id, engine.gapMs, async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": pickUA(),
+          "Accept-Language": "en-US,en;q=0.9",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          ...(engine.referer ? { Referer: engine.referer } : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      const body = await res.text();
+      if (isBlocked(body)) return null;
+      const hits = engine.parse(body);
+      return hits.length ? hits : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 }
 
 /**
- * Ask the free engines, rotating so no single one carries the whole load.
- * Returns null only when every engine is walled or resting.
+ * Why this is four outcomes and not "hits or null".
+ *
+ * `null` used to mean three different things at once, and the caller could only
+ * read it as "rate-limited". The expensive case was a deep page: only Brave
+ * serves one, so asking for page 2 while Brave rested made every engine decline
+ * — and that was reported as a block, buying a 3-30 MINUTE backoff for a page
+ * that does not exist in this pool. Half of every query plan was such a page.
  */
-async function freeSerp(q: string, offset: number): Promise<{ hits: Hit[]; engine: string } | null> {
+type SerpOutcome =
+  | { kind: "hits"; hits: Hit[]; engine: string }
+  | { kind: "unsupported" }  // no engine in the pool serves a page this deep
+  | { kind: "resting" }      // the engines that could are backing off right now
+  | { kind: "walled" };      // engines were asked and every one refused
+
+/** Ask the free engines, rotating so no single one carries the whole load. */
+async function freeSerp(q: string, page: number): Promise<SerpOutcome> {
   const order = ENGINES.map((_, i) => ENGINES[(engineCursor + i) % ENGINES.length]);
   engineCursor = (engineCursor + 1) % ENGINES.length;
+  let capable = 0;
+  let asked = 0;
   for (const engine of order) {
-    if (!engineUsable(engine.id)) continue;
-    if (!engine.build(q, offset)) continue; // can't serve this page — not a failure
-    const hits = await askEngine(engine, q, offset);
+    if (!engine.build(q, page)) continue; // no such page here — not a failure
+    capable++;
+    if (!engineUsable(engine.id)) continue; // resting off an earlier wall
+    asked++;
+    const hits = await askEngine(engine, q, page);
     if (hits) {
       engineOk(engine.id);
-      return { hits, engine: engine.id };
+      return { kind: "hits", hits, engine: engine.id };
     }
     engineWalled(engine.id);
   }
-  return null;
+  if (!capable) return { kind: "unsupported" };
+  if (!asked) return { kind: "resting" };
+  return { kind: "walled" };
 }
 
 // Fetch one results page for the interactive search, across the free pool.
-async function fetchResultsPage(q: string, offset: number): Promise<Hit[]> {
+async function fetchResultsPage(q: string, page: number): Promise<Hit[]> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await freeSerp(q, offset);
-    if (r) return r.hits;
+    const r = await freeSerp(q, page);
+    if (r.kind === "hits") return r.hits;
+    if (r.kind === "unsupported") return []; // retrying cannot conjure the page
     await sleep(1200 * (attempt + 1)); // let a just-walled engine settle
   }
   return [];
@@ -252,8 +333,10 @@ export async function searchCompanies(keywords: string, location: string, limit:
   let gotAnyPage = false;
 
   // One query, up to two pages — enough breadth while keeping requests low.
-  for (const offset of [0, 30]) {
-    const hits = await fetchResultsPage(base, offset);
+  // Page 1 only exists on Brave; on the other engines it resolves to
+  // "unsupported" and costs nothing at all.
+  for (const page of [0, 1]) {
+    const hits = await fetchResultsPage(base, page);
     if (hits.length) gotAnyPage = true;
     for (const h of hits) {
       let host = "";
@@ -318,8 +401,8 @@ export async function searchRaw(
   const seenSite = new Set<string>();
   const seenProfile = new Set<string>();
 
-  for (const offset of [0, 30]) {
-    const hits = await fetchResultsPage(base, offset);
+  for (const page of [0, 1]) {
+    const hits = await fetchResultsPage(base, page);
     for (const h of hits) {
       let host = "";
       try { host = hostOf(h.url); } catch { continue; }
@@ -483,6 +566,23 @@ export const AGGREGATOR_BLOCK =
 // for "directory" in a LABEL, and here it is the top-level domain itself.
 const LISTING_TLD = /\.(?:directory|wiki|blog|news|review|reviews|guide|info)$/i;
 
+/* ---------------------- the "trading" collision ------------------------- */
+// In the Gulf a "trading company" sells goods; on the open web "trading" means
+// FOREX. A live Qatar pass on "trading and contracting W.L.L." returned
+// trading212.com, etrade.com, metatrader5.com, olymptrade.com, wrtrading.com
+// and simul8or.com — global brokerages and demo-account platforms that rank for
+// the word everywhere on earth, and each one costs a full crawl to disprove.
+//
+// Two guards, because neither catches all of them: the well-known platforms are
+// caught by HOST (their titles are just a brand name — "E*TRADE", "Trading
+// 212"), and the long tail is caught by TITLE ("Free Trading Simulator").
+export const FINANCE_BLOCK =
+  /(^|\.)(trading212|etrade|e-trade|olymptrade|olymp|iqoption|iqbroker|expertoption|pocketoption|quotex|binomo|deriv|metatrader\d*|metaquotes|mt4|mt5|ctrader|tradingview|investing|fxpro|fxtm|fxcm|forex\w*|\w*forex|oanda|avatrade|axitrader|pepperstone|icmarkets|exness|xm|xtb|plus500|etoro|markets|cmcmarkets|ig|saxobank|interactivebrokers|thinkorswim|webull|robinhood|coinbase|binance|kraken|bybit|okx|kucoin|bitget|simul8or|wrtrading|tradestation|ninjatrader|tradeciety|babypips|dailyfx|myfxbook|fxblue)\.[a-z.]+$/i;
+
+// Titles that describe a trading/brokerage PRODUCT rather than a local firm.
+const PLATFORM_TITLE =
+  /\b(?:forex|cfds?|spread bett\w*|binary options?|demo account|trading (?:platform|simulator|account|app|bot|signals?|academy|courses?)|online broker\w*|brokerage account|metatrader|mt[45]\b|copy trading|crypto (?:exchange|wallet|trading)|day trading|stock (?:market|broker)|invest(?:ing|ment) (?:platform|app))\b/i;
+
 /**
  * The single "this host can NEVER be a prospect" gate.
  *
@@ -506,6 +606,7 @@ export function isNonProspectHost(host: string): boolean {
     OFFICIAL_BLOCK.test(h) ||
     AGGREGATOR_BLOCK.test(h) ||
     REFERENCE_BLOCK.test(h) ||
+    FINANCE_BLOCK.test(h) ||
     LISTING_TLD.test(h) ||
     isProfileHost(h) ||
     isJunkHost(h)
@@ -614,34 +715,38 @@ const LISTICLE_PATH = /\/(?:top-|best-|list-of|list\/|guide\/|blog\/|news\/|arti
 // Result TITLES that are clearly "top N" round-up articles, not a company.
 const LISTICLE_TITLE = /^\s*(?:the\s+)?(?:top|best|leading|\d+\s+(?:top|best|leading|of the best))\b/i;
 
-function ddgUrl(query: string, offset: number): string {
-  const base = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  return offset ? `${base}&s=${offset}&dc=${offset + 1}` : base;
-}
+const ddgUrl = (query: string) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
 // Fetch ONE results page for the bot, cheapest source first.
 //   1. the free engine pool (four engines, rotated, rested when walled)
 //   2. the Jina reader on DuckDuckGo — metered, so only when the pool is spent
 //   3. the scraping proxy — costs credits, so last
 // `blocked` = we couldn't get a real page from ANY of them.
+// `unsupported` = no engine serves a page that deep. NOT a block: there is
+// nothing to back off from and nothing to retry.
 async function fetchSearchPage(
   query: string,
-  offset: number,
+  page: number,
   readerKey?: string,
   proxy?: ProxyConfig
-): Promise<{ hits: Hit[]; blocked: boolean; engine: string }> {
+): Promise<{ hits: Hit[]; blocked: boolean; unsupported: boolean; engine: string }> {
   // 1) The free pool. This is what keeps the reader bill near zero.
-  const free = await freeSerp(query, offset);
-  if (free) return { hits: free.hits, blocked: false, engine: free.engine };
+  const free = await freeSerp(query, page);
+  if (free.kind === "hits") return { hits: free.hits, blocked: false, unsupported: false, engine: free.engine };
+  if (free.kind === "unsupported") return { hits: [], blocked: false, unsupported: true, engine: "none" };
 
-  const url = ddgUrl(query, offset);
+  // The paid tiers below render DuckDuckGo's FIRST results page. There is no
+  // deep page for them to render, so spending a token on one is pure waste.
+  if (page > 0) return { hits: [], blocked: false, unsupported: true, engine: "none" };
+
+  const url = ddgUrl(query);
 
   // 2) The reader renders the results page and returns real HTML — verified to
   //    bypass the anomaly wall. It costs tokens, hence its position here.
   const rd = await fetchViaReader(url, 45000, readerKey).catch(() => null);
   if (rd?.ok && rd.html && !isBlocked(rd.html)) {
     const hits = parseHits(rd.html);
-    if (hits.length) return { hits, blocked: false, engine: "reader" };
+    if (hits.length) return { hits, blocked: false, unsupported: false, engine: "reader" };
   }
 
   // 3) Scraping proxy — last, because it costs credits. The results page is
@@ -651,15 +756,15 @@ async function fetchSearchPage(
   //    only tried if the cheap one is walled too.
   if (proxy) {
     const cheap = await proxyHits(url, { ...proxy, renderJs: false, premium: false });
-    if (cheap) return { hits: cheap, blocked: false, engine: "proxy" };
+    if (cheap) return { hits: cheap, blocked: false, unsupported: false, engine: "proxy" };
     // Only worth the stealth surcharge if the plain IP swap was walled too.
     if (proxy.premium !== false) {
       const stealth = await proxyHits(url, { ...proxy, renderJs: false, premium: true });
-      if (stealth) return { hits: stealth, blocked: false, engine: "proxy" };
+      if (stealth) return { hits: stealth, blocked: false, unsupported: false, engine: "proxy" };
     }
   }
 
-  return { hits: [], blocked: true, engine: "none" };
+  return { hits: [], blocked: true, unsupported: false, engine: "none" };
 }
 
 // One proxy attempt: parsed results, or null if it was walled.
@@ -670,27 +775,32 @@ async function proxyHits(url: string, cfg: ProxyConfig): Promise<Hit[] | null> {
   return hits.length ? hits : null;
 }
 
-// One page of company results for a query. Filters out social/marketplaces
-// (BLOCK), SEO/listicle/data-broker hosts (CONTENT_BLOCK), and obvious listicle
-// URLs — leaving individual company websites. No email/phone (search only gives
-// the site); the discovery bot then crawls each site to find the email.
-export async function searchCompaniesPaged(
-  query: string,
-  offset: number,
+/**
+ * Turn raw result hits into company records, INTO a shared map.
+ *
+ * Filters out social/marketplaces (BLOCK), SEO/listicle/data-broker hosts
+ * (CONTENT_BLOCK) and obvious listicle URLs — leaving individual company
+ * websites. No email/phone (search only gives the site); the discovery bot then
+ * crawls each site to find the address.
+ *
+ * The map is passed IN rather than returned so that several result pages of the
+ * same query dedupe against each other — which is the whole point of paging: a
+ * deep page that repeats page one must be visible as "added nothing".
+ */
+function collectCompanies(
+  hits: Hit[],
+  byDomain: Map<string, Company>,
   limit: number,
-  readerKey?: string,
-  expectCountry?: string,
-  proxy?: ProxyConfig
-): Promise<{ companies: Company[]; blocked: boolean; engine?: string }> {
-  const { hits, blocked, engine } = await fetchSearchPage(query, offset, readerKey, proxy);
-  if (blocked) return { companies: [], blocked: true };
-
-  const byDomain = new Map<string, Company>();
+  expectCountry?: string
+): number {
+  let added = 0;
   for (const h of hits) {
+    if (byDomain.size >= limit) break;
     let host = "";
     try { host = hostOf(h.url); } catch { continue; }
     if (!host || isNonProspectHost(host)) continue; // social, brokers, directories, regulators
     if (LISTICLE_TITLE.test(h.title || "")) continue; // "Top 20 …", "Best …", "10 Leading …"
+    if (PLATFORM_TITLE.test(h.title || "")) continue; // "Free Trading Simulator" — forex, not a trader
     if (looksForeign(h.title || "", expectCountry || "")) continue; // "Medina, Ohio"
     let path = "/";
     try { path = new URL(h.url).pathname.toLowerCase(); } catch { /* ignore */ }
@@ -705,15 +815,82 @@ export async function searchCompaniesPaged(
     if (!name) continue;
     let website = h.url;
     try { const u = new URL(h.url); website = `${u.protocol}//${u.host}/`; } catch { /* keep */ }
-    byDomain.set(domain, {
-      name,
-      website,
-      city: "",
-      email: null,
-      phone: null,
-      hasWebsite: true,
-    });
+    byDomain.set(domain, { name, website, city: "", email: null, phone: null, hasWebsite: true });
+    added++;
+  }
+  return added;
+}
+
+// One page of company results for a query. Kept as the single-page primitive.
+export async function searchCompaniesPaged(
+  query: string,
+  page: number,
+  limit: number,
+  readerKey?: string,
+  expectCountry?: string,
+  proxy?: ProxyConfig
+): Promise<{ companies: Company[]; blocked: boolean; unsupported?: boolean; engine?: string }> {
+  const { hits, blocked, unsupported, engine } = await fetchSearchPage(query, page, readerKey, proxy);
+  if (blocked) return { companies: [], blocked: true };
+  const byDomain = new Map<string, Company>();
+  collectCompanies(hits, byDomain, limit, expectCountry);
+  return { companies: [...byDomain.values()], blocked: false, unsupported, engine };
+}
+
+export interface DeepSearchResult {
+  companies: Company[];
+  blocked: boolean;
+  pages: number;      // result pages actually fetched
+  engines: string[];  // which engines served them
+}
+
+/**
+ * Every result page one query will give us, merged and deduped.
+ *
+ * This is the unit the discovery bot walks now, and the reason is arithmetic.
+ * Brave is the only engine that paginates, and it is also the one with the
+ * tightest quota (~5 requests before a 429). Four pages of ONE query cost the
+ * same five-request quota as four separate queries — and measured, they return
+ * 69 unique domains against the 20 a single page gives. So depth is free
+ * breadth, and it is only reachable per-query, never per-plan-entry.
+ *
+ * Stops at the first page that adds nothing new, because that is exactly what
+ * an engine repeating page one looks like from here.
+ */
+export async function searchCompaniesDeep(
+  query: string,
+  opts: {
+    maxPages?: number;
+    limit?: number;
+    readerKey?: string;
+    expectCountry?: string;
+    proxy?: ProxyConfig;
+  } = {}
+): Promise<DeepSearchResult> {
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? MAX_RESULT_PAGE + 1, MAX_RESULT_PAGE + 1));
+  const limit = opts.limit ?? 120;
+  const byDomain = new Map<string, Company>();
+  const engines: string[] = [];
+  let pages = 0;
+
+  for (let page = 0; page < maxPages; page++) {
+    const r = await fetchSearchPage(query, page, opts.readerKey, opts.proxy);
+    // Only page ZERO can declare the source rate-limited. A deep page that
+    // nobody can serve is a fact about the pool, not about us being throttled,
+    // and reporting it as a block used to buy a 3-30 minute backoff for nothing.
+    if (r.blocked) {
+      if (page === 0) return { companies: [], blocked: true, pages: 0, engines: [] };
+      break;
+    }
+    if (r.unsupported || !r.hits.length) break;
+    pages++;
+    if (r.engine) engines.push(r.engine);
+    const added = collectCompanies(r.hits, byDomain, limit, opts.expectCountry);
+    // The engine handed back a page it had already given us. Going deeper on a
+    // repeating engine only burns its quota.
+    if (!added) break;
     if (byDomain.size >= limit) break;
   }
-  return { companies: [...byDomain.values()], blocked: false, engine };
+
+  return { companies: [...byDomain.values()], blocked: false, pages, engines };
 }

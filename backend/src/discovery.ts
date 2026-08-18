@@ -13,7 +13,7 @@ import {
 } from "./db";
 import { findLeadsIn, resolveArea, tilesFor, countAvailable, isCompanySite as isCompanySiteHost, type Company, type Tile } from "./leads";
 import {
-  searchCompaniesPaged,
+  searchCompaniesDeep,
   CONTENT_BLOCK,
   SETUP_BLOCK,
   OFFICIAL_BLOCK,
@@ -23,6 +23,7 @@ import {
   domainLooksForeign,
 } from "./search";
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
+import { ccHostsForPattern, ccPageCount } from "./crawler/archives";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
 import { isBadName } from "./repair";
 import { resolveWebsite } from "./enrich";
@@ -117,14 +118,24 @@ const EMPTY_STREAK_LIMIT = 3;
 const READER_RPM_KEYED_HINT = 120;
 const OSM_TILES_PER_RUN = 6;
 const OSM_TILE_PACING_MS = 1_200;
-const SEARCH_QUERIES_PER_RUN = 3;
-const SEARCH_PAGES = [0, 30];
-// The search engine walls a datacenter IP after a couple of quick requests, so
-// throughput is capped by politeness, not by our loop speed. Pacing requests
-// ~4s apart (and batches ~8s apart) keeps a pass moving instead of spending it
-// in backoff. Both were 1.2s/1.5s, which tripped the limiter every third query.
-const SEARCH_PACING_MS = 4_000;
-const SEARCH_CONTINUE_MS = 8_000;
+// A plan entry is ONE QUERY, not one (query, page) pair. It used to be the
+// latter, with pages [0, 30] — but measured against every engine in the pool,
+// `&s=30` (DuckDuckGo) and `&first=31` (Bing) both return page ONE again, and
+// Brave refused any offset in code. So half of every plan re-fetched results we
+// already had, and when the two page-one engines were resting the whole pool
+// declined and the batch recorded a rate limit for a page that never existed.
+//
+// Depth now lives inside `searchCompaniesDeep`, which pulls as many pages as
+// the engine that actually answered will serve — four on Brave, measured at 69
+// unique domains against 20 for its first page alone.
+const SEARCH_QUERIES_PER_RUN = 5;
+const SEARCH_MAX_PAGES = 4;
+// Politeness is now measured PER ENGINE inside search.ts (Bing 1s, Brave 2.5s,
+// DuckDuckGo 4s), so this is just breathing room between plan entries rather
+// than the throttle it used to be. It was 4s for every engine, which made the
+// one engine that never rate-limits us wait out the quota of the one that does.
+const SEARCH_PACING_MS = 1_200;
+const SEARCH_CONTINUE_MS = 4_000;
 const SEARCH_EMPTY_STREAK_LIMIT = 6;
 // Rate-limit backoff for a search source. The engine's ceiling is per-minute,
 // so a blocked query recovers in minutes — sleeping for the source's full
@@ -776,6 +787,14 @@ async function runDirectorySource(src: any): Promise<DirRunResult> {
 // with entries like "A Comprehensive Guide to Company Formation in Qatar".
 // Long-tail trade phrases ("MEP contractor", "steel fabrication") are the
 // opposite: the only pages that rank are the firms that do the work.
+//
+// A NOTE ON SIZE. These lists are long on purpose. Every engine in the free
+// pool returns 10-20 results for a query and only one of them paginates, so the
+// number of DISTINCT queries is the ceiling on how much of a country a search
+// source can ever see. Ten phrases against a country with tens of thousands of
+// companies is not a rate problem that more patience fixes — it is a reach
+// problem, and the only cure is more phrases, each naming a trade narrow enough
+// that the firms doing it are what ranks.
 const SEARCH_KEYWORDS: Record<string, string[]> = {
   // Deliberately NOT the word "companies". A general sweep is a portfolio of
   // specific trades — plus the Gulf legal suffixes ("W.L.L.", "Trading &
@@ -784,30 +803,136 @@ const SEARCH_KEYWORDS: Record<string, string[]> = {
   "Companies (general)": [
     "trading and contracting W.L.L.",
     "general trading est",
+    "trading and services company",
     "MEP contractor",
     "electromechanical company",
     "steel fabrication",
+    "aluminium and glass works",
+    "civil construction company",
+    "interior fit out contractor",
+    "joinery and carpentry works",
     "facilities management company",
+    "cleaning and maintenance services",
+    "manpower supply company",
+    "security services company",
     "industrial supplies",
+    "safety equipment supplier",
+    "building materials supplier",
+    "hardware and tools trading",
+    "electrical equipment supplier",
+    "plumbing materials supplier",
+    "HVAC contracting company",
+    "fire fighting and alarm systems",
     "manufacturing factory",
+    "plastic products factory",
+    "furniture factory",
+    "food processing company",
+    "packaging materials company",
+    "printing press company",
     "logistics and freight company",
+    "shipping and clearing agents",
+    "transport and heavy equipment rental",
+    "car rental and leasing company",
     "IT solutions provider",
+    "software development company",
+    "medical equipment supplier",
+    "laboratory equipment supplier",
+    "chemicals and lubricants trading",
+    "oilfield services company",
+    "agriculture and landscaping company",
+    "event management company",
   ],
-  "Accounting & Tax": ["accounting firm", "audit firm", "tax consultants", "chartered accountants", "bookkeeping services"],
-  "IT & Software": ["IT company", "software company", "IT solutions", "technology company", "IT services provider"],
-  "Construction & Contracting": ["construction company", "contracting company", "building contractor", "civil contractor", "general contracting"],
-  "Consulting": ["consulting firm", "management consultants", "business consultants", "consultancy"],
-  "Engineering": ["engineering company", "engineering consultants", "MEP contractor", "electromechanical company"],
-  "Real Estate": ["real estate company", "property management company", "real estate developers", "real estate agency"],
-  "Legal": ["law firm", "legal consultants", "advocates and legal consultants", "attorneys"],
-  "Logistics & Transport": ["logistics company", "freight forwarders", "shipping company", "transport company", "cargo services"],
-  "Advertising & Marketing": ["advertising agency", "marketing agency", "digital marketing company", "branding agency"],
-  "Insurance": ["insurance company", "insurance brokers", "takaful company"],
-  "Healthcare & Clinics": ["medical clinic", "polyclinic", "medical center", "hospital", "pharmacy"],
-  "Hospitality & Food": ["catering company", "restaurant", "hotel", "hospitality company"],
-  "Manufacturing & Industrial": ["manufacturing company", "factory", "industrial company", "manufacturer", "fabrication company"],
-  "Education & Training": ["training institute", "training center", "academy", "educational institute"],
-  "Trading & Retail": ["trading company", "trading establishment", "distributors", "wholesale company"],
+  "Accounting & Tax": [
+    "accounting firm", "audit firm", "tax consultants", "chartered accountants", "bookkeeping services",
+    "auditors and accountants", "VAT consultants", "payroll services company", "financial advisory firm",
+    "corporate tax advisors", "internal audit services", "accounting and auditing office",
+  ],
+  "IT & Software": [
+    "IT company", "software company", "IT solutions", "technology company", "IT services provider",
+    "software development company", "web design company", "mobile app development company",
+    "ERP implementation partner", "IT infrastructure company", "network solutions provider",
+    "cyber security company", "cloud services provider", "IT support and AMC services",
+    "system integrator", "data center solutions",
+  ],
+  "Construction & Contracting": [
+    "construction company", "contracting company", "building contractor", "civil contractor", "general contracting",
+    "MEP contractor", "road construction company", "infrastructure contractor", "steel structure contractor",
+    "interior fit out contractor", "landscaping contractor", "piling and foundation contractor",
+    "waterproofing and insulation contractor", "demolition and excavation contractor",
+    "painting and finishing contractor", "aluminium and glass contractor", "HVAC contracting company",
+    "electrical contracting company", "plumbing contracting company", "turnkey projects contractor",
+  ],
+  "Consulting": [
+    "consulting firm", "management consultants", "business consultants", "consultancy",
+    "HR consultancy", "engineering consultancy office", "ISO certification consultants",
+    "feasibility study consultants", "project management consultancy", "recruitment consultancy",
+    "environmental consultants", "quality management consultants",
+  ],
+  "Engineering": [
+    "engineering company", "engineering consultants", "MEP contractor", "electromechanical company",
+    "mechanical engineering company", "electrical engineering company", "civil engineering consultants",
+    "architectural and engineering consultants", "structural engineering consultants",
+    "instrumentation and control company", "automation and control systems", "surveying company",
+    "testing and inspection services", "calibration services company",
+  ],
+  "Real Estate": [
+    "real estate company", "property management company", "real estate developers", "real estate agency",
+    "property brokers", "facility and property services", "real estate investment company",
+    "villa and apartment rentals company", "property valuation company", "owners association management",
+  ],
+  "Legal": [
+    "law firm", "legal consultants", "advocates and legal consultants", "attorneys",
+    "law office", "corporate law firm", "arbitration and litigation lawyers",
+    "intellectual property law firm", "notary and legal translation office",
+  ],
+  "Logistics & Transport": [
+    "logistics company", "freight forwarders", "shipping company", "transport company", "cargo services",
+    "customs clearance company", "warehousing and distribution company", "sea freight and air freight company",
+    "land transport company", "courier and delivery company", "cold chain logistics company",
+    "heavy equipment transport company", "relocation and moving company", "supply chain solutions company",
+  ],
+  "Advertising & Marketing": [
+    "advertising agency", "marketing agency", "digital marketing company", "branding agency",
+    "signage and printing company", "media production company", "public relations agency",
+    "exhibition stand contractor", "event management company", "social media marketing agency",
+    "SEO agency", "creative design studio",
+  ],
+  "Insurance": [
+    "insurance company", "insurance brokers", "takaful company", "insurance agency",
+    "medical insurance brokers", "motor insurance company", "reinsurance company", "loss adjusters",
+  ],
+  "Healthcare & Clinics": [
+    "medical clinic", "polyclinic", "medical center", "hospital", "pharmacy",
+    "dental clinic", "diagnostic laboratory", "physiotherapy center", "dermatology and cosmetic clinic",
+    "optical and eye care center", "home healthcare services", "veterinary clinic",
+    "medical equipment supplier", "pharmaceutical distributor",
+  ],
+  "Hospitality & Food": [
+    "catering company", "restaurant", "hotel", "hospitality company",
+    "hotel apartments", "coffee shop and bakery", "food trading company", "foodstuff supplier",
+    "kitchen equipment supplier", "cloud kitchen company", "banquet and event catering",
+    "facilities catering and camp services",
+  ],
+  "Manufacturing & Industrial": [
+    "manufacturing company", "factory", "industrial company", "manufacturer", "fabrication company",
+    "steel fabrication factory", "plastic products factory", "cable manufacturing company",
+    "cement and concrete products factory", "paint manufacturing company", "chemical manufacturing company",
+    "furniture manufacturing factory", "packaging factory", "garment factory",
+    "aluminium extrusion factory", "pipe and fittings factory", "electrical panel manufacturer",
+  ],
+  "Education & Training": [
+    "training institute", "training center", "academy", "educational institute",
+    "language institute", "vocational training center", "professional training provider",
+    "driving school", "nursery and kindergarten", "private school", "tutoring center",
+    "safety training institute",
+  ],
+  "Trading & Retail": [
+    "trading company", "trading establishment", "distributors", "wholesale company",
+    "general trading LLC", "import and export company", "authorised distributor",
+    "spare parts trading company", "electronics trading company", "stationery and office supplies",
+    "textile trading company", "food and beverage distributor", "auto parts supplier",
+    "retail chain company",
+  ],
 };
 
 // Major cities per country, so a country-wide search fans out into local ones —
@@ -864,30 +989,44 @@ function citiesFor(location: string): string[] {
   return cities;
 }
 
-// The ordered (query, page) plan the cursor walks. Country-wide queries first
-// (broad), then each city (individual firms), each across a couple of result
-// pages. De-duplicated and capped so a single walk stays bounded.
-function buildSearchPlan(keywords: string[], location: string): { q: string; offset: number }[] {
+/**
+ * The ordered plan of QUERIES the cursor walks. Country-wide first (broad),
+ * then each city (individual firms). De-duplicated and capped so a single walk
+ * stays bounded.
+ *
+ * One entry is one query, not one (query, page) pair. Depth is pulled inside
+ * the step by `searchCompaniesDeep`, because only the answering engine knows
+ * how deep it can go — see SEARCH_MAX_PAGES.
+ *
+ * ⛔ WHAT IS DELIBERATELY NOT HERE: the `"<kw> <place> contact"` variant, which
+ * used to be half of every plan. Measured against Bing's RSS endpoint — the one
+ * engine that answers every time, so the one that serves most of a real pass —
+ * `"MEP contractor" Qatar contact`, `… Qatar email`, `… Qatar W.L.L.` and
+ * `… Qatar P.O. Box` each returned **zero domains that the plain query had not
+ * already returned**. They are the same result set with a different string
+ * attached. Only two things actually moved the results: a different CITY, and
+ * the `site:` operator. So those are the two axes the plan varies.
+ */
+function buildSearchPlan(keywords: string[], location: string): string[] {
   const loc = (location || "").trim();
   const cities = citiesFor(loc);
   const seen = new Set<string>();
-  const plan: { q: string; offset: number }[] = [];
+  const plan: string[] = [];
   const push = (v: string) => {
     const key = v.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
-    for (const offset of SEARCH_PAGES) plan.push({ q: v, offset });
+    plan.push(v);
   };
 
   const tld = COUNTRY_TLD[normCountry(loc)];
   for (const kw of keywords) {
-    if (!loc) { push(kw); push(`${kw} contact`); continue; }
+    if (!loc) { push(kw); continue; }
 
-    // Country-wide. "<trade> <place>" finds the firms; "… contact" pushes the
-    // engine towards their contact page, which is where the address lives.
+    // Country-wide.
     push(`${kw} ${loc}`);
-    push(`${kw} ${loc} contact`);
-    // The country's own TLD — every result is in-country by definition.
+    // The country's own TLD — every result is in-country by definition, and
+    // measured to return domains the plain query does not.
     if (tld) push(`${kw} site:.${tld}`);
 
     // Per city. The city ALWAYS carries its country: half the Gulf's city names
@@ -896,11 +1035,93 @@ function buildSearchPlan(keywords: string[], location: string): { q: string; off
     // firms in Texas. "… Medina Saudi Arabia" cannot be misread.
     for (const city of cities) {
       push(`${kw} ${city} ${loc}`);
-      push(`${kw} ${city} ${loc} contact`);
+      if (tld) push(`${kw} ${city} site:.${tld}`);
     }
   }
-  return plan.slice(0, 800);
+  return plan.slice(0, SEARCH_PLAN_CAP);
 }
+
+/* ------------------- the country sweep (Common Crawl) -------------------
+ *
+ * A keyword search has a ceiling that no amount of patience raises: the free
+ * engines hand back 10-20 results per query, so a country sweep sees "the firms
+ * that rank for the phrases we thought of". Common Crawl's index answers a
+ * different question — "which hosts exist under .qa" — and that is the question
+ * "how many companies are there in this country" actually needs.
+ *
+ * Measured: ~220 NEW hosts per index page, 23 pages for .qa, 161 for .ae, at
+ * about 8 seconds a page, free and keyless. These run as extra steps on the
+ * SAME cursor as the queries, so the existing resume/stop/exhaust machinery
+ * covers them without a second state machine.
+ */
+
+/** A single step of a search source's walk: a query, or one page of the index. */
+type SearchStep =
+  | { kind: "query"; q: string }
+  | { kind: "sweep"; pattern: string; page: number };
+
+// Hard cap on index pages per pass. `*.ae` has 161; walking all of them in one
+// pass would take an hour and starve the query half of the plan. The cursor
+// resumes where it stopped, so a big country is covered across several passes.
+const SWEEP_PAGES_PER_PASS = 40;
+const SEARCH_PLAN_CAP = 4_000;
+
+/**
+ * Which URL tokens make a swept host plausible for this category.
+ *
+ * The index gives URLs, never a category, so a "Qatar · Construction" source
+ * sweeping `*.qa` would otherwise fill with dentists. The company's own URLs
+ * are a real, free signal — `/contracting`, `/construction-services` — and the
+ * CDX server cannot do this filtering for us (its `filter=` parameter 404s on
+ * this endpoint), so it happens here.
+ *
+ * Empty = keep everything, which is right for a general sweep.
+ */
+const CATEGORY_URL_TOKENS: Record<string, string[]> = {
+  "Accounting & Tax": ["account", "audit", "tax", "bookkeep", "financ"],
+  "IT & Software": ["it-", "tech", "soft", "digital", "web", "cyber", "cloud", "data", "system", "solution"],
+  "Construction & Contracting": ["contract", "construc", "build", "civil", "engineer", "project", "infra"],
+  "Consulting": ["consult", "advisor", "manage", "hr-", "recruit"],
+  "Engineering": ["engineer", "mep", "electro", "mechanic", "electric", "technical", "industr"],
+  "Real Estate": ["real-estate", "realestate", "propert", "estate", "aqar", "rent", "villa"],
+  "Legal": ["law", "legal", "advocate", "attorney", "notary"],
+  "Logistics & Transport": ["logistic", "freight", "cargo", "shipping", "transport", "clearance", "warehous", "courier"],
+  "Advertising & Marketing": ["market", "advert", "media", "brand", "design", "print", "signage", "event", "agency"],
+  "Insurance": ["insur", "takaful", "assur"],
+  "Healthcare & Clinics": ["clinic", "medic", "health", "hospital", "pharm", "dental", "care", "lab"],
+  "Hospitality & Food": ["cater", "restaurant", "hotel", "food", "kitchen", "cafe", "bakery", "hospitality"],
+  "Manufacturing & Industrial": ["factor", "manufact", "industr", "steel", "plastic", "cement", "fabric", "product"],
+  "Education & Training": ["train", "academy", "institute", "school", "educat", "learn", "college"],
+  "Trading & Retail": ["trad", "import", "export", "supply", "supplier", "distribut", "store", "shop", "retail"],
+};
+
+function sweepTokensFor(category: string, custom?: string | null): string[] {
+  // Custom keywords are the user's own words for what they want — a better
+  // signal than any table we could write.
+  const typed = String(custom || "")
+    .split(/[,\n]/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length >= 4)
+    .flatMap((s) => s.split(/\s+/).filter((w) => w.length >= 4))
+    .slice(0, 12);
+  if (typed.length) return [...new Set(typed)];
+  return CATEGORY_URL_TOKENS[category] || [];
+}
+
+/** True when at least one of the host's crawled URLs looks like this category. */
+function sweepHostMatches(urls: string[], host: string, tokens: string[]): boolean {
+  if (!tokens.length) return true; // a general sweep wants everything
+  const hay = (host + " " + urls.join(" ")).toLowerCase();
+  return tokens.some((t) => hay.includes(t));
+}
+
+// Narrow seams for the verification script. Exported rather than re-implemented
+// there, so the test can never pass against a copy of the logic that has since
+// drifted from the one the bot runs.
+export const buildSearchPlanForTest = buildSearchPlan;
+export const sweepTokensForTest = sweepTokensFor;
+export const sweepHostMatchesForTest = sweepHostMatches;
+export const buildSearchStepsForTest = (src: any, location: string) => buildSearchSteps(src, location);
 
 interface SearchRunResult {
   found: number;      // NEW company leads inserted this batch
@@ -915,12 +1136,61 @@ interface SearchRunResult {
   planLen: number;
 }
 
-// Walk ONE batch of a web-search source: a few queries from the plan, insert
+/**
+ * The full ordered walk for a search source: every query, then the country
+ * index pages.
+ *
+ * The two halves share one cursor on purpose. A search source already has
+ * resume, stop-mid-batch, saturation, block-backoff and "a full pass finished"
+ * logic that took several rounds of production bugs to get right; giving the
+ * sweep its own state machine would mean writing all of it a second time, and
+ * the second copy is the one that drifts.
+ */
+async function buildSearchSteps(src: any, location: string): Promise<SearchStep[]> {
+  const keywords = searchKeywordsFor(src.category, src.keywords);
+  const queries: SearchStep[] = buildSearchPlan(keywords, location).map((q) => ({ kind: "query" as const, q }));
+
+  const tld = COUNTRY_TLD[normCountry(location)];
+  if (!tld || Number(src.sweep_country ?? 1) !== 1) return queries;
+
+  const pattern = `*.${tld}`;
+  // One call, cached for 12h. When the index cannot be reached we add NO sweep
+  // steps rather than guessing a length — a plan whose length changes under the
+  // cursor is how a resume lands on the wrong step. The source then runs as a
+  // pure keyword search for this pass and picks the sweep up on the next one.
+  const pages = await ccPageCount(pattern).catch(() => 0);
+  const sweeps: SearchStep[] = [];
+  for (let p = 0; p < Math.min(pages, SWEEP_PAGES_PER_PASS); p++) {
+    sweeps.push({ kind: "sweep", pattern, page: p });
+  }
+  if (!sweeps.length) return queries;
+  if (!queries.length) return sweeps;
+
+  // INTERLEAVE rather than append. Two reasons, and both were learned the hard
+  // way while building this:
+  //   1. An index page is a multi-megabyte response. Running a whole batch of
+  //      them back to back got this container's IP refused by
+  //      index.commoncrawl.org within about fifteen calls. Spread through the
+  //      queries, a pass makes one heavy call every couple of minutes.
+  //   2. Appending would mean every lead from the sweep arrives only after the
+  //      entire keyword plan has been walked — hours in, on a big country — so
+  //      the pool would look unchanged for most of a pass.
+  const every = Math.max(1, Math.floor(queries.length / sweeps.length));
+  const out: SearchStep[] = [];
+  let s = 0;
+  for (let i = 0; i < queries.length; i++) {
+    out.push(queries[i]);
+    if ((i + 1) % every === 0 && s < sweeps.length) out.push(sweeps[s++]);
+  }
+  while (s < sweeps.length) out.push(sweeps[s++]); // any remainder
+  return out;
+}
+
+// Walk ONE batch of a web-search source: a few steps from the plan, inserting
 // every new company site (email-less → enrichTick crawls it for the address).
 async function runSearchSource(src: any): Promise<SearchRunResult> {
   const location = String(src.location || "").trim();
-  const keywords = searchKeywordsFor(src.category, src.keywords);
-  const plan = buildSearchPlan(keywords, location);
+  const plan = await buildSearchSteps(src, location);
   const planLen = plan.length;
   if (!planLen) {
     return { found: 0, extracted: 0, searches: 0, covered: 0, error: "Add a country/city or some keywords", okish: false, blocked: false, nextCursor: 1, exhausted: true, planLen: 0 };
@@ -940,19 +1210,18 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   const dedup = await loadContactDedup();
   // Queries that produced nothing new on their last two passes are cooling off.
   const saturated = await loadSaturatedQueries(src.id);
+  const sweepTokens = sweepTokensFor(src.category, src.keywords);
+  const queryCount = plan.filter((s) => s.kind === "query").length;
+  const sweepCount = planLen - queryCount;
   const label = src.category && src.category !== "Companies (general)"
     ? `${location || "web"} · ${src.category}`
     : (location || "web search");
   // The engine pool is what serves these now; the reader is only reached when
   // every free engine is resting, so saying "free reader" up front was wrong.
   const how = `free engine pool${readerKey ? " → reader" : ""}${proxy ? " → proxy" : ""}`;
-  dlog("search", `${label} — step ${cursor}/${planLen} · ${batch.length} quer${batch.length === 1 ? "y" : "ies"} · ${how}`);
+  dlog("search", `${label} — step ${cursor}/${planLen} (${queryCount} quer${queryCount === 1 ? "y" : "ies"}${sweepCount ? ` + ${sweepCount} country-index page${sweepCount === 1 ? "" : "s"}` : ""}) · ${batch.length} step${batch.length === 1 ? "" : "s"} this batch · ${how}`);
 
   let found = 0, extracted = 0, ok = 0, covered = 0, blocked = false, stopped = false, err: string | undefined;
-  // Page 2 of a query whose page 1 was entirely already-known sites is almost
-  // always more of the same. Skipping it halves the request rate — which is what
-  // trips the search engine's limiter in the first place.
-  let prevQuery = "", prevNew = 0, prevRan = false;
   for (const item of batch) {
     // Deleted / archived / switched off mid-batch? Stop, keeping the position.
     if (await shouldStop(src.id)) {
@@ -960,26 +1229,72 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       stopped = true; // not a rate limit — no backoff, and nothing to resume
       break;
     }
-    if (item.offset > 0 && prevRan && item.q === prevQuery && prevNew === 0) {
+
+    /* ---------------------- one page of the country index ---------------- */
+    if (item.kind === "sweep") {
+      const page = await ccHostsForPattern(item.pattern, item.page).catch(() => null);
       covered++;
-      dlog("search", `  · "${item.q}" p${item.offset / 30 + 1} skipped — page 1 was all sites we already have`);
+      if (!page || !page.ok) {
+        dwarn("search", `  ✗ ${item.pattern} index page ${item.page + 1} — the archive did not answer; moving on`);
+        continue;
+      }
+      ok++;
+      let kept = 0, pageFound = 0;
+      // One index page holds ~14,000 URL records over ~220 hosts, so this is
+      // the one step that can insert hundreds of leads at once.
+      const seenDomains = new Set<string>();
+      for (const h of page.hosts) {
+        if (isNonProspectHost(h.host)) continue;
+        const domain = registrableDomain(h.host);
+        if (!domain || seenDomains.has(domain)) continue; // api.x.qa and www.x.qa are one company
+        seenDomains.add(domain);
+        if (domainLooksForeign(domain, location)) continue;
+        if (!sweepHostMatches(h.urls, h.host, sweepTokens)) continue;
+        extracted++;
+        kept++;
+        const website = `https://${domain}/`;
+        const added = await insertDiscovered({
+          // The index knows the host, never the trading name. Enrichment reads
+          // the site's own <title> and overwrites this, and `repair.ts` treats
+          // a bare domain as a name that still needs fixing.
+          name: domain, website, domain, email: null,
+          phone: null, city: null,
+          country: resolveLeadCountry({ sourceCountry: location, domain, website }),
+          category: src.category || "",
+          audience: audienceOf(src),
+          sourceId: src.id, label,
+          enriched: 0,
+          confidence: null,
+        }, dedup);
+        if (added) { found++; pageFound++; }
+      }
+      dlog("search", `  · ${item.pattern} index page ${item.page + 1}/${planLen - queryCount} → ${page.hosts.length} host(s), ${kept} in scope, +${pageFound} new`);
+      await sleep(SEARCH_PACING_MS);
       continue;
     }
+
+    /* ------------------------------ one query ---------------------------- */
     // Saturated: this exact query has stopped producing anything new. Step over
     // it without spending a request — it comes back automatically once its
     // cool-off expires, because sites do get published.
-    if (saturated.has(`${item.q}|${item.offset}`)) {
+    if (saturated.has(`${item.q}|0`)) {
       covered++;
-      dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} skipped — exhausted, will retry it later`);
+      dlog("search", `  · "${item.q}" skipped — exhausted, will retry it later`);
       continue;
     }
-    const r = await searchCompaniesPaged(item.q, item.offset, 40, readerKey, location, proxy).catch(() => ({ companies: [], blocked: true }));
+    const r = await searchCompaniesDeep(item.q, {
+      maxPages: SEARCH_MAX_PAGES,
+      limit: 120,
+      readerKey,
+      expectCountry: location,
+      proxy,
+    }).catch(() => ({ companies: [], blocked: true, pages: 0, engines: [] as string[] }));
     if (r.blocked) {
       blocked = true;
       err = readerKey
         ? "the search engine rate-limited us — pausing, then resuming from this exact query"
         : "web search was blocked (add a free JINA key in Settings → Crawler to search at full speed)";
-      dwarn("search", `  ✗ "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} — rate-limited, will resume here`);
+      dwarn("search", `  ✗ "${item.q}" — rate-limited, will resume here`);
       break;
     }
     ok++;
@@ -1002,9 +1317,9 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       }, dedup);
       if (added) { found++; batchFound++; }
     }
-    prevQuery = item.q; prevNew = batchFound; prevRan = true;
-    await recordQueryYield(src.id, item.q, item.offset, batchFound);
-    dlog("search", `  · "${item.q}"${item.offset ? ` p${item.offset / 30 + 1}` : ""} → ${r.companies.length} site(s), +${batchFound} new`);
+    await recordQueryYield(src.id, item.q, 0, batchFound);
+    const via = r.engines.length ? ` via ${[...new Set(r.engines)].join("+")}${r.pages > 1 ? ` ×${r.pages}p` : ""}` : "";
+    dlog("search", `  · "${item.q}"${via} → ${r.companies.length} site(s), +${batchFound} new`);
     await sleep(SEARCH_PACING_MS);
   }
 

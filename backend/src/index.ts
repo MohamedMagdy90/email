@@ -1279,11 +1279,16 @@ app.post("/api/discovery/sources", async (c) => {
     const keywords = String(b.keywords || "").trim();
     if (!location && !keywords) return c.json({ error: "Enter a country/city and/or some keywords to search for" }, 400);
     const limit = clamp(Number(b.limit) || 100, 20, 300);
+    // Also walk Common Crawl's index of the country's own ccTLD. Default ON:
+    // the keyword half of a pass can only ever return what ranks for the
+    // phrases we thought of, and "it finds far fewer companies than the country
+    // actually has" is precisely the complaint this answers.
+    const sweep = b.sweepCountry === false ? 0 : 1;
     const rows = await q(
       `INSERT INTO discovery_sources
-        (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,next_run_at,created_at)
-       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING *`,
-      [uid(), location, keywords || null, category, audience, limit, interval, enabled, nowIso(), nowIso()]
+        (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,sweep_country,next_run_at,created_at)
+       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING *`,
+      [uid(), location, keywords || null, category, audience, limit, interval, enabled, sweep, nowIso(), nowIso()]
     );
     return c.json({ source: rows[0] });
   }
@@ -1354,10 +1359,14 @@ app.put("/api/discovery/sources/:id", async (c) => {
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   } else if (existing.type === "search") {
     // Changing what/where we search restarts the query plan from the top.
+    // Toggling the country sweep counts as a change too: it alters the LENGTH
+    // of the plan, and a cursor pointing into a plan that grew or shrank under
+    // it resumes at the wrong step.
     const changed =
       (b.keywords != null && String(b.keywords).trim() !== String(existing.keywords || "")) ||
       (b.location != null && String(b.location).trim() !== String(existing.location || "")) ||
-      (b.category != null && String(b.category).trim() !== String(existing.category || ""));
+      (b.category != null && String(b.category).trim() !== String(existing.category || "")) ||
+      (b.sweepCountry != null && (b.sweepCountry ? 1 : 0) !== Number(existing.sweep_country ?? 1));
     if (changed) { cursor = 1; exhausted = 0; emptyStreak = 0; }
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
@@ -1366,11 +1375,13 @@ app.put("/api/discovery/sources/:id", async (c) => {
   // stop scheduling the next one.
   if (!enabled && existing.enabled) stopSource(id);
 
+  const sweepCountry =
+    b.sweepCountry != null ? (b.sweepCountry ? 1 : 0) : Number(existing.sweep_country ?? 1);
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
+       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
+    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, id]
   );
   return c.json({ source: rows[0] });
 });

@@ -25,9 +25,64 @@ if (DATABASE_URL) {
   // SQLITE_PATH lets a second process (a script, a test) use its own file —
   // two processes sharing one WAL database corrupts it.
   const file = process.env.SQLITE_PATH || "data.sqlite";
-  const db = new Database(file);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA busy_timeout = 5000;");
+
+  // ⚠️ THE HANDLE IS PINNED TO globalThis ON PURPOSE — do not "simplify" this
+  // back to a bare `new Database(file)`.
+  //
+  // `bun --watch` re-evaluates this module in the SAME PROCESS on every save.
+  // A module-scope `new Database(file)` therefore opens ANOTHER handle on the
+  // same WAL each time, and the previous one is never closed — so a dev session
+  // that edits a few backend files ends up with several live writers inside one
+  // process. That is the same hazard as running two dev servers, and it is the
+  // most likely explanation for this database being found corrupt at boot in
+  // session after session (seven parked copies in `.same/` and counting).
+  // Reusing one handle across reloads costs nothing and removes the cause.
+  const g = globalThis as unknown as { __dnaSqlite?: any };
+
+  // WAL IS OFF BY DEFAULT HERE, AND THAT IS DELIBERATE.
+  //
+  // This project has parked EIGHT corrupt copies of this file in `.same/`, one
+  // per session, always discovered as "malformed" at boot. WAL mode needs a
+  // shared-memory `-shm` file plus working POSIX locking; inside this container
+  // the workspace sits on an overlay filesystem where neither is dependable, so
+  // an ordinary interruption — the dev server being SIGKILLed by a supervisor,
+  // say — leaves the `-wal`/`-shm` pair inconsistent with the main file and the
+  // next open fails outright. A rollback journal needs no shared memory and no
+  // second reader, and simply replays or discards on open.
+  //
+  // Production is Postgres, so nothing here is on the hot path that matters.
+  // Set SQLITE_WAL=1 to opt back in on a filesystem that can take it.
+  const openDb = (path: string) => {
+    const d = new Database(path);
+    d.exec(process.env.SQLITE_WAL === "1" ? "PRAGMA journal_mode = WAL;" : "PRAGMA journal_mode = TRUNCATE;");
+    d.exec("PRAGMA busy_timeout = 5000;");
+    d.exec("PRAGMA synchronous = FULL;");
+    d.query("SELECT count(*) FROM sqlite_master").all(); // prove it really opens
+    return d;
+  };
+
+  let db = g.__dnaSqlite;
+  if (!db) {
+    try {
+      db = openDb(file);
+    } catch (e: any) {
+      // A corrupt LOCAL dev database must not turn into a boot loop. Park it
+      // (never delete — it is the only copy of whatever was in it) and carry on
+      // with an empty one, saying loudly where it went.
+      if (!/malformed|corrupt|not a database/i.test(String(e?.message || e))) throw e;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const parked = `${file}.corrupt-${stamp}`;
+      try {
+        const { renameSync, existsSync } = await import("node:fs");
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (existsSync(file + suffix)) renameSync(file + suffix, parked + suffix);
+        }
+      } catch { /* if it cannot be moved, the retry below will fail loudly */ }
+      console.error(`[db] ${file} was corrupt — parked it as ${parked} and started a fresh one. Production (Postgres) is unaffected.`);
+      db = openDb(file);
+    }
+    g.__dnaSqlite = db;
+  }
   query = async (text, params = []) => {
     const isRead = /^\s*(select|with)\b/i.test(text) || /\breturning\b/i.test(text);
     const stmt = db.query(text);
@@ -207,6 +262,14 @@ export async function ensureSchema() {
   // to). Every lead it files inherits the tag, so the two audiences can never be
   // emailed the same pitch by accident. Existing sources default to 'customer'.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
+  // Web-search sources: also walk Common Crawl's index of the country's own
+  // ccTLD, not just the keyword queries. A keyword search can only ever return
+  // the firms that rank for the phrases we thought of (10-20 results per query,
+  // and only one engine in the pool paginates at all); the index answers "which
+  // hosts exist under .qa", which is the question "how many companies are there
+  // here" actually needs. Defaults ON — a source that finds too little is the
+  // complaint this exists to answer, and it can be switched off per source.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN sweep_country INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being

@@ -4,12 +4,20 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
-    "start": "bun src/index.ts"
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit --types bun,node",
+    "//verify": "ALWAYS runs against a scratch DB — never point a script at data.sqlite while the dev server holds it.",
+    "verify": "SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-search.ts && SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-blocks.ts",
+    "verify:batch": "SQLITE_PATH=/tmp/dna-verify-batch.sqlite bun run scripts/verify-batch.ts"
   },
   "dependencies": {
     "hono": "^4.6.15",
     "libphonenumber-js": "^1.13.9",
     "postgres": "^3.4.5",
     "unpdf": "^1.6.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.2"
   }
 }
