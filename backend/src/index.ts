@@ -110,7 +110,23 @@ app.use(
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
+/**
+ * Health, and — deliberately — which BUILD is answering.
+ *
+ * Every other `/api/*` path sits behind the auth middleware, which returns 401
+ * for a route that does not exist just as readily as for one that does. That
+ * makes "did my deploy actually land?" unanswerable from outside: probing a
+ * newly-added endpoint returns 401 either way. Railway injects the commit it
+ * built, so the honest answer is simply to publish it here.
+ *
+ * Nothing secret: the repo is public and this is a bare commit SHA.
+ */
+const BUILD_REV =
+  process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ||
+  process.env.SOURCE_COMMIT?.slice(0, 7) ||
+  process.env.GIT_COMMIT?.slice(0, 7) ||
+  "dev";
+app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now(), rev: BUILD_REV }));
 
 /* ------------------------------- Auth ------------------------------- */
 // Public endpoints (also hit by email recipients, so they must NOT require a token).
