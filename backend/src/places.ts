@@ -9,6 +9,7 @@
 // trusted whatever the engine returned. That is the bug this module exists to
 // close, and putting the data here rather than in `discovery.ts` is what lets
 // `search.ts` use it without importing the module that imports it.
+
 /** Major cities per country, so a country-wide search fans out into local ones. */
 export const COUNTRY_CITIES: Record<string, string[]> = {
   "saudi arabia": ["Riyadh", "Jeddah", "Dammam", "Mecca", "Medina", "Al Khobar", "Dhahran", "Jubail", "Yanbu", "Tabuk", "Abha", "Taif", "Buraidah", "Hail", "Najran", "Jizan"],
@@ -25,6 +26,7 @@ export const COUNTRY_CITIES: Record<string, string[]> = {
   pakistan: ["Karachi", "Lahore", "Islamabad", "Faisalabad", "Rawalpindi"],
   turkey: ["Istanbul", "Ankara", "Izmir", "Bursa", "Antalya"],
 };
+
 /** Country name synonyms so "KSA"/"UAE" map to the right city list. */
 export const COUNTRY_ALIASES: Record<string, string> = {
   ksa: "saudi arabia",
@@ -38,6 +40,7 @@ export const COUNTRY_ALIASES: Record<string, string> = {
   türkiye: "turkey",
   turkiye: "turkey",
 };
+
 /**
  * Country-code top-level domains. A `site:.qa` query returns Qatari domains and
  * nothing else — the highest-precision slice of the web there is for a country,
@@ -58,6 +61,7 @@ export const COUNTRY_TLD: Record<string, string> = {
   pakistan: "pk",
   turkey: "tr",
 };
+
 /** Other words that mean "this page is about that country". */
 const COUNTRY_ADJECTIVES: Record<string, string[]> = {
   "saudi arabia": ["saudi", "ksa", "saudia", "المملكة", "السعودية"],
@@ -74,11 +78,13 @@ const COUNTRY_ADJECTIVES: Record<string, string[]> = {
   pakistan: ["pakistani"],
   turkey: ["turkish", "türkiye", "turkiye"],
 };
+
 /** Lower-cased, alias-resolved country key ("KSA" → "saudi arabia"). */
 export function normCountry(location: string): string {
   const k = (location || "").trim().toLowerCase().replace(/\.$/, "");
   return COUNTRY_ALIASES[k] || k;
 }
+
 /**
  * Cities to fan out into for a location. Only expand when the location is a
  * whole country we know; if the user gave a single city we search just that.
@@ -91,6 +97,7 @@ export function citiesFor(location: string): string[] {
   if (cities.some((c) => c.toLowerCase() === (location || "").trim().toLowerCase())) return [];
   return cities;
 }
+
 /** The ccTLD for a location, or null. Also resolves a bare city to its country. */
 export function tldFor(location: string): string | null {
   const key = normCountry(location);
@@ -101,6 +108,7 @@ export function tldFor(location: string): string | null {
   }
   return null;
 }
+
 /**
  * City names that are also ordinary English words, or well-known places
  * somewhere else. They are perfectly good in a QUERY — "steel fabrication Hail
@@ -113,6 +121,7 @@ export function tldFor(location: string): string | null {
  * domain.
  */
 const AMBIGUOUS_EVIDENCE = new Set(["hail", "sur", "medina", "mecca", "tyre", "tripoli", "alexandria"]);
+
 /**
  * Every word that, appearing in a result, is evidence it belongs to this place:
  * the country, its aliases and adjectives, and all of its cities.
@@ -126,6 +135,7 @@ export function placeTermsFor(location: string): string[] {
   if (!raw) return [];
   const key = normCountry(raw);
   const terms = new Set<string>([raw, key]);
+
   // The country this location belongs to, whether they typed the country or a city.
   let country = COUNTRY_CITIES[key] ? key : "";
   if (!country) {
