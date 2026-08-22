@@ -25,13 +25,14 @@ import {
 import { crawlSite, type CrawlOptions, type FoundEmail } from "./crawler";
 import { ccHostsForPattern, ccPageCount } from "./crawler/archives";
 import { crawlDirectory, looksLikeName, type DirectoryOptions } from "./crawler/directory";
-import { isBadName } from "./repair";
+import { isBadName, nameFromDomain } from "./repair";
 import { resolveWebsite } from "./enrich";
 import { registrableDomain, hostOf } from "./crawler/urls";
-import { resolveLeadCountry } from "./country";
+import { countryFromDomain, normalizeCountry, resolveLeadCountry } from "./country";
 import { getReaderStats, parseReaderKeys } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
 import { cleanEmail, isValidEmail, roleRank } from "./crawler/validate";
+import { citiesFor, COUNTRY_TLD, normCountry } from "./places";
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -935,58 +936,16 @@ const SEARCH_KEYWORDS: Record<string, string[]> = {
   ],
 };
 
-// Major cities per country, so a country-wide search fans out into local ones —
-// where individual company sites (not "top 10" articles) actually rank.
-const COUNTRY_CITIES: Record<string, string[]> = {
-  "saudi arabia": ["Riyadh", "Jeddah", "Dammam", "Mecca", "Medina", "Al Khobar", "Dhahran", "Jubail", "Yanbu", "Tabuk", "Abha", "Taif", "Buraidah", "Hail", "Najran", "Jizan"],
-  "united arab emirates": ["Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Al Ain", "Ras Al Khaimah", "Fujairah", "Umm Al Quwain"],
-  "qatar": ["Doha", "Al Rayyan", "Al Wakrah", "Al Khor", "Lusail", "Umm Salal"],
-  "kuwait": ["Kuwait City", "Hawalli", "Salmiya", "Al Ahmadi", "Al Jahra", "Farwaniya"],
-  "bahrain": ["Manama", "Riffa", "Muharraq", "Hamad Town", "Isa Town", "Sitra"],
-  "oman": ["Muscat", "Salalah", "Sohar", "Sur", "Nizwa", "Seeb"],
-  "egypt": ["Cairo", "Alexandria", "Giza", "Port Said", "Suez", "Mansoura", "Tanta"],
-  "jordan": ["Amman", "Zarqa", "Irbid", "Aqaba", "Russeifa"],
-  "lebanon": ["Beirut", "Tripoli", "Sidon", "Tyre", "Zahle"],
-  "iraq": ["Baghdad", "Basra", "Erbil", "Mosul", "Najaf", "Karbala"],
-  "india": ["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad", "Pune", "Ahmedabad", "Kolkata"],
-  "pakistan": ["Karachi", "Lahore", "Islamabad", "Faisalabad", "Rawalpindi"],
-  "turkey": ["Istanbul", "Ankara", "Izmir", "Bursa", "Antalya"],
-};
-
-// Country name synonyms so "KSA"/"UAE" map to the right city list.
-const COUNTRY_ALIASES: Record<string, string> = {
-  ksa: "saudi arabia", uae: "united arab emirates", emirates: "united arab emirates",
-};
-
-// Country-code top-level domains. A "site:.qa" query returns Qatari domains and
-// nothing else — the highest-precision slice of the web there is for a country,
-// and immune to the homonym problem entirely.
-const COUNTRY_TLD: Record<string, string> = {
-  "saudi arabia": "sa", "united arab emirates": "ae", qatar: "qa", kuwait: "kw",
-  bahrain: "bh", oman: "om", egypt: "eg", jordan: "jo", lebanon: "lb", iraq: "iq",
-  india: "in", pakistan: "pk", turkey: "tr",
-};
-
-function normCountry(location: string): string {
-  const k = (location || "").trim().toLowerCase();
-  return COUNTRY_ALIASES[k] || k;
-}
+/* ------------------------------------------------------------------------
+ * Where a search is looking now lives in `places.ts`, because `search.ts`
+ * needs the identical answer to decide whether a RESULT is in that place. Two
+ * copies of this table is how a query says "Qatar" and the verifier disagrees.
+ * ---------------------------------------------------------------------- */
 
 function searchKeywordsFor(category: string, custom?: string | null): string[] {
   const typed = String(custom || "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
   if (typed.length) return [...new Set(typed)].slice(0, 8);
   return SEARCH_KEYWORDS[category] || SEARCH_KEYWORDS["Companies (general)"];
-}
-
-// Cities to fan out into for a location. Only expand when the location is a
-// whole country we know; if the user gave a single city we search just that.
-function citiesFor(location: string): string[] {
-  const key = normCountry(location);
-  const cities = COUNTRY_CITIES[key];
-  if (!cities) return [];
-  // If they typed one of the cities as the "country", don't fan out.
-  if (cities.some((c) => c.toLowerCase() === (location || "").trim().toLowerCase())) return [];
-  return cities;
 }
 
 /**
@@ -1067,6 +1026,16 @@ const SWEEP_PAGES_PER_PASS = 40;
 const SEARCH_PLAN_CAP = 4_000;
 
 /**
+ * Off-topic answers in a row before the batch gives up and waits.
+ *
+ * One is noise — a narrow trade phrase can genuinely rank nothing in-country.
+ * Three in a row is a broken engine, and continuing past it is how a source
+ * walks its whole plan, files nothing usable, and still reports a completed
+ * pass.
+ */
+const OFFTOPIC_BATCH_LIMIT = 3;
+
+/**
  * Which URL tokens make a swept host plausible for this category.
  *
  * The index gives URLs, never a category, so a "Qatar · Construction" source
@@ -1074,8 +1043,6 @@ const SEARCH_PLAN_CAP = 4_000;
  * are a real, free signal — `/contracting`, `/construction-services` — and the
  * CDX server cannot do this filtering for us (its `filter=` parameter 404s on
  * this endpoint), so it happens here.
- *
- * Empty = keep everything, which is right for a general sweep.
  */
 const CATEGORY_URL_TOKENS: Record<string, string[]> = {
   "Accounting & Tax": ["account", "audit", "tax", "bookkeep", "financ"],
@@ -1095,6 +1062,38 @@ const CATEGORY_URL_TOKENS: Record<string, string[]> = {
   "Trading & Retail": ["trad", "import", "export", "supply", "supplier", "distribut", "store", "shop", "retail"],
 };
 
+/**
+ * The general sweep's token list — and the reason it can no longer be empty.
+ *
+ * "Companies (general)" had no entry above, and `sweepHostMatches` read a
+ * missing entry as "keep everything". Page one of `*.qa` therefore filed
+ * `alabama.qa`, `agdoha2030.qa` (a national strategy site), `akhlaquna.qa` (a
+ * volunteering campaign) and `abercrombie.qa` as company leads. A ccTLD is a
+ * list of every host in a country, not a list of its businesses, so the sweep
+ * has to say what a business looks like — even in the general case.
+ */
+const GENERAL_URL_TOKENS = [
+  "compan", "corp", "group", "holding", "trading", "trade", "contract", "construc",
+  "industr", "factor", "manufact", "engineer", "electro", "mechanic", "technical",
+  "supply", "supplier", "distribut", "import", "export", "logistic", "freight",
+  "transport", "service", "solution", "system", "consult", "agency", "enterprise",
+  "establish", "invest", "product", "equipment", "material", "machinery", "steel",
+  "aluminium", "aluminum", "plastic", "cement", "chemical", "medical", "clinic",
+  "pharma", "food", "cater", "hotel", "restaurant", "retail", "store", "shop",
+  "estate", "propert", "insur", "account", "audit", "legal", "clean",
+  "maintenance", "security", "print", "media", "market", "design", "energy",
+  "petro", "oilfield", "marine", "shipping", "travel", "tour", "auto", "motor",
+  "rental", "international", "gulf", "arab", "tech", "electric", "furniture",
+];
+
+// Hosts a ccTLD sweep turns up that are plainly not businesses: government
+// portals, campaigns, schools, personal pages and the country's own institutions.
+const NON_BUSINESS_HOST =
+  /(^|[.-])(gov|mil|edu|sch|ac|org|net|info|blog|news|forum|wiki|portal|ministry|municipality|embassy|consulate|charity|foundation|mosque|church|club|team|fans?|blogspot|wordpress|weebly|wixsite|github|gitlab|pages|cdn|static|assets|img|images|mail|smtp|webmail|ftp|vpn|test|dev|staging|demo|localhost)([.-]|$)/i;
+
+// A campaign / event / vanity host: a bare year, "2030", "expo", "cup" …
+const CAMPAIGN_HOST = /(?:^|[a-z])(?:19|20)\d{2}(?:$|[a-z])|(?:expo|worldcup|festival|summit|forum|award|campaign|vision)\d*$/i;
+
 function sweepTokensFor(category: string, custom?: string | null): string[] {
   // Custom keywords are the user's own words for what they want — a better
   // signal than any table we could write.
@@ -1105,14 +1104,47 @@ function sweepTokensFor(category: string, custom?: string | null): string[] {
     .flatMap((s) => s.split(/\s+/).filter((w) => w.length >= 4))
     .slice(0, 12);
   if (typed.length) return [...new Set(typed)];
-  return CATEGORY_URL_TOKENS[category] || [];
+  return CATEGORY_URL_TOKENS[category] || GENERAL_URL_TOKENS;
 }
 
-/** True when at least one of the host's crawled URLs looks like this category. */
+/**
+ * True when at least one of the host's crawled URLs looks like this category.
+ *
+ * The haystack is the domain LABEL plus the URL PATHS — deliberately not the
+ * whole URL. Matching the full string meant `"co"` hit the `.com` in every
+ * address and `"est"` hit "latest", "request" and "investment", which is how a
+ * token list that looks strict ends up keeping everything anyway. Same reason
+ * every token here is at least four characters.
+ */
 function sweepHostMatches(urls: string[], host: string, tokens: string[]): boolean {
-  if (!tokens.length) return true; // a general sweep wants everything
-  const hay = (host + " " + urls.join(" ")).toLowerCase();
-  return tokens.some((t) => hay.includes(t));
+  const label = host.toLowerCase().replace(/^www\./, "");
+  if (NON_BUSINESS_HOST.test(label) || CAMPAIGN_HOST.test(label.split(".")[0] || "")) return false;
+  if (!tokens.length) return false; // never "keep everything" — see GENERAL_URL_TOKENS
+  const paths = urls
+    .map((u) => {
+      try {
+        const p = new URL(u);
+        return p.pathname + p.search;
+      } catch {
+        return "";
+      }
+    })
+    .join(" ");
+  const hay = `${label.split(".")[0]} ${paths}`.toLowerCase();
+  return tokens.some((t) => t.length >= 3 && hay.includes(t));
+}
+
+/**
+ * A readable placeholder name for a swept host.
+ *
+ * The index knows the host and nothing else, and filing the literal string
+ * "101domain.qa" as a company name is what made the pool look broken.
+ * `nameFromDomain` is `repair.ts`'s existing "last resort" naming — reused
+ * rather than reimplemented so a swept lead and a repaired one are named by the
+ * same rule. Enrichment later overwrites it with the site's own <title>.
+ */
+function sweepNameFor(domain: string): string {
+  return nameFromDomain(null, domain) || domain;
 }
 
 // Narrow seams for the verification script. Exported rather than re-implemented
@@ -1151,7 +1183,7 @@ async function buildSearchSteps(src: any, location: string): Promise<SearchStep[
   const queries: SearchStep[] = buildSearchPlan(keywords, location).map((q) => ({ kind: "query" as const, q }));
 
   const tld = COUNTRY_TLD[normCountry(location)];
-  if (!tld || Number(src.sweep_country ?? 1) !== 1) return queries;
+  if (!tld || Number(src.sweep_country ?? 0) !== 1) return queries;
 
   const pattern = `*.${tld}`;
   // One call, cached for 12h. When the index cannot be reached we add NO sweep
@@ -1222,6 +1254,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
   dlog("search", `${label} — step ${cursor}/${planLen} (${queryCount} quer${queryCount === 1 ? "y" : "ies"}${sweepCount ? ` + ${sweepCount} country-index page${sweepCount === 1 ? "" : "s"}` : ""}) · ${batch.length} step${batch.length === 1 ? "" : "s"} this batch · ${how}`);
 
   let found = 0, extracted = 0, ok = 0, covered = 0, blocked = false, stopped = false, err: string | undefined;
+  let offtopicRun = 0;
   for (const item of batch) {
     // Deleted / archived / switched off mid-batch? Stop, keeping the position.
     if (await shouldStop(src.id)) {
@@ -1257,7 +1290,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
           // The index knows the host, never the trading name. Enrichment reads
           // the site's own <title> and overwrites this, and `repair.ts` treats
           // a bare domain as a name that still needs fixing.
-          name: domain, website, domain, email: null,
+          name: sweepNameFor(domain), website, domain, email: null,
           phone: null, city: null,
           country: resolveLeadCountry({ sourceCountry: location, domain, website }),
           category: src.category || "",
@@ -1288,7 +1321,7 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       readerKey,
       expectCountry: location,
       proxy,
-    }).catch(() => ({ companies: [], blocked: true, pages: 0, engines: [] as string[] }));
+    }).catch(() => ({ companies: [], blocked: true, pages: 0, engines: [] as string[], offtopic: false }));
     if (r.blocked) {
       blocked = true;
       err = readerKey
@@ -1297,6 +1330,33 @@ async function runSearchSource(src: any): Promise<SearchRunResult> {
       dwarn("search", `  ✗ "${item.q}" — rate-limited, will resume here`);
       break;
     }
+    // The engine answered, and every result was for a different question.
+    //
+    // Two things must NOT happen here. The query must not be charged a zero
+    // yield — that is what `recordQueryYield` does below, and it would cool off
+    // a perfectly good query because an engine misbehaved. And the pass must not
+    // keep walking: a degraded engine returns off-query results for EVERY query
+    // alike, so carrying on would march the cursor through the entire plan,
+    // find nothing, and then report the source as a finished pass.
+    //
+    // So: step over the first couple (one odd query is not a diagnosis), then
+    // stop and resume from this exact query once the pool has rested the engine.
+    if (r.offtopic) {
+      offtopicRun++;
+      dwarn("search", `  ✗ "${item.q}" — the engine answered a different question (it dropped the country/site filter)`);
+      if (offtopicRun >= OFFTOPIC_BATCH_LIMIT) {
+        blocked = true;
+        err =
+          "the search engines are returning results for a different query (they are dropping the country and site: filters) — paused, and will resume from this exact query";
+        dwarn("search", `${label}: pausing — ${offtopicRun} queries in a row came back off-topic`);
+        break;
+      }
+      ok++;
+      covered++;
+      await sleep(SEARCH_PACING_MS);
+      continue;
+    }
+    offtopicRun = 0;
     ok++;
     covered++;
     let batchFound = 0;
@@ -1947,41 +2007,74 @@ async function retireDuplicate(lead: any, phone: string | null, email: string): 
 /* ------------------------- legacy backlog sweep ------------------------ */
 
 /**
- * Retire pool rows whose host can never be a prospect.
+ * Retire pool rows that could never have been prospects.
  *
- * The host blocklists only ever ran when a SEARCH RESULT was inserted, so every
- * row discovered under an older, weaker rule set is still in the queue waiting
- * to be crawled — aggregators, job boards, data brokers, hotel chains, news
- * sites. They are the most expensive rows we own: guaranteed not to yield an
- * address, and almost all sitting behind Cloudflare, so each one costs a
- * multi-page crawl plus a retry ladder to prove it.
+ * The blocklists only ever ran when a SEARCH RESULT was inserted, so every row
+ * discovered under an older, weaker rule set is still in the queue waiting to be
+ * crawled. They are the most expensive rows we own: guaranteed not to yield an
+ * address, and mostly behind Cloudflare, so each one costs a multi-page crawl
+ * plus a retry ladder to prove it.
+ *
+ * Four rules, and every one of them has to be something we can be CERTAIN about
+ * from what is already stored. A lead only has a name, a website and a country
+ * here — no snippet — so this is deliberately narrower than the live verifier.
+ * A Gulf firm on a neutral `.com` whose name happens not to mention its country
+ * is left completely alone; the cost of wrongly deleting a real prospect is far
+ * higher than the cost of crawling a doubtful one.
  *
  * Runs once per boot. Idempotent: a swept row is status='duplicate', which the
  * WHERE clause excludes next time.
  */
 export async function sweepNonProspectLeads(): Promise<number> {
   const rows = (await q(
-    `SELECT id, domain, website, country FROM discovered_leads
+    `SELECT id, name, domain, website, country FROM discovered_leads
       WHERE status='pending' AND (email IS NULL OR email='')
         AND website IS NOT NULL AND website<>''`
   )) as any[];
 
+  const byReason: Record<string, number> = {};
   let swept = 0;
   for (const r of rows) {
     const host = hostOf(String(r.website || "")).replace(/^www\./i, "");
     if (!host) continue;
     const domain = String(r.domain || "") || registrableDomain(host) || "";
-    const junk = isNonProspectHost(host) || domainLooksForeign(domain, String(r.country || ""));
-    if (!junk) continue;
+    const want = String(r.country || "");
+
+    let reason = "";
+    if (isNonProspectHost(host)) {
+      reason = "directories, brokers and job boards";
+    } else if (domainLooksForeign(domain, want)) {
+      reason = "US look-alikes";
+    } else if (String(r.name || "").trim() && companyNameFromTitle(String(r.name), domain) === null) {
+      // The stored name is a headline no rule can turn into a business name —
+      // "Steel: Definition, Composition, Types, Properties, and Applications".
+      // These arrived when a degraded engine answered a vocabulary question.
+      reason = "reference pages, not companies";
+    } else {
+      // The domain's OWN ccTLD names a different country than the one this lead
+      // is filed under. `.cn`, `.us`, `.in` under a Qatar source is not a
+      // judgement call — it is the engine having dropped the country from the
+      // query. Neutral TLDs (.com/.net/.org) resolve to null and are untouched.
+      const onDomain = countryFromDomain(domain);
+      const wanted = normalizeCountry(want);
+      if (onDomain && wanted && onDomain !== wanted) reason = `wrong country (${onDomain})`;
+    }
+    if (!reason) continue;
+
     await q(
       `UPDATE discovered_leads SET status='duplicate', enriched=1, enrich_status='junk', next_enrich_at=NULL WHERE id=?`,
       [r.id]
     );
     if (domain) await closePoolDomain(domain, "junk");
+    byReason[reason] = (byReason[reason] || 0) + 1;
     swept++;
   }
   if (swept) {
-    dlog("", `swept ${swept.toLocaleString()} lead(s) that can never yield an email (directories, job boards, data brokers, US look-alikes) — they will not be crawled again`);
+    const detail = Object.entries(byReason)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => `${n.toLocaleString()} ${k}`)
+      .join(" · ");
+    dlog("", `swept ${swept.toLocaleString()} lead(s) that can never yield an email — ${detail}. They will not be crawled again.`);
   }
   return swept;
 }

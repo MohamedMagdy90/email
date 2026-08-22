@@ -84,6 +84,7 @@ export default function Discovery() {
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
+  const [purging, setPurging] = useState(false);
   const [badNames, setBadNames] = useState<{ leads: number; contacts: number } | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [repairLog, setRepairLog] = useState("");
@@ -208,6 +209,25 @@ export default function Discovery() {
       refreshStatus();
       if (tab === "pending") refreshLeads();
     } catch (e: any) { toast(e.message, "error"); } finally { setReEnriching(false); }
+  }
+
+  // Re-examine the whole pool under the CURRENT rules and retire the rows that
+  // could never have been prospects. Needed after the rules tighten — most
+  // recently when a search engine spent a while answering a different question
+  // than the one it was asked, and its results were filed as leads.
+  async function purgeJunk() {
+    setPurging(true);
+    try {
+      const r = await api.purgeJunkLeads();
+      toast(
+        r.swept
+          ? `Removed ${r.swept.toLocaleString()} lead${r.swept === 1 ? "" : "s"} that could never have been a prospect`
+          : "Nothing to remove — every lead in the pool passes the current rules",
+        r.swept ? "success" : "info"
+      );
+      refreshStatus();
+      refreshLeads();
+    } catch (e: any) { toast(e.message, "error"); } finally { setPurging(false); }
   }
 
   /* ---------------------------- source ops --------------------------- */
@@ -400,6 +420,26 @@ export default function Discovery() {
           <Button size="sm" onClick={() => toggleBot(true)} className="shrink-0">Turn bot on</Button>
         </div>
       )}
+
+      {/* Clean-up for leads filed under older, looser rules — most recently the
+          spell where a search engine answered a different question than the one
+          it was asked and its results were saved as companies. Always available
+          rather than conditional: the whole point is that the pool can contain
+          rows nothing currently flags, and the user is the one who noticed. */}
+      <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-ink/[0.06] font-clash text-ink/60">⌫</span>
+          <div>
+            <div className="text-sm font-semibold text-ink">Clean up leads that were never companies</div>
+            <div className="text-xs leading-relaxed text-muted">
+              Re-checks every pending lead against the current rules and removes the ones that could never yield an email — directories and job boards, reference pages, and results whose own domain belongs to a different country than the source. Real companies are never touched.
+            </div>
+          </div>
+        </div>
+        <Button size="sm" variant="outline" loading={purging} onClick={purgeJunk} className="shrink-0">
+          Clean up pool
+        </Button>
+      </div>
 
       {/* Recovery for the "no email" pool — leads that have a website but no email
           (blocked by Cloudflare, rate-limited, or discovered before retry-tracking
@@ -1065,7 +1105,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   // Web search only: walk the country's own ccTLD in Common Crawl's index as
   // well as running the keyword queries. On by default — a search source that
   // finds a fraction of the country is the problem this exists to solve.
-  const [sweepCountry, setSweepCountry] = useState(true);
+  const [sweepCountry, setSweepCountry] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1082,7 +1122,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
       setInterval(editing.interval_minutes);
       // Sources created before the sweep existed have no value stored; they
       // read as ON, which matches the column default the migration applied.
-      setSweepCountry(Number(editing.sweep_country ?? 1) === 1);
+      setSweepCountry(Number(editing.sweep_country ?? 0) === 1);
     } else {
       setType("search"); setLocation(""); setUrl(""); setKeywords(""); setPlace(null);
       setCategory(cats[0] || "Companies (general)"); setAudience("customer"); setLimit(100); setInterval(360);
@@ -1185,9 +1225,10 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
               </Select>
             </Field>
-            {/* The volume switch. A keyword search can only ever return the
-                firms that rank for the phrases we thought of; the country index
-                answers "which companies have a website here at all". */}
+            {/* The volume switch — and a genuine trade-off, so it is off by
+                default. A ccTLD index lists every HOST in a country, not every
+                business, so switched on blindly it files government portals and
+                campaign sites as leads. */}
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-line/70 bg-ink/[0.02] px-3 py-3">
               <input
                 type="checkbox"
@@ -1196,8 +1237,11 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-good"
               />
               <span className="text-xs leading-relaxed text-muted">
-                <span className="block text-[13px] font-medium text-ink/80">Also sweep the whole country's web</span>
+                <span className="block text-[13px] font-medium text-ink/80">Also sweep the whole country's web <span className="font-normal text-ink/45">— broad, but rougher</span></span>
                 Searching only finds companies that <em>rank</em> for a phrase — typically 10–20 results per search. This additionally walks a public index of every website under the country's own domain (<span className="font-medium text-ink/70">.qa</span>, <span className="font-medium text-ink/70">.sa</span>, <span className="font-medium text-ink/70">.ae</span>…), which is where the <span className="font-medium text-ink/70">thousands</span> come from. Free, and it needs no key.
+                <span className="mt-1 block text-ink/55">
+                  That index lists every <em>website</em> in the country, not every business, so entries arrive named after their web address until the crawler reads the real name off the site. Leave it off if you want a smaller, cleaner pool.
+                </span>
                 {category !== "Companies (general)" ? (
                   <span className="mt-1 block text-ink/55">
                     Swept sites are matched against <span className="font-medium text-ink/70">{category}</span> by their web address, which is a looser filter than a search — expect a wider mix.

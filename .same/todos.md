@@ -244,15 +244,15 @@ written to a ledger you can read back.
 
 ## Frontend
 - [x] `api.ts`: `AutomationConfig` / `AutomationRun` / `AutomationStatus` +
-      `getAutomation` / `saveAutomation` / `runAutomation`.
+  `getAutomation` / `saveAutomation` / `runAutomation`.
 - [x] Settings → **Automation** card: on/off, trigger size, multi-template picker
       with rotate-vs-split, category + country, send rate, daily ceiling,
       cooldown, progress-to-trigger bar, live batch progress, blockers panel,
       run history, **Run now**.
 - [x] Discovery → **automation strip** under the stat row: off ⇒ "these leads
-      wait until you approve them" + Set up automation; on ⇒ live progress to the
-      trigger, "emailing a batch right now", the first blocker if it can't run,
-      and sent-today. Deep-links to Settings through a `dna-navigate` event
+      wait until you approve them" + Set up automation; on ⇒ live progress to
+      the trigger, "emailing a batch right now", the first blocker if it can't
+      run, and sent-today. Deep-links to Settings through a `dna-navigate` event
       handled by the app shell (`goTo()` in `lib/ui`), so screens stay decoupled.
 
 ## Safety rails (all verified)
@@ -292,7 +292,7 @@ written to a ledger you can read back.
   `?page=1` alone silently returns page 1 again.
   1. `pageParamOf()` only accepted `^\d+$` → `0,1` unrecognised → no numeric walk.
   2. `withPage()` in discovery.ts wrote `?page=5` → the site returned page 1 → every
-     batch re-read the same 3 companies → "0 new" → source declared finished.
+      batch re-read the same 3 companies → "0 new" → source declared finished.
 - The `rel="next"` href is entity-encoded (`?combine=&amp;…&amp;page=0%2C1`).
   `collectLinks()` never decoded it, so the URL became `amp;page=…` → the
   pagination parameter was lost → page 2 == page 1.
@@ -526,146 +526,84 @@ Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
       kept (47→48), backoff escalated 3/6/12/24m, step-over fired on the 5th,
       then a clean run covered 3 entries with 2 requests (47→50)
 
-### Still open
-- Geographic drift: Gulf city names matching US homonyms (Medina OH, Hail TX)
-- OSM map source still sweeping micro-businesses with no websites
-- Web search has a structural ceiling (~10 results/query); Directory sources are
-  the higher-yield path for volume
-- Local dev SQLite corrupts if the bun process is SIGKILLed while holding the
-  WAL. Shut the dev server down with plain `kill`, never `kill -9`.
-
-## Crawler efficiency rollout (agreed 2026-08-13)
-
-Diagnosis: search is healthy; enrichment collapsed when the Jina key hit HTTP 402
-at 07:45:12 (~10 blocks/21min before → ~56 blocks/7min after). On top of that
-~1 in 5 crawls is a re-crawl of a domain we already resolved.
-
-### Phase 2 — recover wasted capacity (free, needs nothing from the user)
-- [x] 4. Domain tombstone: new `pool_domains` ledger claims a domain atomically on
-      insert and never releases it, so promoting `dedup_key` to `e:<email>` can no
-      longer let the same site be re-discovered and re-crawled. Backfilled on boot.
-- [x] 5. Split retry ladder: `blockReason` now surfaces on `SiteResult`;
-      cloudflare/403 → 2 tries (30m, 6h) then parked, transient → full 6-try ladder
-- [x] 6. `isNonProspectHost()` in search.ts is now the single gate, applied at
-      insert, at enrich, and in a boot sweep (`sweepNonProspectLeads`). Added
-      `AGGREGATOR_BLOCK` + `.directory`-style TLD guard + `domainLooksForeign()`
-- [x] 7. robots.txt + sitemap deferred until the seed answers; a walled site now
-      costs 1 request instead of 7, and a hard block stops the crawl immediately
-- [x] 8. Enrich batch de-duplicated by registrable domain (`more` measured on the
-      pre-filter list so the chain doesn't stall)
-
-Verified end-to-end on a scratch DB: 8 seeded leads → backfill claimed 8, sweep
-retired 6 junk (nascar/datanyze/ohio/.directory/herecareers/muqawil), the two real
-companies survived, and a resolved domain could no longer be re-claimed.
-
-NOTE: local `backend/data.sqlite` was already corrupt at 07:51 (pre-existing WAL
-issue, identical backup in .same/corrupt-db-backup). Moved to
-.same/corrupt-db-backup-2 and recreated empty. Production is Postgres — unaffected.
-
-### Phase 1 — free bypass capacity
-- [x] 1. UI/logs no longer lie: `bypass.readerKeys{Configured,Live}` + `readerKeyRejected`
-      come from the fetcher's real observations, badge turns RED on exhaustion
-- [x] 2. Multi-key rotation: comma/newline separated keys, per-key rejection with a
-      30m re-test, round-robin. One key dying no longer drops the bot to 20/min.
-- [x] 3. Wayback tier (`web.archive.org/web/2id_/…`) inserted between the reader and
-      the paid proxy. Budgeted to 2 calls/site (≈11s each), and the sitemap is
-      skipped when the seed only arrived via reader/archive/proxy.
-
-Live-tested Wayback against the 5 sites that hard-blocked in the log:
-  qgcontracting.com  → quantumcont14@gmail.com
-  benzcontracting.ae → info@benzcontracting.ae
-  kon-uae.com        → info@kon-uae.com
-  qmic.com           → business@qmic.com
-  baobabtrading.com  → archive 403 (the only miss)
-Key pool tested with 3 bogus keys: rotated 1→2→3, fell through to the free tier,
-still returned the page, and flipped keyRejected=true so the UI goes red.
-
-### Phase 3 — email quality
-- [x] 9. `PLACEHOLDER_LOCAL` catches yoursite@ / youremail@ / example@ on any domain
-- [x] 10. `roleRank()` orders info/sales > support > finance > person > hr > abuse
-      /no-reply, and BOTH pickers now use it (discovery.ts previously preferred
-      personal addresses while enrich.ts preferred role ones — they disagreed)
-- [x] 11. `MAILTO_ARTIFACT` rejects mailoinfo@ / mailtoinfo@ while keeping
-      mail@, mailbox@, mailroom@
-- [x] 12. Query saturation: new `search_query_stats` table. Two consecutive
-      zero-yield passes cools a query off for 6h, doubling to 72h max; ANY yield
-      resets it. Deliberately a cool-off, not a permanent skip.
-
-INCIDENT: the apply model duplicated ~900 lines of discovery.ts and invented two
-bogus helpers during item 12. Repaired by deleting lines 1851-2702 and 2749-2779;
-verified all 17 exports still present and typecheck clean. No git repo here, so
-/tmp/discovery.broken.ts was kept until the repair was confirmed, then removed.
-
 ---
 
-# Discovery sources — collapsible container ✅ shipped
+# Web search quality regression — FIXED (2026-08-22)
 
-The sources list sat between the stat strip and the review pool, so on a screen
-with several sources the pool (the thing you actually work) started below the
-fold. The card now folds away.
+Complaint: "the search results are complete rubbish — wrong company names,
+companies not in the country, industry or keywords we searched."
 
-- [x] `Discovery.tsx`: the card header is the toggle, using the accordion
-      pattern — `<h2>` WRAPS the `<button>`, so the whole title is clickable
-      without putting block elements inside a button. `aria-expanded` on the
-      button; chevron rotates 180°.
-- [x] Body animates with `grid-rows-[1fr] ⇄ [0fr]` + an `overflow-hidden` child,
-      so it opens to the content's real height — no hard-coded max, and a source
-      that starts streaming mid-open still fits.
-- [x] Collapsed header carries a live summary (`N active · N paused · N archived
-      · N found`) plus a green **"N scanning"** pill with a spinner, so folding
-      the list away can never hide the fact that a batch is running.
-- [x] Count badge next to the title; the empty state keeps its own copy.
-- [x] **Add source** expands the card as well as opening the modal — you always
-      see the row you just created.
-- [x] Past 6 sources the list scrolls inside the card (`max-h-[26rem]`) so the
-      review pool stays reachable even when expanded.
-- [x] Open/closed persisted in `localStorage` (`dna-discovery-sources-open`),
-      read/written through try/catch because storage can throw in an iframe.
-- [x] The Archived drawer nests inside the collapsible body and keeps its own
-      independent toggle.
+**Root cause: Bing degrades silently instead of blocking.** HTTP 200, ten
+plausible results, with the `site:` operator, the city and the country all
+discarded, and `&first=11/21/31/41` repeating page one. No captcha, no 429 —
+nothing the old code could detect. DuckDuckGo and Brave hard-wall a datacenter
+IP, so Bing served nearly every query. Measured: `bing-rss` 10/162 hits on
+target (6%); `bing-html` 0/74. My FIRST diagnosis ("the RSS endpoint is bad, the
+HTML page is fine") was wrong — the user pushed back and was right.
 
-Verified: frontend `tsc` clean · `vite build` clean · Tailwind emitted
-`grid-rows-[0fr]` / `grid-rows-[1fr]` / `transition-[grid-template-rows]` /
-`max-h-[26rem]` · all 21 original declarations and all 7 section banners intact.
+The pool was chosen on *availability*, never on *correctness*. Nothing ever
+compared a result against the query that produced it.
 
-INCIDENT: the apply model stripped ~30 explanatory comments across the whole
-file (and flattened two typographic apostrophes) while making this edit. The
-file was rebuilt from the original and every comment restored; there is no git
-repo here, so this was verified by diffing declaration-by-declaration.
+Shipped:
+- [x] `places.ts` — one shared country/city/ccTLD table for the planner AND the
+      verifier, so a query and its check can never disagree
+- [x] Snippets parsed from every engine (locality evidence)
+- [x] `QueryIntent` + `hitSatisfies` — `site:` enforced absolutely; otherwise the
+      result must carry the country in its ccTLD, domain, path, title or snippet
+- [x] Ambiguous cities ("hail", "tyre", "sur", "medina", "mecca") excluded from
+      evidence — fine in a query, useless as proof
+- [x] A degraded engine is rested on the same backoff ladder as a 429 after 3
+      consecutive off-query pages; `offtopic` is its own outcome so a lying
+      engine is never recorded as "this query is exhausted"
+- [x] A degraded pass stops after 3 off-topic queries and resumes in place
+- [x] Reader and proxy tiers verified too
+- [x] Encyclopedic titles ("Steel: Definition, Composition…") and titles cut
+      mid-bracket no longer become company names
+- [x] Country sweep defaults OFF, filters non-business hosts, readable names;
+      one-time migration switches existing sources off it
+- [x] Boot sweep also retires reference pages and leads whose own ccTLD belongs
+      to a different country than their source; exposed as
+      `POST /api/discovery/purge-junk` + "Clean up pool" button
+- [x] `scripts/verify-intent.ts` replays the exact production failures offline
 
-NOTE: local `backend/data.sqlite` was corrupt again on boot — THREE dev servers
-had stacked up, two of them backends writing the same WAL, which is exactly the
-documented corruption cause. All were shut down with SIGTERM (never `kill -9`),
-the corrupt file moved to `.same/corrupt-db-backup-3`, and a single dev server
-restarted. Production is Postgres — unaffected.
+### Engine hunt — done, and the answer is "no new engine needed"
 
----
+Full measurements in `.same/engine-bakeoff.md`. Summary:
 
-# Web search yield — "only a handful of leads per source" ✅ shipped & verified
+- Every candidate is dead from this IP: Mojeek/Yep/Ecosia 403, Stract 404,
+  Brave 429, searx.be walled, priv.au captcha, search.inetol.net returns an
+  empty result set then 429.
+- Bing's degradation is **keyword-dependent, not shape-dependent**: five head
+  terms × five query shapes all scored 0/47. Cookies make no difference;
+  `setmkt=en-QA` makes it worse. So it can only be checked, never predicted.
+- **DuckDuckGo is not permanently walled** — it walls under hammering and
+  recovers with polite pacing. Its earlier 0/18 was my own probing.
+- End-to-end proof the fix works: the five keywords Bing scored 0/47 on now
+  return **41/41 on-target** Qatari companies via duckduckgo + reader.
 
-Full record: **`.same/web-search-yield.md`**.
+Recommendation: keep the verifier strict, and add a free Jina key — the reader
+carried 3 of the 5 queries.
 
-Headline: **half of every query plan was a result page that no engine serves.**
-DuckDuckGo's `&s=30` and Bing's `&first=` both return page one again, and Brave
-— the only engine that really paginates (69 unique domains over 4 pages against
-20 for one) — was capped at page one in code. When the two page-one engines were
-resting the whole pool declined, and that was recorded as a rate limit: a 3-30
-minute backoff for a page that never existed. The `" contact"` query variants,
-another half of the plan, were measured to return **zero** new domains on Bing.
+## Deploy blocker
 
-Fixed, plus a **Common Crawl country sweep** that reads the index as "every host
-under `.qa`" — the thing that actually scales past what happens to rank for a
-phrase. Plus a `FINANCE_BLOCK`, because in the Gulf a "trading company" sells
-goods and on the open web "trading" means forex (a live pass had returned
-trading212, etrade, metatrader5 and olymptrade as Qatari leads).
+`bandoorahamra/email` → 404. All 10 accessible repos enumerated (matches
+`total_private_repos: 9` + 1 org repo); none contains `backend/src/discovery.ts`,
+none contains commit `55f9ece`. GitHub 404s for both "deleted" and "not granted",
+so it is not possible to tell which from here.
 
-Verified end to end on a scratch DB (`cd backend && bun run verify`):
-- 5 keyword steps → **+31 leads in 9s**, all country-resolved, no duplicates
-- one index step → **+106 leads in 15s**
-- Qatar · general plan: **577 steps (560 queries + 17 index pages)**, was ~150
-  real queries of which half were dead
+Did NOT create the repo: a new repo has no Railway link, so it would report
+success while production stayed on the old code.
 
-Also root-caused the **recurring `data.sqlite` corruption** (eight parked copies
-in `.same/`): WAL mode on this container's overlay filesystem. Now
-`journal_mode=TRUNCATE`, one handle pinned across `bun --watch` reloads, and a
-corrupt file parks itself instead of crash-looping — proven to survive a SIGKILL.
+Holding the Netlify deploy too — the frontend now calls
+`POST /api/discovery/purge-junk`, which 404s on the currently-deployed backend.
+Ship both together.
+
+⚠️ Local `.git` is empty and no remote is recorded. **This container is the only
+copy of this work.**
+
+Unblock with any one of:
+1. Railway → backend service → Settings → Source gives the exact `owner/repo`.
+2. Re-authorize the GitHub integration if that repo sits under a different
+   account or a "selected repositories" grant.
+3. Confirm the repo is gone — then create it, push the whole tree, and re-link
+   Railway.
