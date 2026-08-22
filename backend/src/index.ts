@@ -52,6 +52,7 @@ import {
   rejectContentLeads,
   repairEscapedEmails,
   repairPageTitleNames,
+  sweepNonProspectLeads,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -1218,6 +1219,16 @@ app.post("/api/discovery/re-enrich", async (c) => {
   const r = await reEnrichBlocked();
   return c.json(r);
 });
+// ---- Purge leads that could never have been prospects ----
+// The same sweep that runs at boot, on demand. Needed because the rules that
+// decide "this was never a company" get tighter over time — most recently after
+// a search engine spent a while answering a different question than the one it
+// was asked — and the rows filed under the old rules are still sitting in the
+// queue costing a full crawl each to disprove.
+app.post("/api/discovery/purge-junk", async (c) => {
+  const swept = await sweepNonProspectLeads();
+  return c.json({ swept });
+});
 // ---- Repair company names saved by the old (broken) directory harvester ----
 // It used to store the card's tel: link as the company name. This re-reads the
 // directory sources and writes the real names back. Runs as a job because a
@@ -1279,11 +1290,12 @@ app.post("/api/discovery/sources", async (c) => {
     const keywords = String(b.keywords || "").trim();
     if (!location && !keywords) return c.json({ error: "Enter a country/city and/or some keywords to search for" }, 400);
     const limit = clamp(Number(b.limit) || 100, 20, 300);
-    // Also walk Common Crawl's index of the country's own ccTLD. Default ON:
-    // the keyword half of a pass can only ever return what ranks for the
-    // phrases we thought of, and "it finds far fewer companies than the country
-    // actually has" is precisely the complaint this answers.
-    const sweep = b.sweepCountry === false ? 0 : 1;
+    // Also walk Common Crawl's index of the country's own ccTLD. Default OFF:
+    // it reaches far more of a country than the keyword queries can, but a
+    // ccTLD lists every HOST in a country rather than every business, so it
+    // needs a deliberate "yes" and it needs the category filter to have
+    // something to bite on.
+    const sweep = b.sweepCountry === true ? 1 : 0;
     const rows = await q(
       `INSERT INTO discovery_sources
         (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,sweep_country,next_run_at,created_at)
@@ -1366,7 +1378,7 @@ app.put("/api/discovery/sources/:id", async (c) => {
       (b.keywords != null && String(b.keywords).trim() !== String(existing.keywords || "")) ||
       (b.location != null && String(b.location).trim() !== String(existing.location || "")) ||
       (b.category != null && String(b.category).trim() !== String(existing.category || "")) ||
-      (b.sweepCountry != null && (b.sweepCountry ? 1 : 0) !== Number(existing.sweep_country ?? 1));
+      (b.sweepCountry != null && (b.sweepCountry ? 1 : 0) !== Number(existing.sweep_country ?? 0));
     if (changed) { cursor = 1; exhausted = 0; emptyStreak = 0; }
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
@@ -1376,7 +1388,7 @@ app.put("/api/discovery/sources/:id", async (c) => {
   if (!enabled && existing.enabled) stopSource(id);
 
   const sweepCountry =
-    b.sweepCountry != null ? (b.sweepCountry ? 1 : 0) : Number(existing.sweep_country ?? 1);
+    b.sweepCountry != null ? (b.sweepCountry ? 1 : 0) : Number(existing.sweep_country ?? 0);
   const rows = await q(
     `UPDATE discovery_sources
        SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?

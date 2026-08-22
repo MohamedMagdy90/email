@@ -552,7 +552,7 @@ export const api = {
       transports: {
         pages: Record<TransportName, { calls: number; ok: number }>;
         archives: { source: string; fails: number; downForMs: number }[];
-        searchEngines: { engine: string; live: boolean; restingForMs: number }[];
+        searchEngines: { engine: string; live: boolean; restingForMs: number; note?: string }[];
       };
     }>(`/api/settings`),
 
@@ -667,6 +667,7 @@ export const api = {
   // number. Count them, and repair them by re-reading the directory sources.
   getBadNameCount: () => req<{ leads: number; contacts: number }>(`/api/discovery/bad-names`),
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
+  purgeJunkLeads: () => req<{ swept: number }>(`/api/discovery/purge-junk`, { method: "POST", body: "{}" }),
   getDiscoverySources: (archived = false) =>
     req<{ sources: DiscoverySource[]; archivedCount: number }>(
       `/api/discovery/sources${archived ? "?archived=1" : ""}`

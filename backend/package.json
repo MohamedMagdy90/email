@@ -7,7 +7,7 @@
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit --types bun,node",
     "//verify": "ALWAYS runs against a scratch DB — never point a script at data.sqlite while the dev server holds it.",
-    "verify": "SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-search.ts && SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-blocks.ts",
+    "verify": "SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-intent.ts && SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-search.ts && SQLITE_PATH=/tmp/dna-verify.sqlite bun run scripts/verify-blocks.ts",
     "verify:batch": "SQLITE_PATH=/tmp/dna-verify-batch.sqlite bun run scripts/verify-batch.ts"
   },
   "dependencies": {

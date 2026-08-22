@@ -310,7 +310,7 @@ const TIERS: { key: TransportName; label: string; note: string; paid: boolean }[
 function PageSourcesCard() {
   const [pages, setPages] = useState<Record<string, { calls: number; ok: number }>>({});
   const [archives, setArchives] = useState<{ source: string; fails: number; downForMs: number }[]>([]);
-  const [engines, setEngines] = useState<{ engine: string; live: boolean; restingForMs: number }[]>([]);
+  const [engines, setEngines] = useState<{ engine: string; live: boolean; restingForMs: number; note?: string }[]>([]);
 
   async function load() {
     try {
@@ -397,9 +397,20 @@ function PageSourcesCard() {
         <span>
           Search engines: <b className="text-ink/70">{liveEngines}/{engines.length || 4}</b> answering
           {engines.filter((e) => !e.live).length > 0 && (
-            <> · resting: {engines.filter((e) => !e.live).map((e) => e.engine).join(", ")}</>
+            <>
+              {" "}· resting:{" "}
+              {engines
+                .filter((e) => !e.live)
+                .map((e) => (e.note ? `${e.engine} (${e.note})` : e.engine))
+                .join(", ")}
+            </>
           )}
         </span>
+        {engines.some((e) => (e.note || "").includes("ignor")) && (
+          <span className="text-[#8a5a12]">
+            Some engines are returning results that ignore the country/site filter — they’re paused, and those results are being discarded rather than saved. Adding a free Jina key above restores full-speed, accurate searching.
+          </span>
+        )}
         {archives.length > 0 && (
           <span className="text-[#8a5a12]">
             Archive backing off: {archives.map((a) => `${a.source} (${Math.ceil(a.downForMs / 60000)}m)`).join(", ")}

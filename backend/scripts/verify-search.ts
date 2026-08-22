@@ -24,7 +24,10 @@ await q(
   [nowIso()]
 );
 const row = (await q(`SELECT * FROM discovery_sources WHERE id='v1'`))[0] as any;
-ok("sweep_country exists and defaults ON", Number(row.sweep_country) === 1, `= ${row.sweep_country}`);
+// Defaults OFF now. A ccTLD index lists every host in a country, not every
+// business, so it filed `alabama.qa` and `agdoha2030.qa` as companies when it
+// was on by default. Opt-in, per source.
+ok("sweep_country exists and defaults OFF", Number(row.sweep_country) === 0, `= ${row.sweep_country}`);
 
 console.log("\n=== B. the query plan ===");
 const { buildSearchPlanForTest } = await import("../src/discovery");
@@ -113,7 +116,12 @@ const conTokens = sweepTokensForTest("Construction & Contracting", null);
 ok("construction has URL tokens", conTokens.length > 0, conTokens.join(","));
 ok("a contracting host matches", sweepHostMatchesForTest(["https://abhcontracting.com.qa/about"], "abhcontracting.com.qa", conTokens));
 ok("a dental clinic does not", !sweepHostMatchesForTest(["https://smiledental.qa/offers"], "smiledental.qa", conTokens));
-ok("a general sweep keeps everything", sweepHostMatchesForTest(["https://smiledental.qa/"], "smiledental.qa", sweepTokensForTest("Companies (general)", null)));
+// A general sweep no longer keeps everything — that is what put `alabama.qa`
+// and `akhlaquna.qa` in the pool. It now asks the same question as a category
+// sweep, just with a much wider list of what a business looks like.
+const generalTokens = sweepTokensForTest("Companies (general)", null);
+ok("a general sweep still keeps a plain business", sweepHostMatchesForTest(["https://alarabtrading.qa/products"], "alarabtrading.qa", generalTokens));
+ok("a general sweep drops a non-business host", !sweepHostMatchesForTest(["https://akhlaquna.qa/volunteer"], "akhlaquna.qa", generalTokens));
 ok("custom keywords beat the table", sweepTokensForTest("Construction & Contracting", "marble, granite").includes("marble"));
 
 console.log("\n=== G. engine health panel still reports ===");

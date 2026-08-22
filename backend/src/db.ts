@@ -263,13 +263,29 @@ export async function ensureSchema() {
   // emailed the same pitch by accident. Existing sources default to 'customer'.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
   // Web-search sources: also walk Common Crawl's index of the country's own
-  // ccTLD, not just the keyword queries. A keyword search can only ever return
-  // the firms that rank for the phrases we thought of (10-20 results per query,
-  // and only one engine in the pool paginates at all); the index answers "which
-  // hosts exist under .qa", which is the question "how many companies are there
-  // here" actually needs. Defaults ON — a source that finds too little is the
-  // complaint this exists to answer, and it can be switched off per source.
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN sweep_country INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
+  // ccTLD, not just the keyword queries. The index answers "which hosts exist
+  // under .qa", which is a far bigger set than "the firms that rank for the
+  // phrases we thought of".
+  //
+  // Defaults OFF, and this is a deliberate reversal. A ccTLD is a list of every
+  // host in a country, not a list of its businesses: switched on by default it
+  // filed `alabama.qa`, `agdoha2030.qa` and `akhlaquna.qa` as company leads,
+  // each named after its own hostname, and buried the real results. It is now
+  // opt-in, per source, with the host filter it always needed.
+  try { await q(`ALTER TABLE discovery_sources ADD COLUMN sweep_country INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  // Sources created while the default was ON are still carrying it. Turn them
+  // off ONCE — guarded by a settings flag, so a user who deliberately switches
+  // it back on doesn't have it taken away again on the next boot.
+  try {
+    const done = await getSetting("sweep_country_default_off_v1");
+    if (!done) {
+      const rows = await q(`UPDATE discovery_sources SET sweep_country=0 WHERE sweep_country=1 RETURNING id`);
+      if (rows.length) {
+        console.log(`[db] country sweep switched off on ${rows.length} existing source(s) — it was filing non-companies; re-enable per source if you want it`);
+      }
+      await setSetting("sweep_country_default_off_v1", new Date().toISOString());
+    }
+  } catch { /* non-fatal */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being
