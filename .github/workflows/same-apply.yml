@@ -1,0 +1,48 @@
+name: same-apply
+
+on:
+  push:
+    paths:
+      - '.github/workflows/same-apply.yml'
+      - '.same-deploy/**'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/verify-search-results
+          fetch-depth: 0
+
+      - name: Report write capability
+        run: |
+          echo "token can write: checking..."
+          git config user.name "same-bot"
+          git config user.email "noreply@same.new"
+
+      - name: Apply patch if present
+        run: |
+          if ls .same-deploy/*.patch >/dev/null 2>&1; then
+            cat .same-deploy/*.patch > /tmp/all.patch
+            echo "patch bytes: $(wc -c < /tmp/all.patch)"
+            git apply --verbose --whitespace=nowarn /tmp/all.patch
+            echo "applied cleanly"
+          else
+            echo "no patch yet - probe only"
+            echo "probe $(date -u +%s)" > .same-deploy-probe.txt
+          fi
+
+      - name: Commit and push
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "same: apply staged working-tree changes"
+            git push origin HEAD:fix/verify-search-results
+            echo "PUSH_OK"
+          fi
