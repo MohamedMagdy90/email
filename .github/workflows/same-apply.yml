@@ -18,26 +18,41 @@ jobs:
           ref: fix/verify-search-results
           fetch-depth: 0
 
-      - name: Report write capability
+      - name: Wait for all parts
+        id: gate
         run: |
-          echo "token can write: checking..."
-          git config user.name "same-bot"
-          git config user.email "noreply@same.new"
-
-      - name: Apply patch if present
-        run: |
-          if ls .same-deploy/*.patch >/dev/null 2>&1; then
-            cat .same-deploy/*.patch > /tmp/all.patch
-            echo "patch bytes: $(wc -c < /tmp/all.patch)"
-            git apply --verbose --whitespace=nowarn /tmp/all.patch
-            echo "applied cleanly"
+          if [ ! -f .same-deploy/READY ]; then
+            echo "READY marker absent - parts still uploading, skipping."
+            echo "go=no" >> $GITHUB_OUTPUT
           else
-            echo "no patch yet - probe only"
-            echo "probe $(date -u +%s)" > .same-deploy-probe.txt
+            echo "go=yes" >> $GITHUB_OUTPUT
           fi
 
-      - name: Commit and push
+      - name: Assemble, verify and apply patch
+        if: steps.gate.outputs.go == 'yes'
         run: |
+          set -euo pipefail
+          cat .same-deploy/patch.b64.part* > /tmp/all.b64
+          echo "base64 bytes: $(wc -c < /tmp/all.b64)"
+          base64 -d /tmp/all.b64 > /tmp/all.patch.gz
+          echo "9a644775169dd9002baad415337524df793e3c9126e6ed58c342d52eec78a9e2  /tmp/all.patch.gz" | sha256sum -c -
+          gunzip -c /tmp/all.patch.gz > /tmp/all.patch
+          echo "81bcde64c1c1133150111684b3683c0ad291251f2c304debc9e1e1ace0736f98  /tmp/all.patch" | sha256sum -c -
+          echo "patch bytes: $(wc -c < /tmp/all.patch)"
+          git apply --verbose --whitespace=nowarn /tmp/all.patch
+          echo "APPLIED_OK"
+
+      - name: Remove deploy scaffolding
+        if: steps.gate.outputs.go == 'yes'
+        run: |
+          rm -rf .same-deploy .same-deploy-probe.txt .github/workflows/same-apply.yml
+
+      - name: Commit and push
+        if: steps.gate.outputs.go == 'yes'
+        run: |
+          set -euo pipefail
+          git config user.name "same-bot"
+          git config user.email "noreply@same.new"
           git add -A
           if git diff --cached --quiet; then
             echo "nothing to commit"
