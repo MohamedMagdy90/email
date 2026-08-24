@@ -584,26 +584,112 @@ Full measurements in `.same/engine-bakeoff.md`. Summary:
 Recommendation: keep the verifier strict, and add a free Jina key — the reader
 carried 3 of the 5 queries.
 
-## Deploy blocker
+## Deployed ✅ (2026-08-22)
 
-`bandoorahamra/email` → 404. All 10 accessible repos enumerated (matches
-`total_private_repos: 9` + 1 org repo); none contains `backend/src/discovery.ts`,
-none contains commit `55f9ece`. GitHub 404s for both "deleted" and "not granted",
-so it is not possible to tell which from here.
+Repo is **`MohamedMagdy90/email`** (public) — not `bandoorahamra/email`, which is
+why the first push attempt 404'd. The integration account has write access.
 
-Did NOT create the repo: a new repo has no Railway link, so it would report
-success while production stayed on the old code.
+- `55f9ece` → **`32ddddb`** "Verify every search result against the query that
+  produced it" — 3 files created, 10 updated, all 13 blob-SHA verified byte-exact
+- `32ddddb` → **`6af1658`** "Publish the built commit on /api/health"
+- Railway auto-deployed: `GET /api/health` returns `{"ok":true,"rev":"6af1658"}`
+- Netlify frontend live at `https://same-5gyl6ypl5ye-latest.netlify.app`, proxy
+  verified end to end (Netlify `/api/health` → Railway, HTTP 200)
 
-Holding the Netlify deploy too — the frontend now calls
-`POST /api/discovery/purge-junk`, which 404s on the currently-deployed backend.
-Ship both together.
+**Why `/api/health` now publishes the build.** Every other `/api/*` path sits
+behind the auth middleware, which 401s a route that does not exist exactly as
+readily as one that does — so probing a newly added endpoint could not tell a
+landed deploy from a failed one. Confirmed by control test: a made-up
+`/api/discovery/definitely-not-a-real-route` also returned 401. Publishing the
+commit is the only honest answer, and it made this deploy verifiable.
 
-⚠️ Local `.git` is empty and no remote is recorded. **This container is the only
-copy of this work.**
+⚠️ Local `.git` is still empty — the repo is the source of truth, this container
+is not. Re-clone before any further work if history matters.
 
-Unblock with any one of:
-1. Railway → backend service → Settings → Source gives the exact `owner/repo`.
-2. Re-authorize the GitHub integration if that repo sits under a different
-   account or a "selected repositories" grant.
-3. Confirm the repo is gone — then create it, push the whole tree, and re-link
-   Railway.
+---
+
+# Three fixes (2026-08-24) ✅ shipped & verified
+
+## 1. The partner retry ladder overwrote the customer one
+
+**Root cause.** `followup.ts` stored ONE ladder — `followup_no_open` /
+`followup_no_click` — for both audiences. The Customer/Partner toggle on the
+card only chose which starter pack to load; the rungs underneath were shared.
+So the second lane you configured replaced the first, in both directions. The
+`fill()` in the pack loader only touched EMPTY rungs, which is why loading the
+partner pack after the customer one appeared to do nothing at all.
+
+- [x] `followup.ts` — `FollowUpLadder` per audience, keys
+      `followup_{customer,partner}_{no_open,no_click}`; the old flat keys are
+      read as the CUSTOMER lane's fallback, so an existing install keeps its
+      templates and waits (same pattern the automation lanes already use)
+- [x] `setFollowUpConfig` writes lanes independently — a patch for one lane
+      cannot touch the other, and a legacy flat payload only writes customer
+- [x] `scanSequences` reads `contacts.audience` and walks THAT lane's ladder;
+      rung keys are now `audience:branch:step`
+- [x] `rungPerformance()` joins contacts so each lane's sent/opened/clicked are
+      its own
+- [x] `laneBlockers` — "No partner retry chosen" can no longer hide behind a
+      configured customer ladder
+- [x] `config.noOpen` / `config.noClick` still returned as a mirror of the
+      customer lane, so a frontend mid-deploy doesn't break
+- [x] `FollowUp.tsx` — a lane tab (with an `n/2 set` chip per lane), the branch
+      columns render the selected lane, the pack loads into the selected lane,
+      Save posts both lanes as separate objects
+
+## 2. Three tool cards ate the top of Discovery
+
+Re-check emails · Clean up pool · Repair company names were three full-width
+banners — permanent screen for buttons pressed once a month.
+
+- [x] `ui.tsx` — a real `Tooltip` (CSS-only, no portal, works on focus too)
+- [x] `Discovery.tsx` — one `PoolTools` row of 9×9 icon buttons beside the bot
+      switch. The count that mattered is a badge on the icon; the paragraph
+      that justified the banner is the tooltip; a tool with nothing to do is
+      disabled and says so instead of vanishing.
+
+## 3. Automation ran at midnight, ignoring time zones
+
+**The unit of scheduling is the COUNTRY, not the server.** A pool spanning
+Qatar, Jordan, the UK and Singapore has no single "good time" — 9am is four
+different moments — so one server clock could never get this right.
+
+- [x] `schedule.ts` (new) — ISO2 → IANA zone for every country in the country
+      table; Sun–Thu working week for the Gulf (UAE deliberately Mon–Fri since
+      2022); `SendWindow` {start, end, days}; per-country overrides + pause;
+      `isOpen` / `minutesUntilOpen` / `nextOpenAt` computed arithmetically from
+      one `Intl` lookup rather than by stepping a clock
+- [x] `pool.ts` — `discoveredWhere({ countries })` (a LIST; `__none__` = no
+      country on file; an empty list matches NOTHING, which is the honest answer
+      when every window is shut), `approvableByCountry()`
+- [x] `automation.ts` — the tick counts only leads in open countries toward the
+      trigger, and the batch is approved with `filterCountries`; per-lane
+      `readyNow` vs `ready`; `getScheduleStatus()` returns every country in the
+      pool with its live local clock, window and next opening
+- [x] `followup.ts` — a retry that comes due at 02:00 local is HELD, counted as
+      `holding` with `holdingUntil`, not sent
+- [x] Manual **Run now** deliberately ignores the window (it already ignores the
+      trigger and the cooldown)
+- [x] `Automation.tsx` — `ScheduleBlock`: default window (time inputs + day
+      chips) and a live per-country list showing the local time right now,
+      open/closed, "opens in 5h", and per-country hours / hold / reset
+- [x] **Defaults to ON at 09:00–17:00** — a rail that ships switched off is not
+      a rail. Existing installs get it on their next boot.
+
+## Verified
+- `scripts/verify-schedule.ts` — **49/49** offline checks on a scratch DB: zone
+  resolution and aliases · Gulf vs European weeks · open/closed at four real
+  instants · "Saturday in Doha waits 33h for Sunday 09:00" · overrides stored
+  canonically · an end-before-start repaired rather than silently disabling a
+  country · pause · unknown-country hold · the empty-list `1 = 0` guard ·
+  approve honouring the open-country list and leaving closed countries pending ·
+  both ladder-save directions · legacy migration.
+- Live HTTP: schedule round-trips through `/api/automation` (including
+  `country: null` → back to the default); saving the partner ladder leaves the
+  customer ladder byte-identical and vice versa; the legacy mirror tracks the
+  customer lane.
+- backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
+
+## Note for the next session
+Local `data.sqlite` was NOT seeded, so the per-country panel shows its empty
+state on this container. It fills in as soon as the pool holds emailable leads.

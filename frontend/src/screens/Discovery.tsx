@@ -8,7 +8,7 @@ import {
   type AutomationStatus,
   type Place,
 } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, toast, cn, goTo } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
 
 const FALLBACK_CATS = [
@@ -359,17 +359,37 @@ export default function Discovery() {
           </p>
         </div>
 
-        <BotSwitch
-          running={running}
-          nextRunAt={status?.nextRunAt ?? null}
-          activeSources={status?.activeSources ?? 0}
-          onToggle={toggleBot}
-          readerKeyed={status?.bypass?.readerKeyed}
-          proxied={status?.bypass?.proxy}
-          keysLive={status?.bypass?.readerKeysLive}
-          keysConfigured={status?.bypass?.readerKeysConfigured}
-          keyRejected={status?.bypass?.readerKeyRejected}
-        />
+        <div className="flex flex-col items-start gap-3 sm:items-end">
+          {/* Pool maintenance. These three used to be full-width banners that
+              pushed the actual work off the screen; they are occasional, so
+              they belong here as icons with the explanation one hover away. */}
+          <PoolTools
+            recoverable={status?.recoverable ?? 0}
+            blocked={status?.blocked ?? 0}
+            badNames={badNames}
+            readerKeyed={!!status?.bypass?.readerKeyed}
+            proxied={!!status?.bypass?.proxy}
+            readerRateLimited={!!status?.bypass?.readerRateLimited}
+            reChecking={reEnriching}
+            purging={purging}
+            repairing={repairing}
+            repairLog={repairLog}
+            onReCheck={reCheckBlocked}
+            onPurge={purgeJunk}
+            onRepair={repairNames}
+          />
+          <BotSwitch
+            running={running}
+            nextRunAt={status?.nextRunAt ?? null}
+            activeSources={status?.activeSources ?? 0}
+            onToggle={toggleBot}
+            readerKeyed={status?.bypass?.readerKeyed}
+            proxied={status?.bypass?.proxy}
+            keysLive={status?.bypass?.readerKeysLive}
+            keysConfigured={status?.bypass?.readerKeysConfigured}
+            keyRejected={status?.bypass?.readerKeyRejected}
+          />
+        </div>
       </div>
 
       {/* Stat strip */}
@@ -382,27 +402,6 @@ export default function Discovery() {
 
       {/* What happens to this pool — automation state + progress to its trigger. */}
       <AutomationStrip a={automation} />
-
-      {/* Bad-name repair */}
-      {badNames && (badNames.leads > 0 || badNames.contacts > 0) && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#9b6bff]/35 bg-[#f6f1ff] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#9b6bff]/15 font-clash text-[#6c43c5]">✎</span>
-            <div>
-              <div className="text-sm font-semibold text-ink">
-                {badNames.leads.toLocaleString()} lead{badNames.leads === 1 ? "" : "s"} and {badNames.contacts.toLocaleString()} contact{badNames.contacts === 1 ? "" : "s"} have broken company names
-              </div>
-              <div className="text-xs leading-relaxed text-muted">
-                An older directory import sometimes saved a phone number where the company name should be. Run the repair to restore the real names.
-                {repairLog ? <span className="block mt-1 font-medium text-ink/70">{repairLog}</span> : null}
-              </div>
-            </div>
-          </div>
-          <Button size="sm" variant="outline" loading={repairing} onClick={repairNames} className="shrink-0">
-            Repair company names
-          </Button>
-        </div>
-      )}
 
       {/* Paused-with-sources nudge — the #1 reason "scanning stops": the bot is off. */}
       {!running && (status?.activeSources ?? 0) > 0 && (
@@ -418,56 +417,6 @@ export default function Discovery() {
             </div>
           </div>
           <Button size="sm" onClick={() => toggleBot(true)} className="shrink-0">Turn bot on</Button>
-        </div>
-      )}
-
-      {/* Clean-up for leads filed under older, looser rules — most recently the
-          spell where a search engine answered a different question than the one
-          it was asked and its results were saved as companies. Always available
-          rather than conditional: the whole point is that the pool can contain
-          rows nothing currently flags, and the user is the one who noticed. */}
-      <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-start gap-3">
-          <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-ink/[0.06] font-clash text-ink/60">⌫</span>
-          <div>
-            <div className="text-sm font-semibold text-ink">Clean up leads that were never companies</div>
-            <div className="text-xs leading-relaxed text-muted">
-              Re-checks every pending lead against the current rules and removes the ones that could never yield an email — directories and job boards, reference pages, and results whose own domain belongs to a different country than the source. Real companies are never touched.
-            </div>
-          </div>
-        </div>
-        <Button size="sm" variant="outline" loading={purging} onClick={purgeJunk} className="shrink-0">
-          Clean up pool
-        </Button>
-      </div>
-
-      {/* Recovery for the "no email" pool — leads that have a website but no email
-          (blocked by Cloudflare, rate-limited, or discovered before retry-tracking
-          existed, i.e. the historical ~1,000). "Re-check" re-queues them all so the
-          bot crawls their sites again. Shown whenever there's anything to recover
-          OR anything still auto-retrying, so the button is never hidden when needed. */}
-      {((status?.recoverable ?? 0) > 0 || (status?.blocked ?? 0) > 0) && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#5a86c2]/40 bg-[#eef4fb] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#5a86c2]/20 font-clash text-[#2f5a94]">↻</span>
-            <div>
-              <div className="text-sm font-semibold text-ink">
-                {(status?.recoverable ?? 0) > 0
-                  ? <>{status!.recoverable.toLocaleString()} lead{status!.recoverable === 1 ? "" : "s"} have a website but no email yet</>
-                  : <>{status!.blocked.toLocaleString()} lead{status!.blocked === 1 ? "" : "s"} being re-checked for emails…</>}
-              </div>
-              <div className="text-xs leading-relaxed text-muted">
-                Most were skipped because their site blocked the crawler (often a Cloudflare “Just a moment” wall){status!.bypass?.readerRateLimited ? ", and the free reader hit its rate limit" : ""}. Re-check crawls each site again to find the missing email — it runs in the background and can take a while for a big pool.
-                {(status?.recoverable ?? 0) > 0 && (status?.blocked ?? 0) > 0 ? ` (${status!.blocked.toLocaleString()} more are already auto-retrying.)` : ""}
-                {!status!.bypass?.readerKeyed && !status!.bypass?.proxy && <> To get past Cloudflare at scale, add a free <span className="font-medium text-ink/70">Jina key</span> or a <span className="font-medium text-ink/70">scraping proxy</span> in <span className="font-medium text-ink/70">Settings → Crawler</span> first.</>}
-              </div>
-            </div>
-          </div>
-          {(status?.recoverable ?? 0) > 0 && (
-            <Button size="sm" variant="outline" loading={reEnriching} onClick={reCheckBlocked} className="shrink-0">
-              Re-check {status!.recoverable.toLocaleString()} now
-            </Button>
-          )}
         </div>
       )}
 
@@ -1311,6 +1260,149 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
         </div>
       </div>
     </Modal>
+  );
+}
+
+/* ------------------------------ Pool tools ------------------------------ */
+
+// Three occasional maintenance jobs — re-check blocked sites for emails, sweep
+// out leads that were never companies, repair mangled company names.
+//
+// They were three full-width explanation banners stacked above the pool, which
+// is a lot of permanent screen for three buttons you press once a month. Now
+// they're one row of icons: the count that mattered rides on the icon as a
+// badge, and the paragraph that justified the banner is the tooltip.
+function ToolButton({
+  icon, label, tip, count, tone, busy, disabled, onClick,
+}: {
+  icon: string;
+  label: string;
+  tip: React.ReactNode;
+  count?: number;
+  tone: string;
+  busy?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <Tooltip
+      wide
+      label={
+        <>
+          <span className="mb-0.5 block font-semibold text-cream">{label}</span>
+          {tip}
+        </>
+      }
+    >
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy || disabled}
+        aria-label={label}
+        className={cn(
+          "relative grid h-9 w-9 place-items-center rounded-xl border text-[15px] transition-all duration-150",
+          "disabled:cursor-not-allowed disabled:opacity-40",
+          busy ? "border-ink/30 bg-ink/[0.04]" : tone,
+          !busy && !disabled && "hover:-translate-y-px hover:shadow-sm active:translate-y-0"
+        )}
+      >
+        {busy ? <Spinner className="h-3.5 w-3.5" /> : icon}
+        {!busy && !!count && count > 0 && (
+          <span className="absolute -right-1.5 -top-1.5 grid h-[18px] min-w-[18px] place-items-center rounded-full bg-ink px-1 text-[10px] font-semibold tabular-nums text-cream shadow">
+            {count > 999 ? "999+" : count}
+          </span>
+        )}
+      </button>
+    </Tooltip>
+  );
+}
+
+function PoolTools({
+  recoverable, blocked, badNames, readerKeyed, proxied, readerRateLimited,
+  reChecking, purging, repairing, repairLog, onReCheck, onPurge, onRepair,
+}: {
+  recoverable: number;
+  blocked: number;
+  badNames: { leads: number; contacts: number } | null;
+  readerKeyed: boolean;
+  proxied: boolean;
+  readerRateLimited: boolean;
+  reChecking: boolean;
+  purging: boolean;
+  repairing: boolean;
+  repairLog: string;
+  onReCheck: () => void;
+  onPurge: () => void;
+  onRepair: () => void;
+}) {
+  const broken = (badNames?.leads ?? 0) + (badNames?.contacts ?? 0);
+  return (
+    <div className="flex items-center gap-2">
+      <span className="mono-label mr-0.5 hidden text-muted sm:inline">Pool tools</span>
+
+      <ToolButton
+        icon="↻"
+        label={recoverable > 0 ? `Re-check ${recoverable.toLocaleString()} lead${recoverable === 1 ? "" : "s"} for emails` : "Re-check emails"}
+        tone="border-[#5a86c2]/40 bg-[#eef4fb] text-[#2f5a94]"
+        count={recoverable}
+        busy={reChecking}
+        disabled={recoverable === 0}
+        onClick={onReCheck}
+        tip={
+          recoverable > 0 ? (
+            <>
+              These have a website but no email — most were blocked by a Cloudflare wall
+              {readerRateLimited ? ", and the free reader hit its rate limit" : ""}. Crawls each site again in the
+              background.
+              {blocked > 0 ? ` ${blocked.toLocaleString()} more are already auto-retrying.` : ""}
+              {!readerKeyed && !proxied && " Add a Jina key or a scraping proxy in Settings → Crawler to get past Cloudflare at scale."}
+            </>
+          ) : blocked > 0 ? (
+            <>{blocked.toLocaleString()} lead{blocked === 1 ? " is" : "s are"} already being re-checked automatically — nothing to queue by hand.</>
+          ) : (
+            <>Nothing to recover: every lead with a website has been resolved one way or the other.</>
+          )
+        }
+      />
+
+      <ToolButton
+        icon="⌫"
+        label="Clean up the pool"
+        tone="border-line bg-paper text-ink/60"
+        busy={purging}
+        onClick={onPurge}
+        tip={
+          <>
+            Re-checks every pending lead against the current rules and removes the ones that could never yield an
+            email — directories and job boards, reference pages, and results whose own domain belongs to a different
+            country than the source. Real companies are never touched.
+          </>
+        }
+      />
+
+      <ToolButton
+        icon="✎"
+        label={broken > 0 ? `Repair ${broken.toLocaleString()} broken company name${broken === 1 ? "" : "s"}` : "Repair company names"}
+        tone={broken > 0 ? "border-[#9b6bff]/35 bg-[#f6f1ff] text-[#6c43c5]" : "border-line bg-paper text-ink/60"}
+        count={broken}
+        busy={repairing}
+        disabled={broken === 0}
+        onClick={onRepair}
+        tip={
+          broken > 0 ? (
+            <>
+              {badNames!.leads.toLocaleString()} lead{badNames!.leads === 1 ? "" : "s"} and{" "}
+              {badNames!.contacts.toLocaleString()} contact{badNames!.contacts === 1 ? "" : "s"} have a phone number
+              (or a page title) where the company name should be — an older directory import. This re-reads the
+              source and writes the real names back.
+              {repairLog ? <span className="mt-1 block text-cream/70">{repairLog}</span> : null}
+            </>
+          ) : (
+            <>Every stored company name looks like a company name. Nothing to repair.</>
+          )
+        }
+      />
+    </div>
   );
 }
 

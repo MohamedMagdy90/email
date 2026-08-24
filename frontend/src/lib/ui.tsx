@@ -130,6 +130,47 @@ export function Spinner({ className }: { className?: string }) {
   );
 }
 
+/* ------------------------------ Tooltip ----------------------------- */
+
+// A real tooltip, not `title=""`: the native one takes a second to appear, is
+// unstyled, and never shows on a touch device. This one is CSS-only (no state,
+// no portal, no measuring) and stays inside the layout — the trigger is
+// `relative` and the bubble is absolutely positioned above it.
+//
+// It is what makes the compact icon buttons on Discovery legible: the label a
+// full-width banner used to spell out now lives one hover away.
+export function Tooltip({
+  label,
+  children,
+  side = "bottom",
+  className,
+  wide,
+}: {
+  label: ReactNode;
+  children: ReactNode;
+  side?: "top" | "bottom";
+  className?: string;
+  wide?: boolean;
+}) {
+  return (
+    <span className={cn("group/tip relative inline-flex", className)}>
+      {children}
+      <span
+        role="tooltip"
+        className={cn(
+          "pointer-events-none absolute left-1/2 z-50 -translate-x-1/2 rounded-xl bg-ink px-3 py-2 text-left text-[11.5px] font-normal leading-relaxed text-cream/90 shadow-xl",
+          "origin-center scale-95 opacity-0 transition-all duration-150",
+          "group-hover/tip:scale-100 group-hover/tip:opacity-100 group-focus-within/tip:scale-100 group-focus-within/tip:opacity-100",
+          wide ? "w-64" : "w-52",
+          side === "top" ? "bottom-full mb-2" : "top-full mt-2"
+        )}
+      >
+        {label}
+      </span>
+    </span>
+  );
+}
+
 /* ------------------------------ Navigation -------------------------- */
 
 // The app is a single screen with tab state, so a deep link from one screen to

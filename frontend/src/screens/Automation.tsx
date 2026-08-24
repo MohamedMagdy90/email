@@ -6,10 +6,14 @@ import {
   type AutomationLaneStatus,
   type AutomationStatus,
   type AutomationRun,
+  type CountryRule,
+  type ScheduleConfig,
+  type ScheduleCountryStatus,
+  type SendWindow,
   type Template,
   type Job,
 } from "../lib/api";
-import { Button, Card, Field, Input, Select, Spinner, toast, cn } from "../lib/ui";
+import { Button, Card, Field, Input, Select, Spinner, Tooltip, toast, cn } from "../lib/ui";
 
 const RATES = [10, 20, 40, 60];
 const COOLDOWNS: { v: number; label: string }[] = [
@@ -48,7 +52,52 @@ const LANES: {
   },
 ];
 
+/* ---------------------------- sending windows -------------------------- */
+
+// Local weekdays, Sunday first — the Gulf working week starts there, and half
+// this app's pool is in the Gulf.
+const DAYS: { v: number; label: string; full: string }[] = [
+  { v: 0, label: "S", full: "Sunday" },
+  { v: 1, label: "M", full: "Monday" },
+  { v: 2, label: "T", full: "Tuesday" },
+  { v: 3, label: "W", full: "Wednesday" },
+  { v: 4, label: "T", full: "Thursday" },
+  { v: 5, label: "F", full: "Friday" },
+  { v: 6, label: "S", full: "Saturday" },
+];
+
+const NO_COUNTRY = "__none__";
+const countryLabel = (c: string) => (c === NO_COUNTRY ? "No country on file" : c);
+
+/** 540 → "09:00", for an <input type="time">. */
+function toTime(min: number): string {
+  const m = Math.max(0, Math.min(1439, Math.round(min || 0)));
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+/** "09:00" → 540. */
+function fromTime(v: string): number {
+  const [h, m] = String(v || "").split(":").map((x) => Number(x) || 0);
+  return Math.max(0, Math.min(1439, h * 60 + m));
+}
+function describeDays(days: number[]): string {
+  if (!days.length) return "never";
+  if (days.length === 7) return "every day";
+  const sorted = [...days].sort((a, b) => a - b);
+  const contiguous = sorted.every((d, i) => i === 0 || d === sorted[i - 1] + 1);
+  if (contiguous && sorted.length > 2) return `${DAYS[sorted[0]].full.slice(0, 3)}–${DAYS[sorted[sorted.length - 1]].full.slice(0, 3)}`;
+  return sorted.map((d) => DAYS[d].full.slice(0, 3)).join(", ");
+}
+function describeWindow(w: SendWindow): string {
+  return `${toTime(w.start)}–${toTime(w.end)} · ${describeDays(w.days)}`;
+}
+
 type LaneForm = AutomationLaneConfig;
+
+// A country mapped to null means "drop the override and go back to the default"
+// — that's what the server's patch shape expects, so the form carries it too.
+type ScheduleForm = Omit<ScheduleConfig, "countries"> & {
+  countries: Record<string, CountryRule | null>;
+};
 
 type Form = {
   customer: LaneForm;
@@ -57,6 +106,7 @@ type Form = {
   dailyLimit: number;
   cooldownMinutes: number;
   requireResend: boolean;
+  schedule: ScheduleForm;
 };
 
 const EMPTY_LANE = (threshold: number, enabled: boolean): LaneForm => ({
@@ -68,6 +118,14 @@ const EMPTY_LANE = (threshold: number, enabled: boolean): LaneForm => ({
   country: "",
 });
 
+const EMPTY_SCHEDULE: ScheduleForm = {
+  enabled: true,
+  window: { start: 9 * 60, end: 17 * 60, days: [1, 2, 3, 4, 5] },
+  countries: {},
+  fallbackTimezone: "Asia/Qatar",
+  sendUnknown: true,
+};
+
 const EMPTY: Form = {
   customer: EMPTY_LANE(100, true),
   partner: EMPTY_LANE(50, false),
@@ -75,6 +133,7 @@ const EMPTY: Form = {
   dailyLimit: 300,
   cooldownMinutes: 60,
   requireResend: true,
+  schedule: EMPTY_SCHEDULE,
 };
 
 // Read one lane out of whatever the server sent. A backend mid-redeploy (or an
@@ -106,6 +165,7 @@ export default function AutomationCard() {
   dirtyRef.current = dirty;
 
   function syncForm(s: AutomationStatus) {
+    const sc = s.schedule?.config;
     setForm({
       customer: readLane(s.config.customer, EMPTY.customer),
       partner: readLane(s.config.partner, EMPTY.partner),
@@ -113,6 +173,15 @@ export default function AutomationCard() {
       dailyLimit: s.config.dailyLimit ?? EMPTY.dailyLimit,
       cooldownMinutes: s.config.cooldownMinutes ?? EMPTY.cooldownMinutes,
       requireResend: s.config.requireResend ?? EMPTY.requireResend,
+      schedule: sc
+        ? {
+            enabled: sc.enabled,
+            window: { ...sc.window, days: [...sc.window.days] },
+            countries: Object.fromEntries(Object.entries(sc.countries || {}).map(([k, v]) => [k, { ...v }])),
+            fallbackTimezone: sc.fallbackTimezone,
+            sendUnknown: sc.sendUnknown,
+          }
+        : { ...EMPTY_SCHEDULE, window: { ...EMPTY_SCHEDULE.window }, countries: {} },
     });
   }
 
@@ -146,7 +215,7 @@ export default function AutomationCard() {
     return () => { alive = false; clearInterval(t); };
   }, [liveJobId]);
 
-  function set<K extends keyof Omit<Form, "customer" | "partner">>(key: K, value: Form[K]) {
+  function set<K extends keyof Omit<Form, "customer" | "partner" | "schedule">>(key: K, value: Form[K]) {
     setForm((f) => ({ ...f, [key]: value }));
     setDirty(true);
   }
@@ -154,6 +223,52 @@ export default function AutomationCard() {
   function setLane(a: Audience, patch: Partial<LaneForm>) {
     setForm((f) => ({ ...f, [a]: { ...f[a], ...patch } }));
     setDirty(true);
+  }
+
+  /* ---- sending windows ---- */
+
+  function setWindow(patch: Partial<SendWindow>) {
+    setForm((f) => ({ ...f, schedule: { ...f.schedule, window: { ...f.schedule.window, ...patch } } }));
+    setDirty(true);
+  }
+  function setSendUnknown(on: boolean) {
+    setForm((f) => ({ ...f, schedule: { ...f.schedule, sendUnknown: on } }));
+    setDirty(true);
+  }
+  // null = drop the override and fall back to the default window.
+  function setCountryRule(country: string, rule: CountryRule | null) {
+    setForm((f) => ({ ...f, schedule: { ...f.schedule, countries: { ...f.schedule.countries, [country]: rule } } }));
+    setDirty(true);
+  }
+  /** The rule in play for a country: the local edit, else what the server says. */
+  function ruleFor(c: ScheduleCountryStatus): CountryRule | null {
+    const local = form.schedule.countries[c.country];
+    if (local !== undefined) return local;
+    return c.custom || c.paused ? { ...c.window, paused: c.paused } : null;
+  }
+  function windowOf(c: ScheduleCountryStatus): SendWindow {
+    const r = ruleFor(c);
+    return {
+      start: r?.start ?? form.schedule.window.start,
+      end: r?.end ?? form.schedule.window.end,
+      days: r?.days ?? c.window.days,
+    };
+  }
+
+  // The schedule switch saves on the spot, like the lane switches — flipping it
+  // is a decision, not a draft.
+  async function toggleSchedule(on: boolean) {
+    setForm((f) => ({ ...f, schedule: { ...f.schedule, enabled: on } }));
+    try {
+      const s = await api.saveAutomation({ schedule: { enabled: on } });
+      setStatus(s);
+      toast(
+        on ? "Sending windows on — batches wait for each country's working hours" : "Sending windows off — batches go out as soon as a pool is full",
+        on ? "success" : "info"
+      );
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
   }
 
   function toggleTemplate(a: Audience, id: string) {
@@ -171,6 +286,9 @@ export default function AutomationCard() {
       if (form[l.key].enabled && !form[l.key].templateIds.length) {
         return toast(`Choose at least one template for the ${l.title.toLowerCase()} lane, or switch it off`, "error");
       }
+    }
+    if (!form.schedule.window.days.length) {
+      return toast("Pick at least one day for the sending window, or switch windows off", "error");
     }
     setSaving(true);
     try {
@@ -335,6 +453,18 @@ export default function AutomationCard() {
           ))}
         </div>
 
+        {/* When it's allowed to send — per country, in that country's own clock */}
+        <ScheduleBlock
+          form={form.schedule}
+          live={status?.schedule}
+          onToggle={toggleSchedule}
+          onWindow={setWindow}
+          onCountry={setCountryRule}
+          onSendUnknown={setSendUnknown}
+          ruleFor={ruleFor}
+          windowOf={windowOf}
+        />
+
         {/* Guard rails — shared, because both lanes send from the same domains */}
         <div>
           <div className="mb-2 text-[12px] font-medium text-ink/70">
@@ -406,6 +536,282 @@ export default function AutomationCard() {
   );
 }
 
+/* --------------------------- sending windows ---------------------------- */
+
+// The fix for "it emailed everyone at midnight".
+//
+// A pool that spans Qatar, Jordan, the UK and Singapore has no single "good
+// time" — 9am is four different moments. So the window is expressed once, in
+// local terms, and every country is judged against its OWN clock. The list
+// below shows that clock live, which is the only way to make the rule legible:
+// you can see that it is 02:14 in Doha and understand instantly why nothing is
+// going out.
+function ScheduleBlock({
+  form, live, onToggle, onWindow, onCountry, onSendUnknown, ruleFor, windowOf,
+}: {
+  form: ScheduleForm;
+  live?: AutomationStatus["schedule"];
+  onToggle: (on: boolean) => void;
+  onWindow: (patch: Partial<SendWindow>) => void;
+  onCountry: (country: string, rule: CountryRule | null) => void;
+  onSendUnknown: (on: boolean) => void;
+  ruleFor: (c: ScheduleCountryStatus) => CountryRule | null;
+  windowOf: (c: ScheduleCountryStatus) => SendWindow;
+}) {
+  const [open, setOpen] = useState<string | null>(null);
+  const countries = live?.countries ?? [];
+  const on = form.enabled;
+
+  function toggleDay(days: number[], d: number): number[] {
+    return days.includes(d) ? days.filter((x) => x !== d) : [...days, d].sort((a, b) => a - b);
+  }
+
+  return (
+    <div className={cn("rounded-2xl border transition-colors", on ? "border-line bg-white" : "border-dashed border-line bg-white/60")}>
+      {/* head */}
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line-soft px-4 py-3">
+        <div className="flex items-start gap-2.5">
+          <span className={cn("mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-xl text-[15px]", on ? "bg-ink text-cream" : "bg-ink/[0.06] text-ink/40")}>
+            ◷
+          </span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[13px] font-semibold">Sending window</span>
+              {on ? (
+                <span className="rounded-full bg-[#e7f6ec] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#1f8b4c]">
+                  {describeWindow(form.window)}
+                </span>
+              ) : (
+                <span className="rounded-full bg-[#fdf6ea] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#8a5a12]">
+                  any time, day or night
+                </span>
+              )}
+            </div>
+            <div className="mt-0.5 max-w-xl text-[12px] leading-relaxed text-muted">
+              Batches only go out inside working hours — measured in <b>each country's own time zone</b>, so a Qatari
+              lead is emailed at 9am in Doha and a British one at 9am in London. Everyone else waits for their morning
+              instead of arriving at 3am.
+            </div>
+          </div>
+        </div>
+        <Switch small checked={on} onChange={onToggle} />
+      </div>
+
+      {on && (
+        <div className="space-y-4 px-4 py-4">
+          {/* the default window */}
+          <div className="grid gap-3 sm:grid-cols-[auto_auto_1fr] sm:items-end">
+            <Field label="From" hint="Local time">
+              <Input
+                type="time"
+                className="w-[7.5rem]"
+                value={toTime(form.window.start)}
+                onChange={(e) => onWindow({ start: fromTime(e.target.value) })}
+              />
+            </Field>
+            <Field label="Until" hint="Local time">
+              <Input
+                type="time"
+                className="w-[7.5rem]"
+                value={toTime(form.window.end)}
+                onChange={(e) => onWindow({ end: fromTime(e.target.value) })}
+              />
+            </Field>
+            <Field label="Days" hint="Countries on a Sun–Thu week get that by default; this is the fallback.">
+              <div className="flex gap-1">
+                {DAYS.map((d) => {
+                  const active = form.window.days.includes(d.v);
+                  return (
+                    <button
+                      key={d.v}
+                      type="button"
+                      title={d.full}
+                      onClick={() => onWindow({ days: toggleDay(form.window.days, d.v) })}
+                      className={cn(
+                        "h-9 w-9 rounded-xl border text-[12px] font-semibold transition-all",
+                        active ? "border-ink bg-ink text-cream" : "border-line bg-white text-ink/40 hover:border-ink/30"
+                      )}
+                    >
+                      {d.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </Field>
+          </div>
+
+          {/* live, per country */}
+          {countries.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-line px-4 py-4 text-center text-[12px] text-muted">
+              No emailable leads in the pool yet. Once discovery finds some, every country they're in appears here with
+              its own clock and its own window.
+            </div>
+          ) : (
+            <div>
+              <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-2">
+                <div className="text-[12px] font-medium text-ink/70">
+                  Right now <span className="font-normal text-muted">— {live?.sendable?.toLocaleString() ?? 0} lead(s) can be emailed, {live?.holding?.toLocaleString() ?? 0} waiting for their window</span>
+                </div>
+                <div className="text-[11px] text-muted">Click a country to give it its own hours</div>
+              </div>
+
+              <div className="divide-y divide-line-soft overflow-hidden rounded-xl border border-line">
+                {countries.map((c) => {
+                  const rule = ruleFor(c);
+                  const w = windowOf(c);
+                  const paused = rule?.paused === true;
+                  const custom = !!rule && !paused;
+                  const expanded = open === c.country;
+                  const unknown = c.country === NO_COUNTRY;
+                  const held = unknown && !form.sendUnknown;
+                  return (
+                    <div key={c.country} className={cn("bg-white", expanded && "bg-cream/40")}>
+                      <button
+                        type="button"
+                        onClick={() => setOpen(expanded ? null : c.country)}
+                        className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-cream/50"
+                      >
+                        <span
+                          className={cn(
+                            "h-2 w-2 shrink-0 rounded-full",
+                            paused || held ? "bg-ink/25" : c.open ? "bg-good" : "bg-[#e0b354]"
+                          )}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="truncate text-[13px] font-medium">{countryLabel(c.country)}</span>
+                            <span className="shrink-0 text-[11px] tabular-nums text-muted">
+                              {c.ready.toLocaleString()} ready
+                            </span>
+                            {custom && (
+                              <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-ink/50">
+                                custom
+                              </span>
+                            )}
+                            {(paused || held) && (
+                              <span className="shrink-0 rounded-md bg-[#fdf6ea] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-[#8a5a12]">
+                                held
+                              </span>
+                            )}
+                          </span>
+                          <span className="mt-0.5 block text-[11px] text-muted">
+                            {describeWindow(w)} · {c.timezone.replace(/_/g, " ")}
+                          </span>
+                        </span>
+                        <span className="shrink-0 text-right">
+                          <span className="block font-clash text-[15px] font-semibold tabular-nums">{c.localTime}</span>
+                          <span className={cn("block text-[10.5px]", paused || held ? "text-ink/40" : c.open ? "text-good" : "text-muted")}>
+                            {paused || held ? "paused" : c.open ? "open now" : c.nextOpenAt ? `opens ${fmtIn(c.nextOpenAt)}` : "never opens"}
+                          </span>
+                        </span>
+                      </button>
+
+                      {expanded && (
+                        <div className="space-y-3 border-t border-line-soft px-3.5 py-3">
+                          {unknown ? (
+                            <label className="flex items-start gap-2.5 text-[12px]">
+                              <input
+                                type="checkbox"
+                                checked={form.sendUnknown}
+                                onChange={(e) => onSendUnknown(e.target.checked)}
+                                className="mt-0.5 accent-ink"
+                              />
+                              <span>
+                                Email leads with no country on file
+                                <span className="block text-[11px] text-muted">
+                                  There's no clock to obey, so they'd be sent on{" "}
+                                  <b className="text-ink/70">{form.fallbackTimezone.replace(/_/g, " ")}</b> time. Uncheck to
+                                  hold them until someone fills the country in.
+                                </span>
+                              </span>
+                            </label>
+                          ) : (
+                            <>
+                              <div className="grid gap-3 sm:grid-cols-[auto_auto_1fr] sm:items-end">
+                                <Field label="From">
+                                  <Input
+                                    type="time"
+                                    className="w-[7.5rem]"
+                                    value={toTime(w.start)}
+                                    onChange={(e) => onCountry(c.country, { ...w, start: fromTime(e.target.value), paused })}
+                                  />
+                                </Field>
+                                <Field label="Until">
+                                  <Input
+                                    type="time"
+                                    className="w-[7.5rem]"
+                                    value={toTime(w.end)}
+                                    onChange={(e) => onCountry(c.country, { ...w, end: fromTime(e.target.value), paused })}
+                                  />
+                                </Field>
+                                <Field label="Days">
+                                  <div className="flex gap-1">
+                                    {DAYS.map((d) => {
+                                      const active = w.days.includes(d.v);
+                                      return (
+                                        <button
+                                          key={d.v}
+                                          type="button"
+                                          title={d.full}
+                                          onClick={() => onCountry(c.country, { ...w, days: toggleDay(w.days, d.v), paused })}
+                                          className={cn(
+                                            "h-8 w-8 rounded-lg border text-[11px] font-semibold transition-all",
+                                            active ? "border-ink bg-ink text-cream" : "border-line bg-white text-ink/40 hover:border-ink/30"
+                                          )}
+                                        >
+                                          {d.label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </Field>
+                              </div>
+
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
+                                <span>
+                                  {c.customerReady.toLocaleString()} customer · {c.partnerReady.toLocaleString()} partner
+                                  {" · "}local time is {c.localTime} in {c.timezone.replace(/_/g, " ")}
+                                </span>
+                                <span className="flex gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => onCountry(c.country, paused ? { ...w } : { ...w, paused: true })}
+                                    className="font-medium text-ink/70 underline underline-offset-2 hover:text-ink"
+                                  >
+                                    {paused ? "Resume this country" : "Hold this country"}
+                                  </button>
+                                  {(custom || paused) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => onCountry(c.country, null)}
+                                      className="font-medium text-ink/70 underline underline-offset-2 hover:text-ink"
+                                    >
+                                      Use the default
+                                    </button>
+                                  )}
+                                </span>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className="text-[11px] leading-relaxed text-muted">
+            <b className="text-ink/60">Run now</b> ignores the window — that's you deciding to send. The follow-up
+            ladder below obeys it too.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* -------------------------------- lane --------------------------------- */
 
 function LaneCard({
@@ -424,7 +830,13 @@ function LaneCard({
   onToggleTemplate: (id: string) => void;
   onRun: () => void;
 }) {
-  const ready = live?.ready ?? 0;
+  // `ready` is everything this lane holds; `readyNow` is the part whose country
+  // is actually inside its sending window. The trigger counts the second one,
+  // so that's what the bar has to draw — otherwise a full bar would sit there
+  // not firing and look broken.
+  const ready = live?.readyNow ?? live?.ready ?? 0;
+  const total = live?.ready ?? 0;
+  const asleep = Math.max(0, total - ready);
   const threshold = form.threshold || 1;
   const pct = Math.min(100, Math.round((ready / threshold) * 100));
   const off = !form.enabled;
@@ -478,6 +890,12 @@ function LaneCard({
           <span>Last run: {live?.lastRun ? fmtAgo(live.lastRun.started_at) : "never"}</span>
           {live?.nextEligibleAt && new Date(live.nextEligibleAt).getTime() > Date.now() && (
             <span>Next allowed {fmtIn(live.nextEligibleAt)}</span>
+          )}
+          {asleep > 0 && (
+            <span className="text-[#8a5a12]">
+              +{asleep.toLocaleString()} outside their sending window
+              {live?.windowOpensAt ? ` — first opens ${fmtIn(live.windowOpensAt)}` : ""}
+            </span>
           )}
         </div>
       </div>
@@ -580,9 +998,16 @@ function LaneCard({
           <div className="text-[11px] text-muted">The master switch above is off, so this lane is idle.</div>
         )}
 
-        <Button variant="outline" size="sm" loading={starting} onClick={onRun} disabled={busy || !ready} className="w-full">
-          {busy ? "Run in progress…" : `Run now${ready ? ` (${Math.min(ready, threshold).toLocaleString()})` : ""}`}
-        </Button>
+        <Tooltip
+          side="top"
+          wide
+          className="w-full"
+          label="A manual run ignores the trigger count, the cooldown AND the sending window — it takes the oldest leads in the pool and emails them right now."
+        >
+          <Button variant="outline" size="sm" loading={starting} onClick={onRun} disabled={busy || !total} className="w-full">
+            {busy ? "Run in progress…" : `Run now${total ? ` (${Math.min(total, threshold).toLocaleString()})` : ""}`}
+          </Button>
+        </Tooltip>
       </div>
     </div>
   );

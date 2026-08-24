@@ -25,9 +25,22 @@
 
 import { q, nowIso, getSetting, setSetting } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
-import { approveLeads, countApprovableLeads, normalizeAudience, type Audience } from "./pool";
+import { approveLeads, countApprovableLeads, approvableByCountry, normalizeAudience, type Audience } from "./pool";
 import { runSendJob } from "./send";
 import { getResendKey } from "./resend";
+import {
+  getSchedule,
+  describeWindow,
+  windowFor,
+  timezoneFor,
+  localClock,
+  isOpen,
+  isPaused,
+  nextOpenAt,
+  keyOf,
+  NO_COUNTRY,
+  type ScheduleConfig,
+} from "./schedule";
 
 const uid = () => crypto.randomUUID();
 
@@ -271,6 +284,95 @@ async function lastRealRun(audience?: Audience): Promise<AutomationRun | null> {
   return (r[0] as unknown as AutomationRun) || null;
 }
 
+/* ------------------------- send windows (per country) ------------------ */
+
+// Which countries may be emailed RIGHT NOW. The pool spans several countries at
+// once, so this is a set, not a flag: a batch goes out to every country whose
+// local window is open and leaves the rest for their own morning.
+async function openCountriesFor(cfg: ScheduleConfig, audience: Audience): Promise<string[] | null> {
+  if (!cfg.enabled) return null; // null = no country restriction at all
+  const rows = await approvableByCountry(audience);
+  return rows.map((r) => keyOf(r.country)).filter((c) => isOpen(cfg, c));
+}
+
+export interface ScheduleCountryStatus {
+  /** Canonical country name, or `__none__` for leads with no country. */
+  country: string;
+  timezone: string;
+  /** Local time there right now, "14:05". */
+  localTime: string;
+  localDay: number;
+  open: boolean;
+  paused: boolean;
+  /** When it next opens (null = open now, or never). */
+  nextOpenAt: string | null;
+  window: { start: number; end: number; days: number[] };
+  /** True when this country has its own rule rather than the default. */
+  custom: boolean;
+  ready: number;
+  customerReady: number;
+  partnerReady: number;
+}
+
+export interface ScheduleStatus {
+  config: ScheduleConfig;
+  /** Every country the pool currently holds emailable leads for. */
+  countries: ScheduleCountryStatus[];
+  /** Leads sitting in a country whose window is shut. */
+  holding: number;
+  /** Leads that could go out right now. */
+  sendable: number;
+  /** The default window in words, for the UI's summary line. */
+  summary: string;
+}
+
+export async function getScheduleStatus(): Promise<ScheduleStatus> {
+  const config = await getSchedule();
+  const [customer, partner] = await Promise.all([
+    approvableByCountry("customer"),
+    approvableByCountry("partner"),
+  ]);
+  const counts = new Map<string, { customer: number; partner: number }>();
+  for (const r of customer) {
+    const k = keyOf(r.country);
+    counts.set(k, { customer: (counts.get(k)?.customer || 0) + r.n, partner: counts.get(k)?.partner || 0 });
+  }
+  for (const r of partner) {
+    const k = keyOf(r.country);
+    counts.set(k, { customer: counts.get(k)?.customer || 0, partner: (counts.get(k)?.partner || 0) + r.n });
+  }
+
+  const now = new Date();
+  const countries: ScheduleCountryStatus[] = [];
+  let holding = 0;
+  let sendable = 0;
+  for (const [country, n] of counts) {
+    const tz = timezoneFor(config, country);
+    const clock = localClock(tz, now);
+    const open = isOpen(config, country, now);
+    const ready = n.customer + n.partner;
+    if (open) sendable += ready; else holding += ready;
+    countries.push({
+      country,
+      timezone: tz,
+      localTime: clock.hhmm,
+      localDay: clock.day,
+      open,
+      paused: isPaused(config, country),
+      nextOpenAt: nextOpenAt(config, country, now),
+      window: windowFor(config, country),
+      custom: !!config.countries[country],
+      ready,
+      customerReady: n.customer,
+      partnerReady: n.partner,
+    });
+  }
+  // Biggest pools first — that's the one whose window you care about.
+  countries.sort((a, b) => b.ready - a.ready || a.country.localeCompare(b.country));
+
+  return { config, countries, holding, sendable, summary: describeWindow(config.window) };
+}
+
 /* ------------------------------- status -------------------------------- */
 
 export interface AutomationLaneStatus {
@@ -278,11 +380,15 @@ export interface AutomationLaneStatus {
   config: AutomationLaneConfig;
   /** Pending leads of THIS audience that already have an email. */
   ready: number;
+  /** Of those, the ones whose country is inside its sending window now. */
+  readyNow: number;
   remaining: number;
   /** True while this lane is the one mid-run. */
   running: boolean;
   sentToday: number;
   nextEligibleAt: string | null; // this lane's cooldown end
+  /** Earliest moment a held-back country opens (null = nothing is held). */
+  windowOpensAt: string | null;
   lastRun: AutomationRun | null;
   /** Templates this lane has selected AND that still exist. */
   templates: { id: string; name: string; type: string }[];
@@ -302,6 +408,8 @@ export interface AutomationStatus {
   runs: AutomationRun[];
   /** Blockers that stop BOTH lanes (no key, ceiling reached). */
   blockers: string[];
+  /** Per-country sending windows and the local clock in each. */
+  schedule: ScheduleStatus;
 }
 
 async function selectedTemplates(ids: string[]): Promise<{ id: string; name: string; type: string }[]> {
@@ -315,11 +423,12 @@ async function selectedTemplates(ids: string[]): Promise<{ id: string; name: str
 
 export async function getAutomationStatus(): Promise<AutomationStatus> {
   const config = await getAutomationConfig();
-  const [today, last, runs, resendKey] = await Promise.all([
+  const [today, last, runs, resendKey, schedule] = await Promise.all([
     sentToday(),
     lastRealRun(),
     recentRuns(),
     getResendKey(),
+    getScheduleStatus(),
   ]);
 
   const dailyRemaining = config.dailyLimit > 0 ? Math.max(0, config.dailyLimit - today) : null;
@@ -328,11 +437,14 @@ export async function getAutomationStatus(): Promise<AutomationStatus> {
   if (config.requireResend && !resendKey) shared.push("No Resend API key — add one above so real emails can go out.");
   if (dailyRemaining === 0) shared.push(`Daily ceiling reached (${config.dailyLimit} sent today) — it resumes tomorrow.`);
 
+  const open = schedule.config.enabled ? schedule.countries.filter((c) => c.open).map((c) => c.country) : null;
+
   const lanes: AutomationLaneStatus[] = [];
   for (const audience of AUDIENCES) {
     const lane = config[audience];
-    const [ready, templates, laneSent, laneLast] = await Promise.all([
+    const [ready, readyNow, templates, laneSent, laneLast] = await Promise.all([
       countApprovableLeads(null, null, audience),
+      open ? countApprovableLeads(null, null, audience, open) : countApprovableLeads(null, null, audience),
       selectedTemplates(lane.templateIds),
       sentToday(audience),
       lastRealRun(audience),
@@ -341,17 +453,24 @@ export async function getAutomationStatus(): Promise<AutomationStatus> {
     if (!templates.length) {
       blockers.push(`No ${laneLabel(audience)} template chosen — pick the email this lane should send.`);
     }
+    // The soonest a country holding this lane's leads opens up.
+    const held = schedule.countries
+      .filter((c) => !c.open && (audience === "partner" ? c.partnerReady : c.customerReady) > 0 && c.nextOpenAt)
+      .map((c) => c.nextOpenAt as string)
+      .sort();
     lanes.push({
       audience,
       config: lane,
       ready,
-      remaining: Math.max(0, lane.threshold - ready),
+      readyNow,
+      remaining: Math.max(0, lane.threshold - readyNow),
       running: running && runningLane === audience,
       sentToday: laneSent,
       nextEligibleAt:
         laneLast && config.cooldownMinutes > 0
           ? new Date(new Date(laneLast.started_at).getTime() + config.cooldownMinutes * 60000).toISOString()
           : null,
+      windowOpensAt: held[0] || null,
       lastRun: laneLast,
       templates,
       blockers,
@@ -368,6 +487,7 @@ export async function getAutomationStatus(): Promise<AutomationStatus> {
     lastRun: last,
     runs,
     blockers: shared,
+    schedule,
   };
 }
 
@@ -406,7 +526,22 @@ export async function startAutomationRun(
 
   const config = await getAutomationConfig();
   const lane = config[audience];
-  const pool = await countApprovableLeads(null, null, audience);
+
+  // Only countries whose local window is open may be emailed. A MANUAL run is
+  // you deciding to send now, so it ignores the window entirely — same as it
+  // already ignores the trigger count and the cooldown.
+  const schedule = await getSchedule();
+  const openList = trigger === "manual" ? null : await openCountriesFor(schedule, audience);
+  const pool = await countApprovableLeads(null, null, audience, openList);
+
+  if (openList && !openList.length) {
+    const waiting = await countApprovableLeads(null, null, audience);
+    const note = waiting
+      ? `Outside the sending window everywhere — ${waiting.toLocaleString()} ${who} lead(s) are waiting for their country's local morning.`
+      : `No ${who} leads with an email are waiting.`;
+    if (trigger === "manual") return { started: false, audience, error: note };
+    return { started: false, audience, note };
+  }
 
   // ---- Safety checks -----------------------------------------------------
   const templates = await selectedTemplates(lane.templateIds);
@@ -451,7 +586,8 @@ export async function startAutomationRun(
      VALUES (?,?,?,?,'running',?,?,?)`,
     [runId, startedAt, trigger, audience, lane.threshold, pool, templateNames]
   );
-  alog(`▶ ${trigger} ${who} run — pool holds ${pool} emailable ${who} lead(s), taking ${batchSize} · template(s): ${templateNames}`);
+  const whereNote = openList ? ` · inside the window in ${openList.map((c) => (c === NO_COUNTRY ? "no-country" : c)).join(", ")}` : "";
+  alog(`▶ ${trigger} ${who} run — pool holds ${pool} emailable ${who} lead(s)${whereNote}, taking ${batchSize} · template(s): ${templateNames}`);
 
   const finishRun = (patchSql: string, params: any[]) =>
     q(patchSql, params).catch(() => {});
@@ -463,6 +599,7 @@ export async function startAutomationRun(
       limit: batchSize,
       oldestFirst: true,
       filterAudience: audience,
+      filterCountries: openList,
       category: lane.category || null,
       country: lane.country || null,
     });
@@ -551,6 +688,7 @@ async function automationTick(): Promise<void> {
   if (running) return;
   const config = await getAutomationConfig();
   if (!config.enabled) return;
+  const schedule = await getSchedule();
 
   // Both lanes are checked every tick, customer first. Only one may run at a
   // time (they share the sending domains), so the second one goes on the next
@@ -570,10 +708,16 @@ async function automationTick(): Promise<void> {
       if (last && Date.now() < new Date(last.started_at).getTime() + config.cooldownMinutes * 60000) continue;
     }
 
-    const ready = await countApprovableLeads(null, null, audience);
+    // Only the countries that are inside their own working hours count toward
+    // the trigger — otherwise a pool full of sleeping countries would fire a
+    // batch at 3am local time, which is the whole problem this solves.
+    const openList = await openCountriesFor(schedule, audience);
+    if (openList && !openList.length) continue;
+    const ready = await countApprovableLeads(null, null, audience, openList);
     if (ready < lane.threshold) continue;
 
-    alog(`${laneLabel(audience)} pool reached ${ready}/${lane.threshold} lead(s) with an email — starting an automated run`);
+    const where = openList ? ` in ${openList.map((c) => (c === NO_COUNTRY ? "no-country" : c)).join(", ")}` : "";
+    alog(`${laneLabel(audience)} pool reached ${ready}/${lane.threshold} lead(s) with an email${where} — starting an automated run`);
     await startAutomationRun("auto", audience);
     return; // one at a time; the next tick picks up the other lane
   }
@@ -588,6 +732,12 @@ export function startAutomationWorker(): void {
   (async () => {
     try {
       const c = await getAutomationConfig();
+      const s = await getSchedule();
+      alog(
+        s.enabled
+          ? `sending window → ${describeWindow(s.window)} in each country's OWN time zone`
+          : "sending window → OFF (batches go out the moment a lane's pool is full, whatever the local clock says)"
+      );
       if (!c.enabled) { alog("state → OFF (turn it on in Settings → Automation)"); return; }
       const parts: string[] = [];
       for (const a of AUDIENCES) {

@@ -288,13 +288,71 @@ export interface AutomationLaneStatus {
   config: AutomationLaneConfig;
   /** Pending leads of this audience that already have an email. */
   ready: number;
+  /** Of those, the ones whose country is inside its sending window now. */
+  readyNow: number;
   remaining: number;
   running: boolean;
   sentToday: number;
   nextEligibleAt: string | null;
+  /** When the soonest held-back country opens (null = nothing held). */
+  windowOpensAt: string | null;
   lastRun: AutomationRun | null;
   templates: { id: string; name: string; type: string }[];
   blockers: string[];
+}
+
+/* ---------------------------- Sending windows -------------------------- */
+
+// Outreach lands at the recipient's local desk, not on the server's clock, so
+// every country carries its own time zone and its own working hours.
+
+export interface SendWindow {
+  /** Minutes past local midnight. 9am = 540. */
+  start: number;
+  end: number;
+  /** Local weekdays the window is open on. 0 = Sunday. */
+  days: number[];
+}
+
+export interface CountryRule extends Partial<SendWindow> {
+  timezone?: string;
+  /** Hold this country entirely. */
+  paused?: boolean;
+}
+
+export interface ScheduleConfig {
+  enabled: boolean;
+  window: SendWindow;
+  countries: Record<string, CountryRule>;
+  fallbackTimezone: string;
+  sendUnknown: boolean;
+}
+
+export interface ScheduleCountryStatus {
+  /** Canonical country name, or `__none__`. */
+  country: string;
+  timezone: string;
+  /** "14:05" where they are, right now. */
+  localTime: string;
+  localDay: number;
+  open: boolean;
+  paused: boolean;
+  nextOpenAt: string | null;
+  window: SendWindow;
+  /** This country has its own rule rather than the default. */
+  custom: boolean;
+  ready: number;
+  customerReady: number;
+  partnerReady: number;
+}
+
+export interface ScheduleStatus {
+  config: ScheduleConfig;
+  countries: ScheduleCountryStatus[];
+  /** Leads sitting in a country whose window is shut. */
+  holding: number;
+  sendable: number;
+  summary: string;
 }
 
 export interface AutomationStatus {
@@ -309,6 +367,8 @@ export interface AutomationStatus {
   runs: AutomationRun[];
   /** Blockers that stop both lanes. */
   blockers: string[];
+  /** Per-country sending windows + the local clock in each. */
+  schedule: ScheduleStatus;
 }
 
 /* ---------------------------- Follow-up ladder ------------------------- */
@@ -322,18 +382,30 @@ export interface FollowUpStepConfig {
   delayHours: number;
 }
 
+/**
+ * One audience's ladder. Customers and partners get different pitches, so they
+ * get different retries — and saving one must never overwrite the other.
+ */
+export interface FollowUpLadder {
+  noOpen: FollowUpStepConfig[];  // [first retry, second retry]
+  noClick: FollowUpStepConfig[];
+}
+
 export interface FollowUpConfig {
   enabled: boolean;
   /** Ceiling per sequence, including the original email (2 or 3). */
   maxEmails: number;
-  noOpen: FollowUpStepConfig[];  // [first retry, second retry]
-  noClick: FollowUpStepConfig[];
+  customer: FollowUpLadder;
+  partner: FollowUpLadder;
   perMinute: number;
   dailyLimit: number;
   batchSize: number;
   /** Sequences whose last email is older than this are abandoned. */
   lookbackDays: number;
   requireResend: boolean;
+  /** Legacy mirror of the customer lane — read-only as far as the UI cares. */
+  noOpen?: FollowUpStepConfig[];
+  noClick?: FollowUpStepConfig[];
 }
 
 export interface FollowUpRun {
@@ -358,6 +430,7 @@ export interface FollowUpRun {
 }
 
 export interface FollowUpRung {
+  audience: Audience;
   branch: FollowUpBranch;
   step: number;                  // 1 = first retry, 2 = second
   templateId: string;
@@ -379,6 +452,9 @@ export interface FollowUpStatus {
   waiting: number;
   /** In a sequence, but the rung they'd take has no template. */
   unconfigured: number;
+  /** Due, but held until their country's sending window opens. */
+  holding: number;
+  holdingUntil: string | null;
   sentToday: number;
   dailyRemaining: number | null;
   /** App URL set = opens/clicks are actually tracked. */
@@ -389,7 +465,9 @@ export interface FollowUpStatus {
   totals: { retries: number; opened: number; clicked: number };
   templates: { id: string; name: string; type: string }[];
   blockers: string[];
-  dueSample: { email: string; branch: FollowUpBranch; step: number; dueAt: string }[];
+  /** Per lane, so an empty partner ladder can't hide behind a full one. */
+  laneBlockers: { audience: Audience; blockers: string[] }[];
+  dueSample: { email: string; audience: Audience; branch: FollowUpBranch; step: number; dueAt: string }[];
 }
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -617,6 +695,11 @@ export const api = {
   saveAutomation: (cfg: Partial<Omit<AutomationConfig, "customer" | "partner">> & {
     customer?: Partial<AutomationLaneConfig>;
     partner?: Partial<AutomationLaneConfig>;
+    // Sending windows ride along on the same save. A country mapped to null
+    // goes back to the default window.
+    schedule?: Partial<Omit<ScheduleConfig, "countries">> & {
+      countries?: Record<string, CountryRule | null>;
+    };
   }) => req<AutomationStatus>(`/api/automation`, { method: "POST", body: JSON.stringify(cfg) }),
   runAutomation: (audience: Audience = "customer") =>
     req<{ started: boolean; audience?: Audience; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
@@ -626,8 +709,14 @@ export const api = {
 
   // follow-up ladder — retry whoever didn't open / didn't click
   getFollowUp: () => req<FollowUpStatus>(`/api/followup`),
-  saveFollowUp: (cfg: Partial<FollowUpConfig>) =>
-    req<FollowUpStatus>(`/api/followup`, { method: "POST", body: JSON.stringify(cfg) }),
+  // Ladders are patched per audience: send only the lane you changed, and the
+  // other one is left exactly as it was.
+  saveFollowUp: (
+    cfg: Partial<Omit<FollowUpConfig, "customer" | "partner">> & {
+      customer?: Partial<FollowUpLadder>;
+      partner?: Partial<FollowUpLadder>;
+    }
+  ) => req<FollowUpStatus>(`/api/followup`, { method: "POST", body: JSON.stringify(cfg) }),
   runFollowUp: () =>
     req<{ started: boolean; runId?: string; jobId?: string; queued?: number; status: FollowUpStatus }>(
       `/api/followup/run`,

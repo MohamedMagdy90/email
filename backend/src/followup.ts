@@ -12,15 +12,27 @@
 // Hard ceiling of `maxEmails` per sequence (3 by default: the original + two
 // retries), so nobody can ever be walked round the ladder twice.
 //
+// TWO LADDERS. Customers and partners get completely different pitches, so they
+// get completely different retries: each audience has its own no-open and
+// no-click rungs, and a contact walks the ladder of the audience they were
+// tagged with. (They used to share one set of settings, which meant saving the
+// partner retries silently overwrote the customer ones.)
+//
 // The state is DERIVED from the sends table on every pass rather than stored in
 // a queue. That matters: an open that lands late, a bounce, an unsubscribe, a
 // template you delete, a run that crashes half way — all of it is simply the
 // next scan's input. There is no schedule to fall out of sync with reality.
+//
+// The one thing that is NOT derived from the ledger is WHEN: a retry that comes
+// due at 02:00 in the recipient's country waits for that country's sending
+// window (see ./schedule).
 
 import { q, nowIso, getSetting, setSetting } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
 import { runSendPlan, type SendPlanItem } from "./send";
 import { getResendKey } from "./resend";
+import { normalizeAudience, type Audience } from "./pool";
+import { getSchedule, isOpen, nextOpenAt, keyOf } from "./schedule";
 
 const uid = () => crypto.randomUUID();
 
@@ -50,6 +62,8 @@ let started = false;
 
 export type Branch = "no_open" | "no_click";
 export const MAX_STEPS = 2; // retries per sequence — the ladder has two rungs
+/** The two ladders, in the order everything iterates them. */
+export const AUDIENCES: Audience[] = ["customer", "partner"];
 
 /* ------------------------------- config -------------------------------- */
 
@@ -60,14 +74,27 @@ export interface FollowUpStepConfig {
   delayHours: number;
 }
 
-export interface FollowUpConfig {
-  enabled: boolean;
-  /** Ceiling per sequence, including the original email. 2 or 3. */
-  maxEmails: number;
+/**
+ * One audience's ladder.
+ *
+ * These used to be a single shared pair of rungs, which meant saving the
+ * partner retries overwrote the customer ones and vice versa — the two pitches
+ * were fighting over one set of settings. A contact's audience is decided by
+ * the source that found them, so the ladder they walk has to be too.
+ */
+export interface FollowUpLadder {
   /** They never opened. [first retry, second retry] */
   noOpen: FollowUpStepConfig[];
   /** They opened but never clicked. [first retry, second retry] */
   noClick: FollowUpStepConfig[];
+}
+
+export interface FollowUpConfig {
+  enabled: boolean;
+  /** Ceiling per sequence, including the original email. 2 or 3. */
+  maxEmails: number;
+  customer: FollowUpLadder;
+  partner: FollowUpLadder;
   perMinute: number;
   /** Max follow-ups per day. 0 = no ceiling. */
   dailyLimit: number;
@@ -80,18 +107,32 @@ export interface FollowUpConfig {
   lookbackDays: number;
   /** Refuse to run without a Resend key (never auto-"dry-run" a real list). */
   requireResend: boolean;
+  /**
+   * Mirror of the customer ladder, purely so an older frontend (or an
+   * integration written against the single-ladder API) keeps working.
+   * Writes to these are applied to the customer lane.
+   */
+  noOpen: FollowUpStepConfig[];
+  noClick: FollowUpStepConfig[];
 }
+
+const DEFAULT_LADDER = (): FollowUpLadder => ({
+  noOpen: [{ templateId: "", delayHours: 48 }, { templateId: "", delayHours: 96 }],
+  noClick: [{ templateId: "", delayHours: 48 }, { templateId: "", delayHours: 96 }],
+});
 
 export const FOLLOWUP_DEFAULTS: FollowUpConfig = {
   enabled: false,
   maxEmails: 3,
-  noOpen: [{ templateId: "", delayHours: 48 }, { templateId: "", delayHours: 96 }],
-  noClick: [{ templateId: "", delayHours: 48 }, { templateId: "", delayHours: 96 }],
+  customer: DEFAULT_LADDER(),
+  partner: DEFAULT_LADDER(),
   perMinute: 20,
   dailyLimit: 200,
   batchSize: 100,
   lookbackDays: 30,
   requireResend: true,
+  noOpen: DEFAULT_LADDER().noOpen,
+  noClick: DEFAULT_LADDER().noClick,
 };
 
 // Always returns exactly MAX_STEPS rungs, whatever is in storage — the UI and
@@ -102,15 +143,7 @@ function parseSteps(raw: string | null, fallback: FollowUpStepConfig[]): FollowU
     const parsed = raw ? JSON.parse(raw) : null;
     if (Array.isArray(parsed)) arr = parsed;
   } catch { /* fall through to defaults */ }
-  const out: FollowUpStepConfig[] = [];
-  for (let i = 0; i < MAX_STEPS; i++) {
-    const src = arr[i] || {};
-    out.push({
-      templateId: String(src.templateId || "").trim(),
-      delayHours: clamp(Number(src.delayHours) || fallback[i].delayHours, 1, 24 * 90),
-    });
-  }
-  return out;
+  return cleanSteps(arr, fallback);
 }
 
 function cleanSteps(input: any, fallback: FollowUpStepConfig[]): FollowUpStepConfig[] {
@@ -126,48 +159,101 @@ function cleanSteps(input: any, fallback: FollowUpStepConfig[]): FollowUpStepCon
   return out;
 }
 
+const ladderKey = (a: Audience, branch: "no_open" | "no_click") => `followup_${a}_${branch}`;
+
+// Before the two ladders existed there was one, and it belonged to what is now
+// the customer lane — so the customer lane reads the old keys as its fallback.
+// An existing install keeps its templates and waits without re-entering them.
+const LEGACY_KEY: Record<string, string> = {
+  no_open: "followup_no_open",
+  no_click: "followup_no_click",
+};
+
+async function ladderSetting(a: Audience, branch: "no_open" | "no_click"): Promise<string | null> {
+  const v = await getSetting(ladderKey(a, branch));
+  if (v != null) return v;
+  if (a === "customer") return await getSetting(LEGACY_KEY[branch]);
+  return null;
+}
+
+async function getLadder(a: Audience): Promise<FollowUpLadder> {
+  const d = DEFAULT_LADDER();
+  const [noOpen, noClick] = await Promise.all([
+    ladderSetting(a, "no_open"),
+    ladderSetting(a, "no_click"),
+  ]);
+  return { noOpen: parseSteps(noOpen, d.noOpen), noClick: parseSteps(noClick, d.noClick) };
+}
+
 export async function getFollowUpConfig(): Promise<FollowUpConfig> {
-  const [enabled, maxEmails, noOpen, noClick, perMinute, dailyLimit, batchSize, lookback, requireResend] =
+  const [enabled, maxEmails, perMinute, dailyLimit, batchSize, lookback, requireResend, customer, partner] =
     await Promise.all([
       getSetting("followup_enabled"),
       getSetting("followup_max_emails"),
-      getSetting("followup_no_open"),
-      getSetting("followup_no_click"),
       getSetting("followup_per_minute"),
       getSetting("followup_daily_limit"),
       getSetting("followup_batch_size"),
       getSetting("followup_lookback_days"),
       getSetting("followup_require_resend"),
+      getLadder("customer"),
+      getLadder("partner"),
     ]);
   return {
     enabled: enabled === "1",
     maxEmails: clamp(Number(maxEmails) || FOLLOWUP_DEFAULTS.maxEmails, 2, MAX_STEPS + 1),
-    noOpen: parseSteps(noOpen, FOLLOWUP_DEFAULTS.noOpen),
-    noClick: parseSteps(noClick, FOLLOWUP_DEFAULTS.noClick),
+    customer,
+    partner,
     perMinute: clamp(Number(perMinute) || FOLLOWUP_DEFAULTS.perMinute, 1, 120),
     dailyLimit: clamp(Number(dailyLimit ?? FOLLOWUP_DEFAULTS.dailyLimit), 0, 100000),
     batchSize: clamp(Number(batchSize) || FOLLOWUP_DEFAULTS.batchSize, 1, 2000),
     lookbackDays: clamp(Number(lookback) || FOLLOWUP_DEFAULTS.lookbackDays, 1, 365),
     requireResend: requireResend !== "0",
+    noOpen: customer.noOpen,
+    noClick: customer.noClick,
   };
 }
 
-export async function setFollowUpConfig(patch: Partial<FollowUpConfig>): Promise<FollowUpConfig> {
+/** The ladder a contact of this audience walks. */
+export function ladderOf(cfg: FollowUpConfig, audience: Audience): FollowUpLadder {
+  return audience === "partner" ? cfg.partner : cfg.customer;
+}
+
+export interface FollowUpConfigPatch
+  extends Partial<Omit<FollowUpConfig, "customer" | "partner" | "noOpen" | "noClick">> {
+  customer?: Partial<FollowUpLadder>;
+  partner?: Partial<FollowUpLadder>;
+  /** Legacy single-ladder fields — applied to the customer lane. */
+  noOpen?: FollowUpStepConfig[];
+  noClick?: FollowUpStepConfig[];
+}
+
+async function setLadder(a: Audience, patch: Partial<FollowUpLadder>): Promise<void> {
+  const d = DEFAULT_LADDER();
+  if (patch.noOpen) await setSetting(ladderKey(a, "no_open"), JSON.stringify(cleanSteps(patch.noOpen, d.noOpen)));
+  if (patch.noClick) await setSetting(ladderKey(a, "no_click"), JSON.stringify(cleanSteps(patch.noClick, d.noClick)));
+}
+
+export async function setFollowUpConfig(patch: FollowUpConfigPatch): Promise<FollowUpConfig> {
   if (typeof patch.enabled === "boolean") await setSetting("followup_enabled", patch.enabled ? "1" : "0");
   if (patch.maxEmails != null) await setSetting("followup_max_emails", String(clamp(Number(patch.maxEmails), 2, MAX_STEPS + 1)));
-  if (patch.noOpen) await setSetting("followup_no_open", JSON.stringify(cleanSteps(patch.noOpen, FOLLOWUP_DEFAULTS.noOpen)));
-  if (patch.noClick) await setSetting("followup_no_click", JSON.stringify(cleanSteps(patch.noClick, FOLLOWUP_DEFAULTS.noClick)));
   if (patch.perMinute != null) await setSetting("followup_per_minute", String(clamp(Number(patch.perMinute), 1, 120)));
   if (patch.dailyLimit != null) await setSetting("followup_daily_limit", String(clamp(Number(patch.dailyLimit), 0, 100000)));
   if (patch.batchSize != null) await setSetting("followup_batch_size", String(clamp(Number(patch.batchSize), 1, 2000)));
   if (patch.lookbackDays != null) await setSetting("followup_lookback_days", String(clamp(Number(patch.lookbackDays), 1, 365)));
   if (typeof patch.requireResend === "boolean") await setSetting("followup_require_resend", patch.requireResend ? "1" : "0");
+  // Lanes are written independently — that's the whole fix. Saving one never
+  // touches the other, and a legacy flat payload only ever writes the customer.
+  if (patch.customer) await setLadder("customer", patch.customer);
+  if (patch.partner) await setLadder("partner", patch.partner);
+  if (!patch.customer && (patch.noOpen || patch.noClick)) {
+    await setLadder("customer", { noOpen: patch.noOpen, noClick: patch.noClick });
+  }
 
   scanCache = null; // config drives the scan — never answer from a stale one
   const cfg = await getFollowUpConfig();
   if (typeof patch.enabled === "boolean") {
     flog(patch.enabled
-      ? `switched ON — up to ${cfg.maxEmails} emails per contact, retries ${cfg.noOpen[0].delayHours}h / ${cfg.noOpen[1].delayHours}h`
+      ? `switched ON — up to ${cfg.maxEmails} emails per contact, customer retries ${cfg.customer.noOpen[0].delayHours}h / ${cfg.customer.noOpen[1].delayHours}h`
       : "switched OFF — no retries will be sent");
     if (patch.enabled) setTimeout(() => { followUpTick().catch(() => {}); }, 1500);
   }
@@ -236,6 +322,9 @@ async function recordSkip(trigger: string, dueCount: number, note: string) {
 export interface DueFollowUp {
   contactId: string;
   email: string;
+  /** Which ladder this contact walks — decided by the contact's own tag. */
+  audience: Audience;
+  country: string;
   branch: Branch;
   step: number;          // 1 = first retry, 2 = second
   templateId: string;
@@ -249,15 +338,22 @@ export interface ScanResult {
   waiting: number;
   /** Eligible but the rung they'd take has no template — nothing will happen. */
   unconfigured: number;
-  /** Per rung: how many are due now and how many are still waiting. */
+  /** Due, but their country is outside its sending window right now. */
+  holding: number;
+  /** The soonest a held-back contact's country opens. */
+  holdingUntil: string | null;
+  /** Per rung (audience:branch:step): how many are due now and how many wait. */
   rungs: Record<string, { due: number; waiting: number; next: string | null }>;
   /** Sequences considered (capped at SCAN_CAP). */
   scanned: boolean;
 }
 
-const rungKey = (branch: Branch, step: number) => `${branch}:${step}`;
+const rungKey = (audience: Audience, branch: Branch, step: number) => `${audience}:${branch}:${step}`;
 
 let scanCache: { at: number; result: ScanResult } | null = null;
+
+/** Config changed under us — the next read must not answer from the old scan. */
+export function invalidateFollowUpScan() { scanCache = null; }
 
 /**
  * Read every live sequence back out of the sends ledger.
@@ -266,6 +362,9 @@ let scanCache: { at: number; result: ScanResult } | null = null;
  * (followup_step = 0) and covers everything sent after it. Counting from there
  * (rather than counting all sends ever) is what lets a contact who was mailed
  * in a campaign months ago still be followed up today.
+ *
+ * The contact's AUDIENCE and COUNTRY come back with the row: the first decides
+ * which ladder they walk, the second whether their country is awake yet.
  */
 export async function scanSequences(cfg: FollowUpConfig, force = false): Promise<ScanResult> {
   if (!force && scanCache && Date.now() - scanCache.at < SCAN_CACHE_MS) return scanCache.result;
@@ -274,6 +373,8 @@ export async function scanSequences(cfg: FollowUpConfig, force = false): Promise
   const rows = await q(
     `SELECT s.contact_id AS contact_id,
             MAX(s.contact_email) AS email,
+            MAX(COALESCE(c.audience,'customer')) AS audience,
+            MAX(COALESCE(c.country,'')) AS country,
             CAST(count(*) AS INTEGER) AS emails,
             CAST(COALESCE(SUM(s.open_count),0) AS INTEGER) AS opens,
             CAST(COALESCE(SUM(s.click_count),0) AS INTEGER) AS clicks,
@@ -298,14 +399,32 @@ export async function scanSequences(cfg: FollowUpConfig, force = false): Promise
     [cfg.maxEmails, cutoff, SCAN_CAP]
   );
 
+  const schedule = await getSchedule();
   const now = Date.now();
+  const at = new Date(now);
   const due: DueFollowUp[] = [];
   const rungs: Record<string, { due: number; waiting: number; next: string | null }> = {};
-  for (const b of ["no_open", "no_click"] as Branch[]) {
-    for (let s = 1; s <= MAX_STEPS; s++) rungs[rungKey(b, s)] = { due: 0, waiting: 0, next: null };
+  for (const a of AUDIENCES) {
+    for (const b of ["no_open", "no_click"] as Branch[]) {
+      for (let s = 1; s <= MAX_STEPS; s++) rungs[rungKey(a, b, s)] = { due: 0, waiting: 0, next: null };
+    }
   }
   let waiting = 0;
   let unconfigured = 0;
+  let holding = 0;
+  let holdingUntil: string | null = null;
+  // One decision per country, not per contact — a 4,000-row scan would
+  // otherwise format the same time zone thousands of times.
+  const openByCountry = new Map<string, { open: boolean; next: string | null }>();
+  const countryState = (raw: string) => {
+    const key = keyOf(raw);
+    let v = openByCountry.get(key);
+    if (!v) {
+      v = { open: isOpen(schedule, key, at), next: nextOpenAt(schedule, key, at) };
+      openByCountry.set(key, v);
+    }
+    return v;
+  };
 
   for (const r of rows) {
     const emails = Number(r.emails) || 0;
@@ -314,17 +433,28 @@ export async function scanSequences(cfg: FollowUpConfig, force = false): Promise
     // Re-decided every pass: someone who ignored email 1 but opened the first
     // retry has moved from the "no open" branch to the "opened, no click" one.
     const branch: Branch = Number(r.opens) > 0 ? "no_click" : "no_open";
-    const rung = (branch === "no_open" ? cfg.noOpen : cfg.noClick)[step - 1];
+    const audience = normalizeAudience(r.audience);
+    const ladder = ladderOf(cfg, audience);
+    const rung = (branch === "no_open" ? ladder.noOpen : ladder.noClick)[step - 1];
     if (!rung || !rung.templateId) { unconfigured++; continue; }
 
     const lastSentAt = String(r.last_sent_at);
     const dueAtMs = new Date(lastSentAt).getTime() + rung.delayHours * 3_600_000;
-    const key = rungKey(branch, step);
+    const key = rungKey(audience, branch, step);
     if (dueAtMs <= now) {
+      // The wait is over, but a retry at 3am is still a retry at 3am.
+      const state = countryState(String(r.country || ""));
+      if (!state.open) {
+        holding++;
+        if (state.next && (!holdingUntil || state.next < holdingUntil)) holdingUntil = state.next;
+        continue;
+      }
       rungs[key].due++;
       due.push({
         contactId: String(r.contact_id),
         email: String(r.email || ""),
+        audience,
+        country: String(r.country || ""),
         branch,
         step,
         templateId: rung.templateId,
@@ -343,7 +473,9 @@ export async function scanSequences(cfg: FollowUpConfig, force = false): Promise
   // out before one that came due a minute ago.
   due.sort((a, b) => (a.dueAt < b.dueAt ? -1 : a.dueAt > b.dueAt ? 1 : 0));
 
-  const result: ScanResult = { due, waiting, unconfigured, rungs, scanned: rows.length >= SCAN_CAP };
+  const result: ScanResult = {
+    due, waiting, unconfigured, holding, holdingUntil, rungs, scanned: rows.length >= SCAN_CAP,
+  };
   scanCache = { at: Date.now(), result };
   return result;
 }
@@ -351,6 +483,7 @@ export async function scanSequences(cfg: FollowUpConfig, force = false): Promise
 /* ------------------------------- status -------------------------------- */
 
 export interface FollowUpRungStatus {
+  audience: Audience;
   branch: Branch;
   step: number;
   templateId: string;
@@ -371,6 +504,9 @@ export interface FollowUpStatus {
   dueNow: number;
   waiting: number;
   unconfigured: number;
+  /** Due, but held until their country's sending window opens. */
+  holding: number;
+  holdingUntil: string | null;
   sentToday: number;
   dailyRemaining: number | null;
   trackingReady: boolean;
@@ -381,27 +517,34 @@ export interface FollowUpStatus {
   totals: { retries: number; opened: number; clicked: number };
   templates: { id: string; name: string; type: string }[];
   blockers: string[];
+  /** Per lane: is anything actually configured on it? */
+  laneBlockers: { audience: Audience; blockers: string[] }[];
   /** A handful of the contacts that would go out next — trust, but verify. */
-  dueSample: { email: string; branch: Branch; step: number; dueAt: string }[];
+  dueSample: { email: string; audience: Audience; branch: Branch; step: number; dueAt: string }[];
 }
 
-// Per-rung outcome of everything the ladder has ever sent.
+// Per-rung outcome of everything the ladder has ever sent, split by the
+// contact's audience so each lane's numbers are its own.
 async function rungPerformance(): Promise<Map<string, { sent: number; opened: number; clicked: number }>> {
   const rows = await q(
-    `SELECT followup_step AS step, followup_branch AS branch,
+    `SELECT s.followup_step AS step, s.followup_branch AS branch,
+            COALESCE(c.audience,'customer') AS audience,
             CAST(count(*) AS INTEGER) AS sent,
-            CAST(SUM(CASE WHEN open_count > 0 THEN 1 ELSE 0 END) AS INTEGER) AS opened,
-            CAST(SUM(CASE WHEN click_count > 0 THEN 1 ELSE 0 END) AS INTEGER) AS clicked
-       FROM sends
-      WHERE status LIKE 'sent%' AND COALESCE(followup_step,0) > 0
-      GROUP BY followup_step, followup_branch`
+            CAST(SUM(CASE WHEN s.open_count > 0 THEN 1 ELSE 0 END) AS INTEGER) AS opened,
+            CAST(SUM(CASE WHEN s.click_count > 0 THEN 1 ELSE 0 END) AS INTEGER) AS clicked
+       FROM sends s
+       LEFT JOIN contacts c ON c.id = s.contact_id
+      WHERE s.status LIKE 'sent%' AND COALESCE(s.followup_step,0) > 0
+      GROUP BY s.followup_step, s.followup_branch, COALESCE(c.audience,'customer')`
   );
   const m = new Map<string, { sent: number; opened: number; clicked: number }>();
   for (const r of rows) {
-    m.set(`${String(r.branch || "no_open")}:${Number(r.step)}`, {
-      sent: Number(r.sent) || 0,
-      opened: Number(r.opened) || 0,
-      clicked: Number(r.clicked) || 0,
+    const key = `${normalizeAudience(r.audience)}:${String(r.branch || "no_open")}:${Number(r.step)}`;
+    const cur = m.get(key) || { sent: 0, opened: 0, clicked: 0 };
+    m.set(key, {
+      sent: cur.sent + (Number(r.sent) || 0),
+      opened: cur.opened + (Number(r.opened) || 0),
+      clicked: cur.clicked + (Number(r.clicked) || 0),
     });
   }
   return m;
@@ -425,32 +568,37 @@ export async function getFollowUpStatus(): Promise<FollowUpStatus> {
   const trackingReady = !!String(appUrl || process.env.APP_URL || "").trim();
 
   const rungs: FollowUpRungStatus[] = [];
-  for (const branch of ["no_open", "no_click"] as Branch[]) {
-    const ladder = branch === "no_open" ? config.noOpen : config.noClick;
-    for (let step = 1; step <= MAX_STEPS; step++) {
-      const cfgStep = ladder[step - 1];
-      const live = scan.rungs[rungKey(branch, step)] || { due: 0, waiting: 0, next: null };
-      const p = perf.get(`${branch}:${step}`) || { sent: 0, opened: 0, clicked: 0 };
-      rungs.push({
-        branch,
-        step,
-        templateId: cfgStep.templateId,
-        templateName: byId.get(cfgStep.templateId)?.name ?? null,
-        delayHours: cfgStep.delayHours,
-        due: live.due,
-        waiting: live.waiting,
-        nextDueAt: live.next,
-        sent: p.sent,
-        opened: p.opened,
-        clicked: p.clicked,
-      });
+  for (const audience of AUDIENCES) {
+    const ladder = ladderOf(config, audience);
+    for (const branch of ["no_open", "no_click"] as Branch[]) {
+      const steps = branch === "no_open" ? ladder.noOpen : ladder.noClick;
+      for (let step = 1; step <= MAX_STEPS; step++) {
+        const cfgStep = steps[step - 1];
+        const live = scan.rungs[rungKey(audience, branch, step)] || { due: 0, waiting: 0, next: null };
+        const p = perf.get(`${audience}:${branch}:${step}`) || { sent: 0, opened: 0, clicked: 0 };
+        rungs.push({
+          audience,
+          branch,
+          step,
+          templateId: cfgStep.templateId,
+          templateName: byId.get(cfgStep.templateId)?.name ?? null,
+          delayHours: cfgStep.delayHours,
+          due: live.due,
+          waiting: live.waiting,
+          nextDueAt: live.next,
+          sent: p.sent,
+          opened: p.opened,
+          clicked: p.clicked,
+        });
+      }
     }
   }
 
   // A rung whose template was deleted is configured-but-broken: say so loudly,
   // otherwise the ladder silently stops one rung in.
-  const missing = rungs.filter((r) => r.templateId && !r.templateName && r.step < config.maxEmails);
-  const active = rungs.filter((r) => r.templateId && r.templateName && r.step < config.maxEmails);
+  const usable = (r: FollowUpRungStatus) => r.step < config.maxEmails;
+  const missing = rungs.filter((r) => r.templateId && !r.templateName && usable(r));
+  const active = rungs.filter((r) => r.templateId && r.templateName && usable(r));
 
   const blockers: string[] = [];
   if (!active.length) blockers.push("No retry template chosen — pick what each rung of the ladder should send.");
@@ -458,6 +606,19 @@ export async function getFollowUpStatus(): Promise<FollowUpStatus> {
   if (!trackingReady) blockers.push("App URL isn't set (Settings → Resend) — without it opens and clicks can't be tracked, so every contact would look like a non-opener.");
   if (config.requireResend && !resendKey) blockers.push("No Resend API key — add one above so real retries can go out.");
   if (dailyRemaining === 0) blockers.push(`Daily ceiling reached (${config.dailyLimit} retries sent today) — it resumes tomorrow.`);
+
+  // Per lane, so "the partner ladder is empty" can't hide behind a configured
+  // customer ladder — the exact confusion that made these two share settings.
+  const laneBlockers = AUDIENCES.map((audience) => {
+    const mine = rungs.filter((r) => r.audience === audience && usable(r));
+    const list: string[] = [];
+    if (!mine.some((r) => r.templateId)) {
+      list.push(`No ${audience} retry chosen — contacts tagged ${audience} get one email and silence.`);
+    }
+    const gone = mine.filter((r) => r.templateId && !r.templateName);
+    if (gone.length) list.push(`${gone.length} rung(s) point at a deleted template.`);
+    return { audience, blockers: list };
+  });
 
   const totals = rungs.reduce(
     (acc, r) => ({ retries: acc.retries + r.sent, opened: acc.opened + r.opened, clicked: acc.clicked + r.clicked }),
@@ -470,6 +631,8 @@ export async function getFollowUpStatus(): Promise<FollowUpStatus> {
     dueNow: scan.due.length,
     waiting: scan.waiting,
     unconfigured: scan.unconfigured,
+    holding: scan.holding,
+    holdingUntil: scan.holdingUntil,
     sentToday: today,
     dailyRemaining,
     trackingReady,
@@ -479,7 +642,8 @@ export async function getFollowUpStatus(): Promise<FollowUpStatus> {
     totals,
     templates: [...byId.values()],
     blockers,
-    dueSample: scan.due.slice(0, 6).map((d) => ({ email: d.email, branch: d.branch, step: d.step, dueAt: d.dueAt })),
+    laneBlockers,
+    dueSample: scan.due.slice(0, 6).map((d) => ({ email: d.email, audience: d.audience, branch: d.branch, step: d.step, dueAt: d.dueAt })),
   };
 }
 
@@ -502,9 +666,13 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
   const config = await getFollowUpConfig();
 
   // ---- Safety checks -----------------------------------------------------
-  const configured =
-    config.noOpen.some((s, i) => s.templateId && i + 1 < config.maxEmails) ||
-    config.noClick.some((s, i) => s.templateId && i + 1 < config.maxEmails);
+  const configured = AUDIENCES.some((a) => {
+    const l = ladderOf(config, a);
+    return (
+      l.noOpen.some((s, i) => s.templateId && i + 1 < config.maxEmails) ||
+      l.noClick.some((s, i) => s.templateId && i + 1 < config.maxEmails)
+    );
+  });
   if (!configured) {
     const note = "No retry template selected — nothing was sent.";
     await recordSkip(trigger, 0, note);
@@ -538,7 +706,9 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
   // pass has already emailed.
   const scan = await scanSequences(config, true);
   if (!scan.due.length) {
-    const note = scan.waiting
+    const note = scan.holding
+      ? `${scan.holding.toLocaleString()} retry(ies) are ready but their country is outside its sending window — they go out when it opens.`
+      : scan.waiting
       ? `Nothing is due yet — ${scan.waiting.toLocaleString()} contact(s) are still inside their wait.`
       : "No contact is waiting on a follow-up.";
     if (trigger === "manual") return { started: false, error: note };
@@ -552,10 +722,11 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
   const runId = uid();
   const startedAt = nowIso();
 
-  const counts = { no_open: 0, no_click: 0, retry1: 0, retry2: 0 };
+  const counts = { no_open: 0, no_click: 0, retry1: 0, retry2: 0, customer: 0, partner: 0 };
   for (const d of batch) {
     if (d.branch === "no_open") counts.no_open++; else counts.no_click++;
     if (d.step === 1) counts.retry1++; else counts.retry2++;
+    if (d.audience === "partner") counts.partner++; else counts.customer++;
   }
 
   const names = await templateNames([...new Set(batch.map((b) => b.templateId))]);
@@ -566,7 +737,9 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
   );
   flog(
     `▶ ${trigger} pass — ${scan.due.length} due, sending ${batch.length} ` +
-    `(${counts.no_open} no-open · ${counts.no_click} opened-no-click · ${counts.retry1} first retry · ${counts.retry2} second)`
+    `(${counts.customer} customer · ${counts.partner} partner · ${counts.no_open} no-open · ` +
+    `${counts.no_click} opened-no-click · ${counts.retry1} first retry · ${counts.retry2} second)` +
+    (scan.holding ? ` · ${scan.holding} held outside their window` : "")
   );
 
   const plan: SendPlanItem[] = batch.map((d) => ({
@@ -602,7 +775,7 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
           Number(r.failed || 0),
           Number(r.skipped || 0),
           job.error || null,
-          `${counts.retry1} first retry · ${counts.retry2} second retry · ${counts.no_open} never opened · ${counts.no_click} opened but never clicked.`,
+          `${counts.customer} customer · ${counts.partner} partner · ${counts.retry1} first retry · ${counts.retry2} second retry · ${counts.no_open} never opened · ${counts.no_click} opened but never clicked.`,
           runId,
         ]
       ).catch(() => {});
@@ -649,7 +822,8 @@ export function startFollowUpWorker(): void {
       const scan = await scanSequences(c, true);
       flog(
         `state → ON · up to ${c.maxEmails} emails per contact · ${scan.due.length} due, ` +
-        `${scan.waiting} waiting · ${c.perMinute}/min · daily cap ${c.dailyLimit || "none"}`
+        `${scan.waiting} waiting${scan.holding ? `, ${scan.holding} outside their window` : ""} · ` +
+        `${c.perMinute}/min · daily cap ${c.dailyLimit || "none"}`
       );
     } catch { /* ignore */ }
   })();

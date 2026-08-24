@@ -53,6 +53,13 @@ export function discoveredWhere(opts: {
   country?: string | null;
   /** Blank / omitted = both audiences. */
   audience?: string | null;
+  /**
+   * Restrict to a SET of countries (the send-window gate: only the countries
+   * whose local window is open right now). `__none__` in the list means "leads
+   * with no country on file". An empty array matches nothing, which is the
+   * honest answer when every window is shut.
+   */
+  countries?: string[] | null;
 }) {
   const where: string[] = [];
   const params: any[] = [];
@@ -66,6 +73,19 @@ export function discoveredWhere(opts: {
   if (country) {
     if (country === NO_COUNTRY) where.push(`(country IS NULL OR country = '')`);
     else { where.push(`lower(country) = ?`); params.push(country.toLowerCase()); }
+  }
+  if (Array.isArray(opts.countries)) {
+    const list = opts.countries.map((c) => String(c || "").trim()).filter(Boolean);
+    const wantsNone = list.includes(NO_COUNTRY);
+    const named = list.filter((c) => c !== NO_COUNTRY);
+    const parts: string[] = [];
+    if (named.length) {
+      parts.push(`lower(country) IN (${named.map(() => "?").join(",")})`);
+      params.push(...named.map((c) => c.toLowerCase()));
+    }
+    if (wantsNone) parts.push(`(country IS NULL OR country = '')`);
+    // No open country at all — match nothing rather than everything.
+    where.push(parts.length ? `(${parts.join(" OR ")})` : `1 = 0`);
   }
   if (search) {
     const like = `%${String(search).toLowerCase()}%`;
@@ -81,11 +101,27 @@ export function discoveredWhere(opts: {
 export async function countApprovableLeads(
   search?: string | null,
   country?: string | null,
-  audience?: string | null
+  audience?: string | null,
+  countries?: string[] | null
 ): Promise<number> {
-  const { clause, params } = discoveredWhere({ status: "pending", q: search, hasEmail: true, country, audience });
+  const { clause, params } = discoveredWhere({ status: "pending", q: search, hasEmail: true, country, audience, countries });
   const r = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params);
   return Number(r[0]?.n ?? 0);
+}
+
+/** Emailable pending leads grouped by country — what the schedule panel reads. */
+export async function approvableByCountry(
+  audience?: string | null
+): Promise<{ country: string; n: number }[]> {
+  const { clause, params } = discoveredWhere({ status: "pending", hasEmail: true, audience });
+  const rows = await q(
+    `SELECT COALESCE(NULLIF(country,''), '${NO_COUNTRY}') AS country, CAST(count(*) AS INTEGER) AS n
+       FROM discovered_leads ${clause}
+      GROUP BY COALESCE(NULLIF(country,''), '${NO_COUNTRY}')
+      ORDER BY count(*) DESC`,
+    params
+  );
+  return rows.map((r) => ({ country: String(r.country), n: Number(r.n) || 0 }));
 }
 
 /* ----------------------------- approving ------------------------------ */
@@ -102,6 +138,7 @@ export interface ApproveOptions {
   all?: boolean;
   q?: string | null;
   filterCountry?: string | null; // which rows to act on (matches the table's filter)
+  filterCountries?: string[] | null; // only these countries (the open send windows)
   filterAudience?: string | null; // customer | partner (blank = both)
   category?: string | null;      // contact category to save them under
   country?: string | null;       // country override (blank = keep the lead's own)
@@ -123,7 +160,8 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
   let leads: any[];
   if (opts.all === true) {
     const { clause, params } = discoveredWhere({
-      status: "pending", q: opts.q, hasEmail: true, country: opts.filterCountry, audience: opts.filterAudience,
+      status: "pending", q: opts.q, hasEmail: true, country: opts.filterCountry,
+      audience: opts.filterAudience, countries: opts.filterCountries,
     });
     const limit = Math.max(1, Math.min(Number(opts.limit) || 5000, 20000));
     const order = opts.oldestFirst ? `ORDER BY created_at ASC, id ASC` : "";

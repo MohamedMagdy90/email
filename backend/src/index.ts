@@ -27,6 +27,7 @@ import {
   setAutomationConfig,
   startAutomationRun,
 } from "./automation";
+import { setSchedule, type CountryRule } from "./schedule";
 import {
   startFollowUpWorker,
   getFollowUpStatus,
@@ -1612,6 +1613,40 @@ app.post("/api/automation", async (c) => {
     cooldownMinutes: b.cooldownMinutes != null ? Number(b.cooldownMinutes) : undefined,
     requireResend: typeof b.requireResend === "boolean" ? b.requireResend : undefined,
   });
+  // The sending windows ride along on the same save, so the Automation card is
+  // still one screen with one Save button.
+  if (b.schedule && typeof b.schedule === "object") {
+    const s = b.schedule;
+    const win = (v: any) =>
+      v && typeof v === "object"
+        ? {
+            start: v.start != null ? Number(v.start) : undefined,
+            end: v.end != null ? Number(v.end) : undefined,
+            days: Array.isArray(v.days) ? v.days.map((d: any) => Number(d)) : undefined,
+          }
+        : undefined;
+    // A country posted as null means "go back to the default window".
+    let countries: Record<string, CountryRule | null> | undefined;
+    if (s.countries && typeof s.countries === "object") {
+      countries = {};
+      for (const [k, v] of Object.entries<any>(s.countries)) {
+        if (v === null) { countries[k] = null; continue; }
+        if (!v || typeof v !== "object") continue;
+        countries[k] = {
+          ...win(v),
+          timezone: typeof v.timezone === "string" ? v.timezone : undefined,
+          paused: v.paused === true,
+        };
+      }
+    }
+    await setSchedule({
+      enabled: typeof s.enabled === "boolean" ? s.enabled : undefined,
+      window: win(s.window),
+      countries,
+      fallbackTimezone: typeof s.fallbackTimezone === "string" ? s.fallbackTimezone : undefined,
+      sendUnknown: typeof s.sendUnknown === "boolean" ? s.sendUnknown : undefined,
+    });
+  }
   return c.json(await getAutomationStatus());
 });
 
@@ -1643,6 +1678,17 @@ function parseLadder(input: any): { templateId: string; delayHours: number }[] |
   return out;
 }
 
+// One audience's pair of ladders. Absent branches are left exactly as they are,
+// so saving the partner lane can never touch the customer lane — which is the
+// bug this shape exists to make impossible.
+function parseLane(input: any) {
+  if (!input || typeof input !== "object") return undefined;
+  const noOpen = parseLadder(input.noOpen);
+  const noClick = parseLadder(input.noClick);
+  if (!noOpen && !noClick) return undefined;
+  return { noOpen, noClick };
+}
+
 app.get("/api/followup", async (c) => c.json(await getFollowUpStatus()));
 
 app.post("/api/followup", async (c) => {
@@ -1650,8 +1696,11 @@ app.post("/api/followup", async (c) => {
   await setFollowUpConfig({
     enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
     maxEmails: b.maxEmails != null ? Number(b.maxEmails) : undefined,
-    noOpen: parseLadder(b.noOpen),
-    noClick: parseLadder(b.noClick),
+    customer: parseLane(b.customer),
+    partner: parseLane(b.partner),
+    // Legacy flat payload (an older frontend) → the customer lane.
+    noOpen: b.customer ? undefined : parseLadder(b.noOpen),
+    noClick: b.customer ? undefined : parseLadder(b.noClick),
     perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
     dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
     batchSize: b.batchSize != null ? Number(b.batchSize) : undefined,
