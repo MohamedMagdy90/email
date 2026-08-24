@@ -1,0 +1,115 @@
+name: same-apply-schedule
+
+on:
+  push:
+    branches:
+      - same/apply-schedule-payload
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Assert the expected base commit
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD)"
+          echo "base=$base"
+          test "$base" = "6af1658e3611f701479e348f70a3cb0e54915918"
+
+      - name: Download the payload and check its digest
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 5 --retry-delay 3 --max-time 180 -o /tmp/payload.tar.gz "https://litter.catbox.moe/jw0ye0.gz"
+          ls -l /tmp/payload.tar.gz
+          echo "d13f85a6e8943bbde0356a0e0bcc14e0f05e086c8c3eb8e1a403eff4e9ea6222  /tmp/payload.tar.gz" | sha256sum -c -
+
+      - name: Unpack it over the checkout
+        run: |
+          set -euo pipefail
+          tar tzvf /tmp/payload.tar.gz
+          tar xzf /tmp/payload.tar.gz -C .
+
+      - name: Verify every file is byte-exact
+        run: |
+          set -euo pipefail
+          cat > /tmp/expected.txt <<'SHAS'
+          6134d6a39ca9db8c9a7c00c35de5d55cd4830853 backend/src/schedule.ts
+          689a77c1d5b39ef4259da69b041e6f70c4318b26 backend/src/pool.ts
+          74ed5a1db617f29231c6e23194e0526fc34f8caf backend/src/automation.ts
+          54eb5673f048c6cf58d1107c73e26bb5a9de2fb3 backend/src/followup.ts
+          869d925e6ce7109cde084a935eeca99cd8c08c04 backend/src/index.ts
+          6a0d921d7245ea6e260d5330b81e24186f858a6b backend/scripts/verify-schedule.ts
+          b61d66b74a1e10dee49db4cba0ad032e34c4272c backend/package.json
+          ea9c8b8ac05349774ec6c87823bb6776372b840f frontend/src/lib/api.ts
+          9483bc82ed794d0b28dac6acb676f269c9ea739a frontend/src/lib/ui.tsx
+          3b660b73eb9571dead585c0fb3caf761aac647ea frontend/src/screens/Automation.tsx
+          839e1c9755d4dc896a25f1af9efac20f7a8e4864 frontend/src/screens/Discovery.tsx
+          c2dc81c925f69d4330f4f664bb422ad2a84d2588 frontend/src/screens/FollowUp.tsx
+          bfa6a0ae5dce2ff34e246fb564e5e6480c4e5e75 .same/todos.md
+          SHAS
+          fail=0
+          while read -r want path; do
+            if [ -n "${want:-}" ]; then
+              got="$(git hash-object "$path")"
+              if [ "$got" = "$want" ]; then
+                echo "ok   $path  $got"
+              else
+                echo "FAIL $path want=$want got=$got"
+                fail=1
+              fi
+            fi
+          done < /tmp/expected.txt
+          test "$fail" -eq 0
+          echo "--- working tree status ---"
+          git status --porcelain
+          changed="$(git status --porcelain | wc -l)"
+          echo "changed paths: $changed"
+          test "$changed" -eq 13
+
+      - name: Commit onto main
+        run: |
+          set -euo pipefail
+          git config user.name "Same"
+          git config user.email "noreply@same.new"
+          git add -- \
+            backend/src/schedule.ts \
+            backend/src/pool.ts \
+            backend/src/automation.ts \
+            backend/src/followup.ts \
+            backend/src/index.ts \
+            backend/scripts/verify-schedule.ts \
+            backend/package.json \
+            frontend/src/lib/api.ts \
+            frontend/src/lib/ui.tsx \
+            frontend/src/screens/Automation.tsx \
+            frontend/src/screens/Discovery.tsx \
+            frontend/src/screens/FollowUp.tsx \
+            .same/todos.md
+          cat > /tmp/msg.txt <<'MSG'
+          Separate partner retries, add per-country sending windows
+
+          - follow-up: customer and partner each get their own no-open / no-click
+            ladder; the old shared keys are read as the customer lane's fallback, so
+            saving one lane can no longer overwrite the other
+          - schedule.ts: per-country IANA time zones and send windows; the automation
+            only approves and emails leads whose country is inside its own working
+            hours, and retries that come due at 3am local are held until morning
+          - discovery: the three pool-maintenance tools are compact icon buttons
+
+          🤖 Generated with [Same](https://same.new)
+
+          Co-Authored-By: Same <noreply@same.new>
+          MSG
+          git commit -F /tmp/msg.txt
+          git --no-pager log -1 --stat
+          git push origin HEAD:main
+          echo "new head: $(git rev-parse HEAD)"
+          echo "NEW_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
