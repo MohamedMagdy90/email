@@ -1,3 +1,53 @@
+# Stale sources: switch them off, and stop the note eating the row (2026-08-25) ✅
+
+## 1. The stale note was a paragraph in a 100px column
+On a 390px screen the source row is `switch | text (flex-1) | actions (shrink-0)`.
+The four action buttons are ~250px and never shrink, so the text column got what
+was left — about 100px — and every line broke one word at a time. The title was
+squeezed out of existence entirely and the stale sentence ran thirteen lines,
+taller than the row it was describing.
+- [x] Actions drop to their own line under `sm`, so the text column gets the full
+      row width. Same markup rendered in two places rather than two variants
+- [x] The note is a full-width strip under the row, not a third line inside the
+      middle column, with a top rule so it reads as a footnote to the source
+- [x] Copy cut to what is actually actionable: `5 dry runs · last find 12d ago`
+      (or `never found anyone`), plus `off at 4` while it is still running, and a
+      `Re-aim` link. The rest moved to the `title`
+
+## 2. A flagged source kept running anyway
+Flagging a spent source but leaving it scanning means it keeps spending crawl
+budget, rate-limit headroom and reader quota on ground it has already covered —
+every barren run is taken from a source that would have found someone.
+- [x] `STALE_OFF_AFTER_RUNS = 4`, alongside the existing flag at 2 — two
+      thresholds so there is a warning before the switch actually moves
+- [x] `barrenState()` now also returns `off` / `enabled` / `autoOff`; all three
+      source types write `enabled` and `auto_off` with the rest of the batch
+- [x] `off` requires the run to have COUNTED, for the same reason it can't raise
+      the streak: a blocked source has not been shown to be empty. It also
+      requires the source to have been ON, so the transition (and its log line)
+      fires once rather than on every later run
+- [x] `cont` is false when a source switches itself off — otherwise a directory
+      or search would keep streaming a source it had just disabled
+- [x] `auto_off` column so the row can say "switched off" instead of looking
+      like somebody paused it by hand
+- [x] Switching it back on BY HAND clears the counter. Without that the bot runs
+      it once, sees the same dry result and switches it straight off again,
+      which reads as a broken toggle. Only a real 0 → 1 transition counts, so
+      re-scheduling or re-saving an already-on source keeps its history
+- [x] A manual "Run now" DOES count — it restarts a finished source from the
+      top, so a full pass that finds nobody is the strongest evidence there is
+
+**Verified.** 12/12 offline checks on the threshold logic: the streak counts
+1–5, flags at 2, switches off exactly at 4 and does not re-fire at 5; a blocked
+run neither advances it nor switches off even at 9; a find resets it. Live over
+HTTP: bot-off source shows `enabled=0 barren_runs=5 auto_off=1 staleCount=1` →
+switched on by hand → `enabled=1 barren_runs=0 auto_off=0 staleCount=0`; changing
+only the interval, and re-saving an already-on source, both leave `barren_runs=3`
+untouched; re-aiming it at a new country clears it. Both typechecks and the vite
+build are clean.
+
+---
+
 # Overview repair + stale sources (2026-08-25) ✅ shipped & verified
 
 ## 1. "Emails sent · last 14 days" bars were all flat

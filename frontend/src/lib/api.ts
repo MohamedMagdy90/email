@@ -151,6 +151,7 @@ export interface DiscoveryStatus {
   // single new lead. Optional: a frontend can be newer than the API it talks to.
   staleSources?: number;
   staleAfterRuns?: number;
+  staleOffAfterRuns?: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads still auto-retrying after a block/error.
@@ -214,13 +215,19 @@ export interface DiscoverySource {
   barren_runs?: number;
   last_found?: number;
   last_found_at?: string | null;
+  /** 1 when the BOT switched this off for being spent, not a person. */
+  auto_off?: number;
   created_at: string;
 }
 
 /** Has this source run itself dry? (mirrors STALE_AFTER_RUNS on the server) */
 export const STALE_AFTER_RUNS = 2;
+/** …and after this many dry runs the bot switches it off by itself. */
+export const STALE_OFF_AFTER_RUNS = 4;
 export const isStaleSource = (s: DiscoverySource, after = STALE_AFTER_RUNS) =>
   (s.barren_runs ?? 0) >= after;
+/** Switched off by the bot for being spent — not paused by a person. */
+export const isAutoOff = (s: DiscoverySource) => !s.enabled && !!s.auto_off;
 
 export interface DiscoveredLead {
   id: string;
@@ -773,7 +780,7 @@ export const api = {
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
   purgeJunkLeads: () => req<{ swept: number }>(`/api/discovery/purge-junk`, { method: "POST", body: "{}" }),
   getDiscoverySources: (archived = false) =>
-    req<{ sources: DiscoverySource[]; archivedCount: number; staleCount?: number; staleAfterRuns?: number }>(
+    req<{ sources: DiscoverySource[]; archivedCount: number; staleCount?: number; staleAfterRuns?: number; staleOffAfterRuns?: number }>(
       `/api/discovery/sources${archived ? "?archived=1" : ""}`
     ),
   // Retire a source without deleting it — the bot stops scheduling it, but its
@@ -873,10 +880,12 @@ export const api = {
         active: number;
         stale: number;
         staleAfterRuns: number;
+        staleOffAfterRuns?: number;
         staleList: {
           id: string; type?: string; location: string; base_url?: string | null;
           category?: string; audience?: string | null; runs?: number; total_found?: number;
           barren_runs?: number; last_found_at?: string | null; last_run_at?: string | null;
+          enabled?: number; auto_off?: number;
         }[];
       };
     }>(`/api/overview`),

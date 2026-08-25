@@ -9,6 +9,7 @@ import {
   type Place,
   STALE_AFTER_RUNS,
   isStaleSource,
+  STALE_OFF_AFTER_RUNS,
 } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo, takeFocus } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
@@ -103,6 +104,9 @@ export default function Discovery() {
   // the server so the badge and the Overview's count can never disagree; the
   // shared constant is only a fallback for an API that predates the field.
   const [staleAfterRuns, setStaleAfterRuns] = useState(STALE_AFTER_RUNS);
+  // …and how many make the bot switch it off by itself. Two thresholds, so the
+  // row can warn ("off at 4") before the switch actually moves.
+  const [staleOffAfterRuns, setStaleOffAfterRuns] = useState(STALE_OFF_AFTER_RUNS);
 
   const pollRef = useRef<number | null>(null);
   const sourcesRef = useRef<HTMLDivElement | null>(null);
@@ -120,6 +124,7 @@ export default function Discovery() {
       setSources(r.sources);
       setArchivedCount(r.archivedCount ?? 0);
       if (r.staleAfterRuns) setStaleAfterRuns(r.staleAfterRuns);
+      if (r.staleOffAfterRuns) setStaleOffAfterRuns(r.staleOffAfterRuns);
     } catch { /* ignore */ }
   }
   async function refreshArchived() {
@@ -586,6 +591,7 @@ export default function Discovery() {
                       onEdit={() => { setEditing(s); setModalOpen(true); }}
                       onArchive={() => archiveSource(s)}
                       onDelete={() => removeSource(s)}
+                      staleOffAfterRuns={staleOffAfterRuns}
                     />
                   ))}
                 </div>
@@ -1114,7 +1120,7 @@ export function AutomationLaneBars({
 
 /* ------------------------------ Source row ----------------------------- */
 
-function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, staleAfterRuns }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void; stale?: boolean; staleAfterRuns?: number }) {
+function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, staleAfterRuns, staleOffAfterRuns }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void; stale?: boolean; staleAfterRuns?: number; staleOffAfterRuns?: number }) {
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const isSearch = s.type === "search";
@@ -1125,99 +1131,132 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, sta
   // Map area: how much of what OpenStreetMap actually holds here we've taken.
   const osmTiles = s.osm_tiles || 0;
   const osmAvail = s.osm_available || 0;
+  // Switched off by the BOT for being spent, as opposed to paused by a person —
+  // the row has to say which, or the toggle looks like it moved on its own.
+  const autoOff = !s.enabled && !!s.auto_off;
+  const dryRuns = s.barren_runs ?? staleAfterRuns ?? 0;
+  const offAt = staleOffAfterRuns ?? 4;
+
+  // Rendered twice — inline on a wide row, on its own line under a narrow one.
+  // Beside the text on a phone these buttons are `shrink-0` and leave the
+  // column so thin that the status line breaks one word per line.
+  const actions = (
+    <>
+      <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
+        {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : s.exhausted ? (isSearch ? "Re-search" : isDir ? "Restart" : "Re-sweep") : "Run now"}
+      </button>
+      <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
+      <button
+        onClick={onArchive}
+        className="rounded-full px-2.5 py-1.5 text-xs font-medium text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink"
+        title="Archive — stops scanning but keeps the source, its position and its leads"
+      >
+        Archive
+      </button>
+      <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
+    </>
+  );
 
   return (
     <div
       className={cn(
-        "flex items-center gap-4 px-5 py-3.5",
-        !s.enabled && "opacity-55",
+        "px-5 py-3.5",
         // A spent source looks completely healthy from the outside — enabled,
         // on schedule, no error — so the row itself has to carry the warning.
         stale && "border-l-2 border-l-[#e0b354] bg-[#fdf6e7]/60"
       )}
     >
-      <Switch small checked={!!s.enabled} onChange={onToggle} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
-          <AudienceTag a={s.audience} />
-          <span className="truncate font-medium">{title}</span>
-          {stale && (
-            <span
-              className="shrink-0 rounded-md bg-[#fbedd2] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#8a5a12]"
-              title={`Ran ${s.barren_runs} time${s.barren_runs === 1 ? "" : "s"} in a row without finding anyone new. Re-aim it or archive it.`}
-            >
-              stale
-            </span>
-          )}
-          {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
-            <>
-              <span className="text-ink/30">·</span>
-              <span className="truncate text-sm text-ink/70">{s.category}</span>
-            </>
-          )}
-        </div>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
-          {isDir ? (
-            <>
-              {streaming
-                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> streaming · page {s.cursor}</span>
-                : s.exhausted
-                  ? <span>finished at page {s.cursor}</span>
-                  : <span>{s.enabled ? "queued" : "paused"} · resumes page {s.cursor}</span>}
-              <span>· {s.total_found} found</span>
-              {s.location && <span>· {s.location}</span>}
-            </>
-          ) : isSearch ? (
-            <>
-              {streaming
-                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> searching · step {s.cursor}</span>
-                : s.exhausted
-                  ? <span>swept the web · re-searches {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
-                  : <span>{s.enabled ? "searching the web" : "paused"} · step {s.cursor}</span>}
-              <span>· {s.total_found} found</span>
-              {s.keywords ? <span title={s.keywords}>· custom keywords</span> : null}
-            </>
-          ) : (
-            <>
-              {streaming
-                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> sweeping{osmTiles ? ` · tile ${s.cursor} of ${osmTiles}` : ""}</span>
-                : s.exhausted
-                  ? <span>swept the whole area · re-checks {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
-                  : <span>{s.enabled ? "queued" : "paused"}{osmTiles ? ` · resumes tile ${s.cursor} of ${osmTiles}` : ""}</span>}
-              <span>· {(s.total_found || 0).toLocaleString()} found</span>
-              {osmAvail > 0 && (
-                <span title="Everything OpenStreetMap has mapped with a website, email or phone in this area. This is the ceiling — no amount of re-scanning can exceed it.">
-                  · of {osmAvail.toLocaleString()} on the map
-                </span>
-              )}
-            </>
-          )}
-          {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
-        </div>
-        {/* What "stale" actually means for THIS source, in its own numbers. */}
-        {stale && (
-          <div className="mt-1 text-[11px] font-medium text-[#8a5a12]">
-            Found nobody in its last {s.barren_runs ?? staleAfterRuns} runs
-            {s.last_found_at ? ` · last new company ${fmtAgo(s.last_found_at)}` : " · it has never found one"}
-            {" — replace it or archive it."}
+      <div className={cn("flex items-center gap-4", !s.enabled && "opacity-55")}>
+        <Switch small checked={!!s.enabled} onChange={onToggle} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
+            <AudienceTag a={s.audience} />
+            <span className="truncate font-medium">{title}</span>
+            {stale && (
+              <span className="shrink-0 rounded-md bg-[#fbedd2] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#8a5a12]">
+                stale
+              </span>
+            )}
+            {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
+              <>
+                <span className="text-ink/30">·</span>
+                <span className="truncate text-sm text-ink/70">{s.category}</span>
+              </>
+            )}
           </div>
-        )}
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
+            {isDir ? (
+              <>
+                {streaming
+                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> streaming · page {s.cursor}</span>
+                  : s.exhausted
+                    ? <span>finished at page {s.cursor}</span>
+                    : <span>{s.enabled ? "queued" : "paused"} · resumes page {s.cursor}</span>}
+                <span>· {s.total_found} found</span>
+                {s.location && <span>· {s.location}</span>}
+              </>
+            ) : isSearch ? (
+              <>
+                {streaming
+                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> searching · step {s.cursor}</span>
+                  : s.exhausted
+                    ? <span>swept the web · re-searches {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                    : <span>{s.enabled ? "searching the web" : "paused"} · step {s.cursor}</span>}
+                <span>· {s.total_found} found</span>
+                {s.keywords ? <span title={s.keywords}>· custom keywords</span> : null}
+              </>
+            ) : (
+              <>
+                {streaming
+                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> sweeping{osmTiles ? ` · tile ${s.cursor} of ${osmTiles}` : ""}</span>
+                  : s.exhausted
+                    ? <span>swept the whole area · re-checks {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                    : <span>{s.enabled ? "queued" : "paused"}{osmTiles ? ` · resumes tile ${s.cursor} of ${osmTiles}` : ""}</span>}
+                <span>· {(s.total_found || 0).toLocaleString()} found</span>
+                {osmAvail > 0 && (
+                  <span title="Everything OpenStreetMap has mapped with a website, email or phone in this area. This is the ceiling — no amount of re-scanning can exceed it.">
+                    · of {osmAvail.toLocaleString()} on the map
+                  </span>
+                )}
+              </>
+            )}
+            {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
+          </div>
+        </div>
+        <div className="hidden shrink-0 items-center gap-1 sm:flex">{actions}</div>
       </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
-          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : s.exhausted ? (isSearch ? "Re-search" : isDir ? "Restart" : "Re-sweep") : "Run now"}
-        </button>
-        <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
-        <button
-          onClick={onArchive}
-          className="rounded-full px-2.5 py-1.5 text-xs font-medium text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink"
-          title="Archive — stops scanning but keeps the source, its position and its leads"
+
+      {/* Full width, one line: the narrow middle column turned this into a
+          word-per-line paragraph taller than the row it described. */}
+      {stale && (
+        <div
+          className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 border-t border-[#e0b354]/30 pt-2 text-[11px] text-[#8a5a12]"
+          title={
+            autoOff
+              ? `Switched off automatically after ${dryRuns} runs that added no new company. Switching it back on gives it another ${offAt} runs.`
+              : `${dryRuns} runs in a row have added no new company. At ${offAt} it switches itself off.`
+          }
         >
-          Archive
-        </button>
-        <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
-      </div>
+          {autoOff && (
+            <span className="rounded bg-[#8a5a12]/15 px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide">switched off</span>
+          )}
+          <span className="font-medium">{dryRuns} dry run{dryRuns === 1 ? "" : "s"}</span>
+          <span className="text-[#8a5a12]/40">·</span>
+          <span>{s.last_found_at ? `last find ${fmtAgo(s.last_found_at)}` : "never found anyone"}</span>
+          {!autoOff && dryRuns < offAt && (
+            <>
+              <span className="text-[#8a5a12]/40">·</span>
+              <span className="text-[#8a5a12]/75">off at {offAt}</span>
+            </>
+          )}
+          <button onClick={onEdit} className="ml-auto shrink-0 font-medium underline underline-offset-2 hover:text-[#6d4710]">
+            Re-aim
+          </button>
+        </div>
+      )}
+
+      <div className={cn("mt-2 flex items-center gap-1 sm:hidden", !s.enabled && "opacity-55")}>{actions}</div>
     </div>
   );
 }

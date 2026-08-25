@@ -55,6 +55,7 @@ import {
   repairPageTitleNames,
   sweepNonProspectLeads,
   STALE_AFTER_RUNS,
+  STALE_OFF_AFTER_RUNS,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -1293,7 +1294,7 @@ app.get("/api/discovery/sources", async (c) => {
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0 AND barren_runs >= ?`,
     [STALE_AFTER_RUNS]
   ))[0]?.n ?? 0;
-  return c.json({ sources, archivedCount, staleCount, staleAfterRuns: STALE_AFTER_RUNS });
+  return c.json({ sources, archivedCount, staleCount, staleAfterRuns: STALE_AFTER_RUNS, staleOffAfterRuns: STALE_OFF_AFTER_RUNS });
 });
 
 app.post("/api/discovery/sources", async (c) => {
@@ -1430,12 +1431,20 @@ app.put("/api/discovery/sources/:id", async (c) => {
      category !== existing.category ||
      String(placeJson || "") !== String(existing.place_json || "") ||
      sweepCountry !== Number(existing.sweep_country ?? 0));
-  if (changedAim) barrenRuns = 0;
+  // Switching a source back on BY HAND is the other clean slate. Without it the
+  // bot would run it once, see the same dry result, and switch it straight off
+  // again — which reads as the toggle being broken. Turning it on is an explicit
+  // "try again", so it gets a full set of runs to prove itself, and it re-flags
+  // at STALE_AFTER_RUNS if it can't. Only a real 0 → 1 transition counts, so
+  // saving an already-on source doesn't quietly wipe its history.
+  const switchedOnByHand = typeof b.enabled === "boolean" && b.enabled && !Number(existing.enabled);
+  if (changedAim || switchedOnByHand) barrenRuns = 0;
+  const autoOff = changedAim || switchedOnByHand ? 0 : Number(existing.auto_off) || 0;
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?, barren_runs=?
+       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?, barren_runs=?, auto_off=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, barrenRuns, id]
+    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, barrenRuns, autoOff, id]
   );
   return c.json({ source: rows[0] });
 });
@@ -1845,7 +1854,7 @@ app.get("/api/overview", async (c) => {
   // the front page, not only inside the Discovery tab.
   const staleRows = await q(
     `SELECT id, type, location, base_url, keywords, category, audience, runs, total_found,
-            barren_runs, last_found_at, last_run_at
+            barren_runs, last_found_at, last_run_at, enabled, auto_off
        FROM discovery_sources
       WHERE archived=0 AND barren_runs >= ?
       ORDER BY barren_runs DESC, last_run_at DESC`,
@@ -1866,6 +1875,7 @@ app.get("/api/overview", async (c) => {
       active: Number(sourceCounts.active) || 0,
       stale: staleRows.length,
       staleAfterRuns: STALE_AFTER_RUNS,
+      staleOffAfterRuns: STALE_OFF_AFTER_RUNS,
       staleList: staleRows.slice(0, 8),
     },
   });

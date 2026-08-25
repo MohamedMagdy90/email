@@ -114,6 +114,12 @@ const EMPTY_STREAK_LIMIT = 3;
 // already hold, a search step that only returned known sites) — twice running
 // is a pattern.
 export const STALE_AFTER_RUNS = 2;
+// …and after this many it is switched OFF. Flagging a spent source but leaving
+// it running means it keeps spending the crawl budget, the rate-limit headroom
+// and the reader quota on ground it has already covered — every barren run is
+// taken from a source that would have found someone. Two thresholds rather than
+// one so there is a warning before the action: flagged at 2, off at 4.
+export const STALE_OFF_AFTER_RUNS = 4;
 // Web-search sources: how many search queries to run per batch (kept small so
 // the shared free-reader budget isn't starved), which result pages to pull per
 // query, spacing between queries, and how many all-duplicate batches to tolerate
@@ -247,6 +253,7 @@ export interface DiscoveryStatus {
   // they're already retired.
   staleSources: number;
   staleAfterRuns: number;
+  staleOffAfterRuns: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads whose last crawl was BLOCKED/errored (Cloudflare,
@@ -327,6 +334,7 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
     activeSources: activeCount,
     staleSources: staleCount,
     staleAfterRuns: STALE_AFTER_RUNS,
+    staleOffAfterRuns: STALE_OFF_AFTER_RUNS,
     leads: {
       pending: map.pending || 0,
       approved: map.approved || 0,
@@ -1430,14 +1438,29 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
 // source hide behind its own failures).
 function barrenState(src: any, found: number, counted: boolean) {
   const prev = Number(src.barren_runs) || 0;
-  if (!counted) {
-    return { runs: prev, lastFound: Number(src.last_found) || 0, lastFoundAt: src.last_found_at || null };
-  }
+  const wasOn = !!Number(src.enabled);
+  const runs = !counted ? prev : found > 0 ? 0 : prev + 1;
+  // Switch a spent source off instead of letting it keep drawing budget. Only a
+  // run that COUNTED can do this, for the same reason it can't raise the streak:
+  // a blocked source has not been shown to be empty. `wasOn` keeps this to a
+  // real transition, so the log line fires once rather than on every later run.
+  const off = counted && wasOn && runs >= STALE_OFF_AFTER_RUNS;
   return {
-    runs: found > 0 ? 0 : prev + 1,
-    lastFound: found,
-    lastFoundAt: found > 0 ? nowIso() : src.last_found_at || null,
+    runs,
+    lastFound: counted ? found : Number(src.last_found) || 0,
+    lastFoundAt: counted && found > 0 ? nowIso() : src.last_found_at || null,
+    off,
+    enabled: off ? 0 : wasOn ? 1 : 0,
+    autoOff: off || Number(src.auto_off) ? 1 : 0,
   };
+}
+
+// Said the same way for all three source types, because the reason is the same.
+function autoOffLog(src: any, runs: number) {
+  dwarn(
+    src.type === "directory" ? "dir" : src.type === "search" ? "search" : "osm",
+    `${srcLabel(src)}: SWITCHED OFF — ${runs} runs in a row without a single new company. It was still spending crawl budget on ground it has already covered. Re-aim it (new area, keywords or directory) or archive it; switching it back on by hand gives it another ${STALE_OFF_AFTER_RUNS} runs.`
+  );
 }
 
 async function runBatch(src: any): Promise<{ found: number; error?: string; continue: boolean; continueMs?: number }> {
@@ -1493,21 +1516,23 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     }
     // A finished walk starts over from the top next time it's kicked.
     if (exhausted) nextUrl = null;
-    const cont = !r.error && !exhausted && !stalled; // keep streaming while there's more
-    const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
-    const status = r.error ? "error" : exhausted ? "done" : "ok";
     // A batch the site refused (`stalled`) is blocked, not spent — it doesn't
     // count toward the stale streak.
     const barren = barrenState(src, r.found, !r.error && r.okish && !stalled);
+    // A source that just switched itself off must not keep streaming.
+    const cont = !r.error && !exhausted && !stalled && !barren.off;
+    const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+    const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
              total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, next_url=?,
-             barren_runs=?, last_found=?, last_found_at=?
+             barren_runs=?, last_found=?, last_found_at=?, enabled=?, auto_off=?
        WHERE id=?`,
       [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, nextUrl,
-       barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
+       barren.runs, barren.lastFound, barren.lastFoundAt, barren.enabled, barren.autoOff, src.id]
     );
+    if (barren.off) autoOffLog(src, barren.runs);
     if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
     else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${walkedOff ? "the last page had no next page" : `${EMPTY_STREAK_LIMIT} pages with no more listings`}); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
     else if (stalled) dwarn("dir", `${srcLabel(src)}: the site refused page ${cursor} — pausing ${interval}m so the block clears, then resuming from that exact page (nothing skipped).`);
@@ -1553,21 +1578,22 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     const pauseMin = r.blocked && !steppedOver
       ? Math.min(SEARCH_BLOCK_MAX_MIN, SEARCH_BLOCK_BASE_MIN * 2 ** Math.max(0, blockStreak - 1))
       : interval;
-    const cont = !r.error && !exhausted;
-    const next = cont ? nowIso() : new Date(Date.now() + (steppedOver ? SEARCH_BLOCK_BASE_MIN : pauseMin) * 60000).toISOString();
-    const status = r.error ? "error" : exhausted ? "done" : "ok";
     // `okish` is already false when the engines rate-limited us or the source
     // was stopped, which is exactly when a barren batch means nothing.
     const barren = barrenState(src, r.found, !r.error && r.okish);
+    const cont = !r.error && !exhausted && !barren.off;
+    const next = cont ? nowIso() : new Date(Date.now() + (steppedOver ? SEARCH_BLOCK_BASE_MIN : pauseMin) * 60000).toISOString();
+    const status = r.error ? "error" : exhausted ? "done" : "ok";
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
              total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, block_streak=?,
-             barren_runs=?, last_found=?, last_found_at=?
+             barren_runs=?, last_found=?, last_found_at=?, enabled=?, auto_off=?
        WHERE id=?`,
       [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, blockStreak,
-       barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
+       barren.runs, barren.lastFound, barren.lastFoundAt, barren.enabled, barren.autoOff, src.id]
     );
+    if (barren.off) autoOffLog(src, barren.runs);
     if (steppedOver) dwarn("search", `${srcLabel(src)}: step ${r.nextCursor} was refused ${SEARCH_BLOCK_SKIP_AFTER} times running — skipping it and resuming at step ${cursor}${r.planLen ? `/${r.planLen}` : ""} in ${SEARCH_BLOCK_BASE_MIN}m`);
     else if (r.blocked) dwarn("search", `${srcLabel(src)}: ${r.error}${r.covered ? ` — kept the ${r.covered} quer${r.covered === 1 ? "y" : "ies"} it did cover (now at step ${cursor}${r.planLen ? `/${r.planLen}` : ""})` : ""} · resuming in ${pauseMin}m`);
     else if (r.error) derr("search", `${srcLabel(src)}: ${r.error} (retry in ${interval}m)`);
@@ -1584,21 +1610,23 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
   } catch (e: any) {
     r = { found: 0, seen: 0, error: String(e?.message || e), nextCursor: Number(src.cursor) || 1, tiles: Number(src.osm_tiles) || 0, available: Number(src.osm_available) || 0, exhausted: false };
   }
-  const cont = !r.error && !r.exhausted && !r.stopped;
-  const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
-  const status = r.error ? "error" : r.exhausted ? "done" : "ok";
   // A sweep halted by hand covered only part of its tiles, so "found nothing"
   // isn't a verdict on the source.
   const barren = barrenState(src, r.found, !r.error && !r.stopped);
+  const cont = !r.error && !r.exhausted && !r.stopped && !barren.off;
+  const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
+  const status = r.error ? "error" : r.exhausted ? "done" : "ok";
   await q(
     `UPDATE discovery_sources
        SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
            total_found=total_found+?, cursor=?, exhausted=?, osm_tiles=?, osm_available=?,
-           barren_runs=?, last_found=?, last_found_at=?
+           barren_runs=?, last_found=?, last_found_at=?, enabled=?, auto_off=?
      WHERE id=?`,
     [nowIso(), next, status, r.error || null, r.found, r.error ? (Number(src.cursor) || 1) : r.nextCursor,
-     r.exhausted ? 1 : 0, r.tiles, r.available, barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
+     r.exhausted ? 1 : 0, r.tiles, r.available, barren.runs, barren.lastFound, barren.lastFoundAt,
+     barren.enabled, barren.autoOff, src.id]
   );
+  if (barren.off) autoOffLog(src, barren.runs);
   if (r.error) derr("osm", `${srcLabel(src)}: ERROR — ${r.error} (next scan in ${interval}m)`);
   else if (r.exhausted) {
     // A finished sweep is the normal, healthy end state — not a stall. Say how
