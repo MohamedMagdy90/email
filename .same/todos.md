@@ -931,4 +931,21 @@ real company alone, and refuses to run twice.
 backend `tsc` clean · frontend `tsc` clean · `vite build` clean · clean boot with
 both migrations applied · `/api/discovery/bad-names` returns the new shape.
 
+## Shipped
+Both pool-tool fixes pushed as **`5b58737`** to `MohamedMagdy90/email`
+(`367d410` → `5b58737`) — 11 files, 2 added (the verify scripts) and 9 modified,
+confirmed file-by-file against the remote rather than trusting the push output.
+Railway auto-deployed: `GET /api/health` returns `{"ok":true,"rev":"5b58737"}`.
+
+`frontend/{package.json,tsconfig.json,vite.config.ts,bun.lock}` carry Same-IDE-only
+edits (`same-runtime`, `react-grab`, an `optimizeDeps.exclude` for the JSX runtime)
+and were deliberately left OUT, as before. They still show as modified locally;
+that is expected, not drift.
+
+⚠️ Unverified from here: the two `ALTER TABLE` migrations run against production
+POSTGRES, not the SQLite used locally. They follow the same idempotent
+try/catch pattern as the ~30 migrations already in `ensureSchema()`, and the
+process booted cleanly, but the first person to open the Discovery tab should
+confirm the two pool-tool icons render without a 500.
+
 ---
