@@ -13,6 +13,7 @@ import {
 } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo, takeFocus } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
+import { FillRateCard } from "./FillRate";
 
 const FALLBACK_CATS = [
   "Companies (general)", "Accounting & Tax", "IT & Software", "Construction & Contracting",
@@ -438,9 +439,21 @@ export default function Discovery() {
         </div>
       </div>
 
-      {/* Stat strip */}
+      {/* Stat strip.
+          "Pending review" used to lead here, and it was the least useful number
+          on the screen: it only ever went up, it said nothing about whether the
+          bot was still working, and the pool tab below already carries the same
+          count. Nothing is lost by replacing it, and the fill rate is the one
+          number here that can go wrong quietly. */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Stat label="Pending review" value={counts.pending} accent />
+        <FillRateCard
+          fill={status?.fill}
+          openLabel="Review the sources"
+          onOpen={() => {
+            if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); }
+            setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+          }}
+        />
         <Stat label="Ready (with email)" value={status?.leads.withEmail ?? 0} />
         <Stat label="Approved → Contacts" value={counts.approved} />
         <Stat label="Finding emails" value={status?.pendingEnrich ?? 0} hint={status?.autoEnrich ? "queued" : "off"} />

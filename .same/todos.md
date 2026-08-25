@@ -1,3 +1,92 @@
+# Fill rate — is discovery feeding the automation? (2026-08-25) ✅
+
+Replaces **Discovery → Pending review** and **Overview → Contacts** with one
+number: emailable leads arriving per 10 minutes, against what the automation
+actually eats. Every other figure on those two screens is a LEVEL, and a level
+cannot answer the question either screen exists to answer — will this still be
+sending tomorrow? A pool of 4,000 with nothing coming in and a pool of 400 with
+plenty coming in read identically right up until the first one stops.
+
+Neither replaced card lost anything: the pending count is already on the pool
+tab below it, and the contacts total is already in the middle of the donut.
+
+## 1. The target derives itself
+A lane approves `threshold` leads and can only fire once per `cooldownMinutes`,
+so it consumes `threshold / cooldown` — 150 every 3 hours IS 8.3 per 10 minutes.
+Nothing to enter, nothing to keep in sync: change the batch size or the cooldown
+and the target moves with it.
+- [x] Capped by the shared daily ceiling, proportionally across live lanes. You
+      cannot need more leads than the sender will ever send, and a card demanding
+      1,200/day against a 300/day ceiling would be permanently, wrongly red
+- [x] A lane that is switched OFF adds no demand — and its arrivals don't count
+      either, because a partner haul cannot feed a starving customer lane
+- [x] With no lane live at all: the rate is reported, no verdict given
+
+## 2. `email_at`, and why `created_at` could not do this job
+A lead is worth nothing to the automation until it has an address, and the gap
+between discovery and address is the crawl queue — days long precisely when the
+crawler is being walled, which is precisely when this number has to be right.
+On `created_at` the metric would have reported a healthy inflow right through an
+outage, then gone red days after it ended.
+- [x] Column + index, stamped in all three places an address reaches a lead:
+      listed on the card at insert, found by a crawl, and cleared again when
+      `repairEscapedEmails` decides an address is unsalvageable
+- [x] One-time backfill from `created_at` for rows that predate the column —
+      the best answer available, and only ever read for history older than the
+      deploy. Flag-guarded so a 10k pool isn't re-scanned every boot
+
+## 3. Saying WHY, not just that
+A red light with no cause is a puzzle. `reason` names it, ordered by how much it
+explains: bot off · no sources on · every live source dry · and the one that
+separates two failures that look identical from outside — *"1,284 companies
+arrived, none with an email"*, which is a crawler problem (walls, no key), not a
+discovery one, and has a completely different fix.
+
+## 4. Two things live data caught that the design hadn't
+- [x] **8.0 against a target of 8.3 turned the card red.** Being 4% under over a
+      three-hour window is noise — one directory page landing either side of the
+      boundary moves it further. Bands now: ok ≥ 95%, red only under 60% AND
+      with less than 12h of banked leads. A light that goes red for noise is a
+      light nobody looks at
+- [x] **Turning the bot on lit it red for three hours.** Time the bot spent
+      switched off is not time it failed to find anything. The window now
+      measures from the later of the pool's age and `discovery_enabled_at`
+
+## Also fixed while building
+- `api.ts` wrote the auth token straight to `localStorage`. Inside an iframe
+  with partitioned storage — and in Safari private mode — that THROWS rather
+  than returning null, on the first line of the auth check, so the app fell
+  through to a login screen that could never be got past (signing in writes the
+  token too, so it threw again). Falls back to an in-memory session.
+- `db.ts`'s corrupt-database guard matched `malformed|corrupt|not a database`.
+  The ninth corruption said **`unsupported file format`**, sailed past the
+  guard, and took the API down at boot — the exact failure that code exists to
+  absorb. Widened, and it caught the tenth an hour later.
+- The 13 parked `data.sqlite.corrupt-*` files moved to `.same/corrupt-db-backups/`.
+
+## Verified
+`scripts/verify-fillrate.ts` — **57/57** offline: the target derives from the
+lane config · warming gives no verdict · an established pool at exactly target
+reads 8.3 · **200 leads discovered a month ago whose emails were also found a
+month ago don't inflate today's rate, and 30 emails found ten minutes ago on
+month-old leads do count** · the tolerance band · slow-vs-starved by cover ·
+each of the four reasons · an off lane's arrivals excluded, then included when
+it is switched on · rejected/duplicate never counted · the daily-ceiling cap ·
+the bot-just-switched-on window · idle · sparkline bucketing and totals · ETA ·
+and the production migration path (20 pre-existing emailable rows stamped, 7
+address-less ones left alone, no re-scan on the next boot).
+
+`verify-recheck.ts` 28/28 and `verify-names.ts` 29/29 still pass. backend `tsc`
+clean · frontend `tsc` clean · `vite build` clean · live over HTTP on both
+`/api/discovery/status` and `/api/overview`.
+
+⚠️ The dev-only seed and the preview auto-login used to check this were removed.
+⚠️ `.git` has been wiped from the container AGAIN — re-attach with `git init` +
+`fetch` + `reset --mixed origin/main` before pushing. Not committed yet.
+
+---
+
+
 # Stale sources: switch them off, and stop the note eating the row (2026-08-25) ✅
 
 ## 1. The stale note was a paragraph in a 100px column

@@ -3,6 +3,7 @@ import { api, type AutomationStatus } from "../lib/api";
 import { Button, Card, Spinner, cn, goTo } from "../lib/ui";
 import { Header } from "./Contacts";
 import { AutomationLaneBars } from "./Discovery";
+import { FillRateCard } from "./FillRate";
 
 const STATUS_COLORS: Record<string, string> = {
   new: "#c9c1b2",
@@ -62,8 +63,12 @@ export default function Overview() {
   const staleAfter = data?.sources?.staleAfterRuns ?? 2;
   const staleNames = (data?.sources?.staleList || []).map(sourceLabel);
 
+  // "Contacts" led this strip and is the one number here that was already
+  // answered twice over — the donut below is titled "Contacts by status" and
+  // prints the very same total in its middle. The fill rate takes the slot
+  // because nothing else on this page says whether the machine is still being
+  // fed, and that is the question a front page exists to answer.
   const cards = [
-    { label: "Contacts", value: data?.totalContacts || 0 },
     { label: "Emails sent", value: sentCount },
     { label: "Open rate", value: `${openRate}%` },
     { label: "Click rate", value: `${clickRate}%` },
@@ -73,9 +78,10 @@ export default function Overview() {
     <div>
       <Header title="Overview" subtitle="Your outreach at a glance." />
 
-      <div className="mb-5 grid grid-cols-2 gap-2.5 sm:mb-6 sm:gap-3 lg:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 items-stretch gap-2.5 sm:mb-6 sm:gap-3 lg:grid-cols-4">
+        <FillRateCard fill={data?.fill} openLabel="Open Discovery" onOpen={() => goTo("discovery")} />
         {cards.map((c) => (
-          <Card key={c.label} className="px-4 py-3.5 sm:px-5 sm:py-4">
+          <Card key={c.label} className="flex flex-col justify-center px-4 py-3.5 sm:px-5 sm:py-4">
             <div className="font-clash text-2xl font-semibold sm:text-3xl">{typeof c.value === "number" ? c.value.toLocaleString() : c.value}</div>
             <div className="mono-label mt-1 text-muted">{c.label}</div>
           </Card>

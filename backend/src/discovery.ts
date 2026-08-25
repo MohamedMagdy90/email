@@ -228,6 +228,12 @@ export async function isBotEnabled(): Promise<boolean> {
 }
 export async function setBotEnabled(on: boolean): Promise<void> {
   await setSetting("discovery_enabled", on ? "1" : "0");
+  // WHEN it was switched on, so the fill rate can measure over the time the bot
+  // was actually allowed to fill. Without this, turning the bot on after a
+  // weekend off reads as "zero leads in the last three hours" — a true
+  // statement about a window that includes three hours of being switched off,
+  // which would light the card red for the whole first window.
+  if (on) await setSetting("discovery_enabled_at", nowIso());
   // Switching off must also halt whatever batch is already running, or the bot
   // keeps working for minutes after you told it to stop. Switching on lifts it.
   if (on) stopping.delete("*"); else stopAllSources();
@@ -551,17 +557,22 @@ async function insertDiscovered(row: LeadRow, dedup: { emails: Set<string>; doma
   if (domain && !(await claimPoolDomain(domain))) return false;
 
   const key = dedupKey({ domain, email, phone: row.phone, name: row.name, city: row.city });
+  const now = nowIso();
   const rows = await q(
     `INSERT INTO discovered_leads
-      (id,dedup_key,name,website,domain,email,phone,city,country,category,audience,source_id,source_label,status,enriched,confidence,via,created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?)
+      (id,dedup_key,name,website,domain,email,phone,city,country,category,audience,source_id,source_label,status,enriched,confidence,via,created_at,email_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, NULL, ?, ?)
      ON CONFLICT (dedup_key) DO NOTHING RETURNING id`,
     [
       uid(), key,
       row.name || domain || email || "Unknown",
       row.website, domain || null, email || null,
       row.phone, row.city, row.country, row.category, row.audience || "customer",
-      row.sourceId, row.label, row.enriched, row.confidence, nowIso(),
+      row.sourceId, row.label, row.enriched, row.confidence, now,
+      // A listing that already carries an address is emailable the instant it
+      // lands, so it counts toward the fill rate NOW. One that doesn't is
+      // stamped later, by the crawl that finds the address.
+      email ? now : null,
     ]
   );
   return rows.length > 0;
@@ -2086,9 +2097,12 @@ async function enrichOne(
     try {
       await q(
         `UPDATE discovered_leads
-            SET enriched=1, email=?, phone=?, confidence=?, dedup_key=?, enrich_status='found', next_enrich_at=NULL
+            SET enriched=1, email=?, phone=?, confidence=?, dedup_key=?, enrich_status='found', next_enrich_at=NULL,
+                email_at=?
           WHERE id=?`,
-        [email, phone, confidence, "e:" + email, lead.id]
+        // NOW, not the lead's created_at: this is the moment it became
+        // emailable, and it is the only honest input to the fill rate.
+        [email, phone, confidence, "e:" + email, nowIso(), lead.id]
       );
     } catch {
       await retireDuplicate(lead, phone, email);
@@ -2416,7 +2430,9 @@ export async function repairEscapedEmails(): Promise<number> {
       // Nothing mailable in there — clear the address and send the lead back
       // through enrichment instead of keeping a dead contact.
       await q(
-        `UPDATE discovered_leads SET email=NULL, confidence=NULL, enriched=0,
+        // email_at goes with the address: this lead is not emailable, so it
+        // must not sit in the fill rate as though it were.
+        `UPDATE discovered_leads SET email=NULL, email_at=NULL, confidence=NULL, enriched=0,
              retry_count=0, enrich_status=NULL, next_enrich_at=NULL,
              status=CASE WHEN status='found' THEN 'pending' ELSE status END
            WHERE id=?`,

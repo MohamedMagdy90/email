@@ -2,9 +2,28 @@ const BASE = (import.meta as any).env?.VITE_API_URL || "";
 
 /* ------------------------------- Auth ------------------------------- */
 const TOKEN_KEY = "dna_auth_token";
-export const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
-export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+// Storage is not always there. Inside an iframe with third-party storage
+// partitioned off — an embedded preview, an intranet portal — and in Safari's
+// private mode, `localStorage` doesn't return null, it THROWS. Unguarded, that
+// threw on the very first line of the auth check, so the app fell through to a
+// login screen that could never be got past: signing in also writes the token,
+// so it threw again, every time.
+//
+// The session falls back to memory. It doesn't survive a reload, which is the
+// honest cost of having nowhere to write it, and the app works.
+let memoryToken = "";
+export const getToken = () => {
+  try { return localStorage.getItem(TOKEN_KEY) || memoryToken; } catch { return memoryToken; }
+};
+export const setToken = (t: string) => {
+  memoryToken = t;
+  try { localStorage.setItem(TOKEN_KEY, t); } catch { /* memory only */ }
+};
+export const clearToken = () => {
+  memoryToken = "";
+  try { localStorage.removeItem(TOKEN_KEY); } catch { /* memory only */ }
+};
 
 function authHeaders(): Record<string, string> {
   const t = getToken();
@@ -140,6 +159,61 @@ export interface ParsedRow {
   website?: string;
 }
 
+/* ------------------------------ Fill rate ------------------------------ */
+
+// Is discovery feeding the automation fast enough to keep it running?
+//
+// Every other number on Discovery and Overview is a LEVEL — how many leads are
+// pending, how many contacts exist. A level can't answer "will this still be
+// sending tomorrow?", because a pool of 4,000 with nothing coming in and a pool
+// of 400 with plenty coming in look identical right up until the first stops.
+//
+// The target isn't configured anywhere: a lane approves `threshold` leads and
+// can only fire once per `cooldownMinutes`, so it eats threshold / cooldown —
+// 150 every 3 hours is 8.3 every 10 minutes.
+
+export type FillStatus = "ok" | "slow" | "starved" | "idle";
+
+export interface FillRateLane {
+  audience: Audience;
+  /** Master switch AND this lane's switch are on — i.e. it is consuming. */
+  live: boolean;
+  /** Emailable leads arriving, per `unitMinutes`. */
+  rate: number;
+  /** What this lane eats, per `unitMinutes`. Reported even when it's off. */
+  required: number;
+  ratio: number;
+  status: FillStatus;
+  found: number;
+  ready: number;
+  threshold: number;
+  /** How long the leads on hand keep this lane fed. null = no demand. */
+  coverMinutes: number | null;
+  /** Until the next batch is full at this rate. 0 = full, null = never. */
+  etaMinutes: number | null;
+  /** One count per `bucketMinutes`, oldest first. */
+  series: number[];
+}
+
+export interface FillRate {
+  lanes: FillRateLane[];
+  rate: number;
+  required: number;
+  ratio: number;
+  status: FillStatus;
+  unitMinutes: number;
+  windowMinutes: number;
+  coveredMinutes: number;
+  bucketMinutes: number;
+  /** Too little history to judge — a fresh pool, or the bot just came on. */
+  warming: boolean;
+  /** Why it's short, when it is: bot off · no sources · all dry · no emails. */
+  reason: string | null;
+  /** The shared daily ceiling, not the batch size, is what caps the demand. */
+  cappedByDaily: boolean;
+  measuredAt: string;
+}
+
 /* --------------------------- Discovery bot -------------------------- */
 
 export interface DiscoveryStatus {
@@ -180,6 +254,9 @@ export interface DiscoveryStatus {
   };
   nextRunAt: string | null;
   lastLeadAt: string | null;
+  // Emailable leads arriving vs what the automation consumes. Optional: a
+  // frontend can be newer than the API it is talking to.
+  fill?: FillRate;
 }
 
 export interface DiscoverySource {
@@ -887,6 +964,9 @@ export const api = {
        *  `n` == `sent` (kept as the plotted value for older clients). */
       daily: { d: string; n: number; sent?: number; failed?: number; opens?: number; clicks?: number }[];
       windowDays?: number;
+      /** The same fill-rate snapshot the Discovery tab reads — one computation
+       *  on the server, so the two screens can't quote different numbers. */
+      fill?: FillRate;
       /** Discovery sources at a glance, including the ones that have run dry. */
       sources?: {
         total: number;

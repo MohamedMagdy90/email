@@ -58,6 +58,7 @@ import {
   STALE_OFF_AFTER_RUNS,
 } from "./discovery";
 import { repairLeadNames, countBadNames, clearFreemailCompanyNames } from "./repair";
+import { getFillRate } from "./fillrate";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -1226,7 +1227,13 @@ app.post("/api/crawl/check", async (c) => {
 // pool (discovered_leads). It runs while the process is up — no browser needed.
 
 // Live status: bot on/off, source counts, and the review-pool breakdown.
-app.get("/api/discovery/status", async (c) => c.json(await getDiscoveryStatus()));
+// `fill` rides along rather than living on its own endpoint: this is already
+// the Discovery screen's poll, and a rate that arrives one request later than
+// the counts it is about would be read against the wrong pool.
+app.get("/api/discovery/status", async (c) => {
+  const [status, fill] = await Promise.all([getDiscoveryStatus(), getFillRate()]);
+  return c.json({ ...status, fill });
+});
 
 // Flip the global bot switch and/or the "auto-find emails" behaviour.
 app.post("/api/discovery/toggle", async (c) => {
@@ -1875,6 +1882,10 @@ app.get("/api/overview", async (c) => {
     contacts, sends, opens, clicks, totalContacts, totalSends,
     daily,
     windowDays: DAYS,
+    // Are emailable leads arriving fast enough to keep the automation running?
+    // The same snapshot the Discovery tab reads — one computation, so the two
+    // screens can never quote different numbers.
+    fill: await getFillRate(),
     sources: {
       total: Number(sourceCounts.total) || 0,
       active: Number(sourceCounts.active) || 0,

@@ -69,7 +69,12 @@ if (DATABASE_URL) {
       // A corrupt LOCAL dev database must not turn into a boot loop. Park it
       // (never delete — it is the only copy of whatever was in it) and carry on
       // with an empty one, saying loudly where it went.
-      if (!/malformed|corrupt|not a database/i.test(String(e?.message || e))) throw e;
+      // `unsupported file format` is on this list because it is what SQLite
+      // actually said the ninth time this happened, and the guard let it
+      // through — so the one failure mode this code exists to absorb took the
+      // API down anyway. A truncated header reads as an unknown format, not as
+      // corruption, and "file is encrypted" is the same header damage again.
+      if (!/malformed|corrupt|not a database|unsupported file format|file is encrypted/i.test(String(e?.message || e))) throw e;
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const parked = `${file}.corrupt-${stamp}`;
       try {
@@ -374,6 +379,40 @@ export async function ensureSchema() {
   // row is only retried once the directory sources or the naming rules change.
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
   try { await q(`ALTER TABLE contacts ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
+  // WHEN this lead became emailable — the moment an address was first stored on
+  // it, whether it arrived listed on a directory card or was found by a crawl
+  // two days later.
+  //
+  // `created_at` cannot answer that question, which is the whole reason this
+  // column exists. A lead discovered on Monday and enriched on Wednesday would
+  // be credited to Monday, so "are we finding enough emailable leads per hour?"
+  // would lag by however long the crawl queue happens to be — and the queue is
+  // days long whenever the crawler is being walled, which is exactly when the
+  // number matters most.
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN email_at TEXT`); } catch { /* exists */ }
+  // The fill-rate window scans on this column alone.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_email_at ON discovered_leads(email_at)`); } catch { /* ignore */ }
+  // Rows that already had an address get their discovery time. It's the best
+  // answer available for history that predates the column, and it is only ever
+  // read for windows that reach back before this deploy. Guarded by a flag so a
+  // large pool isn't re-scanned on every boot.
+  try {
+    const done = await getSetting("email_at_backfill_v1");
+    if (!done) {
+      const pending = (await q(
+        `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
+          WHERE email IS NOT NULL AND email <> '' AND email_at IS NULL`
+      ))[0]?.n ?? 0;
+      if (Number(pending) > 0) {
+        await q(
+          `UPDATE discovered_leads SET email_at = created_at
+            WHERE email IS NOT NULL AND email <> '' AND email_at IS NULL`
+        );
+        console.log(`[db] fill rate → stamped ${Number(pending).toLocaleString()} existing lead(s) with when their email first landed`);
+      }
+      await setSetting("email_at_backfill_v1", new Date().toISOString());
+    }
+  } catch { /* non-fatal */ }
   // Due-lead scan hits (enriched=0, next_enrich_at) on every enrich tick.
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
   // Domain lookups (the pool-domain backfill + junk sweeps scan by domain).
