@@ -1,4 +1,4 @@
-# Overview repair + stale sources (2026-08-25) — in progress
+# Overview repair + stale sources (2026-08-25) ✅ shipped & verified
 
 ## 1. "Emails sent · last 14 days" bars were all flat
 Root cause is CSS, not data: the chart row is `flex h-40 items-end`, so
@@ -6,21 +6,66 @@ Root cause is CSS, not data: the chart row is `flex h-40 items-end`, so
 becomes its CONTENT height. The bar track inside is `flex-1` of that auto-height
 column, so it resolves to 0, and the bar's `height: N%` is a percentage of zero.
 Every bar collapsed to its 4px `minHeight`, which reads as "all zero".
-- [ ] Redraw the chart with pixel heights computed in JS (no % of an auto parent)
-- [ ] Backend: series counts only real sends (`status LIKE 'sent%'`), keyed on
-      `sent_at` falling back to `created_at`, and returns all 14 days pre-filled
-      so the client's UTC/local day maths can't drop today's bucket
+- [x] Redraw the chart with pixel heights computed in JS against a known `TRACK`
+      constant — no percentage of an auto-height parent anywhere in the chart,
+      which retires the whole class of bug rather than nudging this instance
+- [x] Two counting bugs found while fixing the geometry: the series counted
+      EVERY row in `sends` (failures and still-queued included), so it disagreed
+      with the "Emails sent" card directly above it; and it bucketed on
+      `created_at`, so a mail queued 23:50 and delivered 00:05 landed a day early
+- [x] Backend owns the calendar now: all 14 days pre-filled, keyed on
+      `COALESCE(sent_at, created_at)`, split into sent / failed / opens / clicks.
+      It used to return only the days that HAD rows and leave the browser to line
+      them up against a locally-built calendar — which silently dropped today's
+      bucket for any viewer east of UTC
+- [x] `buildDailySeries` still pads, but anchors on the newest day the SERVER
+      reported, so an older API keeps working without handing the axis back to
+      the viewer's clock
 
 ## 2. Automation batch bars only existed on Discovery
-- [ ] Reuse the per-lane progress (ready / threshold) on Overview
+- [x] Extracted to a shared `AutomationLaneBars({ lanes, className, size })` and
+      used on both screens, so the two can't drift
+- [x] Overview `AutomationCard` also states WHY nothing is moving — master off,
+      both lanes off, or the first blocker — instead of just drawing empty bars
 
 ## 3. Stale sources — "ran twice and fetched nobody"
-- [ ] `discovery_sources.barren_runs` / `last_found` / `last_found_at`
-- [ ] Counted in `runBatch` for all three source types; a blocked / errored /
-      stopped batch does NOT count (that's not stale, that's blocked)
-- [ ] `staleSources` on `/api/discovery/status`, `staleCount` on the sources list
-- [ ] Discovery: badge per source + a "replace these" banner
-- [ ] Overview: a Stale sources metric that deep-links into Discovery
+- [x] `discovery_sources.barren_runs` / `last_found` / `last_found_at`.
+      Deliberately NOT `empty_streak`: that is walk bookkeeping ("these pages
+      held no more listings"), it drives `exhausted`, a manual Run now resets it,
+      and it never applies to map areas at all
+- [x] Counted in `runBatch` for all three source types via one `barrenState()`
+      helper. A blocked / rate-limited / errored / hand-stopped batch does NOT
+      count — it can neither raise the streak (that would libel a blocked source
+      as spent) nor reset it (that would let a permanently blocked source hide
+      behind its own failures)
+- [x] Re-aiming a source (url / keywords / location / category / place / sweep)
+      clears the counter — that IS the replacement. Pausing, renaming or
+      re-scheduling doesn't, since none of those change what it can find
+- [x] `staleSources` on `/api/discovery/status`, `staleCount` on the sources
+      list, `sources.stale` + `staleList` on `/api/overview` — all three read the
+      same `barren_runs >= STALE_AFTER_RUNS` so they can't disagree
+- [x] Discovery: amber left-border + "stale" chip per row, a "N sources have run
+      dry" banner, and a stale-only filter
+- [x] Overview: Stale sources metric deep-linking into Discovery via
+      `goTo("discovery", "stale")` + one-shot `takeFocus()`, which opens the
+      sources card, switches the filter on and scrolls it into view. Landing on a
+      tab of forty rows and leaving the reader to find the two being pointed at
+      is a hint, not a link
+
+**Verified.** Backend `tsc --noEmit` clean, frontend `tsc --noEmit` + `vite build`
+clean. Live check with four sources at `barren_runs` 3/2/1/0: overview
+`stale=2`, `/discovery/status` `staleSources=2`, `/discovery/sources`
+`staleCount=2` — the 1 and the 0 correctly not flagged. `/api/overview` returns
+14 buckets with sent/failed/opens/clicks on each.
+
+⚠️ The dev-only seed route and the preview auto-login used to check this were
+removed before the commit; `POST /api/dev/seed` now 404s.
+
+Pushed as **`c5aeec3`** to `MohamedMagdy90/email` (`8d32bff` → `c5aeec3`).
+Note the container had wiped `.git` again — re-attached with `git init` +
+`fetch` + `reset --mixed origin/main`. `frontend/{package.json,tsconfig.json,
+vite.config.ts,bun.lock}` carry Same-IDE-only edits (`same-runtime`,
+`react-grab`, `jsxImportSource`) and were deliberately left OUT of the commit.
 
 ---
 
