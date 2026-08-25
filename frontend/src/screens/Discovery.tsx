@@ -88,7 +88,7 @@ export default function Discovery() {
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
   const [purging, setPurging] = useState(false);
-  const [badNames, setBadNames] = useState<{ leads: number; contacts: number } | null>(null);
+  const [badNames, setBadNames] = useState<{ leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number } | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [repairLog, setRepairLog] = useState("");
 
@@ -155,8 +155,8 @@ export default function Discovery() {
     }
   }
 
-  // Re-read the directory sources and write the real company names back over the
-  // phone numbers an older version of the harvester stored.
+  // Re-read the directory sources and write the real company names back over
+  // the phone numbers an older version of the harvester stored.
   async function repairNames() {
     setRepairing(true);
     setRepairLog("Checking every saved company name…");
@@ -227,10 +227,23 @@ export default function Discovery() {
     setReEnriching(true);
     try {
       const r = await api.reEnrichDiscovery();
-      toast(
-        r.reset ? `Re-queued ${r.reset.toLocaleString()} lead${r.reset === 1 ? "" : "s"} — the bot will try to find their emails again` : "No blocked leads to re-check right now",
-        r.reset ? "success" : "info"
-      );
+      // Say what a pass actually achieved. This used to report the same number
+      // every time, because the tool re-queued the rows it had just parked —
+      // so "Re-queued 166" was true and meaningless in equal measure.
+      if (r.reset) {
+        toast(
+          `Re-queued ${r.reset.toLocaleString()} lead${r.reset === 1 ? "" : "s"} — the bot is crawling their sites again` +
+            (r.reArmed ? ` · ${r.reArmed.toLocaleString()} unlocked by your new key/proxy` : ""),
+          "success"
+        );
+      } else if (r.stuck) {
+        toast(
+          `Nothing to re-check. All ${r.stuck.toLocaleString()} parked lead${r.stuck === 1 ? " has" : "s have"} already had a pass on this setup and stayed blocked — add a Jina key or a proxy in Settings and they all become re-checkable.`,
+          "info"
+        );
+      } else {
+        toast("Nothing to re-check — every lead with a website has been resolved one way or the other", "info");
+      }
       refreshStatus();
       if (tab === "pending") refreshLeads();
     } catch (e: any) { toast(e.message, "error"); } finally { setReEnriching(false); }
@@ -396,6 +409,8 @@ export default function Discovery() {
               they belong here as icons with the explanation one hover away. */}
           <PoolTools
             recoverable={status?.recoverable ?? 0}
+            stuck={status?.stuck ?? 0}
+            lastRecheckAt={status?.lastRecheckAt ?? null}
             blocked={status?.blocked ?? 0}
             badNames={badNames}
             readerKeyed={!!status?.bypass?.readerKeyed}
@@ -1543,12 +1558,14 @@ function ToolButton({
 }
 
 function PoolTools({
-  recoverable, blocked, badNames, readerKeyed, proxied, readerRateLimited,
+  recoverable, stuck, lastRecheckAt, blocked, badNames, readerKeyed, proxied, readerRateLimited,
   reChecking, purging, repairing, repairLog, onReCheck, onPurge, onRepair,
 }: {
   recoverable: number;
+  stuck: number;
+  lastRecheckAt: string | null;
   blocked: number;
-  badNames: { leads: number; contacts: number } | null;
+  badNames: { leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number } | null;
   readerKeyed: boolean;
   proxied: boolean;
   readerRateLimited: boolean;
@@ -1561,13 +1578,20 @@ function PoolTools({
   onRepair: () => void;
 }) {
   const broken = (badNames?.leads ?? 0) + (badNames?.contacts ?? 0);
+  const stuckNames = (badNames?.stuckLeads ?? 0) + (badNames?.stuckContacts ?? 0);
   return (
     <div className="flex items-center gap-2">
       <span className="mono-label mr-0.5 hidden text-muted sm:inline">Pool tools</span>
 
       <ToolButton
         icon="↻"
-        label={recoverable > 0 ? `Re-check ${recoverable.toLocaleString()} lead${recoverable === 1 ? "" : "s"} for emails` : "Re-check emails"}
+        label={
+          recoverable > 0
+            ? `Re-check ${recoverable.toLocaleString()} lead${recoverable === 1 ? "" : "s"} for emails`
+            : stuck > 0
+              ? `${stuck.toLocaleString()} lead${stuck === 1 ? "" : "s"} parked behind a wall`
+              : "Re-check emails"
+        }
         tone="border-[#5a86c2]/40 bg-[#eef4fb] text-[#2f5a94]"
         count={recoverable}
         busy={reChecking}
@@ -1581,6 +1605,26 @@ function PoolTools({
               background.
               {blocked > 0 ? ` ${blocked.toLocaleString()} more are already auto-retrying.` : ""}
               {!readerKeyed && !proxied && " Add a Jina key or a scraping proxy in Settings → Crawler to get past Cloudflare at scale."}
+            </>
+          ) : stuck > 0 ? (
+            // The state this button used to hide by offering the same number
+            // for ever: these leads have had their pass, nothing has changed
+            // since, and pressing again would only re-crawl the same walls.
+            <>
+              {stuck.toLocaleString()} lead{stuck === 1 ? " has" : "s have"} a website but no email, and{" "}
+              {stuck === 1 ? "it was" : "they were"} re-checked
+              {lastRecheckAt ? ` ${fmtAgo(lastRecheckAt)}` : ""} with your current setup and stayed blocked. Crawling
+              them again from the same address would give the same answer, so the button waits.
+              <span className="mt-1 block text-cream/70">
+                {readerKeyed || proxied
+                  ? "Add another Jina key, or switch on a scraping proxy, and all of them become re-checkable instantly."
+                  : "Add a Jina key or a scraping proxy in Settings → Crawler and all of them become re-checkable instantly."}
+              </span>
+              {blocked > 0 ? (
+                <span className="mt-1 block text-cream/70">
+                  {blocked.toLocaleString()} other{blocked === 1 ? "" : "s"} are still auto-retrying on their own.
+                </span>
+              ) : null}
             </>
           ) : blocked > 0 ? (
             <>{blocked.toLocaleString()} lead{blocked === 1 ? " is" : "s are"} already being re-checked automatically — nothing to queue by hand.</>
@@ -1607,7 +1651,13 @@ function PoolTools({
 
       <ToolButton
         icon="✎"
-        label={broken > 0 ? `Repair ${broken.toLocaleString()} broken company name${broken === 1 ? "" : "s"}` : "Repair company names"}
+        label={
+          broken > 0
+            ? `Repair ${broken.toLocaleString()} broken company name${broken === 1 ? "" : "s"}`
+            : stuckNames > 0
+              ? `${stuckNames.toLocaleString()} name${stuckNames === 1 ? "" : "s"} can't be recovered`
+              : "Repair company names"
+        }
         tone={broken > 0 ? "border-[#9b6bff]/35 bg-[#f6f1ff] text-[#6c43c5]" : "border-line bg-paper text-ink/60"}
         count={broken}
         busy={repairing}
@@ -1621,6 +1671,18 @@ function PoolTools({
               (or a page title) where the company name should be — an older directory import. This re-reads the
               source and writes the real names back.
               {repairLog ? <span className="mt-1 block text-cream/70">{repairLog}</span> : null}
+            </>
+          ) : stuckNames > 0 ? (
+            // Previously these kept the button lit for ever: the count included
+            // names no configured source could supply, so every press re-walked
+            // every directory in full and changed nothing.
+            <>
+              {stuckNames.toLocaleString()} name{stuckNames === 1 ? " is" : "s are"} still wrong, but none of them
+              appear in the directories you have configured and none has a domain worth building a name from — so
+              re-reading those directories would produce the same answer.
+              <span className="mt-1 block text-cream/70">
+                Add or re-aim a Directory source and they all become repairable again.
+              </span>
             </>
           ) : (
             <>Every stored company name looks like a company name. Nothing to repair.</>

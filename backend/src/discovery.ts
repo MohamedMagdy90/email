@@ -31,7 +31,7 @@ import { registrableDomain, hostOf } from "./crawler/urls";
 import { countryFromDomain, normalizeCountry, resolveLeadCountry } from "./country";
 import { getReaderStats, parseReaderKeys } from "./crawler/fetcher";
 import { getProxyConfig, getReaderKey } from "./config";
-import { cleanEmail, isValidEmail, roleRank } from "./crawler/validate";
+import { cleanEmail, isValidEmail, roleRank, isFreeMailDomain, FREEMAIL_DOMAINS } from "./crawler/validate";
 import { citiesFor, COUNTRY_TLD, normCountry } from "./places";
 
 const uid = () => crypto.randomUUID();
@@ -241,6 +241,76 @@ export async function setAutoEnrich(on: boolean): Promise<void> {
   dlog("", `auto-find-emails switched ${on ? "ON" : "OFF"}`);
 }
 
+/* --------------------------- manual recovery --------------------------- */
+
+/**
+ * "Re-check emails" — and the reason it used to be a loop.
+ *
+ * `enrichOne` parks a lead it has given up on as
+ *   `enriched=1, enrich_status='blocked'|'error', next_enrich_at=NULL`
+ * and that was ALSO exactly what the recovery tool selected on. The marker
+ * meaning "we gave up" therefore doubled as "please try me again": a press
+ * re-queued the same rows, spent up to six crawls each proving the same wall
+ * was still there, parked them with an identical status, and left the badge
+ * reading the number it started with. Nothing recorded that a pass had run.
+ *
+ * These three predicates are the fix, and they live together on purpose: the
+ * COUNT on the badge and the UPDATE behind the button read the same text, so
+ * the button can never again offer a number it cannot actually deliver.
+ */
+const PARKED_SQL = `status='pending' AND (email IS NULL OR email='')
+        AND website IS NOT NULL AND website<>''
+        AND enriched=1
+        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))`;
+
+/** Of those, the ones a re-check could still plausibly change. Params: [maxPasses, fingerprint]. */
+const RECHECKABLE_SQL = `${PARKED_SQL}
+        AND (recheck_count < ? OR recheck_key IS NULL OR recheck_key <> ?)`;
+
+/** …and the ones it demonstrably cannot, under the current setup. Params: [maxPasses, fingerprint]. */
+const EXHAUSTED_SQL = `${PARKED_SQL}
+        AND recheck_count >= ? AND recheck_key = ?`;
+
+/**
+ * Manual recovery passes a lead gets per bypass configuration.
+ *
+ * ONE, deliberately. By the time a lead is parked the automatic ladder has
+ * already tried it 2 times (a hard Cloudflare/403 wall) or 6 times with backoff
+ * out to 72 hours (a soft 429/timeout/5xx) — so the transient case has been
+ * thoroughly ruled out before a human ever sees the button. A hand-pressed pass
+ * adds one more attempt for luck; a second one from the same IP with the same
+ * key is the definition of doing the same thing and expecting a different
+ * result, and at 166 leads it costs several hundred crawls to learn nothing.
+ *
+ * The counter is not a life sentence: `bypassFingerprint()` re-arms every
+ * parked lead the moment the operator changes something that could change the
+ * answer.
+ */
+const RECHECK_MAX_PASSES = 1;
+
+/**
+ * A short digest of the crawler's bypass capability.
+ *
+ * Deliberately built from the CONFIGURATION (which keys are saved, which proxy)
+ * rather than from live health. A key that has run out of tokens does not mean
+ * re-crawling is worth another try — nothing the operator did changed — whereas
+ * adding a key, removing one, or wiring up a proxy genuinely does. Hashed so a
+ * lead row never carries a fragment of an API key.
+ */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+async function bypassFingerprint(): Promise<string> {
+  const [proxy, readerKey] = await Promise.all([getProxyConfig(), getReaderKey()]);
+  const keys = parseReaderKeys(readerKey).slice().sort().join(",");
+  return fnv1a(`k:${keys}|p:${proxy ? `${proxy.provider}:${proxy.mode}:${proxy.premium ? 1 : 0}` : "none"}`);
+}
+
 /* ------------------------------- status -------------------------------- */
 
 export interface DiscoveryStatus {
@@ -260,10 +330,19 @@ export interface DiscoveryStatus {
   // rate-limit, timeout) and are still auto-retrying.
   blocked: number;
   // Pending, email-less leads that HAVE a website but were given up on (or predate
-  // retry-tracking) — exactly what "Re-check" re-queues. This is the count that
-  // makes the recovery button appear, so the historical "no email" pool is
-  // actionable even before anything is freshly marked blocked.
+  // retry-tracking), AND that a re-check could still plausibly change — exactly
+  // what "Re-check" re-queues. Once a lead has been through a manual pass under
+  // the current bypass setup it drops out of here and into `stuck`, which is
+  // what stops the button re-arming its own queue for ever.
   recoverable: number;
+  // Parked leads a re-check has already been spent on without the answer
+  // changing. Not lost — adding a Jina key or a proxy re-arms every one of them
+  // — but pressing the button again today cannot help, and saying so is the
+  // whole point of counting them separately.
+  stuck: number;
+  // When the last manual recovery pass ran, so a disabled button can explain
+  // itself rather than just going grey.
+  lastRecheckAt: string | null;
   // Whether a scalable Cloudflare bypass is configured, + how often the free
   // reader has been rate-limited — drives the "add a key/proxy" nudge in the UI.
   bypass: {
@@ -310,14 +389,19 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
   ))[0]?.n ?? 0;
   // Everything "Re-check" would revive: pending, has a website, no email, marked
   // done (enriched=1) either because it was blocked/errored OR because it predates
-  // retry-tracking (enrich_status NULL = the historical ~1,000 "no email" pool).
+  // retry-tracking (enrich_status NULL = the historical ~1,000 "no email" pool)
+  // — MINUS the ones a pass has already been spent on under this exact bypass
+  // setup, which is what used to make this number immovable.
+  const fp = await bypassFingerprint();
   const recoverable = (await q(
-    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
-      WHERE status='pending' AND (email IS NULL OR email='')
-        AND website IS NOT NULL AND website<>''
-        AND enriched=1
-        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))`
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE ${RECHECKABLE_SQL}`,
+    [RECHECK_MAX_PASSES, fp]
   ))[0]?.n ?? 0;
+  const stuckRow = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n, max(recheck_at) AS t
+       FROM discovered_leads WHERE ${EXHAUSTED_SQL}`,
+    [RECHECK_MAX_PASSES, fp]
+  ))[0] || {};
   const nextRunAt = (await q(`SELECT min(next_run_at) AS t FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.t ?? null;
   const lastLeadAt = (await q(`SELECT max(created_at) AS t FROM discovered_leads`))[0]?.t ?? null;
 
@@ -345,6 +429,8 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
     pendingEnrich,
     blocked,
     recoverable,
+    stuck: Number(stuckRow.n) || 0,
+    lastRecheckAt: (stuckRow.t as string) ?? null,
     bypass: {
       readerKeyed: !!readerKey,
       proxy: !!proxy,
@@ -367,15 +453,11 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
 const onlyDigits = (s?: string | null) => (s || "").replace(/\D/g, "");
 
 // Free-mail providers are NOT a company's own domain — dozens of unrelated
-// businesses share gmail.com/hotmail.com, so we never dedupe or classify by them.
-const FREEMAIL = new Set([
-  "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com",
-  "msn.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "icloud.com", "me.com", "aol.com",
-  "protonmail.com", "proton.me", "gmx.com", "gmx.net", "mail.com", "zoho.com",
-  "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
-]);
-const isFreeMail = (domain?: string | null) => FREEMAIL.has((domain || "").toLowerCase());
-const FREEMAIL_HOSTS = FREEMAIL;
+// businesses share gmail.com/hotmail.com, so we never dedupe or classify by
+// them. The list itself lives in `crawler/validate` (a leaf module) so this,
+// `leads.ts` and `repair.ts` all read the same one.
+const isFreeMail = isFreeMailDomain;
+const FREEMAIL_HOSTS = FREEMAIL_DOMAINS;
 
 // Embassies, consulates and missions are not companies — nobody is selling to
 // them, and they were arriving from every source type. Caught by name here so
@@ -2166,23 +2248,62 @@ export async function sweepNonProspectLeads(): Promise<number> {
 // the ones that were BLOCKED/errored or predate retry-tracking (enrich_status
 // NULL); leaves genuinely-empty sites (enrich_status='empty') alone so we don't
 // pointlessly re-crawl sites we already confirmed have no email.
-export async function reEnrichBlocked(): Promise<{ reset: number }> {
+//
+// Each row it touches is STAMPED with the pass — see RECHECK_MAX_PASSES and
+// `bypassFingerprint`. Without that stamp this function selected on the exact
+// state it left behind, so it re-queued the same leads on every press for ever:
+// the count never moved, and each press cost a crawl per lead to re-prove a
+// wall we had already proved. Now a lead is offered again only when the
+// operator changes something that could change the answer.
+export async function reEnrichBlocked(): Promise<{
+  reset: number;
+  stuck: number;
+  /** Of `reset`, how many were re-armed purely because the bypass setup changed. */
+  reArmed: number;
+}> {
+  const fp = await bypassFingerprint();
+  // Counted BEFORE the update: parked leads that had already had a pass, but
+  // under a different key/proxy. These are the ones a new key just unlocked,
+  // and saying so is the difference between "it worked" and "it did nothing".
+  const reArmed = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
+      WHERE ${PARKED_SQL} AND recheck_count > 0 AND (recheck_key IS NULL OR recheck_key <> ?)`,
+    [fp]
+  ))[0]?.n ?? 0;
+
   const rows = await q(
     `UPDATE discovered_leads
-        SET enriched=0, retry_count=0, next_enrich_at=NULL, enrich_status=NULL
-      WHERE status='pending'
-        AND (email IS NULL OR email='')
-        AND website IS NOT NULL AND website<>''
-        AND enriched=1
-        AND (enrich_status IS NULL OR enrich_status IN ('blocked','error'))
-      RETURNING id`
+        SET enriched=0, retry_count=0, next_enrich_at=NULL, enrich_status=NULL,
+            recheck_count=recheck_count+1, recheck_key=?, recheck_at=?
+      WHERE ${RECHECKABLE_SQL}
+      RETURNING id`,
+    [fp, nowIso(), RECHECK_MAX_PASSES, fp]
   );
   const reset = rows.length;
-  dlog("enrich", `re-check requested → re-queued ${reset} blocked/untried lead(s) to find emails again`);
+
+  const stuck = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE ${EXHAUSTED_SQL}`,
+    [RECHECK_MAX_PASSES, fp]
+  ))[0]?.n ?? 0;
+
+  if (reset) {
+    dlog(
+      "enrich",
+      `re-check requested → re-queued ${reset} blocked/untried lead(s) to find emails again` +
+        (reArmed ? ` (${reArmed} of them re-armed by the new key/proxy)` : "")
+    );
+  } else {
+    dlog(
+      "enrich",
+      stuck
+        ? `re-check requested → nothing to re-queue. All ${stuck} parked lead(s) have already had a pass on this exact setup and stayed blocked; add or change a Jina key / scraping proxy and they all become re-checkable again.`
+        : `re-check requested → nothing to re-queue. Every lead with a website has been resolved one way or the other.`
+    );
+  }
   // Nudge the enrich loop so recovery starts immediately (respecting the bot's
   // on/off + auto-enrich switches inside the tick).
   if (reset > 0) setTimeout(() => { enrichTick().catch(() => {}); }, 500);
-  return { reset };
+  return { reset, stuck, reArmed };
 }
 
 /* --------------------------- one-off cleanups -------------------------- */

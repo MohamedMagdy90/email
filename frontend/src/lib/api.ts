@@ -157,8 +157,15 @@ export interface DiscoveryStatus {
   // Pending, email-less leads still auto-retrying after a block/error.
   blocked: number;
   // Pending, email-less leads WITH a website that were given up on / predate
-  // retry-tracking — the count "Re-check" re-queues (drives the recovery button).
+  // retry-tracking AND that a re-check could still plausibly change — the count
+  // that drives the recovery button. A lead drops out of here once a manual
+  // pass has been spent on it under the current bypass setup.
   recoverable: number;
+  // Parked leads a pass has already been spent on without the answer changing.
+  // Not lost: adding or changing a Jina key / proxy re-arms every one of them.
+  // Optional — a frontend can be newer than the API it talks to.
+  stuck?: number;
+  lastRecheckAt?: string | null;
   // Is a scalable Cloudflare bypass configured, and how often has the free reader
   // been rate-limited — drives the "add a key/proxy" nudge.
   bypass: {
@@ -773,10 +780,16 @@ export const api = {
     req<DiscoveryStatus>(`/api/discovery/toggle`, { method: "POST", body: JSON.stringify(body) }),
   // Re-queue leads whose email couldn't be read (Cloudflare wall / reader rate
   // limit) so the bot tries them again — the historical "no email" recovery.
-  reEnrichDiscovery: () => req<{ reset: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
+  // `reset` = re-queued now · `stuck` = parked leads this setup can't help ·
+  // `reArmed` = of the reset, how many a newly-added key/proxy unlocked.
+  reEnrichDiscovery: () =>
+    req<{ reset: number; stuck?: number; reArmed?: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
   // Company names saved by the old directory harvester could be the card's phone
   // number. Count them, and repair them by re-reading the directory sources.
-  getBadNameCount: () => req<{ leads: number; contacts: number }>(`/api/discovery/bad-names`),
+  // `leads`/`contacts` = names the repair can still recover · `stuck*` = ones
+  // already proven unrecoverable from the directory sources you have configured.
+  getBadNameCount: () =>
+    req<{ leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number }>(`/api/discovery/bad-names`),
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
   purgeJunkLeads: () => req<{ swept: number }>(`/api/discovery/purge-junk`, { method: "POST", body: "{}" }),
   getDiscoverySources: (archived = false) =>

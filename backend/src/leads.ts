@@ -119,13 +119,10 @@ const NOT_A_COMPANY_SITE = new Set([
   "wikipedia.org", "en.wikipedia.org", "wikidata.org",
 ]);
 // Shared mailbox hosts. Thousands of unrelated businesses sit behind each, so
-// one can never stand in for a company's identity or name.
-const FREEMAIL = new Set([
-  "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk", "outlook.com",
-  "live.com", "msn.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "icloud.com",
-  "me.com", "aol.com", "protonmail.com", "proton.me", "gmx.com", "gmx.net",
-  "mail.com", "zoho.com", "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
-]);
+// one can never stand in for a company's identity or name. There used to be an
+// identical private copy of this list here and in `discovery.ts`; both now read
+// the canonical one, because three copies of a list is three chances to drift.
+import { FREEMAIL_DOMAINS as FREEMAIL } from "./crawler/validate";
 
 export function isCompanySite(domain: string): boolean {
   if (NOT_A_COMPANY_SITE.has(domain)) return false;

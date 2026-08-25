@@ -344,6 +344,36 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN next_enrich_at TEXT`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN enrich_status TEXT`); } catch { /* exists */ }
+  // MANUAL RECOVERY BOOKKEEPING — the columns that stop "Re-check emails" being
+  // an infinite loop.
+  //
+  // enrichOne() parks a lead it has given up on as
+  //   enriched=1, enrich_status='blocked'|'error', next_enrich_at=NULL
+  // and that was ALSO the exact predicate the re-check tool selected on. So the
+  // marker meaning "we gave up" doubled as "please try me again": every press
+  // re-queued the same rows, spent a crawl (or six) each against the same
+  // datacenter IP that had already been refused, parked them with an identical
+  // status, and left the badge reading the number it started with. Nothing
+  // anywhere recorded that a recovery pass had happened at all.
+  //   recheck_count  how many manual recovery passes this row has been through
+  //   recheck_key    the bypass capability that was in place for the last one
+  //   recheck_at     when that pass ran (so a disabled button can say why)
+  // `recheck_key` is the important one: re-crawling a Cloudflare wall from the
+  // same IP with the same (or no) key cannot produce a different answer, so a
+  // row is only offered again once the OPERATOR changes something — a key added
+  // or removed, a proxy configured.
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_key TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_at TEXT`); } catch { /* exists */ }
+  // The same bookkeeping for "Repair company names", which had the identical
+  // shape of bug: `countBadNames()` counted every unusable name, but the repair
+  // can only fix the ones it can look up in a directory or derive from a
+  // domain. Everything else stayed bad, stayed counted, and re-walked EVERY
+  // directory source from page 1 on the next press to rebuild an identical
+  // index. `name_fix_key` records the setup a failed attempt ran under, so a
+  // row is only retried once the directory sources or the naming rules change.
+  try { await q(`ALTER TABLE discovered_leads ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
+  try { await q(`ALTER TABLE contacts ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
   // Due-lead scan hits (enriched=0, next_enrich_at) on every enrich tick.
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
   // Domain lookups (the pool-domain backfill + junk sweeps scan by domain).

@@ -57,7 +57,7 @@ import {
   STALE_AFTER_RUNS,
   STALE_OFF_AFTER_RUNS,
 } from "./discovery";
-import { repairLeadNames, countBadNames } from "./repair";
+import { repairLeadNames, countBadNames, clearFreemailCompanyNames } from "./repair";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -99,6 +99,11 @@ rejectContentLeads().catch((e) => console.error(`[cleanup] ${String(e?.message |
 repairEscapedEmails().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 // And rewrite company names that are really page headlines ("FCCSA - Home").
 repairPageTitleNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
+// One-time: an older "Repair company names" derived a name from the contact's
+// email domain without excluding shared mailboxes, so contacts on gmail were
+// filed as a company called "Gmail" — which then rendered into {{company}} in a
+// real cold email. Blank the ones that are demonstrably that bug's output.
+clearFreemailCompanyNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(

@@ -2,6 +2,30 @@
 
 import { promises as dns } from "node:dns";
 
+/**
+ * Shared mailbox hosts — the single canonical list.
+ *
+ * Thousands of unrelated businesses sit behind each of these, so a free-mail
+ * domain can never stand in for a company's identity. It must not be deduped
+ * on, it must not be treated as a company's own domain, and — the reason this
+ * moved here from separate private copies in `discovery.ts` and `leads.ts` — a
+ * company NAME must never be derived from one. That last omission is how a
+ * contact on a gmail address ended up filed with the company name "Gmail",
+ * which then renders into the `{{company}}` merge tag of a real outreach email.
+ *
+ * This module is a leaf (node:dns only), so every caller can share it without
+ * risking an import cycle.
+ */
+export const FREEMAIL_DOMAINS = new Set([
+  "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk", "outlook.com",
+  "live.com", "msn.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "icloud.com",
+  "me.com", "aol.com", "protonmail.com", "proton.me", "gmx.com", "gmx.net",
+  "mail.com", "zoho.com", "qq.com", "163.com", "126.com", "yandex.com", "yandex.ru",
+]);
+export function isFreeMailDomain(domain?: string | null): boolean {
+  return FREEMAIL_DOMAINS.has(String(domain || "").trim().toLowerCase());
+}
+
 const ASSET_EXT =
   /\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|css|js|mjs|json|xml|map|mp4|webm|mov|mp3|wav|woff2?|ttf|eot|otf|pdf|zip|rar|gz|doc|docx|xls|xlsx|ppt|pptx)$/i;
 

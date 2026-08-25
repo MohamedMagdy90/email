@@ -814,3 +814,121 @@ different moments — so one server clock could never get this right.
 ## Note for the next session
 Local `data.sqlite` was NOT seeded, so the per-country panel shows its empty
 state on this container. It fills in as soon as the pool holds emailable leads.
+
+---
+
+# "Re-check emails" was a loop — 166 in, 166 out (2026-08-25) ✅
+
+## The bug (confirmed in the SQL, not guessed)
+`enrichOne()` parks a lead it has given up on as
+`enriched=1, enrich_status='blocked'|'error', next_enrich_at=NULL`.
+`recoverable` counts exactly `enriched=1 AND enrich_status IN (NULL,'blocked','error')`.
+`reEnrichBlocked()` resets exactly that same set.
+
+**The marker meaning "we gave up" is the marker the tool selects on.** Nothing
+recorded that a recovery pass had ever run, so the button re-armed its own
+queue: 166 reset → each burns 2 crawls (hard wall) or up to 6 (soft) against the
+same datacenter IP that refused them last time → all park with the identical
+status → badge reads 166 again. ~332 guaranteed-wasted crawls per press.
+
+The leads WERE being marked as failed. "Failed" just also meant "try me again".
+
+## Fix — record the pass, and what capability it ran with
+- [x] `recheck_count` / `recheck_key` / `recheck_at` on `discovered_leads`
+- [x] `bypassFingerprint()` — FNV-1a digest of the saved Jina keys + proxy
+      provider/mode/premium. Built from the CONFIGURATION, not from live health:
+      a key running out of tokens is not a reason to re-crawl (nothing the
+      operator did changed), whereas adding or removing one is. Hashed, so a
+      lead row never carries a fragment of an API key
+- [x] `PARKED_SQL` / `RECHECKABLE_SQL` / `EXHAUSTED_SQL` live together, and the
+      badge COUNT and the button's UPDATE both read them — the button can never
+      again offer a number it cannot deliver
+- [x] `RECHECK_MAX_PASSES = 1`. By the time a lead is parked the automatic
+      ladder has already tried it twice (hard wall) or six times out to 72h
+      (soft), so the transient case is long ruled out. A second hand-pressed
+      pass from the same IP with the same key is the definition of doing the
+      same thing and expecting a different result
+- [x] `stuck` + `lastRecheckAt` on the status, so the disabled button explains
+      itself: what parked them, when it was last tried, what would unlock them
+- [x] Toast now reports what a pass ACHIEVED, incl. `reArmed` — "166 unlocked by
+      your new key/proxy" vs the old, always-true, always-meaningless "166"
+
+## Verified
+`scripts/verify-recheck.ts` — **28/28** offline on a scratch DB: 166 parked →
+recoverable 166 / stuck 0 → press → the crawls fail again → **recoverable 0,
+stuck 166** (this is the line that used to read 166 for ever) → press again
+re-queues 0 and re-crawls nothing → a newly parked lead is still offered
+alongside the stuck ones → adding a Jina key re-arms all 167 and reports them as
+re-armed → removing the key re-arms too, restoring it parks them again → a proxy
+re-arms on its own. Four control rows (`empty`, resolved, site-less, approved)
+untouched throughout.
+
+Live over HTTP: `stuck` / `lastRecheckAt` serialize on `/api/discovery/status`;
+`POST /api/discovery/re-enrich` returns `{reset, stuck, reArmed}`; first press
+`reset:29`, second and third `reset:0` — the log says "nothing to re-queue"
+instead of re-crawling. backend `tsc` clean · frontend `tsc` clean · `vite
+build` clean.
+
+⚠️ Note for the operator: the parked leads are NOT lost. They stay pending in
+the pool with their website on file, and the moment a Jina key or scraping proxy
+is added in Settings → Crawler every one of them becomes re-checkable again.
+
+---
+
+# "Repair company names" — yes, same loop, plus a worse one (2026-08-25) ✅
+
+Asked straight after the re-check fix: does this tool do the same thing? It did.
+
+## 1. Same loop, more expensive
+`countBadNames()` counted EVERY unusable name. `repairLeadNames()` can only fix
+the ones it can look up in a re-walked directory or derive from a domain —
+everything else hits `result.stillBad++` and is left exactly as it was, so it is
+counted again on the next call. The badge therefore stuck at a number no amount
+of pressing could move, and **the count over-promised from the very first press**
+(seeded 4 bad names → fixed 1 → badge still said 3).
+
+Worse than the re-check case on cost: every press re-walks EVERY directory
+source from page 1 at `maxPages: 80, maxDetails: 5000` to rebuild a byte-identical
+index. That is minutes of crawling out of the same budget the discovery bot
+needs, to learn nothing.
+
+- [x] `name_fix_key` on `discovered_leads` AND `contacts` — the fingerprint a
+      failed attempt ran under
+- [x] `namingFingerprint()` = hash(sorted directory `base_url`s + `NAME_RULES_VERSION`).
+      Those are the ONLY inputs that can change the answer; same directories +
+      same rules rebuilds the same index by definition
+- [x] `NAME_RULES_VERSION`, bumped whenever `looksLikeName` / `nameFromDomain`
+      improves, so a smarter rule re-offers every parked row on deploy
+- [x] **Early return before any crawling** when nothing is fixable — this is the
+      part that stops the expensive half
+- [x] `countBadNames()` now returns `{leads, contacts, stuckLeads, stuckContacts}`
+      and the badge only counts what the button can actually deliver
+- [x] Tooltip explains the parked names instead of the icon just going grey
+
+## 2. …and it was renaming contacts to "Gmail"
+`nameFromDomain(null, "gmail.com")` → `"Gmail"` → passes `looksLikeName` → written
+to `contacts.company`. Worse than an empty field: it reads as valid so it never
+comes back for review, and `{{company}}` renders it into the body of a real cold
+email. Reproduced on the first press of the probe.
+- [x] `nameFromDomain` refuses free-mail hosts outright
+- [x] `clearFreemailCompanyNames()` at boot, once, blanking only contacts whose
+      company name is exactly the brand label of their OWN free-mail domain —
+      demonstrably this bug's output, not a real firm sharing the word
+- [x] The free-mail list was duplicated byte-for-byte in `discovery.ts` and
+      `leads.ts` and absent from `repair.ts` — which is exactly how the third
+      caller ended up without it. One canonical copy now lives in
+      `crawler/validate.ts` (a leaf, so no import cycle) and all three read it
+
+## Verified
+`scripts/verify-names.ts` — **29/29**: free-mail guard on five domains · 4 bad
+names offered → press → 1 lead + 1 contact fixed, **offered drops to 0 (was 4)**,
+4 reported parked · presses 2 and 3 walk **0 pages** and change nothing · parked
+rows not corrupted · adding a directory source re-arms all 4 · the gmail contact
+is never renamed to "Gmail" · the one-time cleanup blanks exactly 1, leaves the
+real company alone, and refuses to run twice.
+
+`scripts/verify-recheck.ts` still 28/28 after the free-mail consolidation.
+backend `tsc` clean · frontend `tsc` clean · `vite build` clean · clean boot with
+both migrations applied · `/api/discovery/bad-names` returns the new shape.
+
+---
