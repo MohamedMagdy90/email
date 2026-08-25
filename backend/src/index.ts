@@ -54,6 +54,7 @@ import {
   repairEscapedEmails,
   repairPageTitleNames,
   sweepNonProspectLeads,
+  STALE_AFTER_RUNS,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
 import {
@@ -1285,7 +1286,14 @@ app.get("/api/discovery/sources", async (c) => {
     [archived ? 1 : 0]
   );
   const archivedCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=1`))[0]?.n ?? 0;
-  return c.json({ sources, archivedCount });
+  // How many LIVE sources have run themselves dry (see STALE_AFTER_RUNS). Sent
+  // with every list so the tab can flag them without a second request, and so
+  // the count is identical to the one the Overview shows.
+  const staleCount = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0 AND barren_runs >= ?`,
+    [STALE_AFTER_RUNS]
+  ))[0]?.n ?? 0;
+  return c.json({ sources, archivedCount, staleCount, staleAfterRuns: STALE_AFTER_RUNS });
 });
 
 app.post("/api/discovery/sources", async (c) => {
@@ -1379,6 +1387,14 @@ app.put("/api/discovery/sources/:id", async (c) => {
   let cursor = existing.cursor;
   let exhausted = existing.exhausted;
   let emptyStreak = existing.empty_streak;
+  // Re-aiming a source is how you "replace" it, so it earns a clean slate on the
+  // stale counter: judging the new URL / keywords / area by the old one's dry
+  // runs would flag it the moment it was fixed. Merely pausing, renaming or
+  // re-scheduling it changes nothing about what it can find, so those don't.
+  let barrenRuns = Number(existing.barren_runs) || 0;
+  const reAimed =
+    (b.url != null || b.base_url != null || b.keywords != null || b.location != null ||
+     b.category != null || b.place !== undefined || b.sweepCountry != null);
   if (existing.type === "directory") {
     if (b.url != null || b.base_url != null) {
       let url = String(b.url ?? b.base_url ?? "").trim();
@@ -1406,11 +1422,20 @@ app.put("/api/discovery/sources/:id", async (c) => {
 
   const sweepCountry =
     b.sweepCountry != null ? (b.sweepCountry ? 1 : 0) : Number(existing.sweep_country ?? 0);
+  const changedAim =
+    reAimed &&
+    (String(baseUrl || "") !== String(existing.base_url || "") ||
+     String(keywords || "") !== String(existing.keywords || "") ||
+     location !== existing.location ||
+     category !== existing.category ||
+     String(placeJson || "") !== String(existing.place_json || "") ||
+     sweepCountry !== Number(existing.sweep_country ?? 0));
+  if (changedAim) barrenRuns = 0;
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?
+       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?, barren_runs=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, id]
+    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, barrenRuns, id]
   );
   return c.json({ source: rows[0] });
 });
@@ -1772,13 +1797,78 @@ app.get("/api/overview", async (c) => {
   const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
   const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
 
-  const cutoff = new Date(Date.now() - 14 * 86400000).toISOString();
-  const recent = await q(`SELECT created_at FROM sends WHERE created_at > ?`, [cutoff]);
-  const bucket: Record<string, number> = {};
-  for (const r of recent) { const d = String(r.created_at).slice(0, 10); bucket[d] = (bucket[d] || 0) + 1; }
-  const daily = Object.entries(bucket).map(([d, n]) => ({ d, n })).sort((a, b) => (a.d < b.d ? -1 : 1));
+  // ---- Emails sent, day by day -------------------------------------------
+  // THE SERIES IS BUILT HERE, COMPLETE, INCLUDING THE EMPTY DAYS. It used to
+  // return only the days that had rows and leave the browser to line them up
+  // against a locally-computed calendar — which quietly dropped a bucket
+  // whenever the viewer's clock sat on the other side of midnight UTC from the
+  // server's.
+  //
+  // Two more corrections while we're here:
+  //  · it counted EVERY row in `sends`, including failures and still-queued
+  //    rows, so the chart disagreed with the "Emails sent" card above it,
+  //    which only counts `sent*`;
+  //  · it bucketed on `created_at` (when the row was queued), so a send queued
+  //    before midnight and delivered after it landed on the wrong day.
+  const DAYS = 14;
+  const now = new Date();
+  const startMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - (DAYS - 1) * 86400000;
+  const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const series = new Map<string, { d: string; n: number; sent: number; failed: number; opens: number; clicks: number }>();
+  for (let i = 0; i < DAYS; i++) {
+    const d = dayKey(startMs + i * 86400000);
+    series.set(d, { d, n: 0, sent: 0, failed: 0, opens: 0, clicks: 0 });
+  }
+  const recent = await q(
+    `SELECT COALESCE(sent_at, created_at) AS t, status, opened, click_count
+       FROM sends
+      WHERE COALESCE(sent_at, created_at) >= ?`,
+    [new Date(startMs).toISOString()]
+  );
+  for (const r of recent) {
+    const bucket = series.get(String(r.t ?? "").slice(0, 10));
+    if (!bucket) continue;
+    const status = String(r.status || "");
+    if (status.startsWith("sent")) {
+      bucket.sent++;
+      bucket.n++; // `n` = what the chart plots, kept for older clients
+      if (Number(r.opened) === 1) bucket.opens++;
+      if (Number(r.click_count) > 0) bucket.clicks++;
+    } else if (status === "failed" || status === "bounced") {
+      bucket.failed++;
+    }
+  }
+  const daily = [...series.values()];
 
-  return c.json({ contacts, sends, opens, clicks, totalContacts, totalSends, daily });
+  // ---- Sources that have stopped producing --------------------------------
+  // Surfaced here so the number you act on ("replace these") is visible from
+  // the front page, not only inside the Discovery tab.
+  const staleRows = await q(
+    `SELECT id, type, location, base_url, keywords, category, audience, runs, total_found,
+            barren_runs, last_found_at, last_run_at
+       FROM discovery_sources
+      WHERE archived=0 AND barren_runs >= ?
+      ORDER BY barren_runs DESC, last_run_at DESC`,
+    [STALE_AFTER_RUNS]
+  );
+  const sourceCounts = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS total,
+            CAST(sum(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS INTEGER) AS active
+       FROM discovery_sources WHERE archived=0`
+  ))[0] || {};
+
+  return c.json({
+    contacts, sends, opens, clicks, totalContacts, totalSends,
+    daily,
+    windowDays: DAYS,
+    sources: {
+      total: Number(sourceCounts.total) || 0,
+      active: Number(sourceCounts.active) || 0,
+      stale: staleRows.length,
+      staleAfterRuns: STALE_AFTER_RUNS,
+      staleList: staleRows.slice(0, 8),
+    },
+  });
 });
 
 /* ------------------------------ Helpers ----------------------------- */

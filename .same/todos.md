@@ -1,3 +1,29 @@
+# Overview repair + stale sources (2026-08-25) — in progress
+
+## 1. "Emails sent · last 14 days" bars were all flat
+Root cause is CSS, not data: the chart row is `flex h-40 items-end`, so
+`align-items: flex-end` stops the columns being stretched — each column's height
+becomes its CONTENT height. The bar track inside is `flex-1` of that auto-height
+column, so it resolves to 0, and the bar's `height: N%` is a percentage of zero.
+Every bar collapsed to its 4px `minHeight`, which reads as "all zero".
+- [ ] Redraw the chart with pixel heights computed in JS (no % of an auto parent)
+- [ ] Backend: series counts only real sends (`status LIKE 'sent%'`), keyed on
+      `sent_at` falling back to `created_at`, and returns all 14 days pre-filled
+      so the client's UTC/local day maths can't drop today's bucket
+
+## 2. Automation batch bars only existed on Discovery
+- [ ] Reuse the per-lane progress (ready / threshold) on Overview
+
+## 3. Stale sources — "ran twice and fetched nobody"
+- [ ] `discovery_sources.barren_runs` / `last_found` / `last_found_at`
+- [ ] Counted in `runBatch` for all three source types; a blocked / errored /
+      stopped batch does NOT count (that's not stale, that's blocked)
+- [ ] `staleSources` on `/api/discovery/status`, `staleCount` on the sources list
+- [ ] Discovery: badge per source + a "replace these" banner
+- [ ] Overview: a Stale sources metric that deep-links into Discovery
+
+---
+
 # Cut the Jina bill — free page sources instead of paid reader tokens ✅ shipped & verified
 
 ## Problem

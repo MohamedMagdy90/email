@@ -245,8 +245,21 @@ export function Tooltip({
 // The app is a single screen with tab state, so a deep link from one screen to
 // another (e.g. Discovery → Settings → Automation) goes through an event the
 // shell listens for. Keeps screens decoupled without pulling in a router.
-export function goTo(tab: string) {
+//
+// `focus` carries WHAT the link was about — "stale" from the Overview's stale-
+// sources metric, say — because landing on a tab that holds forty rows and
+// leaving the reader to find the two that were being pointed at is not a link,
+// it's a hint. The target screen claims it once, on mount, with `takeFocus`;
+// it's a one-shot value so a later manual visit to the same tab is clean.
+let pendingFocus: string | null = null;
+export function goTo(tab: string, focus?: string) {
+  pendingFocus = focus || null;
   window.dispatchEvent(new CustomEvent("dna-navigate", { detail: tab }));
+}
+export function takeFocus(): string | null {
+  const f = pendingFocus;
+  pendingFocus = null;
+  return f;
 }
 
 /* -------------------------------- Modal ----------------------------- */

@@ -7,8 +7,10 @@ import {
   type DiscoveredLead,
   type AutomationStatus,
   type Place,
+  STALE_AFTER_RUNS,
+  isStaleSource,
 } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo, takeFocus } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
 
 const FALLBACK_CATS = [
@@ -94,8 +96,16 @@ export default function Discovery() {
   const [editing, setEditing] = useState<DiscoverySource | null>(null);
   // Sources list open/closed — remembered across visits.
   const [showSources, setSourcesOpen] = useState(readSourcesOpen);
+  // Narrow the list to the spent sources — set by the Overview's deep link, and
+  // toggleable by hand from the banner.
+  const [onlyStale, setOnlyStale] = useState(false);
+  // How many completed runs with nothing found make a source "stale". Read from
+  // the server so the badge and the Overview's count can never disagree; the
+  // shared constant is only a fallback for an API that predates the field.
+  const [staleAfterRuns, setStaleAfterRuns] = useState(STALE_AFTER_RUNS);
 
   const pollRef = useRef<number | null>(null);
+  const sourcesRef = useRef<HTMLDivElement | null>(null);
 
   /* ------------------------------- load ------------------------------ */
   async function refreshStatus() {
@@ -109,6 +119,7 @@ export default function Discovery() {
       const r = await api.getDiscoverySources();
       setSources(r.sources);
       setArchivedCount(r.archivedCount ?? 0);
+      if (r.staleAfterRuns) setStaleAfterRuns(r.staleAfterRuns);
     } catch { /* ignore */ }
   }
   async function refreshArchived() {
@@ -176,6 +187,15 @@ export default function Discovery() {
     refreshSources();
     refreshArchived();
     refreshBadNames();
+    // Arrived from the Overview's "Stale sources" metric: open the list and
+    // show only the ones it was pointing at, rather than dropping the reader
+    // at the top of a screen with forty rows on it.
+    if (takeFocus() === "stale") {
+      setOnlyStale(true);
+      setSourcesOpen(true);
+      writeSourcesOpen(true);
+      setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+    }
     api.getLeadCategories().then((r) => r.categories?.length && setCats(r.categories)).catch(() => {});
     api.getCategories().then((r) => setContactCats(r.categories || [])).catch(() => {});
     // Live status + sources while the bot works in the background.
@@ -337,10 +357,16 @@ export default function Discovery() {
   const scanningNow = sources.filter((s) => s.enabled && s.last_status === "running").length;
   const activeCount = sources.filter((s) => s.enabled).length;
   const foundTotal = sources.reduce((n, s) => n + (s.total_found || 0), 0);
+  // Sources that have completed `staleAfterRuns` runs in a row and put nothing
+  // new in the pool. They are still "working" by every other measure — enabled,
+  // scheduled, no errors — which is exactly why they need saying out loud.
+  const stale = sources.filter((s) => isStaleSource(s, staleAfterRuns));
+  const shownSources = onlyStale ? stale : sources;
   const sourcesSummary = (() => {
     if (!sources.length) return "None yet — add one to start discovering companies.";
     const parts = [`${activeCount} active`];
     if (sources.length - activeCount > 0) parts.push(`${sources.length - activeCount} paused`);
+    if (stale.length > 0) parts.push(`${stale.length} stale`);
     if (archivedCount > 0) parts.push(`${archivedCount} archived`);
     if (foundTotal > 0) parts.push(`${foundTotal.toLocaleString()} found`);
     return parts.join(" · ");
@@ -409,7 +435,7 @@ export default function Discovery() {
           <div className="flex items-start gap-3">
             <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">!</span>
             <div>
-              <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren’t scanning</div>
+              <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren't scanning</div>
               <div className="text-xs leading-relaxed text-muted">
                 You have {status?.activeSources} enabled source{(status?.activeSources ?? 0) === 1 ? "" : "s"}. Turn the bot on and it scans
                 continuously in the background — paging through directories back-to-back — even with this tab closed.
@@ -420,9 +446,46 @@ export default function Discovery() {
         </div>
       )}
 
+      {/* Sources that have run dry. Above the list, because a spent source is
+          invisible from inside the list: it is enabled, on schedule, error-free
+          and finding nothing. */}
+      {stale.length > 0 && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#e0b354]/50 bg-[#fdf6e7] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">
+              {stale.length}
+            </span>
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-ink">
+                {stale.length === 1 ? "One source has run dry" : `${stale.length} sources have run dry`}
+              </div>
+              <div className="text-xs leading-relaxed text-muted">
+                {stale.length === 1 ? "It has" : "They have"} finished {staleAfterRuns} run{staleAfterRuns === 1 ? "" : "s"} in a row
+                without adding a single new company — the ground is covered. Re-aim {stale.length === 1 ? "it" : "them"} at a new
+                area, keywords or directory, or archive {stale.length === 1 ? "it" : "them"}.
+                <span className="block truncate pt-0.5 text-ink/60">{stale.map(sourceTitle).join(" · ")}</span>
+              </div>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0"
+            onClick={() => {
+              setOnlyStale((v) => !v);
+              if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); }
+              setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+            }}
+          >
+            {onlyStale ? "Show all sources" : "Review them"}
+          </Button>
+        </div>
+      )}
+
       {/* Sources — collapsible. Once they're configured this list is reference
           material, while the review pool underneath is the daily work; folding it
           away puts the pool on screen without scrolling past every source. */}
+      <div ref={sourcesRef} className="scroll-mt-4">
       <Card className="overflow-hidden">
         <div className="flex items-center justify-between gap-3 px-5 py-4">
           {/* The heading WRAPS the toggle (the accordion pattern) so the whole
@@ -457,6 +520,11 @@ export default function Discovery() {
                     <span className="inline-flex items-center gap-1.5 rounded-full bg-good/15 px-2 py-0.5 text-[11px] font-medium text-good">
                       <Spinner className="h-2.5 w-2.5" />
                       {scanningNow} scanning
+                    </span>
+                  )}
+                  {stale.length > 0 && (
+                    <span className="rounded-full bg-[#fbedd2] px-2 py-0.5 text-[11px] font-medium text-[#8a5a12]">
+                      {stale.length} stale
                     </span>
                   )}
                 </span>
@@ -498,11 +566,21 @@ export default function Discovery() {
               ) : (
                 // Past a handful of sources the list scrolls inside the card, so
                 // the review pool stays reachable even with it expanded.
-                <div className={cn("divide-y divide-line-soft", sources.length > 6 && "max-h-[26rem] overflow-y-auto")}>
-                  {sources.map((s) => (
+                <div className={cn("divide-y divide-line-soft", shownSources.length > 6 && "max-h-[26rem] overflow-y-auto")}>
+                  {onlyStale && (
+                    <div className="flex items-center justify-between gap-3 bg-[#fdf6e7] px-5 py-2 text-[12px] text-[#8a5a12]">
+                      <span>Showing only the {stale.length} source{stale.length === 1 ? "" : "s"} that stopped finding anyone.</span>
+                      <button type="button" className="font-medium underline underline-offset-2" onClick={() => setOnlyStale(false)}>
+                        Show all {sources.length}
+                      </button>
+                    </div>
+                  )}
+                  {shownSources.map((s) => (
                     <SourceRow
                       key={s.id}
                       s={s}
+                      stale={isStaleSource(s, staleAfterRuns)}
+                      staleAfterRuns={staleAfterRuns}
                       onToggle={() => toggleSource(s)}
                       onRun={() => runSource(s)}
                       onEdit={() => { setEditing(s); setModalOpen(true); }}
@@ -546,6 +624,7 @@ export default function Discovery() {
           </div>
         </div>
       </Card>
+      </div>
 
       {/* Review pool */}
       <Card className="overflow-hidden">
@@ -973,42 +1052,69 @@ function AutomationStrip({ a }: { a: AutomationStatus | null }) {
       </div>
 
       {/* One row per live lane, so "how close is it?" is answered per pitch. */}
-      {live.length > 0 && (
-        <div className="mt-3 space-y-2.5">
-          {live.map((l) => {
-            const threshold = Math.max(1, l.config.threshold);
-            const pct = Math.min(100, Math.round((l.ready / threshold) * 100));
-            const partner = l.audience === "partner";
-            return (
-              <div key={l.audience}>
-                <div className="flex flex-wrap items-baseline justify-between gap-2 text-[11px]">
-                  <span className="flex items-center gap-1.5">
-                    <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide", partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]")}>
-                      {partner ? "partner" : "customer"}
-                    </span>
-                    <span className="text-muted">
-                      <b className="text-ink/70">{l.ready.toLocaleString()}</b> of {threshold.toLocaleString()} with an email
-                    </span>
-                  </span>
-                  <span className={cn(l.ready >= threshold ? "font-medium text-good" : "text-muted")}>
-                    {l.running ? "sending now" : l.ready >= threshold ? "batch is full" : `${(threshold - l.ready).toLocaleString()} to go`}
-                  </span>
-                </div>
-                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-ink/[0.07]">
-                  <div className={cn("h-full rounded-full transition-all", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
-                </div>
+      {live.length > 0 && <AutomationLaneBars lanes={live} className="mt-3" />}
+    </div>
+  );
+}
+
+/* ------------------------- Automation batch bars ------------------------ */
+
+// How close each lane is to its next batch: leads with an email, out of the
+// trigger that fires the run. Exported because the Overview shows exactly the
+// same thing — one component, so the two screens can never drift apart or
+// disagree about what "ready" means.
+export function AutomationLaneBars({
+  lanes,
+  className,
+  size = "sm",
+}: {
+  lanes: AutomationStatus["lanes"];
+  className?: string;
+  size?: "sm" | "md";
+}) {
+  if (!lanes.length) return null;
+  return (
+    <div className={cn(size === "md" ? "space-y-3.5" : "space-y-2.5", className)}>
+      {lanes.map((l) => {
+        const threshold = Math.max(1, l.config.threshold);
+        const pct = Math.min(100, Math.round((l.ready / threshold) * 100));
+        const partner = l.audience === "partner";
+        const full = l.ready >= threshold;
+        return (
+          <div key={l.audience}>
+            <div className={cn("flex flex-wrap items-baseline justify-between gap-2", size === "md" ? "text-xs" : "text-[11px]")}>
+              <span className="flex items-center gap-1.5">
+                <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide", partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]")}>
+                  {partner ? "partner" : "customer"}
+                </span>
+                <span className="text-muted">
+                  <b className="text-ink/70 tabular-nums">{l.ready.toLocaleString()}</b> of {threshold.toLocaleString()} with an email
+                </span>
+              </span>
+              <span className={cn(full ? "font-medium text-good" : "text-muted")}>
+                {l.running ? "sending now" : full ? "batch is full" : `${(threshold - l.ready).toLocaleString()} to go`}
+              </span>
+            </div>
+            <div className={cn("mt-1 overflow-hidden rounded-full bg-ink/[0.07]", size === "md" ? "h-2" : "h-1.5")}>
+              <div className={cn("h-full rounded-full transition-all duration-500", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
+            </div>
+            {/* Held-back leads are the most confusing state there is: the bar is
+                full and nothing happens. Say why, right here. */}
+            {size === "md" && l.readyNow < l.ready && (
+              <div className="mt-1 text-[11px] text-muted">
+                {(l.ready - l.readyNow).toLocaleString()} waiting for their country's sending window
               </div>
-            );
-          })}
-        </div>
-      )}
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 /* ------------------------------ Source row ----------------------------- */
 
-function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void }) {
+function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, staleAfterRuns }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void; stale?: boolean; staleAfterRuns?: number }) {
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const isSearch = s.type === "search";
@@ -1021,13 +1127,29 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
   const osmAvail = s.osm_available || 0;
 
   return (
-    <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
+    <div
+      className={cn(
+        "flex items-center gap-4 px-5 py-3.5",
+        !s.enabled && "opacity-55",
+        // A spent source looks completely healthy from the outside — enabled,
+        // on schedule, no error — so the row itself has to carry the warning.
+        stale && "border-l-2 border-l-[#e0b354] bg-[#fdf6e7]/60"
+      )}
+    >
       <Switch small checked={!!s.enabled} onChange={onToggle} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
           <AudienceTag a={s.audience} />
           <span className="truncate font-medium">{title}</span>
+          {stale && (
+            <span
+              className="shrink-0 rounded-md bg-[#fbedd2] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#8a5a12]"
+              title={`Ran ${s.barren_runs} time${s.barren_runs === 1 ? "" : "s"} in a row without finding anyone new. Re-aim it or archive it.`}
+            >
+              stale
+            </span>
+          )}
           {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
             <>
               <span className="text-ink/30">·</span>
@@ -1073,6 +1195,14 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: Dis
           )}
           {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
         </div>
+        {/* What "stale" actually means for THIS source, in its own numbers. */}
+        {stale && (
+          <div className="mt-1 text-[11px] font-medium text-[#8a5a12]">
+            Found nobody in its last {s.barren_runs ?? staleAfterRuns} runs
+            {s.last_found_at ? ` · last new company ${fmtAgo(s.last_found_at)}` : " · it has never found one"}
+            {" — replace it or archive it."}
+          </div>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
         <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
@@ -1505,7 +1635,7 @@ function EmailCell({ lead }: { lead: DiscoveredLead }) {
     );
   }
   if (lead.enrich_status === "blocked" || lead.enrich_status === "error") {
-    return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn’t read site</span>;
+    return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn't read site</span>;
   }
   return <span className="italic">no email found</span>;
 }

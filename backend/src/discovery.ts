@@ -108,6 +108,12 @@ const DIRECTORY_LISTINGS_PER_RUN = 40;
 const DIRECTORY_CONTINUE_MS = 1_500;
 // Consecutive empty batches to tolerate before a directory is "finished".
 const EMPTY_STREAK_LIMIT = 3;
+// STALE: a source that has COMPLETED this many runs in a row without adding a
+// single new lead has stopped paying for itself and wants replacing. Two is the
+// threshold because one barren run is normal (a directory page of companies we
+// already hold, a search step that only returned known sites) — twice running
+// is a pattern.
+export const STALE_AFTER_RUNS = 2;
 // Web-search sources: how many search queries to run per batch (kept small so
 // the shared free-reader budget isn't starved), which result pages to pull per
 // query, spacing between queries, and how many all-duplicate batches to tolerate
@@ -236,6 +242,11 @@ export interface DiscoveryStatus {
   autoEnrich: boolean;
   sources: number;
   activeSources: number;
+  // Sources that have completed STALE_AFTER_RUNS runs in a row without adding a
+  // single new lead — spent ground, worth replacing. Archived ones don't count:
+  // they're already retired.
+  staleSources: number;
+  staleAfterRuns: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads whose last crawl was BLOCKED/errored (Cloudflare,
@@ -267,6 +278,10 @@ export interface DiscoveryStatus {
 export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
   const srcCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0`))[0]?.n ?? 0;
   const activeCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE enabled=1 AND archived=0`))[0]?.n ?? 0;
+  const staleCount = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0 AND barren_runs >= ?`,
+    [STALE_AFTER_RUNS]
+  ))[0]?.n ?? 0;
   const statusRows = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
   const withEmail = (await q(
     `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE status='pending' AND email IS NOT NULL AND email <> ''`
@@ -310,6 +325,8 @@ export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
     autoEnrich: await autoEnrichOn(),
     sources: srcCount,
     activeSources: activeCount,
+    staleSources: staleCount,
+    staleAfterRuns: STALE_AFTER_RUNS,
     leads: {
       pending: map.pending || 0,
       approved: map.approved || 0,
@@ -1402,6 +1419,27 @@ async function executeSource(src: any): Promise<{ found: number; error?: string;
   }
 }
 
+/* ------------------------------- staleness ------------------------------ */
+
+// The three numbers behind the "stale" flag, for one finished batch.
+//
+// `counted` must be FALSE for a run that errored, was rate-limited or was
+// stopped mid-flight. Such a run says nothing about whether the source still
+// has leads left in it, so it can neither raise the streak (that would libel a
+// blocked source as spent) nor reset it (that would let a permanently blocked
+// source hide behind its own failures).
+function barrenState(src: any, found: number, counted: boolean) {
+  const prev = Number(src.barren_runs) || 0;
+  if (!counted) {
+    return { runs: prev, lastFound: Number(src.last_found) || 0, lastFoundAt: src.last_found_at || null };
+  }
+  return {
+    runs: found > 0 ? 0 : prev + 1,
+    lastFound: found,
+    lastFoundAt: found > 0 ? nowIso() : src.last_found_at || null,
+  };
+}
+
 async function runBatch(src: any): Promise<{ found: number; error?: string; continue: boolean; continueMs?: number }> {
   // Never start a batch for a source that's already gone. Between the tick's
   // SELECT and here, it may have been deleted, archived or switched off.
@@ -1458,12 +1496,17 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     const cont = !r.error && !exhausted && !stalled; // keep streaming while there's more
     const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
     const status = r.error ? "error" : exhausted ? "done" : "ok";
+    // A batch the site refused (`stalled`) is blocked, not spent — it doesn't
+    // count toward the stale streak.
+    const barren = barrenState(src, r.found, !r.error && r.okish && !stalled);
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, next_url=?
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, next_url=?,
+             barren_runs=?, last_found=?, last_found_at=?
        WHERE id=?`,
-      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, nextUrl, src.id]
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, nextUrl,
+       barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
     );
     if (r.error) derr("dir", `${srcLabel(src)}: ERROR — ${r.error} (will retry in ${interval}m)`);
     else if (exhausted) dlog("dir", `${srcLabel(src)}: FINISHED — walked to the end of the directory (${walkedOff ? "the last page had no next page" : `${EMPTY_STREAK_LIMIT} pages with no more listings`}); re-checking in ${interval}m. Click "Run now" to re-scan for new listings.`);
@@ -1513,12 +1556,17 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
     const cont = !r.error && !exhausted;
     const next = cont ? nowIso() : new Date(Date.now() + (steppedOver ? SEARCH_BLOCK_BASE_MIN : pauseMin) * 60000).toISOString();
     const status = r.error ? "error" : exhausted ? "done" : "ok";
+    // `okish` is already false when the engines rate-limited us or the source
+    // was stopped, which is exactly when a barren batch means nothing.
+    const barren = barrenState(src, r.found, !r.error && r.okish);
     await q(
       `UPDATE discovery_sources
          SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, block_streak=?
+             total_found=total_found+?, cursor=?, exhausted=?, empty_streak=?, block_streak=?,
+             barren_runs=?, last_found=?, last_found_at=?
        WHERE id=?`,
-      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, blockStreak, src.id]
+      [nowIso(), next, status, r.error || null, r.found, cursor, exhausted ? 1 : 0, exhausted ? 0 : streak, blockStreak,
+       barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
     );
     if (steppedOver) dwarn("search", `${srcLabel(src)}: step ${r.nextCursor} was refused ${SEARCH_BLOCK_SKIP_AFTER} times running — skipping it and resuming at step ${cursor}${r.planLen ? `/${r.planLen}` : ""} in ${SEARCH_BLOCK_BASE_MIN}m`);
     else if (r.blocked) dwarn("search", `${srcLabel(src)}: ${r.error}${r.covered ? ` — kept the ${r.covered} quer${r.covered === 1 ? "y" : "ies"} it did cover (now at step ${cursor}${r.planLen ? `/${r.planLen}` : ""})` : ""} · resuming in ${pauseMin}m`);
@@ -1539,13 +1587,17 @@ async function runBatch(src: any): Promise<{ found: number; error?: string; cont
   const cont = !r.error && !r.exhausted && !r.stopped;
   const next = cont ? nowIso() : new Date(Date.now() + interval * 60000).toISOString();
   const status = r.error ? "error" : r.exhausted ? "done" : "ok";
+  // A sweep halted by hand covered only part of its tiles, so "found nothing"
+  // isn't a verdict on the source.
+  const barren = barrenState(src, r.found, !r.error && !r.stopped);
   await q(
     `UPDATE discovery_sources
        SET last_run_at=?, next_run_at=?, last_status=?, last_error=?, runs=runs+1,
-           total_found=total_found+?, cursor=?, exhausted=?, osm_tiles=?, osm_available=?
+           total_found=total_found+?, cursor=?, exhausted=?, osm_tiles=?, osm_available=?,
+           barren_runs=?, last_found=?, last_found_at=?
      WHERE id=?`,
     [nowIso(), next, status, r.error || null, r.found, r.error ? (Number(src.cursor) || 1) : r.nextCursor,
-     r.exhausted ? 1 : 0, r.tiles, r.available, src.id]
+     r.exhausted ? 1 : 0, r.tiles, r.available, barren.runs, barren.lastFound, barren.lastFoundAt, src.id]
   );
   if (r.error) derr("osm", `${srcLabel(src)}: ERROR — ${r.error} (next scan in ${interval}m)`);
   else if (r.exhausted) {

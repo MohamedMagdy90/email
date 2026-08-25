@@ -147,6 +147,10 @@ export interface DiscoveryStatus {
   autoEnrich: boolean;
   sources: number;
   activeSources: number;
+  // Sources that have completed `staleAfterRuns` runs in a row without adding a
+  // single new lead. Optional: a frontend can be newer than the API it talks to.
+  staleSources?: number;
+  staleAfterRuns?: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads still auto-retrying after a block/error.
@@ -204,8 +208,19 @@ export interface DiscoverySource {
   last_error?: string | null;
   runs: number;
   total_found: number;
+  // STALENESS — completed runs in a row that added nothing new, how many new
+  // leads the last completed run added, and when it last produced anything.
+  // A blocked or errored run doesn't count: that's a different problem.
+  barren_runs?: number;
+  last_found?: number;
+  last_found_at?: string | null;
   created_at: string;
 }
+
+/** Has this source run itself dry? (mirrors STALE_AFTER_RUNS on the server) */
+export const STALE_AFTER_RUNS = 2;
+export const isStaleSource = (s: DiscoverySource, after = STALE_AFTER_RUNS) =>
+  (s.barren_runs ?? 0) >= after;
 
 export interface DiscoveredLead {
   id: string;
@@ -758,7 +773,7 @@ export const api = {
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
   purgeJunkLeads: () => req<{ swept: number }>(`/api/discovery/purge-junk`, { method: "POST", body: "{}" }),
   getDiscoverySources: (archived = false) =>
-    req<{ sources: DiscoverySource[]; archivedCount: number }>(
+    req<{ sources: DiscoverySource[]; archivedCount: number; staleCount?: number; staleAfterRuns?: number }>(
       `/api/discovery/sources${archived ? "?archived=1" : ""}`
     ),
   // Retire a source without deleting it — the bot stops scheduling it, but its
@@ -847,7 +862,23 @@ export const api = {
       clicks: number;
       totalContacts: number;
       totalSends: number;
-      daily: { d: string; n: number }[];
+      /** One entry PER DAY, oldest first, empty days included — the server
+       *  builds the calendar so the browser's time zone can't shift a bucket.
+       *  `n` == `sent` (kept as the plotted value for older clients). */
+      daily: { d: string; n: number; sent?: number; failed?: number; opens?: number; clicks?: number }[];
+      windowDays?: number;
+      /** Discovery sources at a glance, including the ones that have run dry. */
+      sources?: {
+        total: number;
+        active: number;
+        stale: number;
+        staleAfterRuns: number;
+        staleList: {
+          id: string; type?: string; location: string; base_url?: string | null;
+          category?: string; audience?: string | null; runs?: number; total_found?: number;
+          barren_runs?: number; last_found_at?: string | null; last_run_at?: string | null;
+        }[];
+      };
     }>(`/api/overview`),
 
   // history + stats
