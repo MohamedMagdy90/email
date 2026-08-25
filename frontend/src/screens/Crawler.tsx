@@ -485,7 +485,7 @@ export default function Crawler({
 
           {mode === "discover" && (
             <div className="space-y-4">
-              <div className="grid grid-cols-[1fr_1fr_auto] items-end gap-3">
+              <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[1fr_1fr_auto]">
                 <Field label="Country or city">
                   <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="Start typing… e.g. Qatar" onEnter={discover} />
                 </Field>
@@ -494,11 +494,11 @@ export default function Crawler({
                     {cats.map((c) => <option key={c} value={c}>{c}</option>)}
                   </Select>
                 </Field>
-                <Button onClick={discover} loading={discovering} className="mb-[1px]">Discover</Button>
+                <Button onClick={discover} loading={discovering} className="w-full sm:mb-[1px] sm:w-auto">Discover</Button>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
                 <span className="text-[13px] text-muted">Max results</span>
-                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="h-8 w-24">
+                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="w-20 sm:h-8 sm:w-24">
                   {[20, 40, 60, 100].map((n) => <option key={n} value={n}>{n}</option>)}
                 </Select>
                 <span className="text-xs text-muted">Business directory · OpenStreetMap.</span>
@@ -508,18 +508,18 @@ export default function Crawler({
 
           {mode === "keyword" && (
             <div className="space-y-4">
-              <div className="grid grid-cols-[1.3fr_1fr_auto] items-end gap-3">
+              <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[1.3fr_1fr_auto]">
                 <Field label="Keywords" hint="What the company says about itself">
                   <Input value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder='e.g. auto partner, spare parts distributor' onKeyDown={(e) => e.key === "Enter" && searchByKeyword()} />
                 </Field>
                 <Field label="Location (optional)">
                   <LocationAutocomplete value={location} onChange={setLocation} onPick={setPlace} placeholder="e.g. Qatar" onEnter={searchByKeyword} />
                 </Field>
-                <Button onClick={searchByKeyword} loading={searching} className="mb-[1px]">Search</Button>
+                <Button onClick={searchByKeyword} loading={searching} className="w-full sm:mb-[1px] sm:w-auto">Search</Button>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
                 <span className="text-[13px] text-muted">Max results</span>
-                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="h-8 w-24">
+                <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))} className="w-20 sm:h-8 sm:w-24">
                   {[20, 40, 60, 80].map((n) => <option key={n} value={n}>{n}</option>)}
                 </Select>
                 <span className="text-xs text-muted">Searches the live web for matching companies.</span>
@@ -529,26 +529,26 @@ export default function Crawler({
 
           {listMode && companies.length > 0 && (
             <div className="rounded-xl border border-line">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-2">
+              <div className="flex flex-col gap-2 border-b border-line px-3 py-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-ink" />
+                  <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="h-[18px] w-[18px] accent-ink" />
                   {companies.length} found · <span className="text-good">{newCount} new</span>
                   {knownCount > 0 && <span className="text-muted">· {knownCount} known</span>}
                 </label>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                   {knownCount > 0 && (
                     <button onClick={() => setHideKnown((v) => !v)} className="text-xs font-medium text-ink/60 underline hover:text-ink">
                       {hideKnown ? "Show known" : "Hide known"}
                     </button>
                   )}
                   {categories.length > 0 && (
-                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-36 text-[13px]" title="Save under category">
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="min-w-0 flex-1 text-[13px] sm:h-8 sm:w-36 sm:flex-none" title="Save under category">
                       <option value="">No category</option>
                       {categories.map((c) => <option key={c} value={c}>{c}</option>)}
                     </Select>
                   )}
                   {pickedWithEmail.length > 0 && (
-                    <Button size="sm" variant="outline" onClick={addListedEmails}>Add {pickedWithEmail.length} listed</Button>
+                    <Button size="sm" variant="outline" onClick={addListedEmails} className="shrink-0">Add {pickedWithEmail.length} listed</Button>
                   )}
                 </div>
               </div>
@@ -560,7 +560,7 @@ export default function Crawler({
                   const known = c.inContacts || c.crawled;
                   return (
                     <div key={c.website || c.email || c.name} className={cn("flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0", known && "opacity-60")}>
-                      <input type="checkbox" disabled={!c.hasWebsite} checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="accent-ink disabled:opacity-30" />
+                      <input type="checkbox" disabled={!c.hasWebsite} checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="h-[18px] w-[18px] accent-ink disabled:opacity-30" />
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm font-medium">{c.name}</div>
                         <div className="truncate text-xs text-muted">
@@ -595,7 +595,7 @@ export default function Crawler({
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <Field label="Tag country (optional)"><Input value={tagCountry} onChange={(e) => setTagCountry(e.target.value)} placeholder="Qatar" /></Field>
                 <Field label="Tag industry (optional)"><Input value={tagIndustry} onChange={(e) => setTagIndustry(e.target.value)} placeholder="Construction" /></Field>
               </div>
@@ -632,9 +632,9 @@ export default function Crawler({
                 <Toggle label="Respect robots.txt" checked={respectRobots} onChange={setRespectRobots} />
                 <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
                 {categories.length > 0 && (
-                  <div className="ml-auto flex items-center gap-2">
+                  <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
                     <span className="text-[13px] text-muted">Save under</span>
-                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="min-w-0 flex-1 text-[13px] sm:h-8 sm:w-40 sm:flex-none">
                       <option value="">No category</option>
                       {categories.map((c) => <option key={c} value={c}>{c}</option>)}
                     </Select>
@@ -724,7 +724,7 @@ export default function Crawler({
 
               <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-ink/[0.03] p-3">
                 <Field label="Companies to process">
-                  <Select value={pdfMax} onChange={(e) => setPdfMax(Number(e.target.value))} className="h-9 w-36">
+                  <Select value={pdfMax} onChange={(e) => setPdfMax(Number(e.target.value))} className="w-full sm:h-9 sm:w-36">
                     {[25, 50, 100, 250, 500, 1000, 2000, 5000, 10000].filter((n) => !pdfRows.length || n < pdfRows.length).map((n) => <option key={n} value={n}>{n.toLocaleString()}</option>)}
                     {pdfRows.length > 0 && <option value={pdfRows.length}>All ({pdfRows.length.toLocaleString()})</option>}
                   </Select>
@@ -733,9 +733,9 @@ export default function Crawler({
                 <Toggle label="Verify MX (deliverability)" checked={checkMx} onChange={setCheckMx} />
                 <Toggle label="Guess info@ if hidden" checked={pdfGuessInbox} onChange={setPdfGuessInbox} />
                 {categories.length > 0 && (
-                  <div className="ml-auto flex items-center gap-2">
+                  <div className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
                     <span className="text-[13px] text-muted">Save under</span>
-                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="min-w-0 flex-1 text-[13px] sm:h-8 sm:w-40 sm:flex-none">
                       <option value="">No category</option>
                       {categories.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
                     </Select>
@@ -751,7 +751,7 @@ export default function Crawler({
           {/* shared crawl options (not needed for directory / pdf modes) */}
           {mode !== "directory" && mode !== "pdf" && (
           <div className="rounded-xl bg-ink/[0.03] p-3">
-            <div className="mb-2 grid grid-cols-2 gap-3">
+            <div className="mb-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Max pages / site">
                 <Select value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))}>{[10, 20, 30, 40].map((n) => <option key={n} value={n}>{n}</option>)}</Select>
               </Field>
@@ -843,9 +843,9 @@ export default function Crawler({
 
           {isDirJob && leads.length > 0 && (
             <div className="rounded-xl border border-line">
-              <div className="flex items-center justify-between border-b border-line px-3 py-2">
+              <div className="flex flex-col gap-1.5 border-b border-line px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="accent-ink" />
+                  <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="h-[18px] w-[18px] accent-ink" />
                   {leads.length} lead(s) · <span className="text-muted">{leadsWithPhone} with phone</span>
                   {dirAdded.size > 0 && <span className="text-good">· {dirAdded.size} added</span>}
                 </label>
@@ -854,8 +854,37 @@ export default function Crawler({
                   <button onClick={exportLeads} className="text-xs font-medium text-ink/60 underline hover:text-ink">Export CSV</button>
                 </div>
               </div>
-              <div className="max-h-56 overflow-y-auto">
-                <table className="w-full text-sm">
+              <div className="touch-scroll max-h-56 overflow-y-auto">
+                {/* Four columns inside a sheet that is already only 390px wide
+                    leaves the name and the email fighting over about 120px. */}
+                <ul className="divide-y divide-line-soft sm:hidden">
+                  {leads.map((l) => {
+                    const k = leadKey(l);
+                    const added = isAdded(l);
+                    return (
+                      <li key={k} className={cn("flex gap-2.5 px-3 py-2.5", added && "opacity-60")}>
+                        <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="mt-0.5 h-[18px] w-[18px] shrink-0 accent-ink disabled:opacity-30" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-[13.5px] font-medium leading-tight">{l.name || l.domain}</div>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
+                            <span className="min-w-0 truncate">{l.email || <span className="italic">no email</span>}</span>
+                            <SourceTag source={l.source} via={l.via} confidence={l.confidence} />
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                            {l.phone && (
+                              <span className="inline-flex items-center gap-1 tabular-nums text-ink/75">{l.phone}{l.phoneMobile && <Tag tone="green">mobile</Tag>}</span>
+                            )}
+                            {l.inContacts && <Tag tone="blue">in contacts</Tag>}
+                            {!l.inContacts && dirAdded.has(k) && <Tag tone="green">added</Tag>}
+                            {!added && !l.email && l.phone && <Tag tone="gray">phone only</Tag>}
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+
+                <table className="hidden w-full text-sm sm:table">
                   <tbody>
                     {leads.map((l) => {
                       const k = leadKey(l);
@@ -863,7 +892,7 @@ export default function Crawler({
                       return (
                         <tr key={k} className={cn("border-b border-line-soft last:border-0", added && "opacity-60")}>
                           <td className="w-8 px-3 py-2">
-                            <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-ink disabled:opacity-30" />
+                            <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="h-[18px] w-[18px] accent-ink disabled:opacity-30" />
                           </td>
                           <td className="px-1 py-2">
                             <div className="font-medium leading-tight">{l.name || l.domain}</div>
@@ -895,9 +924,9 @@ export default function Crawler({
 
           {!isDirJob && results.length > 0 && (
             <div className="rounded-xl border border-line">
-              <div className="flex items-center justify-between border-b border-line px-3 py-2">
+              <div className="flex flex-col gap-1.5 border-b border-line px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(results.map((r) => r.email)))} className="accent-ink" />
+                  <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(results.map((r) => r.email)))} className="h-[18px] w-[18px] accent-ink" />
                   Select all ({results.length})
                 </label>
                 <div className="flex items-center gap-3">
@@ -905,12 +934,36 @@ export default function Crawler({
                   <button onClick={exportResults} className="text-xs font-medium text-ink/60 underline hover:text-ink">Export CSV</button>
                 </div>
               </div>
-              <div className="max-h-56 overflow-y-auto">
-                <table className="w-full text-sm">
+              <div className="touch-scroll max-h-56 overflow-y-auto">
+                {/* Six columns for one address. The email IS the row; the rest
+                    is metadata and reads as a footer. */}
+                <ul className="divide-y divide-line-soft sm:hidden">
+                  {results.map((r) => (
+                    <li key={r.email} className="flex gap-2.5 px-3 py-2.5">
+                      <input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="mt-0.5 h-[18px] w-[18px] shrink-0 accent-ink" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[13.5px] font-medium">{r.email}</div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+                          <span className="text-ink/55">{r.domain}</span>
+                          {r.phone && (
+                            <span className="inline-flex items-center gap-1 tabular-nums text-ink/75">{r.phone}{r.phoneMobile && <Tag tone="green">mobile</Tag>}</span>
+                          )}
+                          <ConfidenceTag c={r.confidence} />
+                          <span>{r.role_based ? "role" : "personal"}</span>
+                          {r.keywordsMatched && r.keywordsMatched.length > 0 && (
+                            <Tag tone="green">mentions {r.keywordsMatched[0]}</Tag>
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+
+                <table className="hidden w-full text-sm sm:table">
                   <tbody>
                     {results.map((r) => (
                       <tr key={r.email} className="border-b border-line-soft last:border-0">
-                        <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="accent-ink" /></td>
+                        <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="h-[18px] w-[18px] accent-ink" /></td>
                         <td className="px-1 py-2 font-medium">
                           {r.email}
                           {r.keywordsMatched && r.keywordsMatched.length > 0 && (
@@ -938,22 +991,25 @@ export default function Crawler({
             </div>
           )}
 
-          <div className="flex items-center justify-between pt-1">
-            <Button variant="ghost" onClick={reset} disabled={running}>Back</Button>
-            <div className="flex items-center gap-2">
-              {categories.length > 0 && (
-                <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-9 w-40 text-[13px]" title="Save under category">
-                  <option value="">No category</option>
-                  {categories.map((c) => <option key={c} value={c}>{c}</option>)}
-                </Select>
-              )}
-              <Button variant="outline" onClick={close}>Close</Button>
-              {isDirJob ? (
-                <Button onClick={addDirectorySelected} loading={dirBusy} disabled={!dirSelected.size || dirBusy}>Add {dirSelected.size || ""} to contacts</Button>
-              ) : (
-                <Button onClick={addSelected} disabled={!selected.size}>Add {selected.size || ""} to contacts</Button>
-              )}
+          {/* Four controls in one row is fine with a mouse and impossible at
+              390px. On a phone they stack; `sm:contents` then dissolves the
+              grouping wrapper so the original single row comes back intact. */}
+          <div className="space-y-2 pt-1 sm:flex sm:items-center sm:gap-3 sm:space-y-0">
+            {categories.length > 0 && (
+              <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="w-full text-[13px] sm:order-2 sm:h-9 sm:w-40" title="Save under category">
+                <option value="">No category</option>
+                {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+              </Select>
+            )}
+            <div className="flex items-center gap-2 sm:contents">
+              <Button variant="ghost" onClick={reset} disabled={running} className="flex-1 sm:order-1 sm:mr-auto sm:flex-none">Back</Button>
+              <Button variant="outline" onClick={close} className="flex-1 sm:order-3 sm:flex-none">Close</Button>
             </div>
+            {isDirJob ? (
+              <Button onClick={addDirectorySelected} loading={dirBusy} disabled={!dirSelected.size || dirBusy} className="w-full sm:order-4 sm:w-auto">Add {dirSelected.size || ""} to contacts</Button>
+            ) : (
+              <Button onClick={addSelected} disabled={!selected.size} className="w-full sm:order-4 sm:w-auto">Add {selected.size || ""} to contacts</Button>
+            )}
           </div>
         </div>
       )}

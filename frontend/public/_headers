@@ -1,0 +1,18 @@
+# Ships inside dist/, the same reasoning as _redirects: netlify.toml only
+# applies when Netlify builds from the repo, and a pre-built upload never
+# sees it.
+
+# The worker is the one file that must never be served stale — a cached
+# sw.js pins every visitor to the build it was cached with, and no amount
+# of redeploying gets them off it.
+/sw.js
+  Cache-Control: public, max-age=0, must-revalidate
+  Service-Worker-Allowed: /
+
+/manifest.webmanifest
+  Content-Type: application/manifest+json; charset=utf-8
+  Cache-Control: public, max-age=0, must-revalidate
+
+# Vite fingerprints these, so they can be cached hard.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

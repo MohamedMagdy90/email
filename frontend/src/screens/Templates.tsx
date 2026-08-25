@@ -171,14 +171,14 @@ function Editor({
   return (
     <Modal open={open} onClose={onClose} title={t.id ? "Edit template" : "New template"} wide>
       <div className="space-y-4">
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <Field label="Type">
             <Select value={t.type} onChange={(e) => setT({ ...t, type: e.target.value as any })}>
               <option value="customer">Customer</option>
               <option value="partner">Partner</option>
             </Select>
           </Field>
-          <div className="col-span-2">
+          <div className="sm:col-span-2">
             <Field label="Template name">
               <Input value={t.name} onChange={(e) => setT({ ...t, name: e.target.value })} placeholder="Customer — Intro" />
             </Field>
@@ -189,14 +189,14 @@ function Editor({
           <Input value={t.subject} onChange={(e) => setT({ ...t, subject: e.target.value })} />
         </Field>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex rounded-full border border-line bg-paper p-1">
             {(["edit", "preview"] as const).map((x) => (
               <button
                 key={x}
                 onClick={() => setTab(x)}
                 className={cn(
-                  "rounded-full px-3 py-1 text-[13px] font-medium capitalize",
+                  "rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize sm:px-3 sm:py-1",
                   tab === x ? "bg-ink text-cream" : "text-ink/55"
                 )}
               >
@@ -204,12 +204,12 @@ function Editor({
               </button>
             ))}
           </div>
-          <div className="ml-auto flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap gap-1.5 sm:ml-auto">
             {TAGS.map((tag) => (
               <button
                 key={tag}
                 onClick={() => insertTag(tag)}
-                className="rounded-md border border-line bg-white px-2 py-1 font-mono text-[11px] text-ink/70 hover:border-ink/40"
+                className="rounded-md border border-line bg-white px-2 py-1.5 font-mono text-[11px] text-ink/70 hover:border-ink/40 sm:py-1"
               >
                 {`{{${tag}}}`}
               </button>
@@ -226,13 +226,13 @@ function Editor({
             className="font-mono text-xs"
           />
         ) : (
-          <div className="rounded-xl border border-line bg-white p-5">
+          <div className="rounded-xl border border-line bg-white p-4 sm:p-5">
             <div className="mb-3 border-b border-line-soft pb-2 text-sm">
               <span className="text-muted">Subject: </span>
               <span className="font-medium">{render(t.subject, SAMPLE)}</span>
             </div>
             <div
-              className="prose-sm max-w-none text-sm leading-relaxed [&_a]:text-[#2563a8] [&_p]:mb-3"
+              className="prose-sm max-w-none break-words text-sm leading-relaxed [&_a]:text-[#2563a8] [&_p]:mb-3"
               dangerouslySetInnerHTML={{ __html: render(t.body, SAMPLE) }}
             />
           </div>

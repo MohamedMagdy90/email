@@ -24,7 +24,7 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
     "w-full rounded-xl border border-white/15 bg-white/[0.06] px-3.5 py-2.5 text-sm text-cream placeholder:text-cream/35 outline-none transition-colors focus:border-white/40 focus:ring-2 focus:ring-white/10";
 
   return (
-    <div className="relative flex h-screen w-screen items-center justify-center overflow-hidden bg-ink px-4">
+    <div className="relative flex min-h-[100dvh] w-full items-center justify-center overflow-y-auto bg-ink px-4 py-[calc(2rem+var(--sat))] pb-[calc(2rem+var(--sab))]">
       {/* prism glow */}
       <div className="prism-bar pointer-events-none absolute -top-32 left-1/2 h-64 w-[520px] -translate-x-1/2 rounded-full opacity-20 blur-3xl" />
 
@@ -74,7 +74,7 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
             <button
               type="submit"
               disabled={loading}
-              className="flex h-10 w-full items-center justify-center gap-2 rounded-full bg-cream px-5 text-sm font-medium text-ink transition-all hover:bg-cream/90 active:scale-[0.98] disabled:opacity-50"
+              className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-cream px-5 text-[15px] font-medium text-ink sm:h-10 sm:text-sm transition-all hover:bg-cream/90 active:scale-[0.98] disabled:opacity-50"
             >
               {loading ? "Signing in…" : "Sign in"}
             </button>

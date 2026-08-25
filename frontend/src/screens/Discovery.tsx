@@ -588,7 +588,7 @@ export default function Discovery() {
                 <Select
                   value={country}
                   onChange={(e) => setCountry(e.target.value)}
-                  className="h-9 w-44 text-[13px]"
+                  className="w-full text-[13px] sm:h-9 sm:w-44"
                   title="Show only leads from this country. Every action below — including Approve all — then acts on just these."
                 >
                   <option value="">All countries</option>
@@ -599,8 +599,8 @@ export default function Discovery() {
                   ))}
                 </Select>
               )}
-              <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && refreshLeads()} placeholder="Search name, email, domain…" className="h-9 w-56 text-[13px]" />
-              <Button size="sm" variant="outline" onClick={refreshLeads}>Search</Button>
+              <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && refreshLeads()} placeholder="Search name, email, domain…" className="min-w-0 flex-1 text-[13px] sm:h-9 sm:w-56 sm:flex-none" />
+              <Button size="sm" variant="outline" onClick={refreshLeads} className="shrink-0">Search</Button>
             </div>
           </div>
 
@@ -639,22 +639,22 @@ export default function Discovery() {
           )}
 
           {/* action bar */}
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
             <label className="flex items-center gap-2 text-[13px] font-medium">
-              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-ink" disabled={!leads.length} />
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="h-[18px] w-[18px] accent-ink" disabled={!leads.length} />
               {picked.size ? `${picked.size} selected` : `${filteredTotal.toLocaleString()} in view`}
               {tab === "pending" && (
-                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-ink bg-ink text-cream" : "border-line text-ink/55 hover:text-ink")}>
+                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-ink bg-ink text-cream" : "border-line text-ink/55 hover:text-ink")}>
                   {onlyEmail ? "With email only" : "Show all"}
                 </button>
               )}
             </label>
 
-            <div className="flex flex-wrap items-center justify-end gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:justify-end">
               {tab === "pending" && (
                 <>
                   {contactCats.length > 0 && (
-                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-36 text-[13px]" title="Save approved contacts under this category">
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="w-full text-[13px] sm:h-8 sm:w-36" title="Save approved contacts under this category">
                       <option value="">No category</option>
                       {contactCats.map((c) => <option key={c} value={c}>{c}</option>)}
                     </Select>
@@ -664,7 +664,7 @@ export default function Discovery() {
                     onChange={(e) => setSaveCountry(e.target.value)}
                     placeholder="Override country"
                     list="pool-countries"
-                    className="h-8 w-36 text-[13px]"
+                    className="w-full text-[13px] sm:h-8 sm:w-36"
                     title="Optional. Force every approved contact to this country. Leave blank to keep each lead's own country — which is what you normally want."
                   />
                   {poolCountries.length > 0 && (
@@ -696,7 +696,7 @@ export default function Discovery() {
         </div>
 
         {/* table */}
-        <div className="max-h-[520px] overflow-y-auto">
+        <div className="touch-scroll max-h-[60dvh] overflow-y-auto lg:max-h-[520px]">
           {loadingLeads ? (
             <div className="grid place-items-center py-16"><Spinner className="h-5 w-5 text-ink/40" /></div>
           ) : leads.length === 0 ? (
@@ -706,7 +706,62 @@ export default function Discovery() {
                 : `No ${tab} leads.`}
             </div>
           ) : (
-            <table className="w-full text-sm">
+            <>
+          {/* Phone / tablet: a card per lead. Company and email are the two
+              things a reviewer actually reads before approving; country, phone
+              and source drop to a footer line rather than off the right edge. */}
+          <ul className="divide-y divide-line-soft lg:hidden">
+            {leads.map((l) => (
+              <li key={l.id} className={cn("flex gap-3 px-4 py-3", picked.has(l.id) && "bg-ink/[0.03]")}>
+                <input
+                  type="checkbox"
+                  checked={picked.has(l.id)}
+                  onChange={() => toggle(l.id)}
+                  aria-label={`Select ${l.name || l.domain}`}
+                  className="mt-1 h-[18px] w-[18px] shrink-0 accent-ink"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate text-[14px] font-medium leading-tight">{l.name || l.domain}</span>
+                      <AudienceTag a={l.audience} />
+                    </span>
+                    <span className="shrink-0">
+                      {tab === "pending"
+                        ? l.website && (
+                            <a href={l.website} target="_blank" rel="noreferrer" className="text-[11px] font-medium text-ink/45 underline">visit</a>
+                          )
+                        : <StatusChip status={l.status} />}
+                    </span>
+                  </div>
+
+                  <div className="mt-0.5 flex items-center gap-1.5 text-[12.5px] text-muted">
+                    <span className="min-w-0 truncate"><EmailCell lead={l} /></span>
+                    <ConfidenceTag c={l.confidence} />
+                  </div>
+
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted">
+                    {l.country && (
+                      <button
+                        type="button"
+                        onClick={() => setCountry(l.country === country ? "" : String(l.country))}
+                        className={cn(
+                          "max-w-[9rem] truncate rounded-full px-2 py-0.5 font-medium transition-colors",
+                          l.country === country ? "bg-ink text-cream" : "bg-ink/[0.06] text-ink/65"
+                        )}
+                      >
+                        {l.country}
+                      </button>
+                    )}
+                    {l.phone && <span className="tabular-nums">{l.phone}</span>}
+                    {l.source_label && <span className="truncate text-ink/45">{l.source_label}</span>}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+
+            <table className="hidden w-full text-sm lg:table">
               <thead className="sticky top-0 z-10 bg-paper text-left text-[11px] uppercase tracking-wide text-muted">
                 <tr className="border-b border-line">
                   <th className="w-8 px-5 py-2.5" />
@@ -721,7 +776,7 @@ export default function Discovery() {
                 {leads.map((l) => (
                   <tr key={l.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.02]">
                     <td className="px-5 py-2.5">
-                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="accent-ink" />
+                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="h-[18px] w-[18px] accent-ink" />
                     </td>
                     <td className="px-1 py-2.5">
                       <div className="flex items-center gap-1.5">
@@ -761,6 +816,7 @@ export default function Discovery() {
                 ))}
               </tbody>
             </table>
+            </>
           )}
         </div>
       </Card>
@@ -1131,7 +1187,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
             eventually get, so it sits above the details, not buried in them. */}
         <div className="rounded-2xl border border-line bg-paper p-3">
           <div className="text-[13px] font-medium text-ink/80">These companies are…</div>
-          <div className="mt-2 grid grid-cols-2 gap-2">
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
             {([
               ["customer", "Customers", "You sell them DNA ERP", "border-[#ff5a36] bg-[#fdeae6]"],
               ["partner", "Partners", "Firms, VARs & consultancies for the Makers program", "border-[#1c8a68] bg-[#e4f3ec]"],
@@ -1183,7 +1239,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 type="checkbox"
                 checked={sweepCountry}
                 onChange={(e) => setSweepCountry(e.target.checked)}
-                className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-good"
+                className="mt-0.5 h-[18px] w-[18px] shrink-0 cursor-pointer accent-good"
               />
               <span className="text-xs leading-relaxed text-muted">
                 <span className="block text-[13px] font-medium text-ink/80">Also sweep the whole country's web <span className="font-normal text-ink/45">— broad, but rougher</span></span>
@@ -1226,7 +1282,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
             <Field label="Directory URL" hint="Paste the directory's listings page — or just its homepage. If you paste a homepage, the bot automatically finds the listings section, then walks every page pulling company + email + phone.">
               <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com  (homepage or /listings both work)" className="font-mono text-xs" />
             </Field>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Country" hint="Every lead from this directory is filed under it — so you can filter and approve by country later. Also used to read local phone numbers.">
                 <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Qatar" />
               </Field>
@@ -1236,7 +1292,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 </Select>
               </Field>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Leads per batch">
                 <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
                   {[50, 100, 200, 300].map((n) => <option key={n} value={n}>{n}</option>)}

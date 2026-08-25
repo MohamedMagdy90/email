@@ -156,7 +156,7 @@ export default function Send() {
         </Banner>
       )}
 
-      <div className="grid gap-5 lg:grid-cols-[360px_1fr]">
+      <div className="grid gap-4 sm:gap-5 lg:grid-cols-[360px_1fr]">
         {/* Left: setup */}
         <div className="space-y-4">
           <Card className="space-y-4 p-5">
@@ -237,23 +237,23 @@ export default function Send() {
 
         {/* Right: recipients */}
         <Card className="flex flex-col overflow-hidden">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
-            <div className="flex items-center gap-2">
-              <div className="flex rounded-full border border-line bg-cream p-1">
+          <div className="flex flex-col gap-2 border-b border-line px-4 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="flex self-start rounded-full border border-line bg-cream p-1">
                 {["new", "all"].map((f) => (
-                  <button key={f} onClick={() => changeFilter(f)} className={cn("rounded-full px-3 py-1 text-[13px] font-medium capitalize", filter === f ? "bg-ink text-cream" : "text-ink/55")}>{f}</button>
+                  <button key={f} onClick={() => changeFilter(f)} className={cn("rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize sm:px-3 sm:py-1", filter === f ? "bg-ink text-cream" : "text-ink/55")}>{f}</button>
                 ))}
               </div>
               {categories.length > 0 && (
-                <Select value={category} onChange={(e) => changeCategory(e.target.value)} className="h-8 w-40 text-[13px]">
+                <Select value={category} onChange={(e) => changeCategory(e.target.value)} className="w-full text-[13px] sm:h-8 sm:w-40">
                   <option value="all">All categories</option>
                   {categories.map((c) => <option key={c} value={c}>{c}</option>)}
                   <option value="__none__">Uncategorized</option>
                 </Select>
               )}
             </div>
-            <label className="flex items-center gap-2 text-[13px]">
-              <input type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
+            <label className="flex items-center gap-2 py-1 text-[13px]">
+              <input type="checkbox" checked={headerChecked} onChange={toggleAll} className="h-[18px] w-[18px] accent-ink" />
               Select all {filteredTotal.toLocaleString()}
             </label>
           </div>
@@ -265,22 +265,29 @@ export default function Send() {
             </div>
           )}
 
-          <div className="max-h-[520px] flex-1 overflow-y-auto">
+          {/* A fixed 520px pane is most of a phone screen; a fraction of the
+              viewport leaves the pager and the send button reachable. */}
+          <div className="touch-scroll max-h-[55dvh] flex-1 overflow-y-auto lg:max-h-[520px]">
             {listLoading ? (
               <div className="flex items-center justify-center gap-2 py-16 text-muted"><Spinner /> Loading…</div>
             ) : contacts.length === 0 ? (
               <div className="py-16 text-center text-sm text-muted">No contacts in this view.</div>
             ) : (
-              <table className="w-full text-sm">
+              <table className="w-full table-fixed text-sm sm:table-auto">
                 <tbody>
                   {contacts.map((c) => (
                     <tr key={c.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
-                      <td className="w-8 px-4 py-2.5">
-                        <input type="checkbox" checked={selectAllMatching || selected.has(c.id)} onChange={() => toggle(c.id)} className="accent-ink" />
+                      <td className="w-9 px-4 py-3 align-top sm:w-8 sm:py-2.5">
+                        <input type="checkbox" checked={selectAllMatching || selected.has(c.id)} onChange={() => toggle(c.id)} className="h-[18px] w-[18px] accent-ink" />
                       </td>
-                      <td className="px-1 py-2.5 font-medium">{c.email}</td>
-                      <td className="px-1 py-2.5 text-ink/60">{c.company || "—"}</td>
-                      <td className="px-2 py-2.5 text-right"><StatusPill status={c.status} /></td>
+                      <td className="max-w-0 px-1 py-3 font-medium sm:py-2.5">
+                        <div className="truncate">{c.email}</div>
+                        {/* The company gets its own line on a phone instead of
+                            a column that would squeeze the address to nothing. */}
+                        <div className="truncate text-[12px] font-normal text-ink/50 sm:hidden">{c.company || "—"}</div>
+                      </td>
+                      <td className="hidden px-1 py-2.5 text-ink/60 sm:table-cell">{c.company || "—"}</td>
+                      <td className="w-px whitespace-nowrap px-2 py-3 text-right align-top sm:py-2.5"><StatusPill status={c.status} /></td>
                     </tr>
                   ))}
                 </tbody>
@@ -295,10 +302,10 @@ export default function Send() {
                 Showing <span className="font-medium text-ink">{rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()}</span> of{" "}
                 <span className="font-medium text-ink">{filteredTotal.toLocaleString()}</span>
               </span>
-              <div className="flex items-center gap-1.5">
-                <Button variant="outline" size="sm" onClick={prevPage} disabled={pageIndex === 0 || listLoading}>Prev</Button>
-                <span className="min-w-[72px] text-center text-muted">Page {pageIndex + 1} / {totalPages.toLocaleString()}</span>
-                <Button variant="outline" size="sm" onClick={nextPage} disabled={!nextCursor || listLoading}>Next</Button>
+              <div className="flex w-full items-center gap-1.5 sm:w-auto">
+                <Button variant="outline" size="sm" onClick={prevPage} disabled={pageIndex === 0 || listLoading} className="flex-1 sm:flex-none">Prev</Button>
+                <span className="min-w-[72px] shrink-0 text-center text-muted">Page {pageIndex + 1} / {totalPages.toLocaleString()}</span>
+                <Button variant="outline" size="sm" onClick={nextPage} disabled={!nextCursor || listLoading} className="flex-1 sm:flex-none">Next</Button>
               </div>
             </div>
           )}

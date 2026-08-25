@@ -51,27 +51,27 @@ export default function Overview() {
     <div>
       <Header title="Overview" subtitle="Your outreach at a glance." />
 
-      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 gap-2.5 sm:mb-6 sm:gap-3 lg:grid-cols-4">
         {cards.map((c) => (
-          <Card key={c.label} className="px-5 py-4">
-            <div className="font-clash text-3xl font-semibold">{typeof c.value === "number" ? c.value.toLocaleString() : c.value}</div>
+          <Card key={c.label} className="px-4 py-3.5 sm:px-5 sm:py-4">
+            <div className="font-clash text-2xl font-semibold sm:text-3xl">{typeof c.value === "number" ? c.value.toLocaleString() : c.value}</div>
             <div className="mono-label mt-1 text-muted">{c.label}</div>
           </Card>
         ))}
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-[1fr_1.4fr]">
+      <div className="grid gap-4 sm:gap-5 lg:grid-cols-[1fr_1.4fr]">
         {/* Contacts donut */}
-        <Card className="p-5">
+        <Card className="p-4 sm:p-5">
           <div className="mono-label mb-4 text-muted">Contacts by status</div>
           {data?.totalContacts ? (
-            <div className="flex items-center gap-6">
+            <div className="flex items-center gap-4 sm:gap-6">
               <Donut segments={contactSeg} total={data.totalContacts} />
-              <div className="space-y-2">
+              <div className="min-w-0 flex-1 space-y-2">
                 {contactSeg.map((s: any) => (
                   <div key={s.label} className="flex items-center gap-2 text-[13px]">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: s.color }} />
-                    <span className="capitalize text-ink/75">{s.label}</span>
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: s.color }} />
+                    <span className="truncate capitalize text-ink/75">{s.label}</span>
                     <span className="ml-auto font-medium tabular-nums">{s.value}</span>
                   </div>
                 ))}
@@ -83,7 +83,7 @@ export default function Overview() {
         </Card>
 
         {/* Sends bar chart */}
-        <Card className="p-5">
+        <Card className="p-4 sm:p-5">
           <div className="mono-label mb-4 text-muted">Emails sent · last 14 days</div>
           {sentCount ? (
             <Bars data={daily} />
@@ -94,7 +94,7 @@ export default function Overview() {
       </div>
 
       {/* Engagement strip */}
-      <Card className="mt-5 grid grid-cols-2 gap-6 p-5 sm:grid-cols-5">
+      <Card className="mt-4 grid grid-cols-2 gap-5 p-4 sm:mt-5 sm:grid-cols-3 sm:gap-6 sm:p-5 lg:grid-cols-5">
         <Metric label="Delivered / dry-run" value={sentCount} tone="ink" />
         <Metric label="Opens" value={data?.opens || 0} tone="good" />
         <Metric label="Clicks" value={clicks} tone="good" />
@@ -130,7 +130,14 @@ function Donut({ segments, total }: { segments: { label: string; value: number; 
   const size = 168, stroke = 24, r = (size - stroke) / 2, C = 2 * Math.PI * r;
   let acc = 0;
   return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
+    // Sized by class rather than by attribute so it can give up 28px on a
+    // phone without the legend beside it collapsing.
+    <svg
+      viewBox={`0 0 ${size} ${size}`}
+      className="h-[132px] w-[132px] shrink-0 sm:h-[168px] sm:w-[168px]"
+      role="img"
+      aria-label={`${total} contacts by status`}
+    >
       <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
         <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#ece6da" strokeWidth={stroke} />
         {segments.map((s, i) => {
@@ -168,9 +175,9 @@ function Donut({ segments, total }: { segments: { label: string; value: number; 
 function Bars({ data }: { data: { label: string; value: number }[] }) {
   const max = Math.max(1, ...data.map((d) => d.value));
   return (
-    <div className="flex h-44 items-end gap-1.5">
+    <div className="flex h-40 items-end gap-1 sm:h-44 sm:gap-1.5">
       {data.map((d, i) => (
-        <div key={i} className="group flex flex-1 flex-col items-center gap-1.5">
+        <div key={i} className="group flex min-w-0 flex-1 flex-col items-center gap-1.5">
           <div className="relative flex w-full flex-1 items-end">
             <div
               className="w-full rounded-t-md bg-ink/85 transition-all group-hover:bg-ink"
@@ -178,7 +185,11 @@ function Bars({ data }: { data: { label: string; value: number }[] }) {
               title={`${d.label}: ${d.value}`}
             />
           </div>
-          <span className="text-[9px] text-muted">{d.label.slice(5)}</span>
+          {/* Fourteen "08-25" labels do not fit across a phone; the day alone does. */}
+          <span className="text-[9px] leading-none text-muted">
+            <span className="sm:hidden">{d.label.slice(8)}</span>
+            <span className="hidden sm:inline">{d.label.slice(5)}</span>
+          </span>
         </div>
       ))}
     </div>

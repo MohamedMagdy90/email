@@ -18,3 +18,6 @@ data.sqlite
 # Build artifacts from the deploy tool
 output/
 **/output/
+# Dev-mode service worker output from vite-plugin-pwa
+dev-dist/
+**/dev-dist/

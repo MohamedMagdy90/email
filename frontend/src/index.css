@@ -19,6 +19,28 @@
 
 :root {
   color-scheme: light;
+
+  /* Notch and home-indicator insets, exposed as variables so they can be
+     composed inside arbitrary Tailwind values, e.g. pb-[calc(0.5rem+var(--sab))]. */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+
+  /* Height of the mobile bottom tab bar, before its safe-area padding. Zero
+     until the shell actually mounts one, so the toaster and the page footer
+     need no knowledge of which screen is on. */
+  --nav-h: 0px;
+}
+
+body[data-mobile-nav="true"] {
+  --nav-h: 58px;
+}
+/* The tab bar is replaced by the sidebar from lg up. */
+@media (min-width: 1024px) {
+  body[data-mobile-nav="true"] {
+    --nav-h: 0px;
+  }
 }
 
 * {
@@ -31,6 +53,12 @@ body,
   height: 100%;
 }
 
+html {
+  /* Stops iOS Safari inflating type when a phone is turned to landscape. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   font-family: var(--font-satoshi);
@@ -38,6 +66,30 @@ body {
   color: var(--color-ink);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* No grey flash on tap, and no rubber-band chaining out of the app shell. */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+/* Kills the 300ms synthetic-click delay on anything interactive. */
+button,
+a,
+[role="button"],
+label,
+summary {
+  touch-action: manipulation;
+}
+
+/* iOS Safari zooms the page whenever a focused field is under 16px. Every text
+   control in the app is text-sm (14px), so on a phone it zoomed on every tap
+   and left the layout scrolled sideways. This has to beat the utility class,
+   hence the !important — it is a platform workaround, not a style choice. */
+@media (max-width: 639.98px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }
 
 .font-clash {
@@ -63,18 +115,36 @@ body {
   color: transparent;
 }
 
-/* Thin, refined scrollbars */
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+/* Thin, refined scrollbars — pointer devices only. Touch platforms draw their
+   own overlay bars, and a 10px gutter there just steals width. */
+@media (pointer: fine) {
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #d8cfbf;
+    border-radius: 999px;
+    border: 3px solid var(--color-cream);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #c7bca8;
+  }
 }
-::-webkit-scrollbar-thumb {
-  background: #d8cfbf;
-  border-radius: 999px;
-  border: 3px solid var(--color-cream);
+
+/* Horizontal chip rails: swipeable, with no visible bar. */
+@utility no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #c7bca8;
+
+/* Momentum scrolling inside panes that scroll on their own. */
+@utility touch-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 /* Mono label used across the DNA brand */
@@ -83,4 +153,37 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.18em;
   font-size: 11px;
+}
+
+/* Bottom-sheet entrance for modals on small screens. */
+@keyframes sheet-up {
+  from {
+    transform: translateY(12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-sheet-up {
+  animation: sheet-up 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.animate-fade-in {
+  animation: fade-in 0.18s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-sheet-up,
+  .animate-fade-in {
+    animation: none;
+  }
 }

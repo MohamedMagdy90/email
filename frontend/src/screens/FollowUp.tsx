@@ -657,7 +657,7 @@ export default function FollowUpCard() {
             type="checkbox"
             checked={form.requireResend}
             onChange={(e) => set("requireResend", e.target.checked)}
-            className="mt-0.5 accent-ink"
+            className="mt-0.5 h-[18px] w-[18px] shrink-0 accent-ink"
           />
           <span>
             Only run when Resend is connected
@@ -701,7 +701,7 @@ export default function FollowUpCard() {
 
       {/* Pass history */}
       <div className="border-t border-line">
-        <div className="flex items-center justify-between px-5 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3">
           <div className="mono-label text-muted">Recent passes</div>
           {status?.lastRun && <div className="text-[11px] text-muted">Last pass {fmtAgo(status.lastRun.started_at)}</div>}
         </div>

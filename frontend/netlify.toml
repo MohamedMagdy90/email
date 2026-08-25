@@ -1,7 +1,6 @@
 [build]
   command = "bun run build"
   publish = "dist"
-
 # Proxy API calls to the Railway backend.
 # Same-origin for the browser (no CORS), and no VITE_API_URL needed.
 [[redirects]]
@@ -9,9 +8,29 @@
   to = "https://email-production-3c14.up.railway.app/api/:splat"
   status = 200
   force = true
-
-# SPA fallback (keep this LAST)
+# SPA fallback (keep this LAST).
+# Not forced, so real files — sw.js, manifest.webmanifest, the icons — are
+# still served as themselves rather than swallowed by index.html.
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+
+# Mirrors public/_headers, which is what a pre-built upload actually uses.
+# A cached sw.js pins every visitor to the build it was cached with.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+    Service-Worker-Allowed = "/"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json; charset=utf-8"
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

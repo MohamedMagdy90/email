@@ -245,52 +245,57 @@ export default function Contacts() {
         ))}
       </div>
 
-      {/* Toolbar */}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <div className="flex rounded-full border border-line bg-paper p-1">
-          {FILTERS.map((f) => (
-            <button
-              key={f}
-              onClick={() => changeFilter(f)}
-              className={cn(
-                "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
-                filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
-              )}
-            >
-              {f}
-            </button>
-          ))}
+      {/* Toolbar — stacked on a phone (search first, because that is what you
+          reach for), one row from lg up exactly as before. */}
+      <div className="mb-3 space-y-2 lg:flex lg:flex-wrap lg:items-center lg:gap-2 lg:space-y-0">
+        <Input
+          type="search"
+          placeholder="Search email or company…"
+          value={search}
+          onChange={(e) => changeSearch(e.target.value)}
+          className="w-full lg:order-3 lg:ml-auto lg:h-9 lg:w-64"
+        />
+
+        <div className="-mx-4 overflow-x-auto px-4 no-scrollbar lg:order-1 lg:mx-0 lg:overflow-visible lg:px-0">
+          <div className="inline-flex rounded-full border border-line bg-paper p-1">
+            {FILTERS.map((f) => (
+              <button
+                key={f}
+                onClick={() => changeFilter(f)}
+                className={cn(
+                  "shrink-0 rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize transition-colors lg:px-3 lg:py-1",
+                  filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+                )}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
         </div>
+
         {categories.length > 0 && (
           <Select
             value={categoryFilter}
             onChange={(e) => changeCategory(e.target.value)}
-            className="h-9 w-44"
+            className="w-full lg:order-2 lg:h-9 lg:w-44"
           >
             <option value="all">All categories</option>
             {categories.map((c) => <option key={c} value={c}>{c}</option>)}
             <option value="__none__">Uncategorized</option>
           </Select>
         )}
-        <div className="ml-auto flex items-center gap-2">
-          {selectionCount > 0 && (
-            <>
-              {categories.length > 0 && (
-                <BulkCategory categories={categories} onApply={applyCategory} />
-              )}
-              {/* bulk-set assigns a category; clearing is done via Edit */}
-              <Button variant="danger" size="sm" onClick={removeSelected}>
-                Delete {selectionCount.toLocaleString()}
-              </Button>
-            </>
-          )}
-          <Input
-            placeholder="Search email or company…"
-            value={search}
-            onChange={(e) => changeSearch(e.target.value)}
-            className="h-9 w-64"
-          />
-        </div>
+
+        {selectionCount > 0 && (
+          <div className="flex items-center gap-2 lg:order-4">
+            {categories.length > 0 && (
+              <BulkCategory categories={categories} onApply={applyCategory} />
+            )}
+            {/* bulk-set assigns a category; clearing is done via Edit */}
+            <Button variant="danger" size="sm" onClick={removeSelected} className="flex-1 lg:flex-none">
+              Delete {selectionCount.toLocaleString()}
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Table */}
@@ -330,12 +335,41 @@ export default function Contacts() {
           <Empty onFind={() => setCrawlOpen(true)} />
         ) : (
           <>
-            <div className="overflow-x-auto">
+            {/* Phone / tablet: one card per contact. Ten columns cannot be made
+                to work at 390px, and a sideways-scrolling table is not a fix —
+                the columns that matter (who, where, state) go up top and the
+                rest reads underneath. */}
+            <ul className="divide-y divide-line-soft lg:hidden">
+              <li className="flex items-center gap-3 border-b border-line bg-ink/[0.02] px-4 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={headerChecked}
+                  onChange={toggleAll}
+                  aria-label="Select all on this page"
+                  className="h-[18px] w-[18px] accent-ink"
+                />
+                <span className="text-[13px] text-ink/70">
+                  {headerChecked ? "Deselect all" : "Select all on page"}
+                </span>
+                <span className="mono-label ml-auto text-muted">{contacts.length}</span>
+              </li>
+              {contacts.map((c) => (
+                <ContactCard
+                  key={c.id}
+                  contact={c}
+                  selected={selectAllMatching || selected.has(c.id)}
+                  onToggle={() => toggle(c.id)}
+                  onEdit={() => setEditing(c)}
+                />
+              ))}
+            </ul>
+
+            <div className="hidden overflow-x-auto lg:block">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="w-10 px-4 py-3">
-                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
+                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="h-[18px] w-[18px] accent-ink" />
                     </th>
                     <th className="px-2 py-3">Email</th>
                     <th className="px-2 py-3">Company</th>
@@ -420,27 +454,44 @@ export default function Contacts() {
             </div>
 
             {/* Pagination footer */}
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-[13px]">
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2.5 border-t border-line px-4 py-3 text-[13px]">
               <div className="text-muted">
                 Showing <span className="font-medium text-ink">{rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()}</span>{" "}
                 of <span className="font-medium text-ink">{filteredTotal.toLocaleString()}</span>
               </div>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 text-muted">
-                  <span>Per page</span>
-                  <Select value={String(pageSize)} onChange={(e) => changePageSize(Number(e.target.value))} className="h-8 w-[72px]">
-                    {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
-                  </Select>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Button variant="outline" size="sm" onClick={prevPage} disabled={pageIndex === 0 || loading}>
-                    Prev
-                  </Button>
-                  <span className="min-w-[84px] text-center text-muted">Page {pageIndex + 1} / {totalPages.toLocaleString()}</span>
-                  <Button variant="outline" size="sm" onClick={nextPage} disabled={!nextCursor || loading}>
-                    Next
-                  </Button>
-                </div>
+              <div className="flex items-center gap-2 text-muted">
+                <span className="hidden sm:inline">Per page</span>
+                <Select
+                  value={String(pageSize)}
+                  onChange={(e) => changePageSize(Number(e.target.value))}
+                  className="h-9 w-[74px] py-0 sm:h-8"
+                  aria-label="Rows per page"
+                >
+                  {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                </Select>
+              </div>
+              <div className="flex w-full items-center gap-1.5 sm:w-auto">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={prevPage}
+                  disabled={pageIndex === 0 || loading}
+                  className="flex-1 sm:flex-none"
+                >
+                  Prev
+                </Button>
+                <span className="min-w-[84px] shrink-0 text-center text-muted">
+                  Page {pageIndex + 1} / {totalPages.toLocaleString()}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={nextPage}
+                  disabled={!nextCursor || loading}
+                  className="flex-1 sm:flex-none"
+                >
+                  Next
+                </Button>
               </div>
             </div>
           </>
@@ -475,13 +526,86 @@ export function Header({
   actions?: React.ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="font-clash text-3xl font-semibold tracking-tight">{title}</h1>
-        {subtitle && <p className="mt-1 text-sm text-muted">{subtitle}</p>}
+    <div className="mb-5 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between sm:gap-4">
+      <div className="min-w-0">
+        <h1 className="font-clash text-[26px] font-semibold leading-tight tracking-tight sm:text-3xl">
+          {title}
+        </h1>
+        {subtitle && <p className="mt-1 text-[13px] text-muted sm:text-sm">{subtitle}</p>}
       </div>
-      <div className="flex items-center gap-2">{actions}</div>
+      {actions && (
+        // Four buttons will not fit across a 390px screen. Rather than let them
+        // wrap into a ragged block, they become a swipeable rail that bleeds to
+        // both edges — the same trick the filter pills use below.
+        <div className="-mx-4 flex items-center gap-2 overflow-x-auto px-4 pb-0.5 no-scrollbar [&>*]:shrink-0 sm:mx-0 sm:overflow-visible sm:px-0">
+          {actions}
+        </div>
+      )}
     </div>
+  );
+}
+
+/* --------------------------- Contact card --------------------------- */
+
+// The sub-lg row. Tapping the body opens the editor, which is the mobile
+// equivalent of the Edit button that appears on hover in the table; the
+// checkbox stays a separate target so selecting never opens anything.
+function ContactCard({
+  contact: c,
+  selected,
+  onToggle,
+  onEdit,
+}: {
+  contact: Contact;
+  selected: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+}) {
+  const meta = [c.country, c.role_based ? "role" : "personal"].filter(Boolean);
+  return (
+    <li className={cn("flex gap-3 px-4 py-3 transition-colors", selected && "bg-ink/[0.03]")}>
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggle}
+        aria-label={`Select ${c.email}`}
+        className="mt-1 h-[18px] w-[18px] shrink-0 accent-ink"
+      />
+      <button onClick={onEdit} className="min-w-0 flex-1 text-left active:opacity-70">
+        <div className="flex items-start justify-between gap-2">
+          <span className="truncate text-[14px] font-medium">{c.email}</span>
+          <span className="shrink-0">
+            <StatusPill status={c.status} />
+          </span>
+        </div>
+
+        <div className="mt-0.5 truncate text-[13px] text-ink/70">{c.company || "—"}</div>
+
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted">
+          {c.category && (
+            <span className="rounded-full bg-ink/[0.06] px-2 py-0.5 font-medium text-ink/70">
+              {c.category}
+            </span>
+          )}
+          {c.phone && <span className="tabular-nums">{c.phone}</span>}
+          {meta.map((m) => (
+            <span key={m}>{m}</span>
+          ))}
+          {c.last_opened_at && (
+            <span className="inline-flex items-center gap-1 text-ink/60">
+              <span className="h-1.5 w-1.5 rounded-full bg-good" />
+              opened {timeAgo(c.last_opened_at)}
+              {(c.open_count || 0) > 1 && <span className="tabular-nums">·{c.open_count}×</span>}
+            </span>
+          )}
+          {(c.click_count || 0) > 0 && (
+            <span className="rounded bg-good/10 px-1.5 py-0.5 text-[10px] font-medium text-good">
+              clicked
+            </span>
+          )}
+        </div>
+      </button>
+    </li>
   );
 }
 
@@ -512,7 +636,9 @@ function BulkCategory({ categories, onApply }: { categories: string[]; onApply: 
         setVal("");
         if (v) onApply(v);
       }}
-      className="h-8 w-40 text-[13px]"
+      /* Shares a row with the Delete button, so it flexes rather than
+         claiming the full width the way a stacked control would. */
+      className="min-w-0 flex-1 text-[13px] sm:h-8 sm:w-40 sm:flex-none"
     >
       <option value="">Set category…</option>
       {categories.map((c) => <option key={c} value={c}>{c}</option>)}
@@ -556,7 +682,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
   return (
     <Modal open={open} onClose={onClose} title="Add contact">
       <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Email">
             <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} placeholder="name@company.com" />
           </Field>
@@ -564,7 +690,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
             <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
           </Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
           </Field>
@@ -572,7 +698,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
             <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
           </Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Industry">
             <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
           </Field>
@@ -735,14 +861,16 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                 {invalid.length > 0 && <Chip tone="bad">{invalid.length} invalid</Chip>}
               </div>
             </div>
-            <div className="max-h-56 overflow-auto rounded-xl border border-line">
+            <div className="touch-scroll max-h-56 overflow-auto rounded-xl border border-line">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-paper">
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="px-3 py-2">Email</th>
                     <th className="px-2 py-2">Company</th>
-                    <th className="px-2 py-2">Phone</th>
-                    <th className="px-2 py-2">Category</th>
+                    {/* The email column carries the invalid/duplicate markers,
+                        so on a phone it takes the room these two would have. */}
+                    <th className="hidden px-2 py-2 sm:table-cell">Phone</th>
+                    <th className="hidden px-2 py-2 sm:table-cell">Category</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -759,8 +887,8 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                           {dup && <span className="ml-2 text-[11px] text-muted">dup</span>}
                         </td>
                         <td className="px-2 py-1.5 text-ink/70">{r.company || "—"}</td>
-                        <td className="px-2 py-1.5 text-ink/70 tabular-nums">{r.phone || "—"}</td>
-                        <td className="px-2 py-1.5 text-ink/70">{r.category || "—"}</td>
+                        <td className="hidden px-2 py-1.5 tabular-nums text-ink/70 sm:table-cell">{r.phone || "—"}</td>
+                        <td className="hidden px-2 py-1.5 text-ink/70 sm:table-cell">{r.category || "—"}</td>
                       </tr>
                     );
                   })}
@@ -832,7 +960,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
   return (
     <Modal open onClose={onClose} title="Edit contact">
       <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Email">
             <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
           </Field>
@@ -840,7 +968,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
             <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
           </Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
           </Field>
@@ -848,7 +976,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
             <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
           </Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Industry">
             <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
           </Field>

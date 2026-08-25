@@ -497,7 +497,7 @@ export default function AutomationCard() {
             type="checkbox"
             checked={form.requireResend}
             onChange={(e) => set("requireResend", e.target.checked)}
-            className="mt-0.5 accent-ink"
+            className="mt-0.5 h-[18px] w-[18px] shrink-0 accent-ink"
           />
           <span>
             Only run when Resend is connected
@@ -518,7 +518,7 @@ export default function AutomationCard() {
 
       {/* Run history */}
       <div className="border-t border-line">
-        <div className="flex items-center justify-between px-5 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3">
           <div className="mono-label text-muted">Recent runs</div>
           {status?.lastRun && <div className="text-[11px] text-muted">Last run {fmtAgo(status.lastRun.started_at)}</div>}
         </div>
@@ -604,7 +604,7 @@ function ScheduleBlock({
             <Field label="From" hint="Local time">
               <Input
                 type="time"
-                className="w-[7.5rem]"
+                className="w-[8.5rem] sm:w-[7.5rem]"
                 value={toTime(form.window.start)}
                 onChange={(e) => onWindow({ start: fromTime(e.target.value) })}
               />
@@ -612,13 +612,13 @@ function ScheduleBlock({
             <Field label="Until" hint="Local time">
               <Input
                 type="time"
-                className="w-[7.5rem]"
+                className="w-[8.5rem] sm:w-[7.5rem]"
                 value={toTime(form.window.end)}
                 onChange={(e) => onWindow({ end: fromTime(e.target.value) })}
               />
             </Field>
             <Field label="Days" hint="Countries on a Sun–Thu week get that by default; this is the fallback.">
-              <div className="flex gap-1">
+              <div className="flex flex-wrap gap-1">
                 {DAYS.map((d) => {
                   const active = form.window.days.includes(d.v);
                   return (
@@ -714,7 +714,7 @@ function ScheduleBlock({
                                 type="checkbox"
                                 checked={form.sendUnknown}
                                 onChange={(e) => onSendUnknown(e.target.checked)}
-                                className="mt-0.5 accent-ink"
+                                className="mt-0.5 h-[18px] w-[18px] shrink-0 accent-ink"
                               />
                               <span>
                                 Email leads with no country on file
@@ -731,7 +731,7 @@ function ScheduleBlock({
                                 <Field label="From">
                                   <Input
                                     type="time"
-                                    className="w-[7.5rem]"
+                                    className="w-[8.5rem] sm:w-[7.5rem]"
                                     value={toTime(w.start)}
                                     onChange={(e) => onCountry(c.country, { ...w, start: fromTime(e.target.value), paused })}
                                   />
@@ -739,13 +739,13 @@ function ScheduleBlock({
                                 <Field label="Until">
                                   <Input
                                     type="time"
-                                    className="w-[7.5rem]"
+                                    className="w-[8.5rem] sm:w-[7.5rem]"
                                     value={toTime(w.end)}
                                     onChange={(e) => onCountry(c.country, { ...w, end: fromTime(e.target.value), paused })}
                                   />
                                 </Field>
                                 <Field label="Days">
-                                  <div className="flex gap-1">
+                                  <div className="flex flex-wrap gap-1">
                                     {DAYS.map((d) => {
                                       const active = w.days.includes(d.v);
                                       return (

@@ -134,7 +134,7 @@ export default function Settings() {
 
       {/* Domains */}
       <div className="mt-8">
-        <div className="mb-3 flex items-center justify-between">
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="font-clash text-lg font-semibold">Sending domains</div>
           <div className="flex gap-2">
             <Button size="sm" variant="ghost" onClick={resetCounts}>Reset daily counts</Button>
@@ -559,7 +559,7 @@ function ReaderCard() {
         </div>
       </Field>
 
-      <div className="flex items-center justify-between border-t border-line pt-4">
+      <div className="flex flex-col gap-3 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-between">
         <span className="text-xs text-muted">Tried after the free archives, before any paid proxy.</span>
         <Button variant="outline" loading={testing} onClick={test}>Test</Button>
       </div>
@@ -677,14 +677,14 @@ function ScrapeProxyCard() {
               checked={premium}
               onChange={(e) => setPremium(e.target.checked)}
               disabled={!provider}
-              className="accent-ink"
+              className="h-[18px] w-[18px] shrink-0 accent-ink"
             />
             Premium / stealth mode <span className="text-muted">(needed for Cloudflare)</span>
           </label>
         </div>
       </div>
 
-      <div className="flex items-center justify-between border-t border-line pt-4">
+      <div className="flex flex-col gap-3 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-between">
         <span className="text-xs text-muted">
           {mode === "blocked"
             ? "Credits are only spent on sites that actually block the crawler."
@@ -803,7 +803,7 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
         <Field label="Domain" hint="A domain you've verified in Resend (SPF/DKIM added).">
           <Input value={d.domain} onChange={(e) => setD({ ...d, domain: e.target.value })} placeholder="dna-erp.com" />
         </Field>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="From name">
             <Input value={d.from_name} onChange={(e) => setD({ ...d, from_name: e.target.value })} placeholder="Solution ERP" />
           </Field>
@@ -827,7 +827,7 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
           />
         </Field>
         <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="accent-ink" />
+          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="h-[18px] w-[18px] accent-ink" />
           Active (include in rotation)
         </label>
         <div className="flex justify-end gap-2 pt-1">
