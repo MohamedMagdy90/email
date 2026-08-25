@@ -81,8 +81,31 @@ clean · frontend `tsc` clean · `vite build` clean · live over HTTP on both
 `/api/discovery/status` and `/api/overview`.
 
 ⚠️ The dev-only seed and the preview auto-login used to check this were removed.
-⚠️ `.git` has been wiped from the container AGAIN — re-attach with `git init` +
-`fetch` + `reset --mixed origin/main` before pushing. Not committed yet.
+
+## Shipped
+Pushed as **`ba79b94`** to `MohamedMagdy90/email` (`1a6900a` → `ba79b94`) — 11
+files, 3 added and 8 modified. Verified by comparing the FULL commit SHA local
+vs remote rather than the push output: identical, so the whole tree is proven,
+not just the file list. Railway auto-deployed; `GET /api/health` returns
+`{"ok":true,"rev":"ba79b94"}`.
+
+`.git` had been wiped from the container again — re-attached with `git init` +
+`remote add` + `fetch --depth=1` + `reset --mixed FETCH_HEAD`, which leaves the
+working tree untouched and just re-points the index at the remote HEAD.
+
+`frontend/{package.json,tsconfig.json,vite.config.ts,bun.lock}` carry
+Same-IDE-only edits (`same-runtime`, `react-grab`, the `optimizeDeps.exclude`)
+and were left OUT again — diffed first to confirm none of this work had leaked
+into them. They still show as modified locally; that is expected, not drift.
+
+⚠️ Verified from here only as far as the boot: `ensureSchema()` is awaited at
+module load, so production answering `/api/health` at all proves both new
+migrations ran against POSTGRES. What could not be checked without production
+credentials is the request path — `/api/discovery/status` and `/api/overview`
+now call `getFillRate()`, and the auth middleware 401s before the handler, so
+an unauthenticated probe cannot tell a working handler from a throwing one.
+57 offline checks plus a live HTTP pass on the identical code locally say it is
+fine; the first person to open Overview should confirm the card renders.
 
 ---
 
