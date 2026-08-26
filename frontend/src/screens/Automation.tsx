@@ -471,7 +471,7 @@ export default function AutomationCard() {
             Guard rails <span className="font-normal text-muted">— shared by both lanes; they protect the same sending domains.</span>
           </div>
           <div className="grid gap-4 sm:grid-cols-3">
-            <Field label="Send rate" hint="Slower is safer.">
+            <Field label="Send rate" hint="Per domain — total scales with how many are active. Slower is safer.">
               <Select value={form.perMinute} onChange={(e) => set("perMinute", Number(e.target.value))}>
                 {RATES.map((r) => <option key={r} value={r}>{r} / minute</option>)}
               </Select>

@@ -23,7 +23,7 @@
 // automation_runs with the lane it belongs to, which is what the Settings
 // screen reads back to you.
 
-import { q, nowIso, getSetting, setSetting } from "./db";
+import { q, nowIso, getSetting, setSetting, startOfDayIso } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
 import { approveLeads, countApprovableLeads, approvableByCountry, normalizeAudience, type Audience } from "./pool";
 import { runSendJob } from "./send";
@@ -255,12 +255,9 @@ async function recentRuns(limit = 10): Promise<AutomationRun[]> {
   )) as unknown as AutomationRun[];
 }
 
-// Midnight UTC — the boundary the daily ceiling resets on (same convention as
-// the per-domain daily caps).
-function startOfDayIso(): string {
-  const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
-}
+// The daily ceiling resets at midnight UTC — the same boundary the per-domain
+// sending caps roll over on. `startOfDayIso` lives in ./db so there is exactly
+// one definition of "today" and the two ceilings can never disagree.
 
 // The ceiling is shared, so with no audience this counts BOTH lanes.
 async function sentToday(audience?: Audience): Promise<number> {

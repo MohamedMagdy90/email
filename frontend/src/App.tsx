@@ -135,6 +135,55 @@ function BrandMark({ className }: { className?: string }) {
 
 /* --------------------------------- App -------------------------------- */
 
+/**
+ * Pull an access key off the URL and scrub it from the address bar in the same
+ * breath.
+ *
+ * Both forms work:
+ *   /?k=dna_…   query    — simplest to paste; lands in the CDN's access log
+ *   /#k=dna_…   fragment — never leaves the browser on the page request itself
+ *
+ * The scrub matters more than it looks. Left in place the key would sit in the
+ * address bar for every screenshot, ride along in the Referer of any outbound
+ * link, and be saved by the browser's history and session restore.
+ */
+function takeKeyFromUrl(): string {
+  let key = "";
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    key = qs.get("k") || "";
+    if (key) {
+      qs.delete("k");
+      const rest = qs.toString();
+      window.history.replaceState(
+        {},
+        "",
+        window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash
+      );
+    } else if (window.location.hash.startsWith("#k=")) {
+      key = decodeURIComponent(window.location.hash.slice(3));
+      window.history.replaceState({}, "", window.location.pathname + window.location.search);
+    }
+  } catch {
+    /* malformed URL — just behave as though no key was supplied */
+  }
+  return key;
+}
+
+/**
+ * Read at MODULE scope, deliberately — not inside the effect.
+ *
+ * Two reasons. StrictMode runs effects twice in development, and a capture that
+ * both strips and consumes would hand the key to the first pass and an empty
+ * string to the second, which then races the first to decide `authed`. And the
+ * earlier this runs the smaller the window in which the secret is on screen:
+ * module evaluation happens before React mounts anything at all.
+ *
+ * Exchanging the same key twice is harmless — keys are reusable until revoked —
+ * so the double pass in development simply mints two sessions and keeps the last.
+ */
+const URL_KEY = takeKeyFromUrl();
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
@@ -153,6 +202,20 @@ export default function App() {
           setAuthed(false);
           return;
         }
+
+        // An explicit key in the URL wins over whatever stale token might be in
+        // storage — that is the entire point of arriving with one.
+        if (URL_KEY) {
+          try {
+            await api.exchangeKey(URL_KEY);
+            setAuthed(true);
+            return;
+          } catch {
+            // Revoked, expired, or mistyped. Fall through to the normal check so
+            // a human on the same machine still gets their usual session.
+          }
+        }
+
         setAuthed(await api.checkAuth());
       } catch {
         // Offline or the API is down — fall through to the login screen rather

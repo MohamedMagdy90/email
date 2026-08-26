@@ -35,6 +35,10 @@ export default function Send() {
   const logRef = useRef<HTMLDivElement>(null);
   const running = job?.status === "running";
 
+  // The send rate is per domain, so total throughput scales with how many are
+  // active — worth stating, because it's the whole reason to add a second one.
+  const activeDomainCount = domains.filter((d) => d.active).length;
+
   async function loadContacts() {
     setListLoading(true);
     try {
@@ -169,7 +173,14 @@ export default function Send() {
               </Select>
             </Field>
 
-            <Field label="Send rate" hint="Slower is safer for deliverability.">
+            <Field
+              label="Send rate"
+              hint={
+                activeDomainCount > 1
+                  ? `Per domain — ${activeDomainCount} active, so up to ${perMinute * activeDomainCount}/min in total. Slower is safer for deliverability.`
+                  : "Per domain. Slower is safer for deliverability."
+              }
+            >
               <Select value={perMinute} onChange={(e) => setPerMinute(Number(e.target.value))}>
                 <option value={10}>10 / minute (safest)</option>
                 <option value={20}>20 / minute</option>
@@ -181,7 +192,10 @@ export default function Send() {
             <div className="rounded-xl bg-ink/[0.03] p-3 text-[13px]">
               <div className="flex justify-between"><span className="text-muted">Selected</span><span className="font-medium">{selectionCount.toLocaleString()}</span></div>
               <div className="mt-1 flex justify-between"><span className="text-muted">Matching filter</span><span className="font-medium">{filteredTotal.toLocaleString()}</span></div>
-              <div className="mt-1 flex justify-between"><span className="text-muted">Active domains</span><span className="font-medium">{domains.filter((d) => d.active).length}</span></div>
+              <div className="mt-1 flex justify-between"><span className="text-muted">Active domains</span><span className="font-medium">{activeDomainCount}</span></div>
+              {activeDomainCount > 1 && (
+                <div className="mt-1 flex justify-between"><span className="text-muted">Throughput</span><span className="font-medium">{perMinute * activeDomainCount} / minute</span></div>
+              )}
             </div>
 
             {selectAllMatching && filteredTotal > 0 && (

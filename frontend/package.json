@@ -9,7 +9,9 @@
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "same-runtime": "^0.0.1",
+    "react-grab": "latest"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.6",

@@ -19,7 +19,7 @@ import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
-import { runSendJob, buildFrom, isEmail } from "./send";
+import { runSendJob, buildFrom, isEmail, domainUsageToday, resetDomainUsage } from "./send";
 import { discoveredWhere, approveLeads, NO_COUNTRY } from "./pool";
 import {
   startAutomationWorker,
@@ -67,6 +67,12 @@ import {
   isAuthConfigured,
   getUsername,
   setCredentials,
+  looksLikeAccessKey,
+  verifyAccessKey,
+  sessionFromAccessKey,
+  createAccessKey,
+  listAccessKeys,
+  revokeAccessKey,
 } from "./auth";
 
 await ensureSchema();
@@ -144,18 +150,48 @@ const PUBLIC_API = new Set([
   "/api/auth/login",
   "/api/auth/status",
   "/api/auth/setup",
+  // Presenting a valid access key IS the proof of identity here, so this
+  // endpoint cannot itself sit behind the token gate.
+  "/api/auth/exchange",
   "/api/open",
   "/api/click",
   "/api/unsubscribe",
 ]);
 
+/** Best-effort client IP, for the access-key audit trail only. */
+const clientIp = (c: any) =>
+  (c.req.header("x-forwarded-for") || "").split(",")[0].trim() ||
+  c.req.header("x-real-ip") ||
+  "";
+
 // Gate every /api/* route except the public ones above.
+//
+// Two credentials are accepted on the same header. A session token is what the
+// browser gets after a password login; an access key is a standing credential
+// held by a machine. They are told apart by shape (`dna_…` with no dot), so the
+// wrong kind is never checked against the wrong verifier.
 app.use("/api/*", async (c, next) => {
   if (c.req.method === "OPTIONS") return next();
   if (PUBLIC_API.has(c.req.path)) return next();
+
   const header = c.req.header("Authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!(await verifyToken(token))) return c.json({ error: "Unauthorized" }, 401);
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  // A dedicated header too, because some API clients reserve Authorization.
+  const presented = bearer || c.req.header("x-api-key") || "";
+
+  if (looksLikeAccessKey(presented)) {
+    const label = await verifyAccessKey(presented, clientIp(c));
+    if (!label) return c.json({ error: "Unauthorized" }, 401);
+    // Key holders must not be able to mint more keys or change the password —
+    // that would make revocation meaningless, since a stolen key could simply
+    // issue itself a replacement or lock the owner out.
+    if (c.req.path.startsWith("/api/auth/keys") || c.req.path === "/api/account") {
+      return c.json({ error: "Access keys cannot manage credentials. Sign in with your password." }, 403);
+    }
+    return next();
+  }
+
+  if (!(await verifyToken(presented))) return c.json({ error: "Unauthorized" }, 401);
   return next();
 });
 
@@ -184,6 +220,58 @@ app.post("/api/auth/setup", async (c) => {
   await setCredentials(u, p);
   const token = await createToken(u);
   return c.json({ token, username: u });
+});
+
+/**
+ * Trade an access key for an ordinary short-lived session token.
+ *
+ * This is the landing point for `https://app/?k=<key>`: the SPA calls it once on
+ * boot, stores the returned token like any other session, and scrubs the key out
+ * of the address bar. The key itself never becomes the session — so a token
+ * lifted from the agent's browser expires in hours and cannot mint more.
+ *
+ * Rate-limited because this is the one public endpoint that accepts a guessable
+ * secret. 256 bits is not guessable, but an unthrottled oracle is still a gift.
+ */
+const exchangeHits = new Map<string, { n: number; resetAt: number }>();
+app.post("/api/auth/exchange", async (c) => {
+  const ip = clientIp(c);
+  const now = Date.now();
+  // Bucket unattributable requests together rather than letting them share the
+  // empty-string key with nothing; the audit trail keeps the real (blank) value.
+  const bucket = exchangeHits.get(ip || "unknown");
+  if (!bucket || now > bucket.resetAt) {
+    exchangeHits.set(ip || "unknown", { n: 1, resetAt: now + 60_000 });
+  } else if (++bucket.n > 20) {
+    return c.json({ error: "Too many attempts. Wait a minute." }, 429);
+  }
+  if (exchangeHits.size > 5000) exchangeHits.clear(); // crude, unbounded-growth guard
+
+  const { key } = await c.req.json().catch(() => ({}));
+  const token = await sessionFromAccessKey(String(key || ""), ip);
+  if (!token) return c.json({ error: "Invalid or expired access key" }, 401);
+  return c.json({ token, username: await getUsername() });
+});
+
+/* --------------------- Access key management -------------------- */
+// Password-authenticated only — the middleware above blocks key holders here.
+
+app.get("/api/auth/keys", async (c) => c.json({ keys: await listAccessKeys() }));
+
+app.post("/api/auth/keys", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const label = String(b.label || "").trim();
+  const days = Number(b.expiresInDays) || 0;
+  if (!label) return c.json({ error: "Give the key a label so you know what it's for" }, 400);
+  const { id, key, row } = await createAccessKey(label, days);
+  // `key` is returned exactly once. It is not recoverable from the database.
+  return c.json({ id, key, row });
+});
+
+app.delete("/api/auth/keys/:id", async (c) => {
+  const ok = await revokeAccessKey(c.req.param("id"));
+  if (!ok) return c.json({ error: "Key not found" }, 404);
+  return c.json({ ok: true });
 });
 
 // Reaching here means the middleware already validated the token.
@@ -490,9 +578,17 @@ app.delete("/api/templates/:id", async (c) => {
 });
 
 /* ------------------------------ Domains ----------------------------- */
+// `sent_today` is not stored — it is counted from the sends ledger for the
+// current cap window, so it rolls over at midnight UTC without anything having
+// to reset it. The column of the same name is dead; always overlay the real
+// figure before a domain row leaves the API.
+async function withUsage(rows: any[]): Promise<any[]> {
+  const usage = await domainUsageToday();
+  return rows.map((d) => ({ ...d, sent_today: usage.get(String(d.id)) ?? 0 }));
+}
 
 app.get("/api/domains", async (c) => {
-  return c.json({ domains: await q(`SELECT * FROM domains ORDER BY created_at`) });
+  return c.json({ domains: await withUsage(await q(`SELECT * FROM domains ORDER BY created_at`)) });
 });
 
 app.post("/api/domains", async (c) => {
@@ -505,7 +601,7 @@ app.post("/api/domains", async (c) => {
     `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,created_at) VALUES (?,?,?,?,?,1,?) RETURNING *`,
     [uid(), domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, nowIso()]
   );
-  return c.json({ domain: rows[0] });
+  return c.json({ domain: (await withUsage(rows))[0] });
 });
 
 app.put("/api/domains/:id", async (c) => {
@@ -519,7 +615,7 @@ app.put("/api/domains/:id", async (c) => {
     [domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
   );
   if (!rows.length) return c.json({ error: "not found" }, 404);
-  return c.json({ domain: rows[0] });
+  return c.json({ domain: (await withUsage(rows))[0] });
 });
 
 app.delete("/api/domains/:id", async (c) => {
@@ -527,8 +623,11 @@ app.delete("/api/domains/:id", async (c) => {
   return c.json({ ok: true });
 });
 
+// Caps clear themselves at midnight UTC. This is the manual override for "I know
+// those sends don't count, let me carry on now" — it moves the start of the
+// counting window to this moment rather than zeroing anything.
 app.post("/api/domains/reset-counts", async (c) => {
-  await q(`UPDATE domains SET sent_today = 0`);
+  await resetDomainUsage();
   return c.json({ ok: true });
 });
 

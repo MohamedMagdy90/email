@@ -88,4 +88,7 @@ export default defineConfig({
       }
     }
   },
+  optimizeDeps: {
+    exclude: ["same-runtime/dist/jsx-runtime", "same-runtime/dist/jsx-dev-runtime"]
+  }
 });

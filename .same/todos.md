@@ -333,7 +333,7 @@ we read their copy — free, no key, no signup.
 - `backend/data.sqlite` was corrupt at boot again → parked in
   `.same/corrupt-db-backup-6`, recreated. Production is Postgres, unaffected.
 - `frontend/node_modules` was missing its binaries again → `bun install`.
-- Local login re-seeded from env: **admin / dna-outreach**.
+- Local login re-seeded from `AUTH_USERNAME` / `AUTH_PASSWORD` in `backend/.env`.
 
 ## Incident
 - The apply model replaced the WHOLE of `search.ts` with the new engine pool,
@@ -394,7 +394,7 @@ HTTP checks. backend `tsc` clean · frontend `tsc` clean · `vite build` clean.
 ## Housekeeping (local dev only)
 - `backend/data.sqlite` was corrupt at boot again → parked in
   `.same/corrupt-db-backup-5`, recreated. Production is Postgres, unaffected.
-  Local login re-seeded from env: **admin / dna-outreach**.
+  Local login re-seeded from `AUTH_USERNAME` / `AUTH_PASSWORD` in `backend/.env`.
 - `frontend/node_modules` was empty again → `bun install`.
 
 ---

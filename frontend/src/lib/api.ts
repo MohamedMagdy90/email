@@ -71,6 +71,19 @@ export interface Contact {
   last_clicked_at?: string | null;
 }
 
+/** A standing credential for a machine caller. The secret itself is never
+ *  returned by the list endpoint — only `prefix`, enough to identify it. */
+export interface AccessKey {
+  id: string;
+  label: string;
+  prefix: string;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  revoked: number;
+}
+
 export interface Template {
   id: string;
   type: "customer" | "partner";
@@ -648,6 +661,32 @@ export const api = {
     if (data.token) setToken(data.token);
     return data;
   },
+
+  /* --------------------------- access keys --------------------------- */
+
+  /** Trade a `?k=` access key for a normal session. Used once, on boot. */
+  exchangeKey: async (key: string) => {
+    const res = await fetch(`${BASE}/api/auth/exchange`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    });
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error(e.error || "Access key rejected");
+    }
+    const data = (await res.json()) as { token: string; username: string };
+    setToken(data.token);
+    return data;
+  },
+  listKeys: () => req<{ keys: AccessKey[] }>(`/api/auth/keys`),
+  /** The plaintext `key` in the response is shown once and never returned again. */
+  createKey: (label: string, expiresInDays = 0) =>
+    req<{ id: string; key: string; row: AccessKey }>(`/api/auth/keys`, {
+      method: "POST",
+      body: JSON.stringify({ label, expiresInDays }),
+    }),
+  revokeKey: (id: string) => req<{ ok: boolean }>(`/api/auth/keys/${id}`, { method: "DELETE" }),
   logout: () => clearToken(),
 
   // contacts (keyset pagination via opaque `cursor`)

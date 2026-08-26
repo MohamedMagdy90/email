@@ -104,6 +104,16 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+// Midnight UTC today, as ISO text. This is THE day boundary for every daily
+// ceiling in the app — the per-domain sending caps and the automation's shared
+// ceiling both roll over here, so they agree with each other and with the
+// `sent_at` timestamps in the sends ledger (also ISO UTC, so a plain string
+// comparison is a correct date comparison).
+export function startOfDayIso(): string {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
+}
+
 export async function ensureSchema() {
   await q(`CREATE TABLE IF NOT EXISTS contacts (
     id TEXT PRIMARY KEY,
@@ -192,11 +202,64 @@ export async function ensureSchema() {
   // are on its hot path.
   try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_contact ON sends(contact_id)`); } catch { /* ignore */ }
   try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_sent_at ON sends(sent_at)`); } catch { /* ignore */ }
+  // Every send job opens by asking "how much has each domain sent today?", which
+  // is a GROUP BY over exactly these two columns.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_domain_sent_at ON sends(domain_id, sent_at)`); } catch { /* ignore */ }
 
   await q(`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
   )`);
+
+  // Long-lived, individually revocable credentials for non-human callers — an
+  // agent driving the UI in a fresh browser profile, a scripted API client.
+  //
+  // ONLY THE HASH IS STORED. The plaintext key is shown exactly once, at the
+  // moment it is minted, and is unrecoverable afterwards. A leaked database
+  // therefore yields no usable credential, and the blast radius of any single
+  // key is one DELETE — unlike the shared password, which cannot be rotated for
+  // one caller without locking out every other.
+  //
+  // `prefix` is the first few plaintext characters, kept in the clear purely so
+  // the UI can say WHICH key it is listing. `last_used_at`/`last_used_ip` exist
+  // so that a key being used by someone unexpected is visible rather than silent.
+  await q(`CREATE TABLE IF NOT EXISTS access_keys (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT,
+    last_used_ip TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0
+  )`);
+  // Every authenticated request carrying a key looks it up by hash.
+  try { await q(`CREATE INDEX IF NOT EXISTS idx_access_keys_hash ON access_keys(key_hash)`); } catch { /* ignore */ }
+
+  // `domains.sent_today` is DEAD — per-domain daily usage is now counted from the
+  // sends ledger instead (see `domainUsageToday` in send.ts).
+  //
+  // It was a mutable counter that only ever went up: the one and only thing that
+  // reset it was a human pressing "Reset daily counts" in Settings. So the daily
+  // cap quietly behaved as a LIFETIME cap, and once every domain reached it the
+  // sender aborted every batch with "All domains hit their daily cap" and never
+  // recovered on its own. Counting rows in the ledger cannot drift like that: it
+  // rolls over at midnight UTC by itself and it survives restarts.
+  //
+  // Zero the abandoned column ONCE so a database still carrying those stale
+  // (usually maxed-out) numbers doesn't display them. Guarded by a flag so it
+  // runs on the first boot after this change and never again.
+  try {
+    const done = await getSetting("domain_usage_derived_v1");
+    if (!done) {
+      const rows = await q(`UPDATE domains SET sent_today = 0 WHERE sent_today <> 0 RETURNING id`);
+      if (rows.length) {
+        console.log(`[db] cleared the stale sent_today counter on ${rows.length} domain(s) — daily usage is now derived from the sends ledger and resets at midnight UTC`);
+      }
+      await setSetting("domain_usage_derived_v1", new Date().toISOString());
+    }
+  } catch { /* non-fatal */ }
 
   // Persistent crawl ledger: remembers every domain we've ever scanned so we
   // never waste time (or rate-limit budget) re-crawling the same site.

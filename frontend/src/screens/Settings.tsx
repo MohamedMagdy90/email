@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, PAID_TRANSPORTS, type Domain, type TransportName } from "../lib/api";
+import { api, PAID_TRANSPORTS, type AccessKey, type Domain, type TransportName } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
 import AutomationCard from "./Automation";
@@ -134,10 +134,16 @@ export default function Settings() {
 
       {/* Domains */}
       <div className="mt-8">
-        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="font-clash text-lg font-semibold">Sending domains</div>
-          <div className="flex gap-2">
-            <Button size="sm" variant="ghost" onClick={resetCounts}>Reset daily counts</Button>
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div className="font-clash text-lg font-semibold">Sending domains</div>
+            <div className="mt-0.5 text-[13px] text-muted">
+              Sends rotate across every active domain, and each one is paced separately — two domains send twice as fast as one.
+              Daily caps clear on their own at midnight UTC.
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button size="sm" variant="ghost" onClick={resetCounts} title="Start today's count again from right now">Reset daily counts</Button>
             <Button size="sm" onClick={() => setEditing({ id: "", domain: "", from_name: "DNA Systems", from_email: "", daily_cap: 40, sent_today: 0, active: true })}>Add domain</Button>
           </div>
         </div>
@@ -187,6 +193,11 @@ export default function Settings() {
       <div className="mt-8">
         <div className="mb-3 font-clash text-lg font-semibold">Account</div>
         <AccountCard />
+      </div>
+      {/* Agent access */}
+      <div className="mt-8">
+        <div className="mb-3 font-clash text-lg font-semibold">Agent access</div>
+        <AccessKeysCard />
       </div>
 
       {editing && (
@@ -750,6 +761,203 @@ function AccountCard() {
         <Button loading={busy} onClick={save}>Update account</Button>
       </div>
     </Card>
+  );
+}
+
+/**
+ * Standing credentials for machine callers — ChatGPT, a script, a cron job.
+ *
+ * The plaintext key is returned by the API exactly once, at creation. This card
+ * is therefore built around that single moment: mint, show, copy, and from then
+ * on the row can only be identified and revoked, never re-read.
+ */
+function AccessKeysCard() {
+  const [keys, setKeys] = useState<AccessKey[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [label, setLabel] = useState("ChatGPT");
+  const [expiry, setExpiry] = useState("90");
+  const [busy, setBusy] = useState(false);
+  // The one-time reveal. Cleared the moment the user dismisses it.
+  const [minted, setMinted] = useState<{ key: string; label: string } | null>(null);
+
+  async function load() {
+    try {
+      setKeys((await api.listKeys()).keys || []);
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function create() {
+    if (!label.trim()) return toast("Give the key a label so you know what it's for", "error");
+    setBusy(true);
+    try {
+      const r = await api.createKey(label.trim(), Number(expiry) || 0);
+      setMinted({ key: r.key, label: r.row.label });
+      setLabel("ChatGPT");
+      await load();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(k: AccessKey) {
+    if (!confirm(`Revoke "${k.label}"? Anything using it stops working immediately.`)) return;
+    try {
+      await api.revokeKey(k.id);
+      toast(`Revoked "${k.label}"`, "success");
+      await load();
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  }
+
+  const loginUrl = minted ? `${window.location.origin}/?k=${minted.key}` : "";
+
+  return (
+    <Card className="space-y-5 p-5">
+      <p className="text-[13px] text-muted">
+        A key lets something sign in without your password — open the link and you're
+        already in. Use it for ChatGPT or a script, not for yourself.
+      </p>
+
+      {/* The one-time reveal */}
+      {minted && (
+        <div className="space-y-3 rounded-xl border border-[#e0b341]/40 bg-[#e0b341]/[0.07] p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-[13px] font-semibold text-ink">
+                "{minted.label}" created — copy it now
+              </div>
+              <div className="mt-0.5 text-[12px] text-muted">
+                This is the only time it will be shown. Closing this panel loses it for good.
+              </div>
+            </div>
+            <button
+              onClick={() => setMinted(null)}
+              className="shrink-0 rounded-lg px-2 py-1 text-[12px] text-muted transition-colors hover:bg-ink/5 hover:text-ink"
+            >
+              Done
+            </button>
+          </div>
+
+          <CopyRow label="Auto-login link — paste into ChatGPT" value={loginUrl} />
+          <CopyRow label="Raw key — for an Authorization header" value={minted.key} />
+
+          <p className="text-[12px] leading-relaxed text-muted">
+            Treat the link like a password: anyone holding it is fully signed in. Prefer the
+            raw key over the link wherever the caller can send a header — headers don't end
+            up in browser history or server logs.
+          </p>
+        </div>
+      )}
+
+      {/* Mint */}
+      <div className="grid gap-4 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+        <Field label="Label" hint="What is this key for?">
+          <Input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="ChatGPT"
+            onKeyDown={(e) => e.key === "Enter" && create()}
+          />
+        </Field>
+        <Field label="Expires">
+          <Select value={expiry} onChange={(e) => setExpiry(e.target.value)}>
+            <option value="7">In 7 days</option>
+            <option value="30">In 30 days</option>
+            <option value="90">In 90 days</option>
+            <option value="365">In a year</option>
+            <option value="0">Never</option>
+          </Select>
+        </Field>
+        <Button loading={busy} onClick={create}>Create key</Button>
+      </div>
+
+      {/* Existing */}
+      <div className="border-t border-line pt-4">
+        {loading ? (
+          <div className="py-4 text-center text-[13px] text-muted">Loading…</div>
+        ) : keys.length === 0 ? (
+          <div className="py-4 text-center text-[13px] text-muted">
+            No access keys. Everything must sign in with a password.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {keys.map((k) => {
+              const expired = !!k.expires_at && new Date(k.expires_at).getTime() < Date.now();
+              return (
+                <div
+                  key={k.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line px-3.5 py-3"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-[13px] font-medium text-ink">{k.label}</span>
+                      {expired && <Badge className="border-[#c0563f]/30 bg-[#c0563f]/10 text-[#c0563f]">Expired</Badge>}
+                    </div>
+                    <div className="mt-0.5 font-mono text-[11px] text-muted">
+                      {k.prefix}…{" · "}
+                      {k.last_used_at
+                        ? `last used ${new Date(k.last_used_at).toLocaleDateString()}${k.last_used_ip ? ` from ${k.last_used_ip}` : ""}`
+                        : "never used"}
+                      {k.expires_at && !expired
+                        ? ` · expires ${new Date(k.expires_at).toLocaleDateString()}`
+                        : ""}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => revoke(k)}
+                    className="shrink-0 rounded-lg border border-[#c0563f]/30 px-2.5 py-1.5 text-[12px] font-medium text-[#c0563f] transition-colors hover:bg-[#c0563f]/10"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/** A read-only value with a copy button. Selects on focus so it's still
+ *  usable where the clipboard API is blocked (insecure origin, locked-down iframe). */
+function CopyRow({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      return toast("Copy blocked by the browser — select the text and copy manually", "error");
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  }
+  return (
+    <div>
+      <div className="mb-1 text-[12px] font-medium text-ink/70">{label}</div>
+      <div className="flex gap-2">
+        <input
+          readOnly
+          value={value}
+          onFocus={(e) => e.currentTarget.select()}
+          className="min-w-0 flex-1 rounded-lg border border-line bg-paper px-2.5 py-2 font-mono text-[12px] text-ink outline-none"
+        />
+        <button
+          onClick={copy}
+          className="shrink-0 rounded-lg border border-line px-3 py-2 text-[12px] font-medium text-ink transition-colors hover:bg-ink/5"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+    </div>
   );
 }
 
