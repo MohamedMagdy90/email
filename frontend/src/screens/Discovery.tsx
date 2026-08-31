@@ -563,7 +563,7 @@ export default function Discovery() {
                 </span>
                 <span className="mt-0.5 block truncate text-xs font-normal text-muted">
                   {showSources
-                    ? "Web search finds thousands like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped."
+                    ? "Web search hunts a country like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped."
                     : sourcesSummary}
                 </span>
               </span>
@@ -592,7 +592,7 @@ export default function Discovery() {
                 <div className="px-5 py-12 text-center">
                   <p className="text-sm font-medium">No sources yet</p>
                   <p className="mx-auto mt-1 max-w-md text-xs text-muted">
-                    Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
+                    Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in every company site it finds. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
                   </p>
                   <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
                 </div>
@@ -1298,16 +1298,12 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   const [url, setUrl] = useState("");
   const [keywords, setKeywords] = useState("");
   const [category, setCategory] = useState(cats[0] || "Companies (general)");
-  // Who this source is hunting. Every lead it files inherits it, and the
-  // automation has one lane per audience — so this is the single most
+  // Who this source is hunting. Every lead it files inherits it, and
+  // the automation has one lane per audience — so this is the single most
   // consequential field in the form.
   const [audience, setAudience] = useState<Audience>("customer");
   const [limit, setLimit] = useState(100);
   const [interval, setInterval] = useState(360);
-  // Web search only: walk the country's own ccTLD in Common Crawl's index as
-  // well as running the keyword queries. On by default — a search source that
-  // finds a fraction of the country is the problem this exists to solve.
-  const [sweepCountry, setSweepCountry] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1322,13 +1318,9 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
       setAudience(audienceOf(editing.audience));
       setLimit(editing.limit_n);
       setInterval(editing.interval_minutes);
-      // Sources created before the sweep existed have no value stored; they
-      // read as ON, which matches the column default the migration applied.
-      setSweepCountry(Number(editing.sweep_country ?? 0) === 1);
     } else {
       setType("search"); setLocation(""); setUrl(""); setKeywords(""); setPlace(null);
       setCategory(cats[0] || "Companies (general)"); setAudience("customer"); setLimit(100); setInterval(360);
-      setSweepCountry(true);
     }
   }, [open, editing, cats]);
 
@@ -1343,7 +1335,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
     try {
       const body =
         type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, audience, limit, intervalMinutes: interval } :
-        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, audience, limit, intervalMinutes: interval, sweepCountry } :
+        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, audience, limit, intervalMinutes: interval } :
         { type: "osm" as const, location: location.trim(), category, audience, limit, intervalMinutes: interval, place };
       if (editing) {
         await api.updateDiscoverySource(editing.id, body);
@@ -1427,32 +1419,8 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 {INTERVALS.map((i) => <option key={i.v} value={i.v}>{i.label}</option>)}
               </Select>
             </Field>
-            {/* The volume switch — and a genuine trade-off, so it is off by
-                default. A ccTLD index lists every HOST in a country, not every
-                business, so switched on blindly it files government portals and
-                campaign sites as leads. */}
-            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-line/70 bg-ink/[0.02] px-3 py-3">
-              <input
-                type="checkbox"
-                checked={sweepCountry}
-                onChange={(e) => setSweepCountry(e.target.checked)}
-                className="mt-0.5 h-[18px] w-[18px] shrink-0 cursor-pointer accent-good"
-              />
-              <span className="text-xs leading-relaxed text-muted">
-                <span className="block text-[13px] font-medium text-ink/80">Also sweep the whole country's web <span className="font-normal text-ink/45">— broad, but rougher</span></span>
-                Searching only finds companies that <em>rank</em> for a phrase — typically 10–20 results per search. This additionally walks a public index of every website under the country's own domain (<span className="font-medium text-ink/70">.qa</span>, <span className="font-medium text-ink/70">.sa</span>, <span className="font-medium text-ink/70">.ae</span>…), which is where the <span className="font-medium text-ink/70">thousands</span> come from. Free, and it needs no key.
-                <span className="mt-1 block text-ink/55">
-                  That index lists every <em>website</em> in the country, not every business, so entries arrive named after their web address until the crawler reads the real name off the site. Leave it off if you want a smaller, cleaner pool.
-                </span>
-                {category !== "Companies (general)" ? (
-                  <span className="mt-1 block text-ink/55">
-                    Swept sites are matched against <span className="font-medium text-ink/70">{category}</span> by their web address, which is a looser filter than a search — expect a wider mix.
-                  </span>
-                ) : null}
-              </span>
-            </label>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              This searches the web like Google — across the whole country <span className="font-medium text-ink/70">and its major cities</span> — and streams every company website it finds into your pool, then finds each one's email. This is the source that scales to <span className="font-medium text-ink/70">hundreds–thousands</span>. Tip: add a free <span className="font-medium text-ink/70">Jina key</span> in Settings → Crawler so it can search at full speed.
+              This searches the web like Google — across the whole country <span className="font-medium text-ink/70">and its major cities</span> — and streams every company website it finds into your pool, then finds each one's email. Tip: add a free <span className="font-medium text-ink/70">Jina key</span> in Settings → Crawler so it can search at full speed.
             </p>
           </>
         ) : type === "osm" ? (

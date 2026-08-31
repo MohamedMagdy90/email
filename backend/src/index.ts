@@ -1427,12 +1427,14 @@ app.post("/api/discovery/sources", async (c) => {
     const keywords = String(b.keywords || "").trim();
     if (!location && !keywords) return c.json({ error: "Enter a country/city and/or some keywords to search for" }, 400);
     const limit = clamp(Number(b.limit) || 100, 20, 300);
-    // Also walk Common Crawl's index of the country's own ccTLD. Default OFF:
-    // it reaches far more of a country than the keyword queries can, but a
-    // ccTLD lists every HOST in a country rather than every business, so it
-    // needs a deliberate "yes" and it needs the category filter to have
-    // something to bite on.
-    const sweep = b.sweepCountry === true ? 1 : 0;
+    // The ccTLD "sweep the whole country's web" option is RETIRED. It listed
+    // every host under .qa/.sa/.ae rather than every business, so it filed
+    // parked domains, portals and campaign sites as companies and drowned the
+    // real results. The column stays for history; nothing may switch it on
+    // again, and the planner ignores it either way (see SWEEP_COUNTRY_ENABLED
+    // in discovery.ts). A stray `sweepCountry: true` from an old client is
+    // simply dropped rather than rejected.
+    const sweep = 0;
     const rows = await q(
       `INSERT INTO discovery_sources
         (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,sweep_country,next_run_at,created_at)
@@ -1506,7 +1508,7 @@ app.put("/api/discovery/sources/:id", async (c) => {
   let barrenRuns = Number(existing.barren_runs) || 0;
   const reAimed =
     (b.url != null || b.base_url != null || b.keywords != null || b.location != null ||
-     b.category != null || b.place !== undefined || b.sweepCountry != null);
+     b.category != null || b.place !== undefined);
   if (existing.type === "directory") {
     if (b.url != null || b.base_url != null) {
       let url = String(b.url ?? b.base_url ?? "").trim();
@@ -1516,14 +1518,14 @@ app.put("/api/discovery/sources/:id", async (c) => {
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   } else if (existing.type === "search") {
     // Changing what/where we search restarts the query plan from the top.
-    // Toggling the country sweep counts as a change too: it alters the LENGTH
-    // of the plan, and a cursor pointing into a plan that grew or shrank under
-    // it resumes at the wrong step.
+    // Clearing a leftover country-sweep flag counts too: it SHORTENS the plan,
+    // and a cursor pointing into a plan that shrank under it resumes at the
+    // wrong step.
     const changed =
       (b.keywords != null && String(b.keywords).trim() !== String(existing.keywords || "")) ||
       (b.location != null && String(b.location).trim() !== String(existing.location || "")) ||
       (b.category != null && String(b.category).trim() !== String(existing.category || "")) ||
-      (b.sweepCountry != null && (b.sweepCountry ? 1 : 0) !== Number(existing.sweep_country ?? 0));
+      Number(existing.sweep_country ?? 0) === 1;
     if (changed) { cursor = 1; exhausted = 0; emptyStreak = 0; }
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
@@ -1532,16 +1534,17 @@ app.put("/api/discovery/sources/:id", async (c) => {
   // stop scheduling the next one.
   if (!enabled && existing.enabled) stopSource(id);
 
-  const sweepCountry =
-    b.sweepCountry != null ? (b.sweepCountry ? 1 : 0) : Number(existing.sweep_country ?? 0);
+  // Retired (see the POST handler): saving a search source clears any sweep
+  // flag it was still carrying, so the column drains itself as sources are
+  // edited and nothing can turn it back on.
+  const sweepCountry = 0;
   const changedAim =
     reAimed &&
     (String(baseUrl || "") !== String(existing.base_url || "") ||
      String(keywords || "") !== String(existing.keywords || "") ||
      location !== existing.location ||
      category !== existing.category ||
-     String(placeJson || "") !== String(existing.place_json || "") ||
-     sweepCountry !== Number(existing.sweep_country ?? 0));
+     String(placeJson || "") !== String(existing.place_json || ""));
   // Switching a source back on BY HAND is the other clean slate. Without it the
   // bot would run it once, see the same dry result, and switch it straight off
   // again — which reads as the toggle being broken. Turning it on is an explicit

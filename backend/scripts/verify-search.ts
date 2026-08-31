@@ -6,7 +6,6 @@
 
 import { ensureSchema, q, nowIso } from "../src/db";
 import { searchCompaniesDeep, MAX_RESULT_PAGE, searchEngineHealth, isNonProspectHost } from "../src/search";
-import { ccPageCount, ccHostsForPattern } from "../src/crawler/archives";
 import { registrableDomain } from "../src/crawler/urls";
 
 let pass = 0, fail = 0;
@@ -15,7 +14,7 @@ const ok = (name: string, cond: boolean, note = "") => {
   else { fail++; console.log(`  ✗ ${name}${note ? ` — ${note}` : ""}`); }
 };
 
-console.log("\n=== A. schema + the new column ===");
+console.log("\n=== A. schema + the retired sweep column ===");
 await ensureSchema();
 await q(`DELETE FROM discovery_sources WHERE id='v1'`); // re-runnable
 await q(
@@ -24,9 +23,9 @@ await q(
   [nowIso()]
 );
 const row = (await q(`SELECT * FROM discovery_sources WHERE id='v1'`))[0] as any;
-// Defaults OFF now. A ccTLD index lists every host in a country, not every
-// business, so it filed `alabama.qa` and `agdoha2030.qa` as companies when it
-// was on by default. Opt-in, per source.
+// RETIRED, and the column is only still here so old rows read. A ccTLD index
+// lists every host in a country, not every business, so it filed `alabama.qa`
+// and `agdoha2030.qa` as companies. Nothing may write a 1 into it now.
 ok("sweep_country exists and defaults OFF", Number(row.sweep_country) === 0, `= ${row.sweep_country}`);
 
 console.log("\n=== B. the query plan ===");
@@ -67,50 +66,22 @@ const deepPage = await searchCompaniesPaged("MEP contractor Qatar", 9, 40, undef
 ok("page 9 is 'unsupported', not 'blocked'", deepPage.blocked === false && deepPage.unsupported === true,
    `blocked=${deepPage.blocked} unsupported=${deepPage.unsupported}`);
 
-console.log("\n=== E. Common Crawl country index ===");
-const pages = await ccPageCount("*.qa");
-const ccUp = pages > 0;
-if (!ccUp) {
-  console.log("     ⚠ index.commoncrawl.org is not answering this IP right now — checking DEGRADATION instead.");
-} else {
-  ok("page count for *.qa resolves", true, `${pages} index pages`);
-  const t1 = Date.now();
-  const p0 = await ccHostsForPattern("*.qa", 0);
-  console.log(`     page 0: ${Date.now() - t1}ms · records=${p0.records} · hosts=${p0.hosts.length}`);
-  ok("index page 0 returns hosts", p0.ok && p0.hosts.length > 50);
-  const domains = new Set(p0.hosts.map((h) => registrableDomain(h.host)).filter(Boolean));
-  ok("hosts collapse to distinct registrable domains", domains.size > 20, `${domains.size} domains`);
-  const prospects = [...domains].filter((d) => !isNonProspectHost(d!));
-  ok("most swept domains survive the non-prospect gate", prospects.length > domains.size * 0.5,
-     `${prospects.length}/${domains.size} kept`);
-  console.log(`     sample: ${prospects.slice(0, 10).join(", ")}`);
-
-  const past = await ccHostsForPattern("*.qa", 9999);
-  ok("a page past the end reports pastEnd, not a failure", past.ok === true && past.pastEnd === true);
-}
-
-console.log("\n=== E2. the plan shape, with and without the index ===");
+console.log("\n=== E. the country sweep is retired ===");
+// The kill switch has to hold even for a row that still CARRIES the flag —
+// checking it ahead of the column is the whole point. Offline on purpose: a
+// retired path must never be able to fail a run because a free public index
+// happened to be resting.
 const { buildSearchStepsForTest } = await import("../src/discovery");
 const steps = await buildSearchStepsForTest({ id: "v1", category: "Companies (general)", keywords: null, sweep_country: 1 }, "Qatar");
 const nQ = steps.filter((s: any) => s.kind === "query").length;
 const nS = steps.filter((s: any) => s.kind === "sweep").length;
 console.log(`     ${steps.length} steps = ${nQ} queries + ${nS} index pages`);
-ok("the plan is built either way", nQ > 100, `${nQ} queries`);
-if (ccUp) {
-  ok("sweep steps are present", nS > 0);
-  // Never two heavy index calls in a row.
-  let adjacent = 0;
-  for (let i = 1; i < steps.length; i++) if (steps[i].kind === "sweep" && steps[i - 1].kind === "sweep") adjacent++;
-  ok("index pages are interleaved, never back to back", adjacent === 0, `${adjacent} adjacent pairs`);
-  const firstSweep = steps.findIndex((s: any) => s.kind === "sweep");
-  ok("the first index page comes early, not after every query", firstSweep < nQ / 2, `at step ${firstSweep + 1}`);
-} else {
-  ok("with the index unreachable the source degrades to queries only", nS === 0 && nQ > 100);
-}
+ok("the query plan is still built", nQ > 100, `${nQ} queries`);
+ok("a source still flagged sweep_country=1 plans NO index pages", nS === 0);
 const offSteps = await buildSearchStepsForTest({ id: "v1", category: "Companies (general)", keywords: null, sweep_country: 0 }, "Qatar");
-ok("sweep_country=0 adds no index pages", offSteps.every((s: any) => s.kind === "query"));
+ok("and neither does an unflagged one", offSteps.every((s: any) => s.kind === "query"));
 
-console.log("\n=== F. category token filter ===");
+console.log("\n=== F. the dormant sweep filter (kept for the one-line reversal) ===");
 const { sweepTokensForTest, sweepHostMatchesForTest } = await import("../src/discovery");
 const conTokens = sweepTokensForTest("Construction & Contracting", null);
 ok("construction has URL tokens", conTokens.length > 0, conTokens.join(","));

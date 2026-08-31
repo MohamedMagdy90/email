@@ -1144,6 +1144,25 @@ const SWEEP_PAGES_PER_PASS = 40;
 const SEARCH_PLAN_CAP = 4_000;
 
 /**
+ * MASTER SWITCH — the country sweep is OFF.
+ *
+ * In practice the ccTLD index answered the wrong question. It lists every HOST
+ * under a country's domain, not every business, so real pass after real pass
+ * came back with parked domains, government portals, blogs and campaign sites
+ * filed as company leads — each named after its own hostname — and they buried
+ * the genuine keyword results underneath them. The host/category filter cut the
+ * volume but never the character of it.
+ *
+ * So it is disabled at the source: no sweep step is ever planned, no matter
+ * what a row's `sweep_country` column says, and the API refuses to set that
+ * column back to 1. The machinery below is left intact and tested so this is a
+ * one-line reversal if the index is ever worth another look.
+ */
+// Typed `boolean`, not inferred `false`, so the machinery below stays live code
+// to the compiler and the linter instead of being flagged as unreachable.
+const SWEEP_COUNTRY_ENABLED: boolean = false;
+
+/**
  * Off-topic answers in a row before the batch gives up and waits.
  *
  * One is noise — a narrow trade phrase can genuinely rank nothing in-country.
@@ -1299,6 +1318,12 @@ interface SearchRunResult {
 async function buildSearchSteps(src: any, location: string): Promise<SearchStep[]> {
   const keywords = searchKeywordsFor(src.category, src.keywords);
   const queries: SearchStep[] = buildSearchPlan(keywords, location).map((q) => ({ kind: "query" as const, q }));
+
+  // Switched off globally (see SWEEP_COUNTRY_ENABLED). Checked BEFORE the row's
+  // own flag so a source saved back when the sweep existed simply runs as the
+  // pure keyword search it should always have been — no migration required for
+  // it to behave.
+  if (!SWEEP_COUNTRY_ENABLED) return queries;
 
   const tld = COUNTRY_TLD[normCountry(location)];
   if (!tld || Number(src.sweep_country ?? 0) !== 1) return queries;

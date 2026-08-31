@@ -2,7 +2,6 @@
 // SQLITE_PATH is set on the command line (static imports are hoisted).
 import { ensureSchema, q, nowIso } from "../src/db";
 import { runSourceNow } from "../src/discovery";
-import { ccPageCount, ccHostsForPattern } from "../src/crawler/archives";
 
 let pass = 0, fail = 0;
 const ok = (name: string, cond: boolean, note = "") => {
@@ -38,39 +37,17 @@ console.log(`     source now: cursor=${src.cursor} status=${src.last_status} tot
 ok("the cursor advanced past the steps it covered", Number(src.cursor) > 1, `step ${src.cursor}`);
 ok("a healthy batch did not record a rate limit", src.last_status !== "error");
 
-console.log("\n=== the country index, if it is answering ===");
-const pages = await ccPageCount("*.qa");
-if (!pages) {
-  console.log("     ⚠ index.commoncrawl.org still refusing this IP — sweep not exercised this run.");
-} else {
-  // Informational only. A single direct call to a free public index is allowed
-  // to be refused at any instant; what has to be true is that a BATCH gets
-  // leads out of it, which is asserted below.
-  const p = await ccHostsForPattern("*.qa", 0);
-  console.log(`     direct probe: ${p.hosts.length} hosts from ${p.records} records${p.ok ? "" : " (declined right now)"}`);
-
-  // Drive a REAL batch through an index step. The sweep steps are interleaved,
-  // so the cursor has to be parked just before the first one — an assertion
-  // about a code path nothing executes is worth nothing (the lesson from bug 31).
-  const { buildSearchStepsForTest } = await import("../src/discovery");
-  const plan = await buildSearchStepsForTest({ id: "b1", category: "Companies (general)", keywords: null, sweep_country: 1 }, "Qatar");
-  const firstSweep = plan.findIndex((s: any) => s.kind === "sweep");
-  ok("the plan really contains an index step", firstSweep >= 0, `at step ${firstSweep + 1} of ${plan.length}`);
-
-  const before = Number(((await q(`SELECT count(*) AS n FROM discovered_leads`))[0] as any).n);
-  await q(`UPDATE discovery_sources SET cursor=?, exhausted=0 WHERE id='b1'`, [firstSweep + 1]);
-  console.log(`\n=== a batch STARTING on index page 1 (step ${firstSweep + 1}) ===`);
-  const t1 = Date.now();
-  await runSourceNow("b1");
-  const after = Number(((await q(`SELECT count(*) AS n FROM discovered_leads`))[0] as any).n);
-  console.log(`     ${Math.round((Date.now() - t1) / 1000)}s · pool ${before} → ${after}`);
-  ok("the index step put real leads in the pool", after - before > 20, `+${after - before} from one sweep batch`);
-
-  const swept = await q(`SELECT domain FROM discovered_leads ORDER BY id DESC LIMIT 12`);
-  console.log(`     newest: ${swept.map((r: any) => r.domain).join(", ")}`);
-  const src2 = (await q(`SELECT last_status, last_error FROM discovery_sources WHERE id='b1'`))[0] as any;
-  ok("the sweep batch did not error", src2.last_status !== "error", src2.last_error || "clean");
-}
+console.log("\n=== the country sweep stays out of a real batch ===");
+// It used to run here: index pages interleaved into the plan, driven for real
+// against index.commoncrawl.org. Retired — a ccTLD lists every host in a
+// country, not every business, so those steps filed portals and parked domains
+// as companies. The check that matters now is that a source can no longer walk
+// one, even when its row still carries the old flag.
+await q(`UPDATE discovery_sources SET sweep_country=1 WHERE id='b1'`);
+const { buildSearchStepsForTest } = await import("../src/discovery");
+const flagged = (await q(`SELECT * FROM discovery_sources WHERE id='b1'`))[0] as any;
+const plan = await buildSearchStepsForTest(flagged, "Qatar");
+ok("the plan is all queries, no index pages", plan.every((s: any) => s.kind === "query"), `${plan.length} steps`);
 
 console.log(`\n${fail === 0 ? "ALL GREEN" : "FAILURES"} — ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
