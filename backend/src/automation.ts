@@ -19,14 +19,29 @@
 //   · a daily ceiling across BOTH lanes
 //   · it refuses to run without a Resend key (so it can't silently "dry-run"
 //     through your whole pool and mark everyone as sent)
+//   · it never approves more leads than the sending domains can still deliver,
+//     and hands back the ones a batch didn't reach
 // Every run — including the ones it decides to skip — is written to
 // automation_runs with the lane it belongs to, which is what the Settings
 // screen reads back to you.
+//
+// APPROVING IS DESTRUCTIVE, AND THAT IS THE WHOLE DIFFICULTY HERE. A lead
+// leaves the pool the moment it is approved, whether or not an email ever
+// follows it, and the lanes only ever count leads that are still 'pending' — so
+// anything approved into a send that doesn't happen is gone for good. That is
+// not hypothetical: with the per-domain daily caps full, this ran for hours
+// approving 150 leads at a time into a sender that could not deliver one of
+// them, and recorded every one of those runs as "done · sent 0". Two rules fell
+// out of it, and both are load-bearing:
+//   1. ask the sender what it can deliver BEFORE approving anything, and size
+//      the batch to that (`domainCapacity`)
+//   2. whatever the batch didn't reach goes straight back to 'pending'
+//      (`requeueLeads`), and a run that sent nothing is never "done"
 
 import { q, nowIso, getSetting, setSetting, startOfDayIso } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
-import { approveLeads, countApprovableLeads, approvableByCountry, normalizeAudience, type Audience } from "./pool";
-import { runSendJob } from "./send";
+import { approveLeads, countApprovableLeads, approvableByCountry, normalizeAudience, requeueLeads, type Audience } from "./pool";
+import { runSendJob, domainCapacity, type SendPlanOutcome } from "./send";
 import { getResendKey } from "./resend";
 import {
   getSchedule,
@@ -401,9 +416,15 @@ export interface AutomationStatus {
   running: boolean;
   sentToday: number;
   dailyRemaining: number | null; // null = no ceiling
+  /**
+   * What the SENDING DOMAINS can still deliver today — a different ceiling from
+   * `dailyRemaining`, and in practice the one that runs out first. Surfaced
+   * because a day of "done · sent 0" runs was completely unreadable without it.
+   */
+  capacityRemaining: number | null; // null = no cap on any sender
   lastRun: AutomationRun | null;
   runs: AutomationRun[];
-  /** Blockers that stop BOTH lanes (no key, ceiling reached). */
+  /** Blockers that stop BOTH lanes (no key, ceiling reached, domains spent). */
   blockers: string[];
   /** Per-country sending windows and the local clock in each. */
   schedule: ScheduleStatus;
@@ -420,12 +441,13 @@ async function selectedTemplates(ids: string[]): Promise<{ id: string; name: str
 
 export async function getAutomationStatus(): Promise<AutomationStatus> {
   const config = await getAutomationConfig();
-  const [today, last, runs, resendKey, schedule] = await Promise.all([
+  const [today, last, runs, resendKey, schedule, capacity] = await Promise.all([
     sentToday(),
     lastRealRun(),
     recentRuns(),
     getResendKey(),
     getScheduleStatus(),
+    domainCapacity(),
   ]);
 
   const dailyRemaining = config.dailyLimit > 0 ? Math.max(0, config.dailyLimit - today) : null;
@@ -433,6 +455,10 @@ export async function getAutomationStatus(): Promise<AutomationStatus> {
   const shared: string[] = [];
   if (config.requireResend && !resendKey) shared.push("No Resend API key — add one above so real emails can go out.");
   if (dailyRemaining === 0) shared.push(`Daily ceiling reached (${config.dailyLimit} sent today) — it resumes tomorrow.`);
+  // The blocker that used to be invisible: every lane read as perfectly healthy
+  // while the domains had nothing left, so the only symptom was runs quietly
+  // sending zero.
+  if (capacity.remaining <= 0 && capacity.reason) shared.push(capacity.reason);
 
   const open = schedule.config.enabled ? schedule.countries.filter((c) => c.open).map((c) => c.country) : null;
 
@@ -481,6 +507,7 @@ export async function getAutomationStatus(): Promise<AutomationStatus> {
     running,
     sentToday: today,
     dailyRemaining,
+    capacityRemaining: Number.isFinite(capacity.remaining) ? capacity.remaining : null,
     lastRun: last,
     runs,
     blockers: shared,
@@ -564,14 +591,37 @@ export async function startAutomationRun(
     return { started: false, audience, error: note };
   }
 
+  // CAN THE SENDER ACTUALLY DELIVER ANY OF THIS?
+  //
+  // Asked here, before a single lead is approved, because approving is the one
+  // step that cannot be taken back by simply trying again later. Leaving this
+  // out is what let a set of capped-out domains turn into an afternoon of
+  // "done · sent 0" runs, each quietly swallowing another 150 leads.
+  const capacity = await domainCapacity();
+  if (capacity.remaining <= 0) {
+    const note = capacity.reason || "No sending capacity left today.";
+    // Only the manual path writes a row. The tick refuses to get this far while
+    // the domains are spent (see `automationTick`), so an auto run arriving here
+    // is a rare race — and a skip row every minute for hours helps nobody.
+    if (trigger === "manual") {
+      await recordSkip(trigger, audience, lane.threshold, pool, note);
+      awarn(note);
+      return { started: false, audience, error: note };
+    }
+    return { started: false, audience, note };
+  }
+
   if (!pool) {
     const note = `No ${who} leads with an email are waiting.`;
     if (trigger === "manual") return { started: false, audience, error: note };
     return { started: false, audience, note };
   }
 
-  // A batch never exceeds the trigger size, nor what's left of today's ceiling.
-  const batchSize = Math.max(1, Math.min(lane.threshold, pool, dailyRoom));
+  // A batch never exceeds the trigger size, what's left of today's ceiling, nor
+  // what the domains can still physically deliver. That last term is the point
+  // of all this: with 20 sends left in the caps, approve 20 leads and email 20
+  // leads, rather than approving 150 and stranding 130 of them.
+  const batchSize = Math.max(1, Math.min(lane.threshold, pool, dailyRoom, capacity.remaining));
 
   running = true;
   runningLane = audience;
@@ -584,7 +634,8 @@ export async function startAutomationRun(
     [runId, startedAt, trigger, audience, lane.threshold, pool, templateNames]
   );
   const whereNote = openList ? ` · inside the window in ${openList.map((c) => (c === NO_COUNTRY ? "no-country" : c)).join(", ")}` : "";
-  alog(`▶ ${trigger} ${who} run — pool holds ${pool} emailable ${who} lead(s)${whereNote}, taking ${batchSize} · template(s): ${templateNames}`);
+  const capNote = Number.isFinite(capacity.remaining) ? ` · ${capacity.remaining} left in today's domain caps` : "";
+  alog(`▶ ${trigger} ${who} run — pool holds ${pool} emailable ${who} lead(s)${whereNote}, taking ${batchSize}${capNote} · template(s): ${templateNames}`);
 
   const finishRun = (patchSql: string, params: any[]) =>
     q(patchSql, params).catch(() => {});
@@ -655,36 +706,67 @@ export async function startAutomationRun(
 
   // Fire-and-forget: the caller (HTTP request or the tick) mustn't wait minutes.
   (async () => {
+    let outcome: SendPlanOutcome | null = null;
     try {
-      await runSendJob(job, sendTemplateIds, approve.contactIds, config.perMinute);
+      outcome = await runSendJob(job, sendTemplateIds, approve.contactIds, config.perMinute);
       if (job.status === "running") { job.status = "done"; job.progress = 1; }
     } catch (e: any) {
       job.status = "error";
       job.error = String(e?.message || e);
     } finally {
       const r = job.result || {};
+      const sent = Number(r.sent || 0);
       const failed = Number(r.failed || 0);
+      const skipped = Number(r.skipped || 0);
+
+      // ---- Hand back what the batch never reached -------------------------
+      //
+      // These leads were marked 'approved' before the first email was even
+      // attempted. If the sender stopped early — every domain capped, the
+      // template deleted underneath it — everyone past that point would
+      // otherwise be stranded for good: out of the pool, in Contacts, never
+      // emailed, and invisible to a lane that only counts 'pending'.
+      //
+      // `outcome` names them exactly. If the job threw instead, the plan runs in
+      // the same order as `contactIds`, so everything past `job.processed` is by
+      // definition untouched.
+      const unattempted = outcome ? outcome.unattempted : approve.contactIds.slice(job.processed);
+      let requeued = 0;
+      if (unattempted.length) {
+        const leadIds = unattempted.map((cid) => approve.leadByContact[cid]).filter(Boolean);
+        requeued = await requeueLeads(leadIds).catch(() => 0);
+        if (requeued) alog(`↩ returned ${requeued} un-emailed ${who} lead(s) to the pool`);
+      }
+
+      // ---- Say what actually happened -------------------------------------
+      //
+      // A run that queued recipients and attempted NONE of them is not "done".
+      // It used to be recorded that way — green badge, "approved 150 · sent 0" —
+      // which is precisely how a whole day of delivering nothing managed to look
+      // healthy on the Settings screen.
+      const attempted = sent + failed + skipped;
+      const stalled = attempted === 0 && approve.contactIds.length > 0;
+      const status = job.status === "error" || stalled ? "error" : "done";
+      const reason = job.error || outcome?.stopped || null;
+
+      const note = stalled
+        ? `Nothing could be sent — ${reason || "the sender stopped before the first email."}` +
+          (requeued ? ` ${requeued} lead(s) returned to the pool.` : "")
+        : `Approved ${recipients} ${who} contact(s) from the pool` +
+          (approve.adopted ? ` (${approve.adopted} already on file, never emailed)` : "") +
+          ` and emailed them with "${usedNames}".` +
+          (requeued ? ` Stopped early — ${requeued} lead(s) returned to the pool.` : "");
+
       await finishRun(
         `UPDATE automation_runs
             SET status=?, finished_at=?, sent=?, failed=?, skipped=?, error=?, note=?
           WHERE id=?`,
-        [
-          job.status === "error" ? "error" : "done",
-          nowIso(),
-          Number(r.sent || 0),
-          failed,
-          Number(r.skipped || 0),
-          job.error || null,
-          `Approved ${recipients} ${who} contact(s) from the pool` +
-            (approve.adopted ? ` (${approve.adopted} already on file, never emailed)` : "") +
-            ` and emailed them with "${usedNames}".`,
-          runId,
-        ]
+        [status, nowIso(), sent, failed, skipped, stalled ? reason : job.error || null, note, runId]
       );
       await setSetting("automation_last_run_at", nowIso()).catch(() => {});
       running = false; runningLane = null;
-      if (job.status === "error") aerr(`${who} run finished with an error: ${job.error}`);
-      else alog(`✓ ${who} run complete — sent ${r.sent || 0}, failed ${failed}, skipped ${r.skipped || 0}`);
+      if (status === "error") aerr(`${who} run finished without sending: ${reason || "unknown reason"}`);
+      else alog(`✓ ${who} run complete — sent ${sent}, failed ${failed}, skipped ${skipped}`);
     }
   })();
 
@@ -693,11 +775,33 @@ export async function startAutomationRun(
 
 /* -------------------------------- ticks -------------------------------- */
 
+// Logged on the way in and the way out only. The tick runs every minute, and a
+// capped-out afternoon should not put four hundred identical lines in the log.
+let capacityBlocked = false;
+
 async function automationTick(): Promise<void> {
   if (running) return;
   const config = await getAutomationConfig();
   if (!config.enabled) return;
   const schedule = await getSchedule();
+
+  // Settled once, up here, because the ceiling is shared by both lanes.
+  //
+  // Nothing may be approved while the domains have nothing left to give. The
+  // pool is the asset this whole system exists to build, and spending it on
+  // emails that cannot be sent is the one mistake that waiting will not fix.
+  const capacity = await domainCapacity();
+  if (capacity.remaining <= 0) {
+    if (!capacityBlocked) {
+      capacityBlocked = true;
+      awarn(`holding — ${capacity.reason} Nothing will be approved until there is room again.`);
+    }
+    return;
+  }
+  if (capacityBlocked) {
+    capacityBlocked = false;
+    alog(`resuming — ${Number.isFinite(capacity.remaining) ? `${capacity.remaining} email(s)` : "capacity"} available again`);
+  }
 
   // Both lanes are checked every tick, customer first. Only one may run at a
   // time (they share the sending domains), so the second one goes on the next

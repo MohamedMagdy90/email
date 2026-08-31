@@ -161,6 +161,9 @@ export default function AutomationCard() {
   const [saving, setSaving] = useState(false);
   const [starting, setStarting] = useState<Audience | null>(null);
   const [job, setJob] = useState<Job | null>(null);
+  /** Approved-but-never-emailed leads left behind by a run that sent nothing. */
+  const [stranded, setStranded] = useState(0);
+  const [recovering, setRecovering] = useState(false);
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
 
@@ -197,9 +200,39 @@ export default function AutomationCard() {
     load(true);
     api.getTemplates().then((r) => setTemplates(r.templates)).catch(() => {});
     api.getCategories().then((r) => setCats(r.categories || [])).catch(() => {});
+    api.getStranded().then((r) => setStranded(r.stranded)).catch(() => {});
     const t = window.setInterval(() => load(), 6000);
     return () => clearInterval(t);
   }, []);
+
+  // Leads a past run approved and then never emailed. Checked on a slow timer
+  // rather than with the 6s status poll — it is a clean-up prompt, not a live
+  // number, and it should read 0 for ever once the pool has been put right.
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      api.getStranded().then((r) => setStranded(r.stranded)).catch(() => {});
+    }, 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function recoverStranded() {
+    if (!confirm(
+      `Put ${stranded.toLocaleString()} approved-but-never-emailed lead(s) back into the review pool?\n\n` +
+      `They already exist as contacts with no send on record, so the lanes will adopt them into a normal ` +
+      `batch — nobody is duplicated and nobody is emailed twice.`
+    )) return;
+    setRecovering(true);
+    try {
+      const r = await api.requeueStranded();
+      setStranded(r.remaining);
+      toast(`${r.requeued.toLocaleString()} lead(s) returned to the pool`, "success");
+      load();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setRecovering(false);
+    }
+  }
 
   // While a batch is streaming out, follow the live send job for a real progress bar.
   const liveJobId = status?.lastRun?.status === "running" ? status.lastRun.job_id : null;
@@ -401,6 +434,17 @@ export default function AutomationCard() {
             <b className="text-ink/70">{readyAll.toLocaleString()}</b> lead(s) with an email waiting across both lanes
           </span>
           <span>Sent today: <b className="text-ink/70">{(status?.sentToday ?? 0).toLocaleString()}</b>{status?.dailyRemaining != null && <> · {status.dailyRemaining.toLocaleString()} left of the shared daily ceiling</>}</span>
+          {/* The ceiling that actually bites first, and the one that used to be
+              invisible while every run quietly delivered nothing. */}
+          {status?.capacityRemaining != null && (
+            <span className={cn(status.capacityRemaining <= 0 && "font-medium text-[#8a5a12]")}>
+              Domain capacity:{" "}
+              <b className={status.capacityRemaining <= 0 ? "" : "text-ink/70"}>
+                {status.capacityRemaining.toLocaleString()}
+              </b>{" "}
+              email(s) left today
+            </span>
+          )}
           <span>Last run: {status?.lastRun ? `${fmtAgo(status.lastRun.started_at)} (${laneName(status.lastRun.audience)})` : "never"}</span>
           {enabled && !liveLanes.length && <span className="text-[#8a5a12]">Both lanes are switched off — nothing will send.</span>}
         </div>
@@ -428,6 +472,29 @@ export default function AutomationCard() {
           <ul className="mt-1 space-y-0.5 text-[12px] text-[#8a5a12]/90">
             {blockers.map((b) => <li key={b}>· {b}</li>)}
           </ul>
+        </div>
+      )}
+
+      {/* Leads a past run approved and then never emailed.
+          Only shown when there are some — once the pool is put right this
+          disappears and should never come back, because the automation now
+          hands back anything a batch didn't reach. */}
+      {stranded > 0 && (
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line bg-[#fdeae6] px-5 py-3.5">
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold text-[#c0341a]">
+              {stranded.toLocaleString()} lead(s) were approved but never emailed
+            </div>
+            <p className="mt-0.5 max-w-2xl text-[12px] leading-relaxed text-[#c0341a]/90">
+              They were taken out of the review pool by a run that then sent nothing — almost always one that fired
+              after the sending domains had used up their daily caps. They are still on file as contacts with no send
+              against them, so putting them back is safe: the lanes will adopt them into a normal batch, and nobody
+              gets a second copy of anything.
+            </p>
+          </div>
+          <Button variant="outline" loading={recovering} onClick={recoverStranded}>
+            Return them to the pool
+          </Button>
         </div>
       )}
 

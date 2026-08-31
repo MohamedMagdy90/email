@@ -500,6 +500,11 @@ export interface AutomationStatus {
   running: boolean;
   sentToday: number;
   dailyRemaining: number | null;
+  /**
+   * What the sending DOMAINS can still deliver today — a separate ceiling from
+   * `dailyRemaining`, and the one that tends to run out first. null = uncapped.
+   */
+  capacityRemaining: number | null;
   lastRun: AutomationRun | null;
   runs: AutomationRun[];
   /** Blockers that stop both lanes. */
@@ -761,6 +766,20 @@ export const api = {
     }),
 
   adoptContactsJob: (id: string) => req<Job>(`/api/pool/adopt-contacts/${id}`),
+
+  /**
+   * Leads that were approved into a batch that then sent nothing — approved,
+   * turned into a contact, never emailed, and dropped out of the pool. Counted
+   * so the damage from a capped-out day is a number you can look at.
+   */
+  getStranded: () => req<{ stranded: number }>(`/api/pool/stranded`),
+
+  /** Put those leads back to 'pending' so a lane can pick them up again. */
+  requeueStranded: (limit?: number) =>
+    req<{ requeued: number; remaining: number }>(`/api/pool/stranded/requeue`, {
+      method: "POST",
+      body: JSON.stringify(limit ? { limit } : {}),
+    }),
 
   deleteContacts: (ids: string[]) =>
     req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),

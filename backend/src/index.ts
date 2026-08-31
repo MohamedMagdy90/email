@@ -26,6 +26,8 @@ import {
   importLeadsToPool,
   adoptContactsToPool,
   countAdoptableContacts,
+  countStrandedLeads,
+  requeueStrandedLeads,
   normalizeAudience,
   NO_COUNTRY,
 } from "./pool";
@@ -1816,6 +1818,34 @@ app.get("/api/pool/adopt-contacts/:id", (c) => {
   const job = getJob(c.req.param("id"));
   if (!job) return c.json({ error: "job not found" }, 404);
   return c.json(serializeJob(job));
+});
+
+/* --------------------- stranded-lead recovery ------------------------ */
+// Leads that were approved into a batch that then sent nothing.
+//
+// The automation used to approve a batch without first asking whether the
+// sending domains could deliver it. Once they were capped out for the day, every
+// run drained another N leads out of the pool and emailed none of them — and
+// because the lanes only ever count leads that are still 'pending', those people
+// were never looked at again. This puts them back.
+//
+// The gap is closed at the source now (the automation checks capacity before
+// approving, and hands back anything a batch didn't reach), so this is a
+// one-off clean-up for pools that were drained before that shipped. It stays
+// available because it is cheap, idempotent, and the honest answer to "did we
+// lose anyone?" is a number you should be able to look up.
+
+app.get("/api/pool/stranded", async (c) => {
+  return c.json({ stranded: await countStrandedLeads() });
+});
+
+app.post("/api/pool/stranded/requeue", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const before = await countStrandedLeads();
+  if (!before) return c.json({ error: "No stranded leads — nothing to recover." }, 400);
+  const requeued = await requeueStrandedLeads(Number(b.limit) || undefined);
+  console.log(`[pool] recovered ${requeued} stranded lead(s) back to pending`);
+  return c.json({ requeued, remaining: await countStrandedLeads() });
 });
 
 /* ----------------------------- Automation --------------------------- */

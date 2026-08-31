@@ -1,3 +1,92 @@
+# Automation ran for hours delivering nothing (2026-08-31) ✅
+Reported from the run history: "why does production have automations that have
+0 runs? Are the ones approved but not run being marked as sent?"
+
+## Symptom
+Run after run reading `done · approved 150 · sent 0`. Green badge, no error, no
+failures, no skips. The history read as healthy while the day delivered nothing.
+
+## Root cause — a ceiling nobody asked about
+Every active sending domain had used up its `daily_cap`. `pick()` in `send.ts`
+returns null once every slot is at cap and breaks out of the loop BEFORE the
+first email, so `sent`/`failed`/`skipped` all stayed 0 and `job.status` was
+never moved off `running` — whereupon the automation stamped the run **done**.
+
+The giveaway was already in the ledger: one run read `sent 8`. A partial send is
+a batch hitting the wall part way through, and nothing else produces it. Every
+other candidate leaves a different fingerprint — Resend rejecting would show
+`150 failed`, opt-outs would show `150 skipped`, a deleted template would show
+status `error`, a pool of stale duplicates would show `approved 0`.
+
+`startAutomationRun` checked the schedule, the templates, the Resend key, its own
+`dailyLimit` and the pool size — and never whether the domains could send. Two
+ceilings that never spoke: `automation_daily_limit` (default 300) and
+`domains.daily_cap` (default **40 each**).
+
+## The real damage was the pool, not the wasted runs
+Answering the second question directly: they were NOT marked as sent. No `sends`
+row was written and `contacts.status` stayed `new`, because both of those only
+happen inside `if (result.ok)`.
+
+But `approveLeads` marks every lead `approved` before a single email is
+attempted, and the lanes only ever count `pending` — so each no-op run
+permanently consumed ~150 leads. Roughly 1,200 from the visible history alone:
+approved, turned into contacts, never emailed, invisible for ever.
+
+The existing "adoptable" backfill could not rescue them either. `ADOPTABLE_SQL`
+excludes any contact that already has a pool row, and every one of these had
+one, so the recovery path that looked like it applied reported 0.
+
+## Fixed
+- `send.ts` — `buildSendSlots()` is now the single definition of the senders,
+  read by BOTH `runSendPlan` and the new `domainCapacity()`. Two ceilings
+  computed in two places is what caused this; there is now one, read twice.
+- `runSendPlan` returns a `SendPlanOutcome` naming every recipient it never
+  reached and why it stopped.
+- `automation.ts` — capacity is checked BEFORE approving (the tick gates on it
+  too, logging only on the transition so a capped afternoon doesn't write 400
+  identical lines), folded into `batchSize`, and anything a batch didn't reach
+  goes straight back to `pending` via `requeueLeads`.
+- A run that queued recipients and attempted none of them is recorded `error`,
+  never `done`.
+- `followup.ts` — same honest-status fix. Nothing is stranded there (a retry
+  works from contacts that already exist), but a capped sender was invisible in
+  the ladder for exactly the same reason.
+- Recovery for the existing damage: `countStrandedLeads` / `requeueStrandedLeads`
+  + `GET /api/pool/stranded` and `POST /api/pool/stranded/requeue`, surfaced as a
+  banner on the Automation screen that only appears while there is damage to undo.
+- The Automation screen now shows remaining domain capacity beside "sent today",
+  and a spent set of domains is a blocker rather than a silence.
+
+## Verified
+21 checks against a scratch SQLite DB: capped domains refuse to approve and
+leave the pool untouched (recorded `skipped`, not `done`) · partial capacity
+sizes the batch to 3 instead of the lane's threshold of 10 · a mid-plan stop
+reports all 4 unattempted with a reason · **caps consumed between approve and
+send hands all 10 leads back and is not recorded as done** — the production
+scenario, end to end · recovery restores 6 stranded leads, leaves a
+genuinely-emailed one alone, and is idempotent on a second run.
+
+backend `tsc` clean · frontend `tsc` clean · both dev servers boot clean ·
+`/api/pool/stranded` and the new `capacityRemaining` field verified live over
+HTTP with a real access key.
+
+NOTE for the operator: `daily_cap` defaults to **40 per domain**. That is the
+number that actually governs throughput, not the automation's own daily ceiling.
+Raise the caps or add domains if more is needed — the automation will now size
+itself to whatever is genuinely available instead of burning the pool against a
+wall. Nothing was deployed; this is local only.
+
+INCIDENT: the apply model twice made destructive unrequested edits — it
+rewrote the whole of `automation.ts` stripping its comments and silently
+changing the empty-batch branch to `error`, and in `index.ts` it deleted
+`countBadNames` from an import, removed `/api/click` from `PUBLIC_API` (which
+would have broken click tracking for every recipient) and added a 14th `?` to a
+13-column INSERT. All reverted via `git checkout` and re-applied with
+`string_replace`. It also deleted ~1,300 lines of THIS file; restored from git.
+
+---
+
 # Imported contacts never joined the automation queue (2026-08-31) ✅
 
 Reported: "I imported 30,000+ customer contacts with emails. Why didn't they

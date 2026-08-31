@@ -29,7 +29,7 @@
 
 import { q, nowIso, getSetting, setSetting } from "./db";
 import { createJob, getJob, log, type Job } from "./jobs";
-import { runSendPlan, type SendPlanItem } from "./send";
+import { runSendPlan, type SendPlanItem, type SendPlanOutcome } from "./send";
 import { getResendKey } from "./resend";
 import { normalizeAudience, type Audience } from "./pool";
 import { getSchedule, isOpen, nextOpenAt, keyOf } from "./schedule";
@@ -756,34 +756,50 @@ export async function startFollowUpRun(trigger: "auto" | "manual" = "auto"): Pro
 
   // Fire-and-forget: pacing a batch takes minutes, the caller must not wait.
   (async () => {
+    let outcome: SendPlanOutcome | null = null;
     try {
-      await runSendPlan(job, plan, config.perMinute);
+      outcome = await runSendPlan(job, plan, config.perMinute);
       if (job.status === "running") { job.status = "done"; job.progress = 1; }
     } catch (e: any) {
       job.status = "error";
       job.error = String(e?.message || e);
     } finally {
       const r = job.result || {};
+      const sent = Number(r.sent || 0);
+      const failed = Number(r.failed || 0);
+      const skipped = Number(r.skipped || 0);
+
+      // A pass that queued retries and attempted none of them is not "done".
+      // Nothing is stranded here — a follow-up works from contacts that already
+      // exist, so there is no pool row to hand back — but recording it as
+      // success would hide a capped-out sender exactly the way the automation
+      // used to. The ladder simply picks these contacts up again next pass.
+      const stalled = sent + failed + skipped === 0 && plan.length > 0;
+      const status = job.status === "error" || stalled ? "error" : "done";
+      const reason = job.error || outcome?.stopped || null;
+
       await q(
         `UPDATE followup_runs
             SET status=?, finished_at=?, sent=?, failed=?, skipped=?, error=?, note=?
           WHERE id=?`,
         [
-          job.status === "error" ? "error" : "done",
+          status,
           nowIso(),
-          Number(r.sent || 0),
-          Number(r.failed || 0),
-          Number(r.skipped || 0),
-          job.error || null,
-          `${counts.customer} customer · ${counts.partner} partner · ${counts.retry1} first retry · ${counts.retry2} second retry · ${counts.no_open} never opened · ${counts.no_click} opened but never clicked.`,
+          sent,
+          failed,
+          skipped,
+          stalled ? reason : job.error || null,
+          stalled
+            ? `Nothing could be sent — ${reason || "the sender stopped before the first email."} The ${plan.length} due retry(s) stay due.`
+            : `${counts.customer} customer · ${counts.partner} partner · ${counts.retry1} first retry · ${counts.retry2} second retry · ${counts.no_open} never opened · ${counts.no_click} opened but never clicked.`,
           runId,
         ]
       ).catch(() => {});
       await setSetting("followup_last_run_at", nowIso()).catch(() => {});
       scanCache = null; // the sends we just made change every sequence in the batch
       running = false;
-      if (job.status === "error") ferr(`pass finished with an error: ${job.error}`);
-      else flog(`✓ pass complete — sent ${r.sent || 0}, failed ${r.failed || 0}, skipped ${r.skipped || 0}`);
+      if (status === "error") ferr(`pass finished without sending: ${reason || "unknown reason"}`);
+      else flog(`✓ pass complete — sent ${sent}, failed ${failed}, skipped ${skipped}`);
     }
   })();
 
