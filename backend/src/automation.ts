@@ -608,11 +608,21 @@ export async function startAutomationRun(
     return { started: false, audience, error: msg };
   }
 
-  alog(`approved ${approve.approvedIds.length} ${who} lead(s) → ${approve.added} new contact(s)${approve.skipped ? ` · ${approve.skipped} already known` : ""}`);
+  // `adopted` are people already in Contacts who had never actually been
+  // emailed — imported before the import-to-pool route existed, most commonly.
+  // They cost no new contact row but they DO get the email, so they have to be
+  // counted here or a batch made entirely of backfill would read as
+  // "approved 0" and look like it had done nothing.
+  const recipients = approve.added + approve.adopted;
+  alog(
+    `approved ${approve.approvedIds.length} ${who} lead(s) → ${approve.added} new contact(s)` +
+    (approve.adopted ? ` · ${approve.adopted} already on file, never emailed` : "") +
+    (approve.skipped ? ` · ${approve.skipped} already known` : "")
+  );
 
   if (!approve.contactIds.length) {
     running = false; runningLane = null;
-    const note = "Every lead in that batch was already a contact — nothing to email.";
+    const note = "Every lead in that batch was already a contact that has been emailed before — nothing to send.";
     await finishRun(
       `UPDATE automation_runs SET status='done', finished_at=?, approved=?, contacts_added=0, note=? WHERE id=?`,
       [nowIso(), approve.approvedIds.length, note, runId]
@@ -640,7 +650,7 @@ export async function startAutomationRun(
   job.result = { sent: 0, failed: 0, skipped: 0 };
   log(job, { level: "info", msg: `Automation (${who}): emailing ${approve.contactIds.length} newly-approved contact(s) with "${usedNames}".` });
   await q(`UPDATE automation_runs SET approved=?, contacts_added=?, job_id=?, template_names=? WHERE id=?`, [
-    approve.approvedIds.length, approve.added, job.id, usedNames, runId,
+    approve.approvedIds.length, recipients, job.id, usedNames, runId,
   ]);
 
   // Fire-and-forget: the caller (HTTP request or the tick) mustn't wait minutes.
@@ -665,7 +675,9 @@ export async function startAutomationRun(
           failed,
           Number(r.skipped || 0),
           job.error || null,
-          `Approved ${approve.added} ${who} contact(s) from the pool and emailed them with "${usedNames}".`,
+          `Approved ${recipients} ${who} contact(s) from the pool` +
+            (approve.adopted ? ` (${approve.adopted} already on file, never emailed)` : "") +
+            ` and emailed them with "${usedNames}".`,
           runId,
         ]
       );
@@ -676,7 +688,7 @@ export async function startAutomationRun(
     }
   })();
 
-  return { started: true, audience, runId, jobId: job.id, approved: approve.added };
+  return { started: true, audience, runId, jobId: job.id, approved: recipients };
 }
 
 /* -------------------------------- ticks -------------------------------- */

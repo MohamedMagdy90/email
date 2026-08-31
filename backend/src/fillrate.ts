@@ -30,7 +30,7 @@
 
 import { q, getSetting } from "./db";
 import { getAutomationConfig, AUDIENCES } from "./automation";
-import { countApprovableLeads, type Audience } from "./pool";
+import { countApprovableLeads, IMPORT_SOURCE_ID, type Audience } from "./pool";
 import { STALE_AFTER_RUNS } from "./discovery";
 
 /** Everything is quoted per TEN MINUTES: short enough to feel live, long enough
@@ -161,11 +161,18 @@ async function computeFillRate(): Promise<FillRate> {
     q(
       // 'rejected' and 'duplicate' are excluded because they never reached the
       // automation: counting them would report an inflow that no lane can eat.
+      //
+      // Imports are excluded because this card answers "is DISCOVERY feeding
+      // the automation?". A CSV of 30,000 addresses is the operator feeding it
+      // by hand — counting it would read as a colossal inflow spike for one
+      // bucket and as a total collapse for every bucket after, while saying
+      // nothing at all about whether the crawler is still finding anyone.
       `SELECT email_at AS t, audience FROM discovered_leads
         WHERE email_at IS NOT NULL AND email_at >= ?
           AND status NOT IN ('duplicate','rejected')
+          AND COALESCE(source_id,'') <> ?
         ORDER BY email_at DESC LIMIT ?`,
-      [sinceIso, SERIES_ROW_CAP]
+      [sinceIso, IMPORT_SOURCE_ID, SERIES_ROW_CAP]
     ),
     measurableMinutes(windowMinutes, endMs),
   ]);
@@ -351,7 +358,11 @@ async function shortfallReason(sinceIso: string, found: number): Promise<string 
   // completely different fixes while looking identical from the outside.
   if (found === 0) {
     const arrived = Number(
-      (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads WHERE created_at >= ?`, [sinceIso]))[0]?.n
+      (await q(
+        `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
+          WHERE created_at >= ? AND COALESCE(source_id,'') <> ?`,
+        [sinceIso, IMPORT_SOURCE_ID]
+      ))[0]?.n
     ) || 0;
     if (arrived > 0) return `${arrived.toLocaleString()} companies arrived, none with an email`;
   }

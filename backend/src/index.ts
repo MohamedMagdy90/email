@@ -20,7 +20,15 @@ import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
 import { runSendJob, buildFrom, isEmail, domainUsageToday, resetDomainUsage } from "./send";
-import { discoveredWhere, approveLeads, NO_COUNTRY } from "./pool";
+import {
+  discoveredWhere,
+  approveLeads,
+  importLeadsToPool,
+  adoptContactsToPool,
+  countAdoptableContacts,
+  normalizeAudience,
+  NO_COUNTRY,
+} from "./pool";
 import {
   startAutomationWorker,
   getAutomationStatus,
@@ -428,9 +436,9 @@ app.post("/api/contacts/bulk", async (c) => {
     if (!email || !isValidEmail(email)) { skipped++; continue; }
 
     const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.phone || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,audience,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.phone || null, it.role_based ? 1 : 0, it.source || "import", normalizeAudience(it.audience ?? b.audience), nowIso()]
     );
     if (ins.length) { added++; continue; }
 
@@ -1694,7 +1702,10 @@ app.post("/api/discovery/leads/approve", async (c) => {
     category: b.category,
     country: b.country,
   });
-  return c.json({ added: r.added, skipped: r.skipped });
+  // `adopted` are existing contacts that had never been emailed and were taken
+  // into the batch rather than dropped as duplicates — reported separately so
+  // the UI's counts stay honest about what was created vs. what was reused.
+  return c.json({ added: r.added, adopted: r.adopted, skipped: r.skipped });
 });
 
 // Reject leads (dismiss from the pool) — by ids or every matching pending lead.
@@ -1727,6 +1738,84 @@ app.post("/api/discovery/leads/delete", async (c) => {
   const ph = ids.map(() => "?").join(",");
   await q(`DELETE FROM discovered_leads WHERE id IN (${ph})`, ids);
   return c.json({ deleted: ids.length });
+});
+
+/* ------------------- importing straight into the pool ------------------ */
+
+// Why this exists: the automation lanes count `discovered_leads` and nothing
+// else, so a CSV written into `contacts` (which is what /api/contacts/bulk
+// does) can never enter the queue. Importing HERE puts the same rows in front
+// of the automation with every rail intact — batching, cooldown, the daily
+// ceiling and the per-country send windows.
+app.post("/api/pool/import", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const items: any[] = Array.isArray(b.contacts) ? b.contacts : [];
+  if (!items.length) return c.json({ error: "no rows to import" }, 400);
+  const r = await importLeadsToPool(items, {
+    audience: b.audience,
+    label: b.label || "CSV import",
+    category: b.category,
+    country: b.country,
+  });
+  return c.json(r);
+});
+
+// How many contacts could still be queued — the preview behind the backfill
+// button, sharing its predicate so the number offered is the number delivered.
+app.get("/api/pool/adoptable", async (c) => {
+  return c.json(await countAdoptableContacts());
+});
+
+// ONE-TIME BACKFILL for contacts imported before the pool route existed.
+// Runs as a job: 30,000 rows is well past what a request should hold open.
+app.post("/api/pool/adopt-contacts", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const summary = await countAdoptableContacts();
+  const importedOnly = b.importedOnly !== false;
+  const total = importedOnly ? summary.imported : summary.adoptable;
+  if (!total) return c.json({ error: "No contacts are waiting to be queued." }, 400);
+
+  const job = createJob("import", total);
+  job.result = { added: 0, duplicate: 0, invalid: 0, scanned: 0 };
+  log(job, { level: "info", msg: `Queueing ${total.toLocaleString()} never-emailed contact(s) into the review pool.` });
+
+  (async () => {
+    try {
+      const r = await adoptContactsToPool({
+        importedOnly,
+        audience: b.audience,
+        category: b.category,
+        country: b.country,
+        limit: b.limit,
+        onProgress: (done, all) => {
+          job.processed = done;
+          job.total = all;
+          job.progress = all ? done / all : 1;
+        },
+      });
+      job.result = r;
+      log(job, {
+        level: "info",
+        msg:
+          `Queued ${r.added.toLocaleString()} contact(s). ` +
+          `${r.duplicate.toLocaleString()} were already in the pool, ${r.invalid.toLocaleString()} had an unmailable address. ` +
+          `They will be emailed in batches by whichever lane owns them — nothing goes out all at once.`,
+      });
+      if (job.status === "running") { job.status = "done"; job.progress = 1; }
+    } catch (e: any) {
+      job.status = "error";
+      job.error = String(e?.message || e);
+      log(job, { level: "fail", msg: job.error });
+    }
+  })();
+
+  return c.json({ jobId: job.id, total });
+});
+
+app.get("/api/pool/adopt-contacts/:id", (c) => {
+  const job = getJob(c.req.param("id"));
+  if (!job) return c.json({ error: "job not found" }, 404);
+  return c.json(serializeJob(job));
 });
 
 /* ----------------------------- Automation --------------------------- */

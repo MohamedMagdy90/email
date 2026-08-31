@@ -7,7 +7,7 @@
 // rules instead of re-implementing them and drifting.
 
 import { q, nowIso } from "./db";
-import { cleanEmail, isValidEmail } from "./crawler/validate";
+import { cleanEmail, isValidEmail, isFreeMailDomain } from "./crawler/validate";
 import { normalizeCountry } from "./country";
 
 const uid = () => crypto.randomUUID();
@@ -20,6 +20,17 @@ export const ROLE_RE =
 // The explicit "no country on file" bucket, so those leads stay reviewable
 // instead of being invisible to every country filter.
 export const NO_COUNTRY = "__none__";
+
+/**
+ * `source_id` on a pool row that came from a CSV/contact import rather than
+ * from a discovery source.
+ *
+ * It exists so the fill-rate metric can tell the two apart. That card answers
+ * "is DISCOVERY feeding the automation?" — a 30,000-row import is not
+ * discovery, and counting it would spike the rate to something absurd for ten
+ * minutes and then read as a total collapse for the rest of the day.
+ */
+export const IMPORT_SOURCE_ID = "__import__";
 
 /* ------------------------------ audience ------------------------------ */
 
@@ -128,7 +139,13 @@ export async function approvableByCountry(
 
 export interface ApproveResult {
   added: number;          // contacts actually created
-  skipped: number;        // duplicates / no (or unmailable) email
+  /**
+   * Existing contacts that had never been emailed and were taken into this
+   * batch. Counted apart from `added` because no row was created — but they
+   * ARE in `contactIds`, so they get the email.
+   */
+  adopted: number;
+  skipped: number;        // duplicates already emailed / no (or unmailable) email
   contactIds: string[];   // the new contact rows (what the automation emails)
   approvedIds: string[];  // pool rows marked 'approved'
 }
@@ -168,12 +185,12 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
     leads = await q(`SELECT * FROM discovered_leads ${clause} ${order} LIMIT ?`, [...params, limit]);
   } else {
     const ids: string[] = Array.isArray(opts.ids) ? opts.ids : [];
-    if (!ids.length) return { added: 0, skipped: 0, contactIds: [], approvedIds: [] };
+    if (!ids.length) return { added: 0, adopted: 0, skipped: 0, contactIds: [], approvedIds: [] };
     const ph = ids.map(() => "?").join(",");
     leads = await q(`SELECT * FROM discovered_leads WHERE id IN (${ph})`, ids);
   }
 
-  let added = 0, skipped = 0;
+  let added = 0, adopted = 0, skipped = 0;
   const contactIds: string[] = [];
   const approvedIds: string[] = [];
   const seenEmails = new Set<string>(); // guards against the same email twice in one batch
@@ -190,6 +207,7 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
     if (seenEmails.has(email)) { skipped++; continue; }
     seenEmails.add(email);
     const id = uid();
+    const leadAudience = normalizeAudience(l.audience);
     const ins = await q(
       `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,audience,status,created_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
@@ -198,11 +216,43 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
         category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery",
         // The pitch this company gets is decided by the source that found them —
         // never by whoever happens to click Approve.
-        normalizeAudience(l.audience), nowIso(),
+        leadAudience, nowIso(),
       ]
     );
-    if (ins.length) { added++; contactIds.push(String(ins[0].id ?? id)); }
-    else skipped++; // already an existing Contact
+    if (ins.length) { added++; contactIds.push(String(ins[0].id ?? id)); continue; }
+
+    // ---- Already a Contact. That is NOT the same as "already handled". -----
+    //
+    // The row losing the insert race used to be counted as a duplicate and
+    // dropped, which is right for someone we have emailed before and wrong for
+    // everybody else. A contact that arrived by CSV import (or was typed in by
+    // hand) and has never actually been sent anything is a perfectly good
+    // recipient — and under the old behaviour was unreachable by the
+    // automation for ever, because the automation only emails the ids that its
+    // own approve step created.
+    //
+    // Ground truth for "have we emailed them" is the sends ledger, not
+    // `contacts.status`: the status column is also moved by bounce and
+    // unsubscribe handling, whereas a row in `sends` means an email was
+    // genuinely built and handed to the sender for that contact.
+    const existing = (await q(`SELECT id, status, audience, category FROM contacts WHERE email = ?`, [email]))[0] as any;
+    if (!existing) { skipped++; continue; }
+    if (existing.status === "unsubscribed" || existing.status === "bounced") { skipped++; continue; }
+    const alreadySent = await q(`SELECT 1 AS x FROM sends WHERE contact_id = ? LIMIT 1`, [String(existing.id)]);
+    if (alreadySent.length) { skipped++; continue; }
+
+    // Take it into the batch, and let the lead fill in what the contact is
+    // missing. An imported contact has no audience at all (the bulk endpoint
+    // never wrote one), so without this it could never be routed to a lane.
+    const patch: string[] = [];
+    const vals: any[] = [];
+    if (!String(existing.audience || "").trim()) { patch.push(`audience = ?`); vals.push(leadAudience); }
+    if (category && !String(existing.category || "").trim()) { patch.push(`category = ?`); vals.push(category); }
+    if (patch.length) {
+      await q(`UPDATE contacts SET ${patch.join(", ")} WHERE id = ?`, [...vals, String(existing.id)]).catch(() => {});
+    }
+    adopted++;
+    contactIds.push(String(existing.id));
   }
 
   if (approvedIds.length) {
@@ -214,5 +264,216 @@ export async function approveLeads(opts: ApproveOptions): Promise<ApproveResult>
     }
   }
 
-  return { added, skipped, contactIds, approvedIds };
+  return { added, adopted, skipped, contactIds, approvedIds };
+}
+
+/* ------------------------- importing into the pool --------------------- */
+
+export interface ImportLeadRow {
+  email: string;
+  company?: string | null;
+  country?: string | null;
+  industry?: string | null;
+  category?: string | null;
+  phone?: string | null;
+}
+
+export interface ImportToPoolResult {
+  added: number;      // new pending pool rows
+  duplicate: number;  // already in the pool (same address)
+  invalid: number;    // no address, or one that could never be mailed
+}
+
+/**
+ * Put rows into the REVIEW POOL rather than straight into Contacts.
+ *
+ * This is what makes an import reachable by the automation at all: the lanes
+ * count `discovered_leads`, never `contacts`, so anything written directly to
+ * Contacts is invisible to them for ever.
+ *
+ * Deliberately NOT reusing discovery's `insertDiscovered`: that one drops any
+ * lead whose address already belongs to a Contact (correct when the crawler
+ * re-finds a company you already have, exactly wrong when the operator is
+ * explicitly asking for these people to be queued), and it claims the domain
+ * for crawling, which an imported row never needs.
+ */
+export async function importLeadsToPool(
+  rows: ImportLeadRow[],
+  opts: { audience?: string | null; label?: string | null; category?: string | null; country?: string | null } = {}
+): Promise<ImportToPoolResult> {
+  const audience = normalizeAudience(opts.audience);
+  const label = String(opts.label || "CSV import").slice(0, 120);
+  const forcedCategory = String(opts.category ?? "").trim() || null;
+  const rawCountry = String(opts.country ?? "").trim();
+  const forcedCountry = normalizeCountry(rawCountry) || rawCountry || null;
+
+  let added = 0, duplicate = 0, invalid = 0;
+  const seen = new Set<string>();
+
+  for (const r of rows) {
+    const email = cleanEmail(String(r?.email || "")) || "";
+    if (!email || !isValidEmail(email)) { invalid++; continue; }
+    if (seen.has(email)) { duplicate++; continue; }
+    seen.add(email);
+
+    // The domain is only recorded when it identifies a company. A free-mail
+    // host does not, and writing "gmail.com" into `domain` would let one
+    // gmail lead block every other one through domain-level de-duplication.
+    const host = (email.split("@")[1] || "").trim().toLowerCase();
+    const domain = host && !isFreeMailDomain(host) ? host : null;
+    const country = forcedCountry || normalizeCountry(String(r?.country || "")) || String(r?.country || "").trim() || null;
+    const now = nowIso();
+
+    const ins = await q(
+      `INSERT INTO discovered_leads
+        (id,dedup_key,name,website,domain,email,phone,city,country,category,audience,
+         source_id,source_label,status,enriched,enrich_status,confidence,via,created_at,email_at)
+       VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,?,'pending',1,'import',?,'import',?,?)
+       ON CONFLICT (dedup_key) DO NOTHING RETURNING id`,
+      [
+        uid(),
+        // Same key shape discovery uses for an address-bearing lead, so an
+        // import and a crawl can never file the same person twice.
+        "e:" + email,
+        String(r?.company || "").trim() || domain || email,
+        domain ? `https://${domain}` : null,
+        domain,
+        email,
+        String(r?.phone || "").trim() || null,
+        country,
+        forcedCategory || String(r?.category || r?.industry || "").trim() || null,
+        audience,
+        IMPORT_SOURCE_ID,
+        label,
+        // We were handed the address; there is nothing to be confident about
+        // and nothing to crawl. `enriched=1` keeps it out of the enrich queue.
+        "listed",
+        now,
+        // It is emailable the instant it lands. The fill-rate query filters
+        // imports out by source, so this cannot distort discovery's health.
+        now,
+      ]
+    );
+    if (ins.length) added++; else duplicate++;
+  }
+
+  return { added, duplicate, invalid };
+}
+
+/* --------------------- backfilling contacts already held --------------- */
+
+/**
+ * A contact is adoptable when it can still be emailed and never has been:
+ * a real address, not opted out, and no row in the sends ledger. Written once
+ * and shared by the count and the backfill so the button can never offer a
+ * number it will not deliver — the same rule the pool tools learned the hard
+ * way.
+ */
+const ADOPTABLE_SQL = `
+  FROM contacts c
+ WHERE c.email IS NOT NULL AND c.email <> ''
+   AND c.status NOT IN ('unsubscribed','bounced')
+   AND NOT EXISTS (SELECT 1 FROM sends s WHERE s.contact_id = c.id)
+   AND NOT EXISTS (SELECT 1 FROM discovered_leads d WHERE d.email = c.email)`;
+
+export interface AdoptableSummary {
+  /** Contacts that could be queued right now. */
+  adoptable: number;
+  /** Of those, the ones that arrived by import rather than by hand. */
+  imported: number;
+  /** Contacts already emailed at least once — shown so the number has context. */
+  alreadyEmailed: number;
+}
+
+export async function countAdoptableContacts(): Promise<AdoptableSummary> {
+  const [all, imported, sent] = await Promise.all([
+    q(`SELECT CAST(count(*) AS INTEGER) AS n ${ADOPTABLE_SQL}`),
+    q(`SELECT CAST(count(*) AS INTEGER) AS n ${ADOPTABLE_SQL} AND lower(COALESCE(c.source,'')) IN ('import','csv')`),
+    q(`SELECT CAST(count(DISTINCT contact_id) AS INTEGER) AS n FROM sends WHERE contact_id IS NOT NULL`),
+  ]);
+  return {
+    adoptable: Number(all[0]?.n ?? 0),
+    imported: Number(imported[0]?.n ?? 0),
+    alreadyEmailed: Number(sent[0]?.n ?? 0),
+  };
+}
+
+export interface AdoptOptions {
+  /** Restrict to contacts that arrived by import (default) or take every one. */
+  importedOnly?: boolean;
+  /** Lane to queue them under. Blank keeps each contact's own tag. */
+  audience?: string | null;
+  category?: string | null;
+  country?: string | null;
+  /** Safety valve — process at most this many in one pass. */
+  limit?: number;
+  /** Called after each chunk, so a 30k backfill can report progress. */
+  onProgress?: (done: number, total: number) => void;
+}
+
+/**
+ * ONE-TIME BACKFILL for contacts that were imported before the pool route
+ * existed. Creates a pending pool row per never-emailed contact so the
+ * automation can see, batch, schedule and send to them under all its normal
+ * rails.
+ *
+ * The contact row is left exactly as it is. When the lane later approves the
+ * pool row, `approveLeads` finds the address already taken, sees the ledger is
+ * empty for it, and adopts that existing contact into the batch — which is why
+ * this backfill and the adoption change have to ship together.
+ *
+ * Idempotent: `ADOPTABLE_SQL` excludes any contact that already has a pool row,
+ * so running it twice queues nobody twice, and a pass that dies half way can
+ * simply be run again.
+ */
+export async function adoptContactsToPool(opts: AdoptOptions = {}): Promise<ImportToPoolResult & { scanned: number }> {
+  const limit = Math.max(1, Math.min(Number(opts.limit) || 50000, 200000));
+  const importedOnly = opts.importedOnly !== false;
+  const filter = importedOnly ? ` AND lower(COALESCE(c.source,'')) IN ('import','csv')` : "";
+
+  const rows = await q(
+    `SELECT c.email, c.company, c.country, c.industry, c.category, c.phone, c.audience
+     ${ADOPTABLE_SQL}${filter}
+     ORDER BY c.created_at ASC, c.id ASC
+     LIMIT ?`,
+    [limit]
+  );
+
+  const override = String(opts.audience || "").trim();
+  let added = 0, duplicate = 0, invalid = 0;
+
+  // Chunked, and grouped by lane inside each chunk: a contact that already
+  // carries a tag keeps it, and only the untagged ones take the override. One
+  // call per contact would be 30,000 round trips — minutes of latency for work
+  // that batches perfectly well.
+  const CHUNK = 500;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const slice = rows.slice(i, i + CHUNK);
+    const byLane = new Map<string, ImportLeadRow[]>();
+    for (const c of slice) {
+      const lane = override || String((c as any).audience || "").trim() || "customer";
+      const list = byLane.get(lane) || [];
+      list.push({
+        email: String((c as any).email || ""),
+        company: (c as any).company,
+        country: (c as any).country,
+        industry: (c as any).industry,
+        category: (c as any).category,
+        phone: (c as any).phone,
+      });
+      byLane.set(lane, list);
+    }
+    for (const [lane, list] of byLane) {
+      const r = await importLeadsToPool(list, {
+        audience: lane,
+        label: "Imported contacts",
+        category: opts.category ?? null,
+        country: opts.country ?? null,
+      });
+      added += r.added; duplicate += r.duplicate; invalid += r.invalid;
+    }
+    opts.onProgress?.(Math.min(i + CHUNK, rows.length), rows.length);
+  }
+
+  return { scanned: rows.length, added, duplicate, invalid };
 }

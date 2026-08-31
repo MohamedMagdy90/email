@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type Contact } from "../lib/api";
+import { api, type AdoptableSummary, type Contact } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, Spinner, StatusPill, Textarea, toast, cn } from "../lib/ui";
 import { downloadCsv, parseContacts, CONTACTS_TEMPLATE, type ParsedContact } from "../lib/csv";
 import Crawler from "./Crawler";
@@ -244,6 +244,8 @@ export default function Contacts() {
           </Card>
         ))}
       </div>
+
+      <UnreachableBanner onDone={refreshFromStart} />
 
       {/* Toolbar — stacked on a phone (search first, because that is what you
           reach for), one row from lg up exactly as before. */}
@@ -720,6 +722,11 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
   const [fileName, setFileName] = useState("");
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  // Where the rows land. "pool" is the default because it is what almost
+  // everybody means by importing: the automation only ever reads the review
+  // pool, so a CSV sent straight to Contacts can never be emailed by the bot.
+  const [dest, setDest] = useState<"pool" | "contacts">("pool");
+  const [audience, setAudience] = useState<"customer" | "partner">("customer");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const parsed = useMemo<ParsedContact[]>(() => (csv.trim() ? parseContacts(csv) : []), [csv]);
@@ -757,23 +764,30 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
     if (!valid.length) return toast("No valid rows to import", "error");
     setBusy(true);
     try {
-      // upsert=true: existing contacts are UPDATED (status preserved), new ones added.
-      const r = await api.bulkContacts(
-        valid.map((c) => ({
-          email: c.email,
-          company: c.company || undefined,
-          country: c.country || undefined,
-          industry: c.industry || undefined,
-          category: c.category || undefined,
-          phone: c.phone || undefined,
-          source: "csv",
-        })),
-        true
-      );
-      const parts = [`${r.added} added`];
-      if (r.updated) parts.push(`${r.updated} updated`);
-      if (r.skipped) parts.push(`${r.skipped} unchanged`);
-      toast(parts.join(" · "), "success");
+      const rows = valid.map((c) => ({
+        email: c.email,
+        company: c.company || undefined,
+        country: c.country || undefined,
+        industry: c.industry || undefined,
+        category: c.category || undefined,
+        phone: c.phone || undefined,
+        source: "csv",
+      }));
+
+      if (dest === "pool") {
+        const r = await api.importToPool(rows, { audience, label: fileName || "CSV import" });
+        const parts = [`${r.added} queued for the automation`];
+        if (r.duplicate) parts.push(`${r.duplicate} already known`);
+        if (r.invalid) parts.push(`${r.invalid} unmailable`);
+        toast(parts.join(" · "), "success");
+      } else {
+        // upsert=true: existing contacts are UPDATED (status preserved), new ones added.
+        const r = await api.bulkContacts(rows, true, audience);
+        const parts = [`${r.added} added`];
+        if (r.updated) parts.push(`${r.updated} updated`);
+        if (r.skipped) parts.push(`${r.skipped} unchanged`);
+        toast(parts.join(" · "), "success");
+      }
       reset();
       onDone();
       onClose();
@@ -849,11 +863,79 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           </details>
         </div>
 
-        {/* Step 3 — preview */}
+        {/* Step 3 — destination. The single most consequential choice in this
+            modal, and the one that used to be made silently and wrongly. */}
+        <div>
+          <div className="mb-2 flex items-center gap-3">
+            <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
+            <div className="text-[13px] font-semibold text-ink">Where should these go?</div>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setDest("pool")}
+              className={cn(
+                "rounded-xl border px-4 py-3 text-left transition-colors",
+                dest === "pool" ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40"
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <span className={cn("h-2 w-2 rounded-full", dest === "pool" ? "bg-ink" : "bg-ink/20")} />
+                <span className="text-[13px] font-semibold text-ink">Review pool</span>
+                <span className="rounded-full bg-[#e7f6ec] px-2 py-0.5 text-[10px] font-medium text-[#1f8b4c]">
+                  automation
+                </span>
+              </div>
+              <div className="mt-1 text-xs leading-relaxed text-muted">
+                The bot emails them in batches, on its own schedule, respecting each
+                country's sending window and your daily limit.
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setDest("contacts")}
+              className={cn(
+                "rounded-xl border px-4 py-3 text-left transition-colors",
+                dest === "contacts" ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40"
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <span className={cn("h-2 w-2 rounded-full", dest === "contacts" ? "bg-ink" : "bg-ink/20")} />
+                <span className="text-[13px] font-semibold text-ink">Contacts only</span>
+              </div>
+              <div className="mt-1 text-xs leading-relaxed text-muted">
+                Stored, but the automation will never touch them. You email them
+                yourself from the Send screen.
+              </div>
+            </button>
+          </div>
+
+          <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-ink/[0.02] px-3 py-2">
+            <span className="text-xs font-medium text-ink/70">Pitch these as</span>
+            {(["customer", "partner"] as const).map((a) => (
+              <button
+                key={a}
+                type="button"
+                onClick={() => setAudience(a)}
+                className={cn(
+                  "rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition-colors",
+                  audience === a ? "bg-ink text-cream" : "text-ink/60 hover:bg-ink/[0.06]"
+                )}
+              >
+                {a}s
+              </button>
+            ))}
+            <span className="text-xs text-muted">
+              — decides which lane, and which template, they get.
+            </span>
+          </div>
+        </div>
+
+        {/* Step 4 — preview */}
         {parsed.length > 0 && (
           <div>
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
+              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">04</span>
               <div className="text-[13px] font-semibold text-ink">Review</div>
               <div className="ml-1 flex flex-wrap gap-1.5">
                 <Chip tone="good">{valid.length} ready</Chip>
@@ -905,12 +987,16 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           {csv.trim() ? (
             <button onClick={reset} className="text-xs font-medium text-ink/50 underline hover:text-ink">Clear</button>
           ) : (
-            <span className="text-xs text-muted">Existing contacts are updated (their status is kept); new ones are added.</span>
+            <span className="text-xs text-muted">
+              {dest === "pool"
+                ? "Anyone already in Contacts or the pool is skipped, so re-importing is safe."
+                : "Existing contacts are updated (their status is kept); new ones are added."}
+            </span>
           )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
             <Button loading={busy} onClick={submit} disabled={!valid.length}>
-              Import {valid.length || ""} contact{valid.length === 1 ? "" : "s"}
+              {dest === "pool" ? "Queue" : "Import"} {valid.length || ""} contact{valid.length === 1 ? "" : "s"}
             </Button>
           </div>
         </div>
@@ -996,5 +1082,118 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
         </div>
       </div>
     </Modal>
+  );
+}
+
+/* ------------------- Contacts the automation cannot see ------------------ */
+
+/**
+ * Contacts imported before the pool route existed are invisible to the bot:
+ * every lane counts the review pool and nothing else. They are not broken and
+ * not lost — they have simply never been queued, and there was previously no
+ * way to tell from this screen, because a contact the bot will email tomorrow
+ * and one it will never email look identical in the table.
+ *
+ * Shown only when there is something to do, and it disappears for good once
+ * the backfill has run.
+ */
+function UnreachableBanner({ onDone }: { onDone: () => void }) {
+  const [info, setInfo] = useState<AdoptableSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+
+  async function load() {
+    try {
+      setInfo(await api.getAdoptable());
+    } catch {
+      /* a failure here must never break the Contacts screen */
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function queueThem() {
+    setBusy(true);
+    setProgress({ done: 0, total: info?.imported || 0 });
+    try {
+      const { jobId, total } = await api.adoptContacts({ importedOnly: true });
+      setProgress({ done: 0, total });
+      // Poll until the job settles. A 30k backfill is chunked server-side, so
+      // this reports real movement rather than an indeterminate spinner.
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 700));
+        const job = await api.adoptContactsJob(jobId);
+        setProgress({ done: job.processed || 0, total: job.total || total });
+        if (job.status === "done") {
+          const r = job.result || {};
+          toast(
+            `${(r.added || 0).toLocaleString()} contact(s) queued — the automation will email them in batches.`,
+            "success"
+          );
+          break;
+        }
+        if (job.status === "error") {
+          toast(job.error || "The backfill failed", "error");
+          break;
+        }
+      }
+      await load();
+      onDone();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  }
+
+  if (dismissed || !info || info.imported < 1) return null;
+
+  const pct = progress && progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
+
+  return (
+    <Card className="mb-6 border-ink/15 bg-ink/[0.02] px-4 py-3.5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded-full bg-[#fdf3e3] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#9a6b16]">
+              not queued
+            </span>
+            <span className="text-[13px] font-semibold text-ink">
+              {info.imported.toLocaleString()} imported contact{info.imported === 1 ? " has" : "s have"} never been emailed
+            </span>
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-muted">
+            The automation only reads the review pool, so contacts imported straight
+            into this list were never picked up. Queue them and the bot will email
+            them in its normal batches — same daily limit, same sending windows.
+            {info.alreadyEmailed > 0 && (
+              <>
+                {" "}
+                The {info.alreadyEmailed.toLocaleString()} already emailed are left alone.
+              </>
+            )}
+          </p>
+          {progress && (
+            <div className="mt-2">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink/10">
+                <div className="h-full rounded-full bg-ink transition-all" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="mt-1 text-[11px] tabular-nums text-muted">
+                {progress.done.toLocaleString()} of {progress.total.toLocaleString()} queued
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setDismissed(true)} disabled={busy}>
+            Not now
+          </Button>
+          <Button size="sm" loading={busy} onClick={queueThem}>
+            Queue for automation
+          </Button>
+        </div>
+      </div>
+    </Card>
   );
 }

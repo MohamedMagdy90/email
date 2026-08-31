@@ -124,6 +124,19 @@ export interface SendRow {
   created_at: string;
 }
 
+/**
+ * How many contacts are sitting in the database that the automation has never
+ * been able to reach — imported straight into Contacts, which no lane reads.
+ */
+export interface AdoptableSummary {
+  /** Never emailed, not opted out, and not already queued. */
+  adoptable: number;
+  /** Of those, the ones that arrived by import rather than by hand. */
+  imported: number;
+  /** Contacts emailed at least once — context for the number above. */
+  alreadyEmailed: number;
+}
+
 export interface Job {
   id: string;
   type: string;
@@ -277,8 +290,13 @@ export interface DiscoverySource {
   type?: "osm" | "directory" | "search";
   base_url?: string | null;
   keywords?: string | null; // web-search sources: custom keywords (blank = from category)
-  // Web-search sources: also walk Common Crawl's index of the country's own
-  // ccTLD, not just the keyword queries. 1 = on (the default).
+  /**
+   * RETIRED. Web-search sources could once also walk Common Crawl's index of
+   * the country's own ccTLD. It listed every host in a country rather than
+   * every business, so it filed portals and parked domains as companies. The
+   * backend now ignores the column and clears it on boot; kept on the type
+   * only because old rows still send it.
+   */
   sweep_country?: number;
   /** customer | partner — every lead this source files inherits it. */
   audience?: string | null;
@@ -709,11 +727,41 @@ export const api = {
     req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
   updateContact: (id: string, c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(c) }),
-  bulkContacts: (contacts: Partial<Contact>[], upsert = false) =>
+  bulkContacts: (contacts: Partial<Contact>[], upsert = false, audience?: string) =>
     req<{ added: number; updated?: number; skipped: number }>(`/api/contacts/bulk`, {
       method: "POST",
-      body: JSON.stringify({ contacts, upsert }),
+      body: JSON.stringify({ contacts, upsert, audience }),
     }),
+  /**
+   * Import into the REVIEW POOL instead of straight into Contacts.
+   *
+   * The automation lanes count pool rows and nothing else, so this is the only
+   * import route the bot can actually see. Rows written to Contacts directly
+   * are reachable only by a manual campaign.
+   */
+  importToPool: (
+    contacts: Partial<Contact>[],
+    opts: { audience?: string; label?: string; category?: string; country?: string } = {}
+  ) =>
+    req<{ added: number; duplicate: number; invalid: number }>(`/api/pool/import`, {
+      method: "POST",
+      body: JSON.stringify({ contacts, ...opts }),
+    }),
+
+  /**
+   * Preview for the backfill button — shares the backfill's own predicate.
+   */
+  getAdoptable: () => req<AdoptableSummary>(`/api/pool/adoptable`),
+
+  /** One-time: queue already-held, never-emailed contacts into the pool. */
+  adoptContacts: (opts: { importedOnly?: boolean; audience?: string; category?: string; country?: string } = {}) =>
+    req<{ jobId: string; total: number }>(`/api/pool/adopt-contacts`, {
+      method: "POST",
+      body: JSON.stringify(opts),
+    }),
+
+  adoptContactsJob: (id: string) => req<Job>(`/api/pool/adopt-contacts/${id}`),
+
   deleteContacts: (ids: string[]) =>
     req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),
   // Delete EVERY contact matching the current filter ("select all N matching").
@@ -929,9 +977,8 @@ export const api = {
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
-    sweepCountry?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null; sweepCountry: boolean }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>
