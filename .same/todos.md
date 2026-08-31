@@ -55,8 +55,8 @@ together.**
       not `contacts.status`, because status is also moved by bounce/unsub
       handling. Reported as `adopted`, separate from `added`
 
-- [x] An adopted contact inherits the lead's `audience` if it had none — which
-      every imported contact did, since the bulk endpoint never wrote one
+- [x] An adopted contact inherits the lead's `audience` if it had none —
+      which every imported contact did, since the bulk endpoint never wrote one
 
 - [x] `ADOPTABLE_SQL` shared by the count and the backfill, so the button can
       never offer a number it will not deliver (the lesson from the re-check and
@@ -116,6 +116,60 @@ the new methods, and invented a bogus `normalizeAudience` in `index.ts` that
 returned `"manual"`. Both caught and reverted; `api.ts` re-checked
 declaration-by-declaration.
 
+## Shipped
+
+Two commits pushed to `MohamedMagdy90/email` (`ad90dd1` → **`4015c71`**):
+
+- **`d735dd0`** "Retire the country sweep, which was filing websites as
+  businesses" — 6 files. This was the 2026-08-26 work, which had been sitting
+  UNCOMMITTED in the container all along; its prepared message was still in
+  `.commit-msg.txt`, so that message was used rather than a new one.
+- **`4015c71`** "Let imported contacts reach the automation queue" — 9 files,
+  1 added.
+
+`backend/src/index.ts` carried hunks from BOTH pieces of work, so it was split
+by hunk (`git apply --cached` on a filtered patch) rather than bundled into one
+commit: the 4 sweep hunks are in the discovery-source POST/PUT handlers, the 4
+import hunks are the pool imports, `contacts/bulk` audience, `adopted` on
+approve, and the new `/api/pool/*` routes.
+
+Verified by comparing the full 40-char SHA local vs remote (identical), then
+blob-SHA per file for all 14 files across both commits — all byte-exact. The
+push output itself was not trusted.
+
+`.git` had been wiped from the container AGAIN — an empty `.git/` directory,
+which fails `rev-parse` while still existing. Re-attached with `git init` +
+`remote add` + `fetch --depth=1` + `reset --mixed FETCH_HEAD`. Local branch is
+`master`, remote is `main`, so the push was `master:main`.
+
+`frontend/{package.json,tsconfig.json,vite.config.ts,bun.lock}` did NOT show as
+modified this time and needed no exclusion — a change from every previous
+session.
+
+### ⚠️ Backend is live, FRONTEND IS NOT
+
+- Railway auto-deployed: `GET /api/health` → `{"ok":true,"rev":"4015c71"}`.
+  Every new endpoint is live in production.
+- **Netlify was NOT redeployed.** The live bundle
+  (`assets/index-BFEQUvO3.js`) contains 0 hits for `Queue for automation` and 0
+  for `pool/adoptable`, so production has the API but neither the destination
+  chooser in the import modal nor the backfill banner. Netlify does not build
+  from GitHub here — it is published with the deploy tool.
+
+Until the frontend ships, the backfill can only be triggered by hand:
+`POST /api/pool/adopt-contacts` with `{"importedOnly":true}`.
+
+### ⚠️ Shell hazard found while committing
+
+`git commit -m` with a heredoc silently STRIPPED every blank line from the
+message and dropped the `🤖 Generated with` line entirely, leaving a 45-line
+message with no subject/body separation. Caught with
+`test -z "$(git log -1 --format=%B | sed -n 2p)"`. Both commits were written via
+`git commit -F .commit-msg.txt` instead, which is presumably why that file is in
+`.gitignore` in the first place. Terminal echo in this container also visually
+collapses blank lines, so `head`/`sed` output cannot be trusted to show them —
+count with `grep -c '^$'`.
+
 ---
 
 # Country sweep retired (2026-08-26) ✅
@@ -165,10 +219,10 @@ tab below it, and the contacts total is already in the middle of the donut.
 
 ## 1. The target derives itself
 
-A lane approves `threshold` leads and can only fire once per `cooldownMinutes`,
-so it consumes `threshold / cooldown` — 150 every 3 hours IS 8.3 per 10 minutes.
-Nothing to enter, nothing to keep in sync: change the batch size or the cooldown
-and the target moves with it.
+A lane approves `threshold` leads and can only fire once per
+`cooldownMinutes`, so it consumes `threshold / cooldown` — 150 every 3 hours IS
+8.3 per 10 minutes. Nothing to enter, nothing to keep in sync: change the batch
+size or the cooldown and the target moves with it.
 
 - [x] Capped by the shared daily ceiling, proportionally across live lanes. You
       cannot need more leads than the sender will ever send, and a card demanding
@@ -200,14 +254,14 @@ outage, then gone red days after it ended.
 A red light with no cause is a puzzle. `reason` names it, ordered by how much it
 explains: bot off · no sources on · every live source dry · and the one that
 separates two failures that look identical from outside — *"1,284 companies
-arrived, none with an email"*, which is a crawler problem (walls, no key), not a
-discovery one, and has a completely different fix.
+arrived, none with an email"*, which is a crawler problem (walls, no key), not
+a discovery one, and has a completely different fix.
 
 ## 4. Two things live data caught that the design hadn't
 
 - [x] **8.0 against a target of 8.3 turned the card red.** Being 4% under over a
-      three-hour window is noise — one directory page landing either side of the
-      boundary moves it further. Bands now: ok ≥ 95%, red only under 60% AND
+      three-hour window is noise — one directory page landing either side of
+      the boundary moves it further. Bands now: ok ≥ 95%, red only under 60% AND
       with less than 12h of banked leads. A light that goes red for noise is a
       light nobody looks at
 
@@ -228,7 +282,8 @@ discovery one, and has a completely different fix.
   guard, and took the API down at boot — the exact failure that code exists to
   absorb. Widened, and it caught the tenth an hour later.
 
-- The 13 parked `data.sqlite.corrupt-*` files moved to `.same/corrupt-db-backups/`.
+- The 13 parked `data.sqlite.corrupt-*` files moved to
+  `.same/corrupt-db-backups/`.
 
 ## Verified
 
@@ -262,9 +317,10 @@ not just the file list. Railway auto-deployed; `GET /api/health` returns
 working tree untouched and just re-points the index at the remote HEAD.
 
 `frontend/{package.json,tsconfig.json,vite.config.ts,bun.lock}` carry
-Same-IDE-only edits (`same-runtime`, `react-grab`, the `optimizeDeps.exclude`)
-and were left OUT again — diffed first to confirm none of this work had leaked
-into them. They still show as modified locally; that is expected, not drift.
+Same-IDE-only edits (`same-runtime`, `react-grab`, the
+`optimizeDeps.exclude`) and were left OUT again — diffed first to confirm none
+of this work had leaked into them. They still show as modified locally; that is
+expected, not drift.
 
 ⚠️ Verified from here only as far as the boot: `ensureSchema()` is awaited at
 module load, so production answering `/api/health` at all proves both new
@@ -294,8 +350,8 @@ taller than the row it was describing.
       middle column, with a top rule so it reads as a footnote to the source
 
 - [x] Copy cut to what is actually actionable: `5 dry runs · last find 12d ago`
-      (or `never found anyone`), plus `off at 4` while it is still running, and a
-      `Re-aim` link. The rest moved to the `title`
+      (or `never found anyone`), plus `off at 4` while it is still running, and
+      a `Re-aim` link. The rest moved to the `title`
 
 ## 2. A flagged source kept running anyway
 
@@ -365,8 +421,8 @@ Every bar collapsed to its 4px `minHeight`, which reads as "all zero".
       bucket for any viewer east of UTC
 
 - [x] `buildDailySeries` still pads, but anchors on the newest day the SERVER
-      reported, so an older API keeps working without handing the axis back to
-      the viewer's clock
+      reported, so an older API keeps working without handing the axis back to the
+      viewer's clock
 
 ## 2. Automation batch bars only existed on Discovery
 
@@ -394,16 +450,16 @@ Every bar collapsed to its 4px `minHeight`, which reads as "all zero".
       re-scheduling doesn't, since none of those change what it can find
 
 - [x] `staleSources` on `/api/discovery/status`, `staleCount` on the sources
-      list, `sources.stale` + `staleList` on `/api/overview` — all three read the
-      same `barren_runs >= STALE_AFTER_RUNS` so they can't disagree
+      list, `sources.stale` + `staleList` on `/api/overview` — all three read
+      the same `barren_runs >= STALE_AFTER_RUNS` so they can't disagree
 
 - [x] Discovery: amber left-border + "stale" chip per row, a "N sources have run
       dry" banner, and a stale-only filter
 
 - [x] Overview: Stale sources metric deep-linking into Discovery via
       `goTo("discovery", "stale")` + one-shot `takeFocus()`, which opens the
-      sources card, switches the filter on and scrolls it into view. Landing on a
-      tab of forty rows and leaving the reader to find the two being pointed at
+      sources card, switches the filter on and scrolls it into view. Landing on
+      a tab of forty rows and leaving the reader to find the two being pointed at
       is a hint, not a link
 
 **Verified.** Backend `tsc --noEmit` clean, frontend `tsc --noEmit` + `vite build`
@@ -705,9 +761,9 @@ written to a ledger you can read back.
 
 - [x] `pool.ts` (new): `discoveredWhere` + `approveLeads()` moved out of index.ts,
       so the Approve buttons AND the automation share ONE path — same country
-      filter (incl. the `__none__` bucket), same `cleanEmail`/`isValidEmail`
-      guard, same `normalizeCountry` override. Returns the new contact ids (how
-      the automation knows exactly who to email) and takes `limit` +
+      filter (incl. the `__none__` bucket), same `cleanEmail`/`isValidEmail` guard,
+      same `normalizeCountry` override. Returns the new contact ids (how the
+      automation knows exactly who to email) and takes `limit` +
       `oldestFirst` so the pool drains FIFO in fixed batches.
 
 - [x] `send.ts` (new): `runSendJob` (+ `buildFrom` / `isEmail`) moved out of
@@ -787,8 +843,8 @@ written to a ledger you can read back.
       batch re-read the same 3 companies → "0 new" → source declared finished.
 
 - The `rel="next"` href is entity-encoded (`?combine=&amp;…&amp;page=0%2C1`).
-  `collectLinks()` never decoded it, so the URL became `amp;page=…` → the
-  pagination parameter was lost → page 2 == page 1.
+  `collectLinks()` never decoded it, so the URL became `amp;page=…` → the pagination
+  parameter was lost → page 2 == page 1.
 
 - `useInline` said NO: the page's 3 cards vs. 6 unrelated nav links
   (`/tasmu-digital-valley-services/*-Membership-Form`) failed `distinct >= details*0.6`,
@@ -812,8 +868,8 @@ written to a ledger you can read back.
       params; the moving slot is the last non-zero one. `pageNumberOf` now returns
       `null` (not 0) for "no marker", so a 0-indexed pager isn't unreachable.
 
-- [x] `directory.ts`: `useInline` also wins when the detail links don't match the
-      cards' own hrefs (nav links, not listings).
+- [x] `directory.ts`: `useInline` also wins when the detail links don't match
+      the cards' own hrefs (nav links, not listings).
 
 - [x] `directory.ts`: inline mode is STICKY for the rest of a walk — the shell page
       past the end can't fall back to the site menu (that's how the directory's own
@@ -829,7 +885,7 @@ written to a ledger you can read back.
       `pickCardName` ignores headings longer than 160 raw chars.
 
 - [x] `discovery.ts`: directory batches resume from the stored `next_url`; budgets are
-      25 pages OR 40 listings, whichever comes first; `walkedOff` (`nextUrl === null`)
+      25 pages OR 40 listings, whichever comes first. `walkedOff` (`nextUrl === null`)
       ends the walk; `stalled` now keys off "did we read a page", not cursor maths;
       `withPage`/`initialCursor` are multi-pager aware.
 
@@ -1034,12 +1090,11 @@ Seen in the pool: `//info@rumaillahgroup.com`, `//sales@sagarsteel.net`,
 - [x] Approve / bulk / manual contact inserts validate before writing to
       `contacts`, so junk can never reach the sender
 
-- [x] Verified: 4 mangled rows repaired, clash deduped, unsalvageable re-queued;
-      `first.last+tag@`, `sales_2@steel-works.com.sa`, multi-label ccTLDs intact
+- [x] Verified: `first.last+tag@`, `sales_2@steel-works.com.sa`, multi-label ccTLDs intact
 
 ## Search source stalled for 16h on one step (rate limit + cursor bug)
 
-Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
+Log evidence: Qatar — step 46/300 repeated hourly from Aug 7 16:11 to Aug 8
 08:43. Steps 25, 34, 37, 40, 43 stalled the same way. ~21 plan steps in 2 days.
 
 - ROOT CAUSE: `runBatch` only saved the cursor when `r.okish` was true. A batch
@@ -1049,8 +1104,8 @@ Log evidence: `Qatar — step 46/300` repeated hourly from Aug 7 16:11 to Aug 8
   whole time — the caller discarded it.
 
 - Compounding: p2 requests are ~half of all traffic and nearly always `+0 new`,
-  and they're what trips the limiter. Blocks were also punished with the
-  source's FULL interval (60m) when the engine's ceiling is per-minute.
+  and they're what trips the limiter. Blocks were also punished with the source's
+  FULL interval (60m) when the engine's ceiling is per-minute.
 
 - [x] Cursor advances by queries actually covered, even on a block; the blocked
       query stays next up (`covered` counter, separate from pages fetched)
@@ -1277,8 +1332,8 @@ state on this container. It fills in as soon as the pool holds emailable leads.
 
 **The marker meaning "we gave up" is the marker the tool selects on.** Nothing
 recorded that a recovery pass had ever run, so the button re-armed its own
-queue: 166 reset → each burns 2 crawls (hard wall) or up to 6 (soft) against the
-same datacenter IP that refused them last time → all park with the identical
+queue: 166 reset → each burns 2 crawls (hard wall) or up to 6 (soft) against
+the same datacenter IP that refused them last time → all park with the identical
 status → badge reads 166 again. ~332 guaranteed-wasted crawls per press.
 
 The leads WERE being marked as failed. "Failed" just also meant "try me again".
@@ -1296,8 +1351,8 @@ The leads WERE being marked as failed. "Failed" just also meant "try me again".
       badge COUNT and the button's UPDATE both read them — the button can never
       again offer a number it cannot deliver
 
-- [x] `RECHECK_MAX_PASSES = 1`. By the time a lead is parked the automatic
-      ladder has already tried it twice (hard wall) or six times out to 72h
+- [x] `RECHECK_MAX_PASSES = 1`. By the time a lead is parked the automatic ladder
+      has already tried it twice (hard wall) or six times out to 72h
       (soft), so the transient case is long ruled out. A second hand-pressed
       pass from the same IP with the same key is the definition of doing the
       same thing and expecting a different result
@@ -1322,12 +1377,12 @@ untouched throughout.
 Live over HTTP: `stuck` / `lastRecheckAt` serialize on `/api/discovery/status`;
 `POST /api/discovery/re-enrich` returns `{reset, stuck, reArmed}`; first press
 `reset:29`, second and third `reset:0` — the log says "nothing to re-queue"
-instead of re-crawling. backend `tsc` clean · frontend `tsc` clean · `vite
-build` clean.
+instead of re-crawling. backend `tsc` clean · frontend `tsc` clean ·
+`vite build` clean.
 
-⚠️ Note for the operator: the parked leads are NOT lost. They stay pending in
-the pool with their website on file, and the moment a Jina key or scraping proxy
-is added in Settings → Crawler every one of them becomes re-checkable again.
+⚠️ Note for the operator: the parked leads are NOT lost. They stay pending in the
+pool with their website on file, and the moment a Jina key or scraping proxy is
+added in Settings → Crawler every one of them becomes re-checkable again.
 
 ---
 
