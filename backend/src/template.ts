@@ -1,5 +1,7 @@
 // Merge-tag rendering + email HTML wrapping (unsubscribe + open pixel).
 
+import { createHash } from "node:crypto";
+
 export function renderTemplate(tpl: string, contact: Record<string, any>): string {
   return tpl.replace(/\{\{\s*([a-z_]+)\s*\}\}/gi, (_, raw: string) => {
     const key = raw.toLowerCase();
@@ -40,10 +42,58 @@ export function wrapLinks(html: string, clickBase: string, unsubUrl = ""): strin
   });
 }
 
-export function wrapHtml(inner: string, unsubUrl: string, pixelUrl: string, clickBase = ""): string {
+// Stable, URL-safe id for a remote image — same URL always maps to the same id,
+// so re-sending a template never piles up duplicate asset rows.
+export function assetId(url: string): string {
+  return createHash("sha256").update(url).digest("hex").slice(0, 20);
+}
+
+function assetExt(url: string): string {
+  try {
+    const m = /\.(png|jpe?g|gif|webp)$/i.exec(new URL(url).pathname);
+    return m ? `.${m[1].toLowerCase()}` : "";
+  } catch {
+    return "";
+  }
+}
+
+// Re-host every remote <img> through our own (sending-domain) host, e.g.
+//   https://cdn.prod.website-files.com/.../logo.webp  ->  https://t.dna-erp.com/i/<id>.webp
+// Gmail and Resend flag images served from a domain unrelated to the sender.
+// Each rewritten URL is recorded in `assets` (id -> original URL) so the caller
+// can register it; the /i/:file route only serves registered ids (no open proxy).
+export function hostImages(html: string, assetBase: string, assets: Map<string, string>): string {
+  if (!assetBase) return html;
+  const base = assetBase.replace(/\/+$/, "");
+  return html.replace(/<img\b[^>]*>/gi, (tag) =>
+    tag.replace(/\bsrc\s*=\s*(["'])(.*?)\1/i, (m, quote: string, src: string) => {
+      const raw = String(src).trim().replace(/&amp;/g, "&");
+      if (!/^https?:\/\//i.test(raw)) return m; // data:, cid:, relative — leave alone
+      if (raw.startsWith(base + "/")) return m; // already on our host
+      const id = assetId(raw);
+      assets.set(id, raw);
+      return `src=${quote}${base}/i/${id}${assetExt(raw)}${quote}`;
+    })
+  );
+}
+
+export interface WrapOptions {
+  unsubUrl?: string;
+  pixelUrl?: string;
+  clickBase?: string;
+  // Host that re-serves remote images (the sending domain's tracking host).
+  assetBase?: string;
+  // Collects id -> original URL for every image rewritten by hostImages().
+  assets?: Map<string, string>;
+}
+
+export function wrapHtml(inner: string, opts: WrapOptions = {}): string {
+  const unsubUrl = opts.unsubUrl || "";
+  const pixelUrl = opts.pixelUrl || "";
   // Track links first — the footer (unsub link + pixel) is appended afterward,
   // so it's never rewritten.
-  inner = wrapLinks(inner, clickBase, unsubUrl);
+  inner = wrapLinks(inner, opts.clickBase || "", unsubUrl);
+  if (opts.assetBase && opts.assets) inner = hostImages(inner, opts.assetBase, opts.assets);
 
   const looksLikeFullDoc = /<html[\s>]/i.test(inner);
   const hasUnsub = unsubUrl && unsubUrl !== "#";

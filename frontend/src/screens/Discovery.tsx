@@ -1,19 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import {
   api,
-  type Audience,
   type DiscoveryStatus,
   type DiscoverySource,
   type DiscoveredLead,
-  type AutomationStatus,
   type Place,
-  STALE_AFTER_RUNS,
-  isStaleSource,
-  STALE_OFF_AFTER_RUNS,
 } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, Tooltip, toast, cn, goTo, takeFocus } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, Select, Spinner, toast, cn } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
-import { FillRateCard } from "./FillRate";
 
 const FALLBACK_CATS = [
   "Companies (general)", "Accounting & Tax", "IT & Software", "Construction & Contracting",
@@ -34,31 +28,13 @@ const INTERVALS: { v: number; label: string }[] = [
 
 type LeadTab = "pending" | "approved" | "rejected";
 
-// Which pitch a lead belongs to. "" = show both. The tag comes from the
-// discovery source that found it, and it decides which automation lane emails
-// them — so it's a first-class filter here, not a cosmetic label.
-type AudienceFilter = "" | Audience;
-const AUDIENCE_LABEL: Record<Audience, string> = { customer: "Customer", partner: "Partner" };
-
 // The server's bucket for leads with no country on file — kept reviewable
 // rather than hidden, so nothing silently falls out of the pool.
 const NO_COUNTRY = "__none__";
 const countryLabel = (c: string) => (c === NO_COUNTRY ? "No country" : c);
 
-// Whether the sources list is expanded. Persisted, because once your sources
-// are set up you come to this screen to work the review pool, not to edit them —
-// and wrapped in try/catch because storage can be unavailable inside an iframe.
-const SOURCES_OPEN_KEY = "dna-discovery-sources-open";
-function readSourcesOpen(): boolean {
-  try { return localStorage.getItem(SOURCES_OPEN_KEY) !== "0"; } catch { return true; }
-}
-function writeSourcesOpen(open: boolean) {
-  try { localStorage.setItem(SOURCES_OPEN_KEY, open ? "1" : "0"); } catch { /* ignore */ }
-}
-
 export default function Discovery() {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
-  const [automation, setAutomation] = useState<AutomationStatus | null>(null);
   const [sources, setSources] = useState<DiscoverySource[]>([]);
   const [archived, setArchived] = useState<DiscoverySource[]>([]);
   const [archivedCount, setArchivedCount] = useState(0);
@@ -80,52 +56,29 @@ export default function Discovery() {
   // on exactly the rows on screen — "Approve all" included.
   const [country, setCountry] = useState("");
   const [countries, setCountries] = useState<{ country: string; n: number }[]>([]);
-  // Same idea for the pitch: work the customer pool and the partner pool
-  // separately, because they get completely different emails.
-  const [audience, setAudience] = useState<AudienceFilter>("");
-  const [audienceCounts, setAudienceCounts] = useState<{ audience: string; n: number }[]>([]);
   const [breakdown, setBreakdown] = useState<{ withEmail: number; crawling: number; queued: number; noEmail: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadingLeads, setLoadingLeads] = useState(false);
   const [reEnriching, setReEnriching] = useState(false);
-  const [purging, setPurging] = useState(false);
-  const [badNames, setBadNames] = useState<{ leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number } | null>(null);
+  const [badNames, setBadNames] = useState<{ leads: number; contacts: number } | null>(null);
   const [repairing, setRepairing] = useState(false);
-  const [repairLog, setRepairLog] = useState("");
+  const [repairLog, setRepairLog] = useState<string>("");
 
   // add / edit source
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<DiscoverySource | null>(null);
-  // Sources list open/closed — remembered across visits.
-  const [showSources, setSourcesOpen] = useState(readSourcesOpen);
-  // Narrow the list to the spent sources — set by the Overview's deep link, and
-  // toggleable by hand from the banner.
-  const [onlyStale, setOnlyStale] = useState(false);
-  // How many completed runs with nothing found make a source "stale". Read from
-  // the server so the badge and the Overview's count can never disagree; the
-  // shared constant is only a fallback for an API that predates the field.
-  const [staleAfterRuns, setStaleAfterRuns] = useState(STALE_AFTER_RUNS);
-  // …and how many make the bot switch it off by itself. Two thresholds, so the
-  // row can warn ("off at 4") before the switch actually moves.
-  const [staleOffAfterRuns, setStaleOffAfterRuns] = useState(STALE_OFF_AFTER_RUNS);
 
   const pollRef = useRef<number | null>(null);
-  const sourcesRef = useRef<HTMLDivElement | null>(null);
 
   /* ------------------------------- load ------------------------------ */
   async function refreshStatus() {
     try { setStatus(await api.getDiscoveryStatus()); } catch { /* ignore */ }
-  }
-  async function refreshAutomation() {
-    try { setAutomation(await api.getAutomation()); } catch { /* ignore */ }
   }
   async function refreshSources() {
     try {
       const r = await api.getDiscoverySources();
       setSources(r.sources);
       setArchivedCount(r.archivedCount ?? 0);
-      if (r.staleAfterRuns) setStaleAfterRuns(r.staleAfterRuns);
-      if (r.staleOffAfterRuns) setStaleOffAfterRuns(r.staleOffAfterRuns);
     } catch { /* ignore */ }
   }
   async function refreshArchived() {
@@ -141,12 +94,11 @@ export default function Discovery() {
   async function refreshLeads() {
     setLoadingLeads(true);
     try {
-      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200, country: country || undefined, audience: audience || undefined });
+      const r = await api.getDiscoveryLeads({ status: tab, q: search.trim() || undefined, hasEmail: tab === "pending" && onlyEmail, limit: 200, country: country || undefined });
       setLeads(r.leads);
       setFilteredTotal(r.filteredTotal);
       setApprovableTotal(r.approvableTotal);
       setCountries(r.countries || []);
-      setAudienceCounts(r.audiences || []);
       setBreakdown(r.breakdown || null);
       setPicked(new Set());
     } catch (e: any) {
@@ -156,8 +108,8 @@ export default function Discovery() {
     }
   }
 
-  // Re-read the directory sources and write the real company names back over
-  // the phone numbers an older version of the harvester stored.
+  // Re-read the directory sources and write the real company names back over the
+  // phone numbers an older version of the harvester stored.
   async function repairNames() {
     setRepairing(true);
     setRepairLog("Checking every saved company name…");
@@ -189,28 +141,18 @@ export default function Discovery() {
 
   useEffect(() => {
     refreshStatus();
-    refreshAutomation();
     refreshSources();
     refreshArchived();
     refreshBadNames();
-    // Arrived from the Overview's "Stale sources" metric: open the list and
-    // show only the ones it was pointing at, rather than dropping the reader
-    // at the top of a screen with forty rows on it.
-    if (takeFocus() === "stale") {
-      setOnlyStale(true);
-      setSourcesOpen(true);
-      writeSourcesOpen(true);
-      setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
-    }
     api.getLeadCategories().then((r) => r.categories?.length && setCats(r.categories)).catch(() => {});
     api.getCategories().then((r) => setContactCats(r.categories || [])).catch(() => {});
     // Live status + sources while the bot works in the background.
-    pollRef.current = window.setInterval(() => { refreshStatus(); refreshAutomation(); refreshSources(); refreshBadNames(); }, 5000);
+    pollRef.current = window.setInterval(() => { refreshStatus(); refreshSources(); refreshBadNames(); }, 5000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
   // Reload the pool whenever the filters change.
-  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail, country, audience]);
+  useEffect(() => { refreshLeads(); /* eslint-disable-next-line */ }, [tab, onlyEmail, country]);
 
   /* ------------------------------ bot ops ---------------------------- */
   async function toggleBot(on: boolean) {
@@ -228,45 +170,13 @@ export default function Discovery() {
     setReEnriching(true);
     try {
       const r = await api.reEnrichDiscovery();
-      // Say what a pass actually achieved. This used to report the same number
-      // every time, because the tool re-queued the rows it had just parked —
-      // so "Re-queued 166" was true and meaningless in equal measure.
-      if (r.reset) {
-        toast(
-          `Re-queued ${r.reset.toLocaleString()} lead${r.reset === 1 ? "" : "s"} — the bot is crawling their sites again` +
-            (r.reArmed ? ` · ${r.reArmed.toLocaleString()} unlocked by your new key/proxy` : ""),
-          "success"
-        );
-      } else if (r.stuck) {
-        toast(
-          `Nothing to re-check. All ${r.stuck.toLocaleString()} parked lead${r.stuck === 1 ? " has" : "s have"} already had a pass on this setup and stayed blocked — add a Jina key or a proxy in Settings and they all become re-checkable.`,
-          "info"
-        );
-      } else {
-        toast("Nothing to re-check — every lead with a website has been resolved one way or the other", "info");
-      }
+      toast(
+        r.reset ? `Re-queued ${r.reset.toLocaleString()} lead${r.reset === 1 ? "" : "s"} — the bot will try to find their emails again` : "No blocked leads to re-check right now",
+        r.reset ? "success" : "info"
+      );
       refreshStatus();
       if (tab === "pending") refreshLeads();
     } catch (e: any) { toast(e.message, "error"); } finally { setReEnriching(false); }
-  }
-
-  // Re-examine the whole pool under the CURRENT rules and retire the rows that
-  // could never have been prospects. Needed after the rules tighten — most
-  // recently when a search engine spent a while answering a different question
-  // than the one it was asked, and its results were filed as leads.
-  async function purgeJunk() {
-    setPurging(true);
-    try {
-      const r = await api.purgeJunkLeads();
-      toast(
-        r.swept
-          ? `Removed ${r.swept.toLocaleString()} lead${r.swept === 1 ? "" : "s"} that could never have been a prospect`
-          : "Nothing to remove — every lead in the pool passes the current rules",
-        r.swept ? "success" : "info"
-      );
-      refreshStatus();
-      refreshLeads();
-    } catch (e: any) { toast(e.message, "error"); } finally { setPurging(false); }
   }
 
   /* ---------------------------- source ops --------------------------- */
@@ -332,17 +242,17 @@ export default function Discovery() {
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
   }
   // Approve every pending lead with an email that matches the CURRENT view —
-  // search, country *and* audience filter — not just the loaded page. Drains a
-  // large pool one slice at a time, in one action.
+  // search *and* country filter — not just the loaded page. Drains a large pool
+  // one country at a time, in one action.
   async function approveAll() {
     if (!approvableTotal) return;
-    const scope = [country ? ` in ${countryLabel(country)}` : "", audience ? ` (${AUDIENCE_LABEL[audience]})` : ""].join("");
+    const scope = country ? ` in ${countryLabel(country)}` : "";
     const tags = [saveCategory && `category "${saveCategory}"`, saveCountry.trim() && `country "${saveCountry.trim()}"`].filter(Boolean);
     const suffix = tags.length ? `\nThey'll be saved under ${tags.join(" and ")}.` : "";
     if (!confirm(`Approve all ${approvableTotal.toLocaleString()} lead${approvableTotal === 1 ? "" : "s"}${scope} into Contacts?${suffix}`)) return;
     setBusy(true);
     try {
-      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined, filterCountry: country || undefined, filterAudience: audience || undefined });
+      const r = await api.approveDiscoveryLeads({ all: true, q: search.trim() || undefined, category: saveCategory || undefined, country: saveCountry.trim() || undefined, filterCountry: country || undefined });
       toast(`Approved ${r.added.toLocaleString()}${scope} → Contacts${r.skipped ? ` · ${r.skipped} skipped` : ""}`, "success");
       refreshLeads(); refreshStatus();
     } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); }
@@ -367,30 +277,6 @@ export default function Discovery() {
   const running = !!status?.enabled;
   const counts = { pending: status?.leads.pending ?? 0, approved: status?.leads.approved ?? 0, rejected: status?.leads.rejected ?? 0 };
 
-  function toggleSourcesOpen() {
-    setSourcesOpen((v) => { writeSourcesOpen(!v); return !v; });
-  }
-
-  // What the collapsed header has to convey on its own: that work is happening,
-  // and how much of it. Closing the list must never hide a running scan.
-  const scanningNow = sources.filter((s) => s.enabled && s.last_status === "running").length;
-  const activeCount = sources.filter((s) => s.enabled).length;
-  const foundTotal = sources.reduce((n, s) => n + (s.total_found || 0), 0);
-  // Sources that have completed `staleAfterRuns` runs in a row and put nothing
-  // new in the pool. They are still "working" by every other measure — enabled,
-  // scheduled, no errors — which is exactly why they need saying out loud.
-  const stale = sources.filter((s) => isStaleSource(s, staleAfterRuns));
-  const shownSources = onlyStale ? stale : sources;
-  const sourcesSummary = (() => {
-    if (!sources.length) return "None yet — add one to start discovering companies.";
-    const parts = [`${activeCount} active`];
-    if (sources.length - activeCount > 0) parts.push(`${sources.length - activeCount} paused`);
-    if (stale.length > 0) parts.push(`${stale.length} stale`);
-    if (archivedCount > 0) parts.push(`${archivedCount} archived`);
-    if (foundTotal > 0) parts.push(`${foundTotal.toLocaleString()} found`);
-    return parts.join(" · ");
-  })();
-
   return (
     <div className="space-y-8">
       {/* Header + master switch */}
@@ -404,63 +290,44 @@ export default function Discovery() {
           </p>
         </div>
 
-        <div className="flex flex-col items-start gap-3 sm:items-end">
-          {/* Pool maintenance. These three used to be full-width banners that
-              pushed the actual work off the screen; they are occasional, so
-              they belong here as icons with the explanation one hover away. */}
-          <PoolTools
-            recoverable={status?.recoverable ?? 0}
-            stuck={status?.stuck ?? 0}
-            lastRecheckAt={status?.lastRecheckAt ?? null}
-            blocked={status?.blocked ?? 0}
-            badNames={badNames}
-            readerKeyed={!!status?.bypass?.readerKeyed}
-            proxied={!!status?.bypass?.proxy}
-            readerRateLimited={!!status?.bypass?.readerRateLimited}
-            reChecking={reEnriching}
-            purging={purging}
-            repairing={repairing}
-            repairLog={repairLog}
-            onReCheck={reCheckBlocked}
-            onPurge={purgeJunk}
-            onRepair={repairNames}
-          />
-          <BotSwitch
-            running={running}
-            nextRunAt={status?.nextRunAt ?? null}
-            activeSources={status?.activeSources ?? 0}
-            onToggle={toggleBot}
-            readerKeyed={status?.bypass?.readerKeyed}
-            proxied={status?.bypass?.proxy}
-            keysLive={status?.bypass?.readerKeysLive}
-            keysConfigured={status?.bypass?.readerKeysConfigured}
-            keyRejected={status?.bypass?.readerKeyRejected}
-          />
-        </div>
+        <BotSwitch
+          running={running}
+          nextRunAt={status?.nextRunAt ?? null}
+          activeSources={status?.activeSources ?? 0}
+          onToggle={toggleBot}
+          readerKeyed={status?.bypass?.readerKeyed}
+          proxied={status?.bypass?.proxy}
+        />
       </div>
 
-      {/* Stat strip.
-          "Pending review" used to lead here, and it was the least useful number
-          on the screen: it only ever went up, it said nothing about whether the
-          bot was still working, and the pool tab below already carries the same
-          count. Nothing is lost by replacing it, and the fill rate is the one
-          number here that can go wrong quietly. */}
+      {/* Stat strip */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <FillRateCard
-          fill={status?.fill}
-          openLabel="Review the sources"
-          onOpen={() => {
-            if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); }
-            setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
-          }}
-        />
+        <Stat label="Pending review" value={counts.pending} accent />
         <Stat label="Ready (with email)" value={status?.leads.withEmail ?? 0} />
         <Stat label="Approved → Contacts" value={counts.approved} />
         <Stat label="Finding emails" value={status?.pendingEnrich ?? 0} hint={status?.autoEnrich ? "queued" : "off"} />
       </div>
 
-      {/* What happens to this pool — automation state + progress to its trigger. */}
-      <AutomationStrip a={automation} />
+      {/* Bad-name repair */}
+      {badNames && (badNames.leads > 0 || badNames.contacts > 0) && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#9b6bff]/35 bg-[#f6f1ff] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#9b6bff]/15 font-clash text-[#6c43c5]">✎</span>
+            <div>
+              <div className="text-sm font-semibold text-ink">
+                {badNames.leads.toLocaleString()} lead{badNames.leads === 1 ? "" : "s"} and {badNames.contacts.toLocaleString()} contact{badNames.contacts === 1 ? "" : "s"} have broken company names
+              </div>
+              <div className="text-xs leading-relaxed text-muted">
+                An older directory import sometimes saved a phone number where the company name should be. Run the repair to restore the real names.
+                {repairLog ? <span className="block mt-1 font-medium text-ink/70">{repairLog}</span> : null}
+              </div>
+            </div>
+          </div>
+          <Button size="sm" variant="outline" loading={repairing} onClick={repairNames} className="shrink-0">
+            Repair company names
+          </Button>
+        </div>
+      )}
 
       {/* Paused-with-sources nudge — the #1 reason "scanning stops": the bot is off. */}
       {!running && (status?.activeSources ?? 0) > 0 && (
@@ -468,7 +335,7 @@ export default function Discovery() {
           <div className="flex items-start gap-3">
             <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">!</span>
             <div>
-              <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren't scanning</div>
+              <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren’t scanning</div>
               <div className="text-xs leading-relaxed text-muted">
                 You have {status?.activeSources} enabled source{(status?.activeSources ?? 0) === 1 ? "" : "s"}. Turn the bot on and it scans
                 continuously in the background — paging through directories back-to-back — even with this tab closed.
@@ -479,186 +346,100 @@ export default function Discovery() {
         </div>
       )}
 
-      {/* Sources that have run dry. Above the list, because a spent source is
-          invisible from inside the list: it is enabled, on schedule, error-free
-          and finding nothing. */}
-      {stale.length > 0 && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#e0b354]/50 bg-[#fdf6e7] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+      {/* Recovery for the "no email" pool — leads that have a website but no email
+          (blocked by Cloudflare, rate-limited, or discovered before retry-tracking
+          existed, i.e. the historical ~1,000). "Re-check" re-queues them all so the
+          bot crawls their sites again. Shown whenever there's anything to recover
+          OR anything still auto-retrying, so the button is never hidden when needed. */}
+      {((status?.recoverable ?? 0) > 0 || (status?.blocked ?? 0) > 0) && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#5a86c2]/40 bg-[#eef4fb] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">
-              {stale.length}
-            </span>
-            <div className="min-w-0">
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#5a86c2]/20 font-clash text-[#2f5a94]">↻</span>
+            <div>
               <div className="text-sm font-semibold text-ink">
-                {stale.length === 1 ? "One source has run dry" : `${stale.length} sources have run dry`}
+                {(status?.recoverable ?? 0) > 0
+                  ? <>{status!.recoverable.toLocaleString()} lead{status!.recoverable === 1 ? "" : "s"} have a website but no email yet</>
+                  : <>{status!.blocked.toLocaleString()} lead{status!.blocked === 1 ? "" : "s"} being re-checked for emails…</>}
               </div>
               <div className="text-xs leading-relaxed text-muted">
-                {stale.length === 1 ? "It has" : "They have"} finished {staleAfterRuns} run{staleAfterRuns === 1 ? "" : "s"} in a row
-                without adding a single new company — the ground is covered. Re-aim {stale.length === 1 ? "it" : "them"} at a new
-                area, keywords or directory, or archive {stale.length === 1 ? "it" : "them"}.
-                <span className="block truncate pt-0.5 text-ink/60">{stale.map(sourceTitle).join(" · ")}</span>
+                Most were skipped because their site blocked the crawler (often a Cloudflare “Just a moment” wall){status!.bypass?.readerRateLimited ? ", and the free reader hit its rate limit" : ""}. Re-check crawls each site again to find the missing email — it runs in the background and can take a while for a big pool.
+                {(status?.recoverable ?? 0) > 0 && (status?.blocked ?? 0) > 0 ? ` (${status!.blocked.toLocaleString()} more are already auto-retrying.)` : ""}
+                {!status!.bypass?.readerKeyed && !status!.bypass?.proxy && <> To get past Cloudflare at scale, add a free <span className="font-medium text-ink/70">Jina key</span> or a <span className="font-medium text-ink/70">scraping proxy</span> in <span className="font-medium text-ink/70">Settings → Crawler</span> first.</>}
               </div>
             </div>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            className="shrink-0"
-            onClick={() => {
-              setOnlyStale((v) => !v);
-              if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); }
-              setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
-            }}
-          >
-            {onlyStale ? "Show all sources" : "Review them"}
-          </Button>
+          {(status?.recoverable ?? 0) > 0 && (
+            <Button size="sm" variant="outline" loading={reEnriching} onClick={reCheckBlocked} className="shrink-0">
+              Re-check {status!.recoverable.toLocaleString()} now
+            </Button>
+          )}
         </div>
       )}
 
-      {/* Sources — collapsible. Once they're configured this list is reference
-          material, while the review pool underneath is the daily work; folding it
-          away puts the pool on screen without scrolling past every source. */}
-      <div ref={sourcesRef} className="scroll-mt-4">
+      {/* Sources */}
       <Card className="overflow-hidden">
-        <div className="flex items-center justify-between gap-3 px-5 py-4">
-          {/* The heading WRAPS the toggle (the accordion pattern) so the whole
-              title is clickable without putting block elements inside a button.
-              The summary line is what keeps a closed card honest — it still
-              reports what's active and what's scanning. */}
-          <h2 className="min-w-0 flex-1">
+        <div className="flex items-center justify-between border-b border-line px-5 py-4">
+          <div>
+            <h2 className="font-clash text-lg font-semibold">Discovery sources</h2>
+            <p className="text-xs text-muted">Web search finds thousands like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped.</p>
+          </div>
+          <Button size="sm" onClick={() => { setEditing(null); setModalOpen(true); }}>Add source</Button>
+        </div>
+
+        {sources.length === 0 ? (
+          <div className="px-5 py-12 text-center">
+            <p className="text-sm font-medium">No sources yet</p>
+            <p className="mx-auto mt-1 max-w-md text-xs text-muted">
+              Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in hundreds–thousands of companies. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
+            </p>
+            <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
+          </div>
+        ) : (
+          <div className="divide-y divide-line-soft">
+            {sources.map((s) => (
+              <SourceRow
+                key={s.id}
+                s={s}
+                onToggle={() => toggleSource(s)}
+                onRun={() => runSource(s)}
+                onEdit={() => { setEditing(s); setModalOpen(true); }}
+                onArchive={() => archiveSource(s)}
+                onDelete={() => removeSource(s)}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Archived drawer — retired sources, kept intact and restorable. */}
+        {archivedCount > 0 && (
+          <div className="border-t border-line bg-cream/40">
             <button
               type="button"
-              onClick={toggleSourcesOpen}
-              aria-expanded={showSources}
-              className="group flex w-full min-w-0 items-start gap-2.5 text-left"
+              onClick={() => { setShowArchived((v) => !v); if (!showArchived) refreshArchived(); }}
+              className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-ink/[0.03]"
             >
-              <span
-                className={cn(
-                  "mt-1 grid h-5 w-5 shrink-0 place-items-center rounded-md text-[11px] text-ink/40 transition-all duration-200",
-                  "group-hover:bg-ink/[0.07] group-hover:text-ink",
-                  showSources && "rotate-180"
-                )}
-              >
-                ▾
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="flex flex-wrap items-center gap-2">
-                  <span className="font-clash text-lg font-semibold">Discovery sources</span>
-                  {sources.length > 0 && (
-                    <span className="rounded-full bg-ink/[0.07] px-2 py-0.5 text-[11px] font-semibold tabular-nums text-ink/55">
-                      {sources.length}
-                    </span>
-                  )}
-                  {scanningNow > 0 && (
-                    <span className="inline-flex items-center gap-1.5 rounded-full bg-good/15 px-2 py-0.5 text-[11px] font-medium text-good">
-                      <Spinner className="h-2.5 w-2.5" />
-                      {scanningNow} scanning
-                    </span>
-                  )}
-                  {stale.length > 0 && (
-                    <span className="rounded-full bg-[#fbedd2] px-2 py-0.5 text-[11px] font-medium text-[#8a5a12]">
-                      {stale.length} stale
-                    </span>
-                  )}
+              <span className="flex items-center gap-2 text-[13px] font-medium text-ink/70">
+                <span className="grid h-5 w-5 place-items-center rounded-md bg-ink/[0.07] text-[10px] font-semibold tabular-nums text-ink/55">
+                  {archivedCount}
                 </span>
-                <span className="mt-0.5 block truncate text-xs font-normal text-muted">
-                  {showSources
-                    ? "Web search hunts a country like Google · Directory streams a listing site · Map area sweeps everything OpenStreetMap has mapped."
-                    : sourcesSummary}
-                </span>
+                Archived source{archivedCount === 1 ? "" : "s"}
               </span>
+              <span className={cn("text-xs text-ink/40 transition-transform", showArchived && "rotate-180")}>▾</span>
             </button>
-          </h2>
-          <Button
-            size="sm"
-            className="shrink-0"
-            onClick={() => { setEditing(null); setModalOpen(true); if (!showSources) { setSourcesOpen(true); writeSourcesOpen(true); } }}
-          >
-            Add source
-          </Button>
-        </div>
-
-        {/* grid-rows animates to the content's real height, so the list can grow
-            (or a source can start streaming) without a hard-coded max-height. */}
-        <div
-          className={cn(
-            "grid transition-[grid-template-rows] duration-300 ease-out",
-            showSources ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
-          )}
-        >
-          <div className="overflow-hidden">
-            <div className="border-t border-line">
-              {sources.length === 0 ? (
-                <div className="px-5 py-12 text-center">
-                  <p className="text-sm font-medium">No sources yet</p>
-                  <p className="mx-auto mt-1 max-w-md text-xs text-muted">
-                    Add a <span className="font-medium text-ink/70">Web search</span> source (e.g. Saudi Arabia · Construction) — it searches the web like Google across the country and its cities, streaming in every company site it finds. Or paste a business <span className="font-medium text-ink/70">Directory</span> URL. (A <span className="font-medium text-ink/70">Map area</span> source sweeps every business OpenStreetMap has mapped there — accurate, but capped at what the map holds.)
-                  </p>
-                  <Button size="sm" variant="outline" className="mt-4" onClick={() => { setEditing(null); setModalOpen(true); }}>Add your first source</Button>
-                </div>
+            {showArchived && (
+              archived.length === 0 ? (
+                <div className="px-5 pb-4 text-xs text-muted">Loading…</div>
               ) : (
-                // Past a handful of sources the list scrolls inside the card, so
-                // the review pool stays reachable even with it expanded.
-                <div className={cn("divide-y divide-line-soft", shownSources.length > 6 && "max-h-[26rem] overflow-y-auto")}>
-                  {onlyStale && (
-                    <div className="flex items-center justify-between gap-3 bg-[#fdf6e7] px-5 py-2 text-[12px] text-[#8a5a12]">
-                      <span>Showing only the {stale.length} source{stale.length === 1 ? "" : "s"} that stopped finding anyone.</span>
-                      <button type="button" className="font-medium underline underline-offset-2" onClick={() => setOnlyStale(false)}>
-                        Show all {sources.length}
-                      </button>
-                    </div>
-                  )}
-                  {shownSources.map((s) => (
-                    <SourceRow
-                      key={s.id}
-                      s={s}
-                      stale={isStaleSource(s, staleAfterRuns)}
-                      staleAfterRuns={staleAfterRuns}
-                      onToggle={() => toggleSource(s)}
-                      onRun={() => runSource(s)}
-                      onEdit={() => { setEditing(s); setModalOpen(true); }}
-                      onArchive={() => archiveSource(s)}
-                      onDelete={() => removeSource(s)}
-                      staleOffAfterRuns={staleOffAfterRuns}
-                    />
+                <div className="divide-y divide-line-soft border-t border-line-soft">
+                  {archived.map((s) => (
+                    <ArchivedRow key={s.id} s={s} onRestore={() => restoreSource(s)} onDelete={() => removeSource(s)} />
                   ))}
                 </div>
-              )}
-
-              {/* Archived drawer — retired sources, kept intact and restorable. */}
-              {archivedCount > 0 && (
-                <div className="border-t border-line bg-cream/40">
-                  <button
-                    type="button"
-                    onClick={() => { setShowArchived((v) => !v); if (!showArchived) refreshArchived(); }}
-                    className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-ink/[0.03]"
-                  >
-                    <span className="flex items-center gap-2 text-[13px] font-medium text-ink/70">
-                      <span className="grid h-5 w-5 place-items-center rounded-md bg-ink/[0.07] text-[10px] font-semibold tabular-nums text-ink/55">
-                        {archivedCount}
-                      </span>
-                      Archived source{archivedCount === 1 ? "" : "s"}
-                    </span>
-                    <span className={cn("text-xs text-ink/40 transition-transform", showArchived && "rotate-180")}>▾</span>
-                  </button>
-                  {showArchived && (
-                    archived.length === 0 ? (
-                      <div className="px-5 pb-4 text-xs text-muted">Loading…</div>
-                    ) : (
-                      <div className="divide-y divide-line-soft border-t border-line-soft">
-                        {archived.map((s) => (
-                          <ArchivedRow key={s.id} s={s} onRestore={() => restoreSource(s)} onDelete={() => removeSource(s)} />
-                        ))}
-                      </div>
-                    )
-                  )}
-                </div>
-              )}
-            </div>
+              )
+            )}
           </div>
-        </div>
+        )}
       </Card>
-      </div>
 
       {/* Review pool */}
       <Card className="overflow-hidden">
@@ -676,32 +457,11 @@ export default function Discovery() {
               ))}
             </div>
             <div className="flex items-center gap-2">
-              {/* Which pitch. The two pools are drained separately, because the
-                  automation emails them completely different templates. */}
-              <div className="flex rounded-full border border-line bg-cream p-0.5 text-[12px]">
-                {([["", "All"], ["customer", "Customers"], ["partner", "Partners"]] as const).map(([v, label]) => {
-                  const n = v ? audienceCounts.find((a) => a.audience === v)?.n : audienceCounts.reduce((s, a) => s + a.n, 0);
-                  return (
-                    <button
-                      key={v || "all"}
-                      type="button"
-                      onClick={() => setAudience(v as AudienceFilter)}
-                      title={v === "partner" ? "Leads found by sources tagged Partner — the Makers program pitch" : v === "customer" ? "Leads found by sources tagged Customer — the DNA ERP pitch" : "Both pitches"}
-                      className={cn(
-                        "rounded-full px-2.5 py-1.5 font-medium transition-colors",
-                        audience === v ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
-                      )}
-                    >
-                      {label}{n ? ` · ${n.toLocaleString()}` : ""}
-                    </button>
-                  );
-                })}
-              </div>
               {countries.length > 0 && (
                 <Select
                   value={country}
                   onChange={(e) => setCountry(e.target.value)}
-                  className="w-full text-[13px] sm:h-9 sm:w-44"
+                  className="h-9 w-44 text-[13px]"
                   title="Show only leads from this country. Every action below — including Approve all — then acts on just these."
                 >
                   <option value="">All countries</option>
@@ -712,8 +472,8 @@ export default function Discovery() {
                   ))}
                 </Select>
               )}
-              <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && refreshLeads()} placeholder="Search name, email, domain…" className="min-w-0 flex-1 text-[13px] sm:h-9 sm:w-56 sm:flex-none" />
-              <Button size="sm" variant="outline" onClick={refreshLeads} className="shrink-0">Search</Button>
+              <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && refreshLeads()} placeholder="Search name, email, domain…" className="h-9 w-56 text-[13px]" />
+              <Button size="sm" variant="outline" onClick={refreshLeads}>Search</Button>
             </div>
           </div>
 
@@ -752,22 +512,22 @@ export default function Discovery() {
           )}
 
           {/* action bar */}
-          <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <label className="flex items-center gap-2 text-[13px] font-medium">
-              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="h-[18px] w-[18px] accent-ink" disabled={!leads.length} />
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-ink" disabled={!leads.length} />
               {picked.size ? `${picked.size} selected` : `${filteredTotal.toLocaleString()} in view`}
               {tab === "pending" && (
-                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-ink bg-ink text-cream" : "border-line text-ink/55 hover:text-ink")}>
+                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-ink bg-ink text-cream" : "border-line text-ink/55 hover:text-ink")}>
                   {onlyEmail ? "With email only" : "Show all"}
                 </button>
               )}
             </label>
 
-            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:justify-end">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               {tab === "pending" && (
                 <>
                   {contactCats.length > 0 && (
-                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="w-full text-[13px] sm:h-8 sm:w-36" title="Save approved contacts under this category">
+                    <Select value={saveCategory} onChange={(e) => setSaveCategory(e.target.value)} className="h-8 w-36 text-[13px]" title="Save approved contacts under this category">
                       <option value="">No category</option>
                       {contactCats.map((c) => <option key={c} value={c}>{c}</option>)}
                     </Select>
@@ -777,7 +537,7 @@ export default function Discovery() {
                     onChange={(e) => setSaveCountry(e.target.value)}
                     placeholder="Override country"
                     list="pool-countries"
-                    className="w-full text-[13px] sm:h-8 sm:w-36"
+                    className="h-8 w-36 text-[13px]"
                     title="Optional. Force every approved contact to this country. Leave blank to keep each lead's own country — which is what you normally want."
                   />
                   {poolCountries.length > 0 && (
@@ -809,7 +569,7 @@ export default function Discovery() {
         </div>
 
         {/* table */}
-        <div className="touch-scroll max-h-[60dvh] overflow-y-auto lg:max-h-[520px]">
+        <div className="max-h-[520px] overflow-y-auto">
           {loadingLeads ? (
             <div className="grid place-items-center py-16"><Spinner className="h-5 w-5 text-ink/40" /></div>
           ) : leads.length === 0 ? (
@@ -819,62 +579,7 @@ export default function Discovery() {
                 : `No ${tab} leads.`}
             </div>
           ) : (
-            <>
-          {/* Phone / tablet: a card per lead. Company and email are the two
-              things a reviewer actually reads before approving; country, phone
-              and source drop to a footer line rather than off the right edge. */}
-          <ul className="divide-y divide-line-soft lg:hidden">
-            {leads.map((l) => (
-              <li key={l.id} className={cn("flex gap-3 px-4 py-3", picked.has(l.id) && "bg-ink/[0.03]")}>
-                <input
-                  type="checkbox"
-                  checked={picked.has(l.id)}
-                  onChange={() => toggle(l.id)}
-                  aria-label={`Select ${l.name || l.domain}`}
-                  className="mt-1 h-[18px] w-[18px] shrink-0 accent-ink"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <span className="truncate text-[14px] font-medium leading-tight">{l.name || l.domain}</span>
-                      <AudienceTag a={l.audience} />
-                    </span>
-                    <span className="shrink-0">
-                      {tab === "pending"
-                        ? l.website && (
-                            <a href={l.website} target="_blank" rel="noreferrer" className="text-[11px] font-medium text-ink/45 underline">visit</a>
-                          )
-                        : <StatusChip status={l.status} />}
-                    </span>
-                  </div>
-
-                  <div className="mt-0.5 flex items-center gap-1.5 text-[12.5px] text-muted">
-                    <span className="min-w-0 truncate"><EmailCell lead={l} /></span>
-                    <ConfidenceTag c={l.confidence} />
-                  </div>
-
-                  <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted">
-                    {l.country && (
-                      <button
-                        type="button"
-                        onClick={() => setCountry(l.country === country ? "" : String(l.country))}
-                        className={cn(
-                          "max-w-[9rem] truncate rounded-full px-2 py-0.5 font-medium transition-colors",
-                          l.country === country ? "bg-ink text-cream" : "bg-ink/[0.06] text-ink/65"
-                        )}
-                      >
-                        {l.country}
-                      </button>
-                    )}
-                    {l.phone && <span className="tabular-nums">{l.phone}</span>}
-                    {l.source_label && <span className="truncate text-ink/45">{l.source_label}</span>}
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
-
-            <table className="hidden w-full text-sm lg:table">
+            <table className="w-full text-sm">
               <thead className="sticky top-0 z-10 bg-paper text-left text-[11px] uppercase tracking-wide text-muted">
                 <tr className="border-b border-line">
                   <th className="w-8 px-5 py-2.5" />
@@ -889,13 +594,10 @@ export default function Discovery() {
                 {leads.map((l) => (
                   <tr key={l.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.02]">
                     <td className="px-5 py-2.5">
-                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="h-[18px] w-[18px] accent-ink" />
+                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="accent-ink" />
                     </td>
                     <td className="px-1 py-2.5">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate font-medium leading-tight">{l.name || l.domain}</span>
-                        <AudienceTag a={l.audience} />
-                      </div>
+                      <div className="font-medium leading-tight">{l.name || l.domain}</div>
                       <div className="flex items-center gap-1.5 text-xs text-muted">
                         <span className="truncate"><EmailCell lead={l} /></span>
                         <ConfidenceTag c={l.confidence} />
@@ -929,7 +631,6 @@ export default function Discovery() {
                 ))}
               </tbody>
             </table>
-            </>
           )}
         </div>
       </Card>
@@ -954,12 +655,9 @@ export default function Discovery() {
   );
 }
 
-
 /* ------------------------------ Bot switch ----------------------------- */
 
-function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied, keysLive, keysConfigured, keyRejected }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean; keysLive?: number; keysConfigured?: number; keyRejected?: boolean }) {
-  const live = keysLive ?? 0;
-  const configured = keysConfigured ?? 0;
+function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean }) {
   return (
     <div className={cn("w-full shrink-0 rounded-2xl border p-4 sm:w-[300px]", running ? "border-good/40 bg-good/[0.06]" : "border-line bg-paper")}>
       <div className="flex items-center justify-between">
@@ -979,39 +677,18 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
         </div>
         <Switch checked={running} onChange={onToggle} />
       </div>
-      {/* How much bypass capacity the crawler ACTUALLY has. This used to read
-          "Jina key active · 120 pages/min" whenever a key string existed in
-          Settings — so when the key ran out of tokens the header kept claiming
-          full speed while the crawler crawled at 15/min for hours. It now
-          reports what the fetcher observed on its last call. */}
-      <div className="mt-3 flex items-start gap-1.5 border-t border-line/60 pt-2.5 text-[11px]">
-        <span className={cn(
-          "mt-1 h-1.5 w-1.5 shrink-0 rounded-full",
-          keyRejected ? "bg-bad" : live > 0 || proxied ? "bg-good" : "bg-ink/25"
-        )} />
-        {keyRejected ? (
-          <span className="text-bad">
-            <span className="font-medium">
-              {configured > 1 ? `All ${configured} Jina keys are out of tokens` : "Jina key is out of tokens"}
-            </span>
-            {" "}— crawling at 20 pages/min.{" "}
-            <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium underline">get another free key</a>
-          </span>
-        ) : live > 0 ? (
-          <span className="text-ink/60">
-            Free archives + {live > 1 ? `${live} Jina keys` : "a Jina key"} · <span className="font-medium text-ink/75">120 pages/min</span>
-          </span>
+      {/* Whether the crawler is keyed decides how many sites it can actually
+          read. Stating it here means never having to infer it from a log. */}
+      <div className="mt-3 flex items-center gap-1.5 border-t border-line/60 pt-2.5 text-[11px]">
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", readerKeyed || proxied ? "bg-good" : "bg-ink/25")} />
+        {readerKeyed ? (
+          <span className="text-ink/60">Jina key active · <span className="font-medium text-ink/75">120 pages/min</span></span>
         ) : proxied ? (
-          <span className="text-ink/60">Free archives + scraping proxy</span>
+          <span className="text-ink/60">Scraping proxy active</span>
         ) : (
-          // No key is a normal, supported state now: Common Crawl and the
-          // Wayback Machine do the walled pages for nothing. Nudging for a key
-          // here read as "you are broken", which was never true and is now
-          // actively misleading.
           <span className="text-muted">
-            Free sources only ·{" "}
-            <span className="font-medium text-ink/70">Common Crawl + Wayback</span>{" "}
-            handle blocked sites
+            Free reader · 20 pages/min ·{" "}
+            <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="font-medium text-ink/70 underline">get a free key</a>
           </span>
         )}
       </div>
@@ -1019,136 +696,9 @@ function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, p
   );
 }
 
-/* --------------------------- Automation strip --------------------------- */
-
-// Answers the question this screen inevitably raises: "so what happens to all
-// these leads?" — either the automation takes the next batch by itself (and
-// here's how close each lane is), or nothing happens until you approve them.
-function AutomationStrip({ a }: { a: AutomationStatus | null }) {
-  if (!a) return null;
-  const enabled = a.config.enabled;
-  const sending = a.running || a.lastRun?.status === "running";
-  const blocked = enabled && a.blockers.length > 0;
-  const lanes = a.lanes ?? [];
-  const live = lanes.filter((l) => l.config.enabled);
-
-  if (!enabled) {
-    // `?? 100` covers a backend that predates the lanes (or one mid-redeploy):
-    // the strip still reads sensibly instead of throwing on the whole screen.
-    const trigger = lanes.find((l) => l.config.enabled)?.config.threshold ?? a.config.customer?.threshold ?? 100;
-    return (
-      <div className="flex flex-col gap-3 rounded-2xl border border-line bg-paper px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-start gap-3">
-          <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-ink/[0.06]">
-            <span className="h-2 w-2 rounded-full bg-ink/25" />
-          </span>
-          <div className="text-[13px] leading-relaxed">
-            <span className="font-medium text-ink">Automation is off</span>
-            <span className="text-muted"> — these leads wait here until you approve them. Turn it on and every {trigger.toLocaleString()} leads with an email get approved and emailed on their own, customers and partners in their own lane.</span>
-          </div>
-        </div>
-        <Button size="sm" variant="outline" className="shrink-0" onClick={() => goTo("settings")}>Set up automation</Button>
-      </div>
-    );
-  }
-
-  return (
-    <div className={cn("rounded-2xl border px-5 py-4", blocked ? "border-[#e0b354]/50 bg-[#fdf6e7]" : "border-good/40 bg-good/[0.06]")}>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-start gap-3">
-          <span className={cn("relative mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg", blocked ? "bg-[#e0b354]/25" : "bg-good/15")}>
-            <span className={cn("h-2 w-2 rounded-full", blocked ? "bg-[#b06b16]" : "bg-good")} />
-            {!blocked && <span className="absolute h-2 w-2 animate-ping rounded-full bg-good/60" />}
-          </span>
-          <div className="text-[13px] leading-relaxed">
-            <span className="font-medium text-ink">
-              {sending
-                ? "Automation is emailing a batch right now"
-                : blocked
-                ? "Automation is on, but it can't run yet"
-                : !live.length
-                ? "Automation is on, but both lanes are switched off"
-                : "Automation is watching this pool"}
-            </span>
-            <span className="text-muted">
-              {blocked
-                ? ` — ${a.blockers[0]}`
-                : !live.length
-                ? " — switch on the customer or partner lane in Settings."
-                : " — approved automatically, then emailed, one lane per pitch."}
-            </span>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-3">
-          {a.sentToday > 0 && <span className="text-[11px] text-muted">{a.sentToday.toLocaleString()} sent today</span>}
-          <Button size="sm" variant="ghost" onClick={() => goTo("settings")}>Settings</Button>
-        </div>
-      </div>
-
-      {/* One row per live lane, so "how close is it?" is answered per pitch. */}
-      {live.length > 0 && <AutomationLaneBars lanes={live} className="mt-3" />}
-    </div>
-  );
-}
-
-/* ------------------------- Automation batch bars ------------------------ */
-
-// How close each lane is to its next batch: leads with an email, out of the
-// trigger that fires the run. Exported because the Overview shows exactly the
-// same thing — one component, so the two screens can never drift apart or
-// disagree about what "ready" means.
-export function AutomationLaneBars({
-  lanes,
-  className,
-  size = "sm",
-}: {
-  lanes: AutomationStatus["lanes"];
-  className?: string;
-  size?: "sm" | "md";
-}) {
-  if (!lanes.length) return null;
-  return (
-    <div className={cn(size === "md" ? "space-y-3.5" : "space-y-2.5", className)}>
-      {lanes.map((l) => {
-        const threshold = Math.max(1, l.config.threshold);
-        const pct = Math.min(100, Math.round((l.ready / threshold) * 100));
-        const partner = l.audience === "partner";
-        const full = l.ready >= threshold;
-        return (
-          <div key={l.audience}>
-            <div className={cn("flex flex-wrap items-baseline justify-between gap-2", size === "md" ? "text-xs" : "text-[11px]")}>
-              <span className="flex items-center gap-1.5">
-                <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide", partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]")}>
-                  {partner ? "partner" : "customer"}
-                </span>
-                <span className="text-muted">
-                  <b className="text-ink/70 tabular-nums">{l.ready.toLocaleString()}</b> of {threshold.toLocaleString()} with an email
-                </span>
-              </span>
-              <span className={cn(full ? "font-medium text-good" : "text-muted")}>
-                {l.running ? "sending now" : full ? "batch is full" : `${(threshold - l.ready).toLocaleString()} to go`}
-              </span>
-            </div>
-            <div className={cn("mt-1 overflow-hidden rounded-full bg-ink/[0.07]", size === "md" ? "h-2" : "h-1.5")}>
-              <div className={cn("h-full rounded-full transition-all duration-500", pct >= 100 ? "prism-bar" : "bg-ink")} style={{ width: `${pct}%` }} />
-            </div>
-            {/* Held-back leads are the most confusing state there is: the bar is
-                full and nothing happens. Say why, right here. */}
-            {size === "md" && l.readyNow < l.ready && (
-              <div className="mt-1 text-[11px] text-muted">
-                {(l.ready - l.readyNow).toLocaleString()} waiting for their country's sending window
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 /* ------------------------------ Source row ----------------------------- */
 
-function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, staleAfterRuns, staleOffAfterRuns }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void; stale?: boolean; staleAfterRuns?: number; staleOffAfterRuns?: number }) {
+function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete }: { s: DiscoverySource; onToggle: () => void; onRun: () => void; onEdit: () => void; onArchive: () => void; onDelete: () => void }) {
   const runningNow = s.last_status === "running";
   const isDir = s.type === "directory";
   const isSearch = s.type === "search";
@@ -1159,132 +709,74 @@ function SourceRow({ s, onToggle, onRun, onEdit, onArchive, onDelete, stale, sta
   // Map area: how much of what OpenStreetMap actually holds here we've taken.
   const osmTiles = s.osm_tiles || 0;
   const osmAvail = s.osm_available || 0;
-  // Switched off by the BOT for being spent, as opposed to paused by a person —
-  // the row has to say which, or the toggle looks like it moved on its own.
-  const autoOff = !s.enabled && !!s.auto_off;
-  const dryRuns = s.barren_runs ?? staleAfterRuns ?? 0;
-  const offAt = staleOffAfterRuns ?? 4;
-
-  // Rendered twice — inline on a wide row, on its own line under a narrow one.
-  // Beside the text on a phone these buttons are `shrink-0` and leave the
-  // column so thin that the status line breaks one word per line.
-  const actions = (
-    <>
-      <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
-        {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : s.exhausted ? (isSearch ? "Re-search" : isDir ? "Restart" : "Re-sweep") : "Run now"}
-      </button>
-      <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
-      <button
-        onClick={onArchive}
-        className="rounded-full px-2.5 py-1.5 text-xs font-medium text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink"
-        title="Archive — stops scanning but keeps the source, its position and its leads"
-      >
-        Archive
-      </button>
-      <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
-    </>
-  );
 
   return (
-    <div
-      className={cn(
-        "px-5 py-3.5",
-        // A spent source looks completely healthy from the outside — enabled,
-        // on schedule, no error — so the row itself has to carry the warning.
-        stale && "border-l-2 border-l-[#e0b354] bg-[#fdf6e7]/60"
-      )}
-    >
-      <div className={cn("flex items-center gap-4", !s.enabled && "opacity-55")}>
-        <Switch small checked={!!s.enabled} onChange={onToggle} />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
-            <AudienceTag a={s.audience} />
-            <span className="truncate font-medium">{title}</span>
-            {stale && (
-              <span className="shrink-0 rounded-md bg-[#fbedd2] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#8a5a12]">
-                stale
-              </span>
-            )}
-            {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
-              <>
-                <span className="text-ink/30">·</span>
-                <span className="truncate text-sm text-ink/70">{s.category}</span>
-              </>
-            )}
-          </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
-            {isDir ? (
-              <>
-                {streaming
-                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> streaming · page {s.cursor}</span>
-                  : s.exhausted
-                    ? <span>finished at page {s.cursor}</span>
-                    : <span>{s.enabled ? "queued" : "paused"} · resumes page {s.cursor}</span>}
-                <span>· {s.total_found} found</span>
-                {s.location && <span>· {s.location}</span>}
-              </>
-            ) : isSearch ? (
-              <>
-                {streaming
-                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> searching · step {s.cursor}</span>
-                  : s.exhausted
-                    ? <span>swept the web · re-searches {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
-                    : <span>{s.enabled ? "searching the web" : "paused"} · step {s.cursor}</span>}
-                <span>· {s.total_found} found</span>
-                {s.keywords ? <span title={s.keywords}>· custom keywords</span> : null}
-              </>
-            ) : (
-              <>
-                {streaming
-                  ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> sweeping{osmTiles ? ` · tile ${s.cursor} of ${osmTiles}` : ""}</span>
-                  : s.exhausted
-                    ? <span>swept the whole area · re-checks {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
-                    : <span>{s.enabled ? "queued" : "paused"}{osmTiles ? ` · resumes tile ${s.cursor} of ${osmTiles}` : ""}</span>}
-                <span>· {(s.total_found || 0).toLocaleString()} found</span>
-                {osmAvail > 0 && (
-                  <span title="Everything OpenStreetMap has mapped with a website, email or phone in this area. This is the ceiling — no amount of re-scanning can exceed it.">
-                    · of {osmAvail.toLocaleString()} on the map
-                  </span>
-                )}
-              </>
-            )}
-            {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
-          </div>
-        </div>
-        <div className="hidden shrink-0 items-center gap-1 sm:flex">{actions}</div>
-      </div>
-
-      {/* Full width, one line: the narrow middle column turned this into a
-          word-per-line paragraph taller than the row it described. */}
-      {stale && (
-        <div
-          className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 border-t border-[#e0b354]/30 pt-2 text-[11px] text-[#8a5a12]"
-          title={
-            autoOff
-              ? `Switched off automatically after ${dryRuns} runs that added no new company. Switching it back on gives it another ${offAt} runs.`
-              : `${dryRuns} runs in a row have added no new company. At ${offAt} it switches itself off.`
-          }
-        >
-          {autoOff && (
-            <span className="rounded bg-[#8a5a12]/15 px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide">switched off</span>
-          )}
-          <span className="font-medium">{dryRuns} dry run{dryRuns === 1 ? "" : "s"}</span>
-          <span className="text-[#8a5a12]/40">·</span>
-          <span>{s.last_found_at ? `last find ${fmtAgo(s.last_found_at)}` : "never found anyone"}</span>
-          {!autoOff && dryRuns < offAt && (
+    <div className={cn("flex items-center gap-4 px-5 py-3.5", !s.enabled && "opacity-55")}>
+      <Switch small checked={!!s.enabled} onChange={onToggle} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          {badge && <span className="shrink-0 rounded-md bg-ink/[0.06] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/55">{badge}</span>}
+          <span className="truncate font-medium">{title}</span>
+          {(!isDir || (s.category && s.category !== "Companies (general)")) && s.category && (
             <>
-              <span className="text-[#8a5a12]/40">·</span>
-              <span className="text-[#8a5a12]/75">off at {offAt}</span>
+              <span className="text-ink/30">·</span>
+              <span className="truncate text-sm text-ink/70">{s.category}</span>
             </>
           )}
-          <button onClick={onEdit} className="ml-auto shrink-0 font-medium underline underline-offset-2 hover:text-[#6d4710]">
-            Re-aim
-          </button>
         </div>
-      )}
-
-      <div className={cn("mt-2 flex items-center gap-1 sm:hidden", !s.enabled && "opacity-55")}>{actions}</div>
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted">
+          {isDir ? (
+            <>
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> streaming · page {s.cursor}</span>
+                : s.exhausted
+                  ? <span>finished at page {s.cursor}</span>
+                  : <span>{s.enabled ? "queued" : "paused"} · resumes page {s.cursor}</span>}
+              <span>· {s.total_found} found</span>
+              {s.location && <span>· {s.location}</span>}
+            </>
+          ) : isSearch ? (
+            <>
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> searching · step {s.cursor}</span>
+                : s.exhausted
+                  ? <span>swept the web · re-searches {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                  : <span>{s.enabled ? "searching the web" : "paused"} · step {s.cursor}</span>}
+              <span>· {s.total_found} found</span>
+              {s.keywords ? <span title={s.keywords}>· custom keywords</span> : null}
+            </>
+          ) : (
+            <>
+              {streaming
+                ? <span className="inline-flex items-center gap-1 font-medium text-good"><Spinner className="h-2.5 w-2.5" /> sweeping{osmTiles ? ` · tile ${s.cursor} of ${osmTiles}` : ""}</span>
+                : s.exhausted
+                  ? <span>swept the whole area · re-checks {s.enabled && s.next_run_at ? fmtIn(s.next_run_at) : intervalLabel(s.interval_minutes).toLowerCase()}</span>
+                  : <span>{s.enabled ? "queued" : "paused"}{osmTiles ? ` · resumes tile ${s.cursor} of ${osmTiles}` : ""}</span>}
+              <span>· {(s.total_found || 0).toLocaleString()} found</span>
+              {osmAvail > 0 && (
+                <span title="Everything OpenStreetMap has mapped with a website, email or phone in this area. This is the ceiling — no amount of re-scanning can exceed it.">
+                  · of {osmAvail.toLocaleString()} on the map
+                </span>
+              )}
+            </>
+          )}
+          {s.last_status === "error" && <span className="text-bad">· blocked / error</span>}
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        <button onClick={onRun} disabled={runningNow} className="rounded-full px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:bg-ink/[0.06] hover:text-ink disabled:opacity-50">
+          {runningNow ? <span className="inline-flex items-center gap-1.5"><Spinner className="h-3 w-3" /> running</span> : s.exhausted ? (isSearch ? "Re-search" : isDir ? "Restart" : "Re-sweep") : "Run now"}
+        </button>
+        <button onClick={onEdit} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink" title="Edit">✎</button>
+        <button
+          onClick={onArchive}
+          className="rounded-full px-2.5 py-1.5 text-xs font-medium text-ink/45 transition-colors hover:bg-ink/[0.06] hover:text-ink"
+          title="Archive — stops scanning but keeps the source, its position and its leads"
+        >
+          Archive
+        </button>
+        <button onClick={onDelete} className="grid h-8 w-8 place-items-center rounded-full text-ink/45 transition-colors hover:bg-bad/10 hover:text-bad" title="Delete permanently">✕</button>
+      </div>
     </div>
   );
 }
@@ -1298,10 +790,6 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
   const [url, setUrl] = useState("");
   const [keywords, setKeywords] = useState("");
   const [category, setCategory] = useState(cats[0] || "Companies (general)");
-  // Who this source is hunting. Every lead it files inherits it, and
-  // the automation has one lane per audience — so this is the single most
-  // consequential field in the form.
-  const [audience, setAudience] = useState<Audience>("customer");
   const [limit, setLimit] = useState(100);
   const [interval, setInterval] = useState(360);
   const [saving, setSaving] = useState(false);
@@ -1315,12 +803,11 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
       setKeywords(editing.keywords || "");
       setPlace(null);
       setCategory(editing.category);
-      setAudience(audienceOf(editing.audience));
       setLimit(editing.limit_n);
       setInterval(editing.interval_minutes);
     } else {
       setType("search"); setLocation(""); setUrl(""); setKeywords(""); setPlace(null);
-      setCategory(cats[0] || "Companies (general)"); setAudience("customer"); setLimit(100); setInterval(360);
+      setCategory(cats[0] || "Companies (general)"); setLimit(100); setInterval(360);
     }
   }, [open, editing, cats]);
 
@@ -1334,9 +821,9 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
     setSaving(true);
     try {
       const body =
-        type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, audience, limit, intervalMinutes: interval } :
-        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, audience, limit, intervalMinutes: interval } :
-        { type: "osm" as const, location: location.trim(), category, audience, limit, intervalMinutes: interval, place };
+        type === "directory" ? { type: "directory" as const, url: url.trim(), location: location.trim(), category, limit, intervalMinutes: interval } :
+        type === "search" ? { type: "search" as const, location: location.trim(), keywords: keywords.trim(), category, limit, intervalMinutes: interval } :
+        { type: "osm" as const, location: location.trim(), category, limit, intervalMinutes: interval, place };
       if (editing) {
         await api.updateDiscoverySource(editing.id, body);
         toast("Source updated", "success");
@@ -1372,35 +859,6 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
           ))}
         </div>
 
-        {/* WHO this source is for. Decides the pitch every lead it finds will
-            eventually get, so it sits above the details, not buried in them. */}
-        <div className="rounded-2xl border border-line bg-paper p-3">
-          <div className="text-[13px] font-medium text-ink/80">These companies are…</div>
-          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {([
-              ["customer", "Customers", "You sell them DNA ERP", "border-[#ff5a36] bg-[#fdeae6]"],
-              ["partner", "Partners", "Firms, VARs & consultancies for the Makers program", "border-[#1c8a68] bg-[#e4f3ec]"],
-            ] as const).map(([v, label, hint, on]) => (
-              <button
-                key={v}
-                type="button"
-                onClick={() => setAudience(v)}
-                className={cn(
-                  "rounded-xl border px-3 py-2.5 text-left transition-all",
-                  audience === v ? on : "border-line bg-white hover:border-ink/30"
-                )}
-              >
-                <div className="text-[13px] font-semibold">{label}</div>
-                <div className="mt-0.5 text-[11px] leading-snug text-muted">{hint}</div>
-              </button>
-            ))}
-          </div>
-          <div className="mt-2 text-[11px] leading-relaxed text-muted">
-            Every lead this source finds is tagged with it, all the way into Contacts — and the automation runs a
-            separate lane per audience, so the two pitches never cross.
-          </div>
-        </div>
-
         {type === "search" ? (
           <>
             <Field label="Country or city" hint="Where to search. For a whole country, the bot fans out across its major cities automatically to find far more companies.">
@@ -1420,7 +878,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               </Select>
             </Field>
             <p className="rounded-xl bg-ink/[0.03] px-3 py-2.5 text-xs leading-relaxed text-muted">
-              This searches the web like Google — across the whole country <span className="font-medium text-ink/70">and its major cities</span> — and streams every company website it finds into your pool, then finds each one's email. Tip: add a free <span className="font-medium text-ink/70">Jina key</span> in Settings → Crawler so it can search at full speed.
+              This searches the web like Google — across the whole country <span className="font-medium text-ink/70">and its major cities</span> — and streams every company website it finds into your pool, then finds each one's email. This is the source that scales to <span className="font-medium text-ink/70">hundreds–thousands</span>. Tip: add a free <span className="font-medium text-ink/70">Jina key</span> in Settings → Crawler so it can search at full speed.
             </p>
           </>
         ) : type === "osm" ? (
@@ -1447,7 +905,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
             <Field label="Directory URL" hint="Paste the directory's listings page — or just its homepage. If you paste a homepage, the bot automatically finds the listings section, then walks every page pulling company + email + phone.">
               <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.example-directory.com  (homepage or /listings both work)" className="font-mono text-xs" />
             </Field>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-2 gap-3">
               <Field label="Country" hint="Every lead from this directory is filed under it — so you can filter and approve by country later. Also used to read local phone numbers.">
                 <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Qatar" />
               </Field>
@@ -1457,7 +915,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
                 </Select>
               </Field>
             </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-2 gap-3">
               <Field label="Leads per batch">
                 <Select value={limit} onChange={(e) => setLimit(Number(e.target.value))}>
                   {[50, 100, 200, 300].map((n) => <option key={n} value={n}>{n}</option>)}
@@ -1481,196 +939,6 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
         </div>
       </div>
     </Modal>
-  );
-}
-
-/* ------------------------------ Pool tools ------------------------------ */
-
-// Three occasional maintenance jobs — re-check blocked sites for emails, sweep
-// out leads that were never companies, repair mangled company names.
-//
-// They were three full-width explanation banners stacked above the pool, which
-// is a lot of permanent screen for three buttons you press once a month. Now
-// they're one row of icons: the count that mattered rides on the icon as a
-// badge, and the paragraph that justified the banner is the tooltip.
-function ToolButton({
-  icon, label, tip, count, tone, busy, disabled, onClick,
-}: {
-  icon: string;
-  label: string;
-  tip: React.ReactNode;
-  count?: number;
-  tone: string;
-  busy?: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <Tooltip
-      wide
-      label={
-        <>
-          <span className="mb-0.5 block font-semibold text-cream">{label}</span>
-          {tip}
-        </>
-      }
-    >
-      <button
-        type="button"
-        onClick={onClick}
-        disabled={busy || disabled}
-        aria-label={label}
-        className={cn(
-          "relative grid h-9 w-9 place-items-center rounded-xl border text-[15px] transition-all duration-150",
-          "disabled:cursor-not-allowed disabled:opacity-40",
-          busy ? "border-ink/30 bg-ink/[0.04]" : tone,
-          !busy && !disabled && "hover:-translate-y-px hover:shadow-sm active:translate-y-0"
-        )}
-      >
-        {busy ? <Spinner className="h-3.5 w-3.5" /> : icon}
-        {!busy && !!count && count > 0 && (
-          <span className="absolute -right-1.5 -top-1.5 grid h-[18px] min-w-[18px] place-items-center rounded-full bg-ink px-1 text-[10px] font-semibold tabular-nums text-cream shadow">
-            {count > 999 ? "999+" : count}
-          </span>
-        )}
-      </button>
-    </Tooltip>
-  );
-}
-
-function PoolTools({
-  recoverable, stuck, lastRecheckAt, blocked, badNames, readerKeyed, proxied, readerRateLimited,
-  reChecking, purging, repairing, repairLog, onReCheck, onPurge, onRepair,
-}: {
-  recoverable: number;
-  stuck: number;
-  lastRecheckAt: string | null;
-  blocked: number;
-  badNames: { leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number } | null;
-  readerKeyed: boolean;
-  proxied: boolean;
-  readerRateLimited: boolean;
-  reChecking: boolean;
-  purging: boolean;
-  repairing: boolean;
-  repairLog: string;
-  onReCheck: () => void;
-  onPurge: () => void;
-  onRepair: () => void;
-}) {
-  const broken = (badNames?.leads ?? 0) + (badNames?.contacts ?? 0);
-  const stuckNames = (badNames?.stuckLeads ?? 0) + (badNames?.stuckContacts ?? 0);
-  return (
-    <div className="flex items-center gap-2">
-      <span className="mono-label mr-0.5 hidden text-muted sm:inline">Pool tools</span>
-
-      <ToolButton
-        icon="↻"
-        label={
-          recoverable > 0
-            ? `Re-check ${recoverable.toLocaleString()} lead${recoverable === 1 ? "" : "s"} for emails`
-            : stuck > 0
-              ? `${stuck.toLocaleString()} lead${stuck === 1 ? "" : "s"} parked behind a wall`
-              : "Re-check emails"
-        }
-        tone="border-[#5a86c2]/40 bg-[#eef4fb] text-[#2f5a94]"
-        count={recoverable}
-        busy={reChecking}
-        disabled={recoverable === 0}
-        onClick={onReCheck}
-        tip={
-          recoverable > 0 ? (
-            <>
-              These have a website but no email — most were blocked by a Cloudflare wall
-              {readerRateLimited ? ", and the free reader hit its rate limit" : ""}. Crawls each site again in the
-              background.
-              {blocked > 0 ? ` ${blocked.toLocaleString()} more are already auto-retrying.` : ""}
-              {!readerKeyed && !proxied && " Add a Jina key or a scraping proxy in Settings → Crawler to get past Cloudflare at scale."}
-            </>
-          ) : stuck > 0 ? (
-            // The state this button used to hide by offering the same number
-            // for ever: these leads have had their pass, nothing has changed
-            // since, and pressing again would only re-crawl the same walls.
-            <>
-              {stuck.toLocaleString()} lead{stuck === 1 ? " has" : "s have"} a website but no email, and{" "}
-              {stuck === 1 ? "it was" : "they were"} re-checked
-              {lastRecheckAt ? ` ${fmtAgo(lastRecheckAt)}` : ""} with your current setup and stayed blocked. Crawling
-              them again from the same address would give the same answer, so the button waits.
-              <span className="mt-1 block text-cream/70">
-                {readerKeyed || proxied
-                  ? "Add another Jina key, or switch on a scraping proxy, and all of them become re-checkable instantly."
-                  : "Add a Jina key or a scraping proxy in Settings → Crawler and all of them become re-checkable instantly."}
-              </span>
-              {blocked > 0 ? (
-                <span className="mt-1 block text-cream/70">
-                  {blocked.toLocaleString()} other{blocked === 1 ? "" : "s"} are still auto-retrying on their own.
-                </span>
-              ) : null}
-            </>
-          ) : blocked > 0 ? (
-            <>{blocked.toLocaleString()} lead{blocked === 1 ? " is" : "s are"} already being re-checked automatically — nothing to queue by hand.</>
-          ) : (
-            <>Nothing to recover: every lead with a website has been resolved one way or the other.</>
-          )
-        }
-      />
-
-      <ToolButton
-        icon="⌫"
-        label="Clean up the pool"
-        tone="border-line bg-paper text-ink/60"
-        busy={purging}
-        onClick={onPurge}
-        tip={
-          <>
-            Re-checks every pending lead against the current rules and removes the ones that could never yield an
-            email — directories and job boards, reference pages, and results whose own domain belongs to a different
-            country than the source. Real companies are never touched.
-          </>
-        }
-      />
-
-      <ToolButton
-        icon="✎"
-        label={
-          broken > 0
-            ? `Repair ${broken.toLocaleString()} broken company name${broken === 1 ? "" : "s"}`
-            : stuckNames > 0
-              ? `${stuckNames.toLocaleString()} name${stuckNames === 1 ? "" : "s"} can't be recovered`
-              : "Repair company names"
-        }
-        tone={broken > 0 ? "border-[#9b6bff]/35 bg-[#f6f1ff] text-[#6c43c5]" : "border-line bg-paper text-ink/60"}
-        count={broken}
-        busy={repairing}
-        disabled={broken === 0}
-        onClick={onRepair}
-        tip={
-          broken > 0 ? (
-            <>
-              {badNames!.leads.toLocaleString()} lead{badNames!.leads === 1 ? "" : "s"} and{" "}
-              {badNames!.contacts.toLocaleString()} contact{badNames!.contacts === 1 ? "" : "s"} have a phone number
-              (or a page title) where the company name should be — an older directory import. This re-reads the
-              source and writes the real names back.
-              {repairLog ? <span className="mt-1 block text-cream/70">{repairLog}</span> : null}
-            </>
-          ) : stuckNames > 0 ? (
-            // Previously these kept the button lit for ever: the count included
-            // names no configured source could supply, so every press re-walked
-            // every directory in full and changed nothing.
-            <>
-              {stuckNames.toLocaleString()} name{stuckNames === 1 ? " is" : "s are"} still wrong, but none of them
-              appear in the directories you have configured and none has a domain worth building a name from — so
-              re-reading those directories would produce the same answer.
-              <span className="mt-1 block text-cream/70">
-                Add or re-aim a Directory source and they all become repairable again.
-              </span>
-            </>
-          ) : (
-            <>Every stored company name looks like a company name. Nothing to repair.</>
-          )
-        }
-      />
-    </div>
   );
 }
 
@@ -1717,30 +985,9 @@ function EmailCell({ lead }: { lead: DiscoveredLead }) {
     );
   }
   if (lead.enrich_status === "blocked" || lead.enrich_status === "error") {
-    return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn't read site</span>;
+    return <span className="italic text-ink/45" title="The site kept blocking the crawler. Add a Jina key / proxy in Settings, then Re-check blocked.">couldn’t read site</span>;
   }
   return <span className="italic">no email found</span>;
-}
-
-// Customer or partner, at a glance. Anything found before the tag existed has
-// no value stored and reads as a customer — the app's original behaviour — so
-// the chip only ever needs to shout about the exception.
-function audienceOf(a?: string | null): Audience {
-  return String(a || "").toLowerCase() === "partner" ? "partner" : "customer";
-}
-function AudienceTag({ a }: { a?: string | null }) {
-  const partner = audienceOf(a) === "partner";
-  return (
-    <span
-      className={cn(
-        "shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-        partner ? "bg-[#e4f3ec] text-[#127055]" : "bg-[#fdeae6] text-[#c0341a]"
-      )}
-      title={partner ? "Partner — pitched the Makers program by the partner automation lane" : "Customer — pitched DNA ERP by the customer automation lane"}
-    >
-      {partner ? "partner" : "customer"}
-    </span>
-  );
 }
 
 function ConfidenceTag({ c }: { c?: string | null }) {

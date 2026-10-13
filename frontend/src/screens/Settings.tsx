@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
-import { api, PAID_TRANSPORTS, type AccessKey, type Domain, type TransportName } from "../lib/api";
+import { api, type Domain } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, toast, Badge, cn } from "../lib/ui";
 import { Header } from "./Contacts";
-import AutomationCard from "./Automation";
-import FollowUpCard from "./FollowUp";
 
 export default function Settings() {
   const [resendKey, setResendKey] = useState("");
@@ -66,18 +64,7 @@ export default function Settings() {
 
   return (
     <div>
-      <Header title="Settings" subtitle="Connect Resend, automate your outreach, and manage your sending domains." />
-
-      {/* Automation — auto-approve a full pool of leads, then auto-send */}
-      <div className="mb-8">
-        <AutomationCard />
-      </div>
-
-      {/* Follow-up ladder — chase whoever didn't open, and whoever opened but
-          didn't click, up to a hard ceiling of 3 emails per contact. */}
-      <div className="mb-8">
-        <FollowUpCard />
-      </div>
+      <Header title="Settings" subtitle="Connect Resend and manage your sending domains." />
 
       <div className="grid gap-5 lg:grid-cols-2">
         {/* Resend */}
@@ -91,7 +78,7 @@ export default function Settings() {
           <Field label="Resend API key" hint={resendOn ? "A key is already saved. Enter a new one to replace it." : "Get it from resend.com → API Keys."}>
             <Input type="password" value={resendKey} onChange={(e) => setResendKey(e.target.value)} placeholder="re_xxxxxxxx" />
           </Field>
-          <Field label="App URL" hint="Public URL of THIS app's backend — used for unsubscribe & open-tracking links. e.g. https://your-api.up.railway.app">
+          <Field label="App URL" hint="Public URL of THIS app's backend, e.g. https://your-api.up.railway.app. Fallback for tracking links — a sending domain's own tracking host (below) takes priority.">
             <Input value={appUrl} onChange={(e) => setAppUrl(e.target.value)} placeholder="https://your-api.up.railway.app" />
           </Field>
           <Field label="Reply-to email" hint="Where replies land when someone hits Reply (e.g. a real inbox you monitor). Emails send from your domain, but replies go here.">
@@ -118,32 +105,27 @@ export default function Settings() {
           <ul className="space-y-2 text-[13px] text-ink/75">
             <Tip>Send from <b>secondary domains</b> (e.g. dna-erp.com) — never your primary dna.systems.</Tip>
             <Tip>Set <b>SPF, DKIM &amp; DMARC</b> on each domain in Resend.</Tip>
+            <Tip>Give each domain a <b>tracking host</b> (e.g. t.dna-erp.com) so links &amp; images match the sender.</Tip>
+            <Tip>Use a <b>mailto:</b> on the sending domain (or rely on Reply-to) — a mailto: on dna.systems is flagged as a mismatch.</Tip>
             <Tip>Keep a <b>daily cap</b> per domain and a slow send rate.</Tip>
             <Tip>Keep lists clean &amp; targeted — complaints are what get accounts suspended.</Tip>
           </ul>
         </Card>
       </div>
 
-      {/* Crawler — where pages come from, then the two optional paid tiers */}
+      {/* Crawler — free reader + optional paid proxy */}
       <div className="mt-8 space-y-3">
         <div className="mb-3 font-clash text-lg font-semibold">Crawler — page fetching</div>
-        <PageSourcesCard />
         <ReaderCard />
         <ScrapeProxyCard />
       </div>
 
       {/* Domains */}
       <div className="mt-8">
-        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <div className="font-clash text-lg font-semibold">Sending domains</div>
-            <div className="mt-0.5 text-[13px] text-muted">
-              Sends rotate across every active domain, and each one is paced separately — two domains send twice as fast as one.
-              Daily caps clear on their own at midnight UTC.
-            </div>
-          </div>
-          <div className="flex shrink-0 gap-2">
-            <Button size="sm" variant="ghost" onClick={resetCounts} title="Start today's count again from right now">Reset daily counts</Button>
+        <div className="mb-3 flex items-center justify-between">
+          <div className="font-clash text-lg font-semibold">Sending domains</div>
+          <div className="flex gap-2">
+            <Button size="sm" variant="ghost" onClick={resetCounts}>Reset daily counts</Button>
             <Button size="sm" onClick={() => setEditing({ id: "", domain: "", from_name: "DNA Systems", from_email: "", daily_cap: 40, sent_today: 0, active: true })}>Add domain</Button>
           </div>
         </div>
@@ -165,6 +147,21 @@ export default function Settings() {
                     {d.active ? "active" : "paused"}
                   </Badge>
                 </div>
+                {d.tracking_host ? (
+                  <div className="mt-2 flex items-center gap-1.5 text-xs text-[#1f8b4c]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[#1f8b4c]" />
+                    Links &amp; images via {d.tracking_host}
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setEditing(d)}
+                    className="mt-2 flex items-center gap-1.5 text-left text-xs text-[#8a5a12] hover:underline"
+                  >
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#d99a2b]" />
+                    No tracking host — links &amp; images won't match {d.domain}. Add one
+                  </button>
+                )}
                 <div className="mt-3 flex items-center gap-3">
                   <div className="flex-1">
                     <div className="mb-1 flex justify-between text-xs text-muted">
@@ -193,11 +190,6 @@ export default function Settings() {
       <div className="mt-8">
         <div className="mb-3 font-clash text-lg font-semibold">Account</div>
         <AccountCard />
-      </div>
-      {/* Agent access */}
-      <div className="mt-8">
-        <div className="mb-3 font-clash text-lg font-semibold">Agent access</div>
-        <AccessKeysCard />
       </div>
 
       {editing && (
@@ -298,189 +290,32 @@ const PROVIDERS: { value: string; label: string; hint: string }[] = [
   { value: "zenrows", label: "ZenRows", hint: "zenrows.com" },
 ];
 
-
-/* --------------------------- where pages come from --------------------------- */
-
-// The tiers, in the order the crawler actually tries them.
-const TIERS: { key: TransportName; label: string; note: string; paid: boolean }[] = [
-  { key: "direct", label: "Direct fetch", note: "the site answered us", paid: false },
-  { key: "commoncrawl", label: "Common Crawl", note: "already crawled by the public archive", paid: false },
-  { key: "archive", label: "Wayback Machine", note: "already archived", paid: false },
-  { key: "reader", label: "Jina reader", note: "renders JavaScript · costs tokens", paid: true },
-  { key: "proxy", label: "Scraping proxy", note: "residential IPs · costs credits", paid: true },
-];
-
-/**
- * The answer to "why is the Jina bill so high?".
- *
- * Before this panel existed there was no way to see which tier was doing the
- * work, so the reader quietly absorbed every blocked page and the keys kept
- * running dry. The bar makes the split obvious at a glance: as long as the
- * paid slice stays thin, the archives are earning their keep.
- */
-function PageSourcesCard() {
-  const [pages, setPages] = useState<Record<string, { calls: number; ok: number }>>({});
-  const [archives, setArchives] = useState<{ source: string; fails: number; downForMs: number }[]>([]);
-  const [engines, setEngines] = useState<{ engine: string; live: boolean; restingForMs: number; note?: string }[]>([]);
-
-  async function load() {
-    try {
-      const s = await api.getSettings();
-      setPages(s.transports?.pages || {});
-      setArchives(s.transports?.archives || []);
-      setEngines(s.transports?.searchEngines || []);
-    } catch { /* ignore — the poller retries */ }
-  }
-  useEffect(() => {
-    load();
-    const t = window.setInterval(load, 10000);
-    return () => clearInterval(t);
-  }, []);
-
-  // Count only pages a tier actually DELIVERED. Attempts would flatter the
-  // free tiers (a Common Crawl miss is cheap but useless) and unfairly punish
-  // the reader, which is only ever asked for the hard ones.
-  const got = (k: TransportName) => pages[k]?.ok ?? 0;
-  const total = TIERS.reduce((n, t) => n + got(t.key), 0);
-  const paid = PAID_TRANSPORTS.reduce((n, k) => n + got(k), 0);
-  const freeShare = total ? Math.round(((total - paid) / total) * 100) : 0;
-  const liveEngines = engines.filter((e) => e.live).length;
-
-  return (
-    <Card className="space-y-4 p-5">
-      <div className="flex items-center justify-between">
-        <div className="font-clash text-lg font-semibold">Where pages come from</div>
-        {total > 0 && (
-          <Badge className={freeShare >= 80 ? "bg-[#e7f6ec] text-[#1f8b4c]" : freeShare >= 50 ? "bg-[#fdf6ea] text-[#8a5a12]" : "bg-[#fde8e8] text-[#c0392b]"}>
-            {freeShare}% free
-          </Badge>
-        )}
-      </div>
-      <p className="text-[13px] leading-relaxed text-muted">
-        A Cloudflare wall isn't a property of the page — it's a property of us asking for it from a datacenter IP.
-        Somebody else already fetched that page and wrote it down, so the crawler reads <b>their</b> copy first:
-        Common Crawl and the Wayback Machine are free, unlimited and need no key. The metered tiers below are only
-        reached when neither archive holds the page.
-      </p>
-
-      {total === 0 ? (
-        <div className="rounded-xl border border-dashed border-line px-4 py-5 text-center text-[12px] text-muted">
-          Nothing fetched yet this run. Turn the discovery bot on and the split appears here.
-        </div>
-      ) : (
-        <>
-          {/* free vs paid, at a glance */}
-          <div className="flex h-2 overflow-hidden rounded-full bg-ink/[0.07]">
-            {TIERS.filter((t) => got(t.key) > 0).map((t) => (
-              <div
-                key={t.key}
-                title={`${t.label}: ${got(t.key).toLocaleString()} page(s)`}
-                className={cn("h-full", t.paid ? (t.key === "reader" ? "bg-[#e6a33c]" : "bg-[#c0392b]") : t.key === "direct" ? "bg-ink/70" : "bg-good")}
-                style={{ width: `${(got(t.key) / total) * 100}%` }}
-              />
-            ))}
-          </div>
-
-          <div className="space-y-1">
-            {TIERS.map((t) => {
-              const n = got(t.key);
-              const tried = pages[t.key]?.calls ?? 0;
-              return (
-                <div key={t.key} className={cn("flex items-baseline justify-between gap-3 text-[12px]", !n && "opacity-45")}>
-                  <span className="flex min-w-0 items-center gap-2">
-                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", t.paid ? (t.key === "reader" ? "bg-[#e6a33c]" : "bg-[#c0392b]") : t.key === "direct" ? "bg-ink/70" : "bg-good")} />
-                    <span className="font-medium text-ink/80">{t.label}</span>
-                    {t.paid && <span className="rounded bg-[#fdf6ea] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-[#8a5a12]">paid</span>}
-                    <span className="truncate text-muted">{t.note}</span>
-                  </span>
-                  <span className="shrink-0 tabular-nums text-ink/70">
-                    <b>{n.toLocaleString()}</b>
-                    <span className="text-muted"> / {tried.toLocaleString()} tried</span>
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </>
-      )}
-
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line pt-3 text-[11px] text-muted">
-        <span>
-          Search engines: <b className="text-ink/70">{liveEngines}/{engines.length || 4}</b> answering
-          {engines.filter((e) => !e.live).length > 0 && (
-            <>
-              {" "}· resting:{" "}
-              {engines
-                .filter((e) => !e.live)
-                .map((e) => (e.note ? `${e.engine} (${e.note})` : e.engine))
-                .join(", ")}
-            </>
-          )}
-        </span>
-        {engines.some((e) => (e.note || "").includes("ignor")) && (
-          <span className="text-[#8a5a12]">
-            Some engines are returning results that ignore the country/site filter — they’re paused, and those results are being discarded rather than saved. Adding a free Jina key above restores full-speed, accurate searching.
-          </span>
-        )}
-        {archives.length > 0 && (
-          <span className="text-[#8a5a12]">
-            Archive backing off: {archives.map((a) => `${a.source} (${Math.ceil(a.downForMs / 60000)}m)`).join(", ")}
-          </span>
-        )}
-      </div>
-    </Card>
-  );
-}
-
 function ReaderCard() {
   const [apiKey, setApiKey] = useState("");
   const [configured, setConfigured] = useState(false);
   const [fromEnv, setFromEnv] = useState(false);
-  const [adding, setAdding] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [keys, setKeys] = useState<{ masked: string; live: boolean; status: number }[]>([]);
-  const [removing, setRemoving] = useState("");
-
   async function load() {
     try {
       const s = await api.getSettings();
       setConfigured(s.reader.configured);
       setFromEnv(s.reader.fromEnv);
-      setKeys(s.reader.keys || []);
     } catch { /* ignore */ }
   }
   useEffect(() => { load(); }, []);
   const keyed = configured || fromEnv;
-  const liveCount = keys.filter((k) => k.live).length;
-
-  // Append, never replace. Pasting a second key used to wipe the first,
-  // because the field saved its whole contents and cleared itself afterwards.
-  async function add() {
-    if (!apiKey.trim()) return;
-    setAdding(true);
+  async function save() {
+    setSaving(true);
     try {
-      const r = await api.addReaderKey(apiKey);
+      await api.saveSettings({ jina_api_key: apiKey });
+      toast(apiKey ? "Reader key saved" : "Reader key cleared", "success");
       setApiKey("");
-      await load();
-      if (r.added && r.duplicates) toast(`Added ${r.added} key — ${r.duplicates} already saved`, "success");
-      else if (r.added) toast(r.total > 1 ? `Key added — ${r.total} in the pool` : "Key added", "success");
-      else toast("That key is already saved", "info");
+      load();
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
-      setAdding(false);
-    }
-  }
-  async function remove(masked: string) {
-    setRemoving(masked);
-    try {
-      await api.removeReaderKey(masked);
-      await load();
-      toast("Key removed", "success");
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setRemoving("");
+      setSaving(false);
     }
   }
   async function test() {
@@ -488,91 +323,42 @@ function ReaderCard() {
     try {
       const r = await api.testReader();
       toast(`Free reader works — rendered ${r.bytes.toLocaleString()} bytes${r.keyed ? " (with your key)" : ""}`, "success");
-      load(); // a 402 during the test retires the key — reflect that immediately
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
       setTesting(false);
     }
   }
-
   return (
     <Card className="space-y-4 p-5">
       <div className="flex items-center justify-between">
-        <div className="font-clash text-lg font-semibold">Jina reader <span className="text-muted">(metered fallback)</span></div>
-        <Badge className={liveCount > 0 ? "bg-[#e7f6ec] text-[#1f8b4c]" : keyed ? "bg-[#fde8e8] text-[#c0392b]" : "bg-ink/[0.06] text-ink/55"}>
-          {liveCount > 0 ? `${liveCount} key${liveCount > 1 ? "s" : ""} live` : keyed ? "keys spent" : "no key · optional"}
-        </Badge>
+        <div className="font-clash text-lg font-semibold">Free reader <span className="text-muted">(no payment)</span></div>
+        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">{keyed ? "on · keyed" : "on · free"}</Badge>
       </div>
-      <p className="text-[13px] leading-relaxed text-muted">
-        Renders JavaScript, which is the one thing the free archives can't do. It now sits <b>below</b> them in the
-        ladder, so it is only asked for pages that Common Crawl and the Wayback Machine don't hold — that is what
-        stops the keys burning through tokens. <b>You do not need a key for the crawler to work</b>; without one it
-        simply runs slower on that last slice of pages.{" "}
-        {keyed
-          ? <>Each key from <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a> carries its own allowance, and the crawler rotates through them.</>
-          : <>If you do add one, get it free at <a href="https://jina.ai/api-dashboard" target="_blank" rel="noreferrer" className="underline">jina.ai</a>.</>}
-        {fromEnv && <span className="text-good"> A key is also set via the server environment.</span>}
+      <p className="text-[13px] text-muted">
+        The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
+        built-in reader — <b>no scraping proxy needed</b>. Adding a free API key from{" "}
+        <a href="https://jina.ai/reader" target="_blank" rel="noreferrer" className="underline">jina.ai/reader</a>{" "}
+        just raises the rate limit for large PDF imports. It works fine without one.
+        {fromEnv && <span className="text-good"> A key is set via the server environment.</span>}
       </p>
-
-      {/* The saved pool. Keys are listed as fingerprints, never in full, and are
-          removed one at a time — so adding a key can't destroy the others. */}
-      {keys.length > 0 && (
-        <div className="space-y-1.5">
-          {keys.map((k) => (
-            <div
-              key={k.masked}
-              className={cn(
-                "flex items-center justify-between rounded-xl border px-3 py-2",
-                k.live ? "border-line bg-paper" : "border-bad/30 bg-bad/[0.04]"
-              )}
-            >
-              <div className="flex min-w-0 items-center gap-2.5">
-                <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", k.live ? "bg-good" : "bg-bad")} />
-                <code className="truncate font-mono text-[12px] text-ink/75">{k.masked}</code>
-                {!k.live && (
-                  <span className="shrink-0 text-[11px] text-bad">
-                    {k.status === 402 ? "out of tokens" : k.status === 401 ? "invalid" : "not working"}
-                  </span>
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={() => remove(k.masked)}
-                disabled={removing === k.masked}
-                className="shrink-0 text-[11px] font-medium text-muted underline transition-colors hover:text-bad disabled:opacity-40"
-              >
-                {removing === k.masked ? "removing…" : "remove"}
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-
       <Field
-        label={keys.length ? "Add another key" : "Jina Reader API key"}
-        hint={
-          keys.length
-            ? "Paste one key and press Add. Your existing keys are kept."
-            : "Optional. Without a key the reader still runs at 20 pages/min — and it is the last tier tried, so that is rarely the bottleneck."
-        }
+        label="Jina Reader API key (optional)"
+        hint={configured ? "A key is saved. Enter a new one to replace it, or clear the box and save to remove." : "Leave empty to use the free tier."}
       >
-        <div className="flex gap-2">
-          <Input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
-            placeholder="jina_…"
-            className="flex-1"
-          />
-          <Button loading={adding} onClick={add} disabled={!apiKey.trim()}>Add</Button>
-        </div>
+        <Input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder={configured ? "•••••••• (saved)" : "jina_… (optional)"}
+        />
       </Field>
-
-      <div className="flex flex-col gap-3 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-between">
-        <span className="text-xs text-muted">Tried after the free archives, before any paid proxy.</span>
-        <Button variant="outline" loading={testing} onClick={test}>Test</Button>
+      <div className="flex items-center justify-between border-t border-line pt-4">
+        <span className="text-xs text-muted">Used automatically before any paid proxy.</span>
+        <div className="flex gap-2">
+          <Button variant="outline" loading={testing} onClick={test}>Test</Button>
+          <Button loading={saving} onClick={save}>Save</Button>
+        </div>
       </div>
     </Card>
   );
@@ -688,14 +474,14 @@ function ScrapeProxyCard() {
               checked={premium}
               onChange={(e) => setPremium(e.target.checked)}
               disabled={!provider}
-              className="h-[18px] w-[18px] shrink-0 accent-ink"
+              className="accent-ink"
             />
             Premium / stealth mode <span className="text-muted">(needed for Cloudflare)</span>
           </label>
         </div>
       </div>
 
-      <div className="flex flex-col gap-3 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-center justify-between border-t border-line pt-4">
         <span className="text-xs text-muted">
           {mode === "blocked"
             ? "Credits are only spent on sites that actually block the crawler."
@@ -764,203 +550,6 @@ function AccountCard() {
   );
 }
 
-/**
- * Standing credentials for machine callers — ChatGPT, a script, a cron job.
- *
- * The plaintext key is returned by the API exactly once, at creation. This card
- * is therefore built around that single moment: mint, show, copy, and from then
- * on the row can only be identified and revoked, never re-read.
- */
-function AccessKeysCard() {
-  const [keys, setKeys] = useState<AccessKey[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [label, setLabel] = useState("ChatGPT");
-  const [expiry, setExpiry] = useState("90");
-  const [busy, setBusy] = useState(false);
-  // The one-time reveal. Cleared the moment the user dismisses it.
-  const [minted, setMinted] = useState<{ key: string; label: string } | null>(null);
-
-  async function load() {
-    try {
-      setKeys((await api.listKeys()).keys || []);
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setLoading(false);
-    }
-  }
-  useEffect(() => { load(); }, []);
-
-  async function create() {
-    if (!label.trim()) return toast("Give the key a label so you know what it's for", "error");
-    setBusy(true);
-    try {
-      const r = await api.createKey(label.trim(), Number(expiry) || 0);
-      setMinted({ key: r.key, label: r.row.label });
-      setLabel("ChatGPT");
-      await load();
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function revoke(k: AccessKey) {
-    if (!confirm(`Revoke "${k.label}"? Anything using it stops working immediately.`)) return;
-    try {
-      await api.revokeKey(k.id);
-      toast(`Revoked "${k.label}"`, "success");
-      await load();
-    } catch (e: any) {
-      toast(e.message, "error");
-    }
-  }
-
-  const loginUrl = minted ? `${window.location.origin}/?k=${minted.key}` : "";
-
-  return (
-    <Card className="space-y-5 p-5">
-      <p className="text-[13px] text-muted">
-        A key lets something sign in without your password — open the link and you're
-        already in. Use it for ChatGPT or a script, not for yourself.
-      </p>
-
-      {/* The one-time reveal */}
-      {minted && (
-        <div className="space-y-3 rounded-xl border border-[#e0b341]/40 bg-[#e0b341]/[0.07] p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-[13px] font-semibold text-ink">
-                "{minted.label}" created — copy it now
-              </div>
-              <div className="mt-0.5 text-[12px] text-muted">
-                This is the only time it will be shown. Closing this panel loses it for good.
-              </div>
-            </div>
-            <button
-              onClick={() => setMinted(null)}
-              className="shrink-0 rounded-lg px-2 py-1 text-[12px] text-muted transition-colors hover:bg-ink/5 hover:text-ink"
-            >
-              Done
-            </button>
-          </div>
-
-          <CopyRow label="Auto-login link — paste into ChatGPT" value={loginUrl} />
-          <CopyRow label="Raw key — for an Authorization header" value={minted.key} />
-
-          <p className="text-[12px] leading-relaxed text-muted">
-            Treat the link like a password: anyone holding it is fully signed in. Prefer the
-            raw key over the link wherever the caller can send a header — headers don't end
-            up in browser history or server logs.
-          </p>
-        </div>
-      )}
-
-      {/* Mint */}
-      <div className="grid gap-4 sm:grid-cols-[1fr_auto_auto] sm:items-end">
-        <Field label="Label" hint="What is this key for?">
-          <Input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            placeholder="ChatGPT"
-            onKeyDown={(e) => e.key === "Enter" && create()}
-          />
-        </Field>
-        <Field label="Expires">
-          <Select value={expiry} onChange={(e) => setExpiry(e.target.value)}>
-            <option value="7">In 7 days</option>
-            <option value="30">In 30 days</option>
-            <option value="90">In 90 days</option>
-            <option value="365">In a year</option>
-            <option value="0">Never</option>
-          </Select>
-        </Field>
-        <Button loading={busy} onClick={create}>Create key</Button>
-      </div>
-
-      {/* Existing */}
-      <div className="border-t border-line pt-4">
-        {loading ? (
-          <div className="py-4 text-center text-[13px] text-muted">Loading…</div>
-        ) : keys.length === 0 ? (
-          <div className="py-4 text-center text-[13px] text-muted">
-            No access keys. Everything must sign in with a password.
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {keys.map((k) => {
-              const expired = !!k.expires_at && new Date(k.expires_at).getTime() < Date.now();
-              return (
-                <div
-                  key={k.id}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line px-3.5 py-3"
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-[13px] font-medium text-ink">{k.label}</span>
-                      {expired && <Badge className="border-[#c0563f]/30 bg-[#c0563f]/10 text-[#c0563f]">Expired</Badge>}
-                    </div>
-                    <div className="mt-0.5 font-mono text-[11px] text-muted">
-                      {k.prefix}…{" · "}
-                      {k.last_used_at
-                        ? `last used ${new Date(k.last_used_at).toLocaleDateString()}${k.last_used_ip ? ` from ${k.last_used_ip}` : ""}`
-                        : "never used"}
-                      {k.expires_at && !expired
-                        ? ` · expires ${new Date(k.expires_at).toLocaleDateString()}`
-                        : ""}
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => revoke(k)}
-                    className="shrink-0 rounded-lg border border-[#c0563f]/30 px-2.5 py-1.5 text-[12px] font-medium text-[#c0563f] transition-colors hover:bg-[#c0563f]/10"
-                  >
-                    Revoke
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </Card>
-  );
-}
-
-/** A read-only value with a copy button. Selects on focus so it's still
- *  usable where the clipboard API is blocked (insecure origin, locked-down iframe). */
-function CopyRow({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      return toast("Copy blocked by the browser — select the text and copy manually", "error");
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
-  }
-  return (
-    <div>
-      <div className="mb-1 text-[12px] font-medium text-ink/70">{label}</div>
-      <div className="flex gap-2">
-        <input
-          readOnly
-          value={value}
-          onFocus={(e) => e.currentTarget.select()}
-          className="min-w-0 flex-1 rounded-lg border border-line bg-paper px-2.5 py-2 font-mono text-[12px] text-ink outline-none"
-        />
-        <button
-          onClick={copy}
-          className="shrink-0 rounded-lg border border-line px-3 py-2 text-[12px] font-medium text-ink transition-colors hover:bg-ink/5"
-        >
-          {copied ? "Copied" : "Copy"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function Tip({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex gap-2">
@@ -970,9 +559,34 @@ function Tip({ children }: { children: React.ReactNode }) {
   );
 }
 
+function cleanHost(s: string) {
+  return s.trim().replace(/^https?:\/\//i, "").replace(/[/?#].*$/, "").replace(/\.$/, "").toLowerCase();
+}
+
 function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: () => void; onSaved: () => void }) {
-  const [d, setD] = useState(domain);
+  const [d, setD] = useState({ ...domain, tracking_host: domain.tracking_host || "" });
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [check, setCheck] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const root = cleanHost(d.domain).replace(/^www\./, "");
+  const host = cleanHost(d.tracking_host || "");
+  const suggested = root ? `t.${root}` : "t.yourdomain.com";
+  const hostMismatch = !!host && !!root && host !== root && !host.endsWith(`.${root}`);
+
+  async function checkHost() {
+    if (!host) return toast(`Enter a tracking host first, e.g. ${suggested}`, "error");
+    setChecking(true);
+    setCheck(null);
+    try {
+      await api.checkTrackingHost(host);
+      setCheck({ ok: true, msg: `https://${host} reaches this backend over HTTPS.` });
+    } catch (e: any) {
+      setCheck({ ok: false, msg: e.message });
+    } finally {
+      setChecking(false);
+    }
+  }
 
   // Resolve what the From email will actually be saved as (auto-append domain if the
   // user typed only a mailbox like "no-reply").
@@ -991,9 +605,10 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
   async function save() {
     if (!d.domain.trim()) return toast("Domain is required", "error");
     if (!fromValid) return toast("Enter a full From email like no-reply@" + (d.domain || "yourdomain.com"), "error");
+    if (hostMismatch) return toast(`Tracking host must be on ${root} (e.g. ${suggested})`, "error");
     setBusy(true);
     try {
-      const payload = { ...d, from_email: resolvedFrom };
+      const payload = { ...d, from_email: resolvedFrom, tracking_host: host || null };
       if (d.id) await api.updateDomain(d.id, payload);
       else await api.saveDomain(payload);
       toast("Saved", "success");
@@ -1011,7 +626,7 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
         <Field label="Domain" hint="A domain you've verified in Resend (SPF/DKIM added).">
           <Input value={d.domain} onChange={(e) => setD({ ...d, domain: e.target.value })} placeholder="dna-erp.com" />
         </Field>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="From name">
             <Input value={d.from_name} onChange={(e) => setD({ ...d, from_name: e.target.value })} placeholder="Solution ERP" />
           </Field>
@@ -1034,8 +649,51 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
             placeholder="no-reply@dna-erp.com"
           />
         </Field>
+
+        {/* Tracking host — aligns links, images & unsubscribe with the sending domain */}
+        <div className="rounded-xl border border-line bg-ink/[0.02] p-3.5">
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <div className="text-[13px] font-medium text-ink/80">Tracking host</div>
+            {!host && root && (
+              <button
+                type="button"
+                onClick={() => { setD({ ...d, tracking_host: suggested }); setCheck(null); }}
+                className="text-xs font-medium text-ink underline decoration-ink/30 underline-offset-2 hover:decoration-ink"
+              >
+                Use {suggested}
+              </button>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <Input
+              value={d.tracking_host || ""}
+              onChange={(e) => { setD({ ...d, tracking_host: e.target.value }); setCheck(null); }}
+              placeholder={suggested}
+            />
+            <Button variant="outline" loading={checking} onClick={checkHost} disabled={!host}>Check</Button>
+          </div>
+          {hostMismatch ? (
+            <div className="mt-1.5 text-xs text-bad">Must be {root} or a subdomain of it — otherwise links still won't match the sender.</div>
+          ) : check ? (
+            <div className={cn("mt-1.5 text-xs", check.ok ? "text-[#1f8b4c]" : "text-bad")}>{check.msg}</div>
+          ) : (
+            <div className="mt-1.5 text-xs text-muted">
+              Click links, images, the open pixel and the unsubscribe link are served from this host so they match the sending domain. Leave blank to use the App URL.
+            </div>
+          )}
+          <details className="mt-2.5 text-xs text-ink/70">
+            <summary className="cursor-pointer select-none font-medium text-ink/80">How to set it up</summary>
+            <ol className="mt-2 list-decimal space-y-1 pl-4">
+              <li>Railway → your backend service → Settings → Networking → <b>Custom Domain</b> → add <code className="rounded bg-ink/[0.06] px-1">{host || suggested}</code>.</li>
+              <li>At your DNS provider for <b>{root || "the domain"}</b>, add the <b>CNAME</b> (and TXT) record Railway shows you.</li>
+              <li>Wait for Railway to issue the certificate, then hit <b>Check</b> and save.</li>
+            </ol>
+            <div className="mt-2 text-muted">Railway's Hobby plan allows 2 custom domains per service; Pro allows more.</div>
+          </details>
+        </div>
+
         <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="h-[18px] w-[18px] accent-ink" />
+          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="accent-ink" />
           Active (include in rotation)
         </label>
         <div className="flex justify-end gap-2 pt-1">

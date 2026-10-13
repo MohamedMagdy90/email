@@ -25,69 +25,9 @@ if (DATABASE_URL) {
   // SQLITE_PATH lets a second process (a script, a test) use its own file —
   // two processes sharing one WAL database corrupts it.
   const file = process.env.SQLITE_PATH || "data.sqlite";
-
-  // ⚠️ THE HANDLE IS PINNED TO globalThis ON PURPOSE — do not "simplify" this
-  // back to a bare `new Database(file)`.
-  //
-  // `bun --watch` re-evaluates this module in the SAME PROCESS on every save.
-  // A module-scope `new Database(file)` therefore opens ANOTHER handle on the
-  // same WAL each time, and the previous one is never closed — so a dev session
-  // that edits a few backend files ends up with several live writers inside one
-  // process. That is the same hazard as running two dev servers, and it is the
-  // most likely explanation for this database being found corrupt at boot in
-  // session after session (seven parked copies in `.same/` and counting).
-  // Reusing one handle across reloads costs nothing and removes the cause.
-  const g = globalThis as unknown as { __dnaSqlite?: any };
-
-  // WAL IS OFF BY DEFAULT HERE, AND THAT IS DELIBERATE.
-  //
-  // This project has parked EIGHT corrupt copies of this file in `.same/`, one
-  // per session, always discovered as "malformed" at boot. WAL mode needs a
-  // shared-memory `-shm` file plus working POSIX locking; inside this container
-  // the workspace sits on an overlay filesystem where neither is dependable, so
-  // an ordinary interruption — the dev server being SIGKILLed by a supervisor,
-  // say — leaves the `-wal`/`-shm` pair inconsistent with the main file and the
-  // next open fails outright. A rollback journal needs no shared memory and no
-  // second reader, and simply replays or discards on open.
-  //
-  // Production is Postgres, so nothing here is on the hot path that matters.
-  // Set SQLITE_WAL=1 to opt back in on a filesystem that can take it.
-  const openDb = (path: string) => {
-    const d = new Database(path);
-    d.exec(process.env.SQLITE_WAL === "1" ? "PRAGMA journal_mode = WAL;" : "PRAGMA journal_mode = TRUNCATE;");
-    d.exec("PRAGMA busy_timeout = 5000;");
-    d.exec("PRAGMA synchronous = FULL;");
-    d.query("SELECT count(*) FROM sqlite_master").all(); // prove it really opens
-    return d;
-  };
-
-  let db = g.__dnaSqlite;
-  if (!db) {
-    try {
-      db = openDb(file);
-    } catch (e: any) {
-      // A corrupt LOCAL dev database must not turn into a boot loop. Park it
-      // (never delete — it is the only copy of whatever was in it) and carry on
-      // with an empty one, saying loudly where it went.
-      // `unsupported file format` is on this list because it is what SQLite
-      // actually said the ninth time this happened, and the guard let it
-      // through — so the one failure mode this code exists to absorb took the
-      // API down anyway. A truncated header reads as an unknown format, not as
-      // corruption, and "file is encrypted" is the same header damage again.
-      if (!/malformed|corrupt|not a database|unsupported file format|file is encrypted/i.test(String(e?.message || e))) throw e;
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const parked = `${file}.corrupt-${stamp}`;
-      try {
-        const { renameSync, existsSync } = await import("node:fs");
-        for (const suffix of ["", "-wal", "-shm"]) {
-          if (existsSync(file + suffix)) renameSync(file + suffix, parked + suffix);
-        }
-      } catch { /* if it cannot be moved, the retry below will fail loudly */ }
-      console.error(`[db] ${file} was corrupt — parked it as ${parked} and started a fresh one. Production (Postgres) is unaffected.`);
-      db = openDb(file);
-    }
-    g.__dnaSqlite = db;
-  }
+  const db = new Database(file);
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec("PRAGMA busy_timeout = 5000;");
   query = async (text, params = []) => {
     const isRead = /^\s*(select|with)\b/i.test(text) || /\breturning\b/i.test(text);
     const stmt = db.query(text);
@@ -102,16 +42,6 @@ export const q = query;
 
 export function nowIso() {
   return new Date().toISOString();
-}
-
-// Midnight UTC today, as ISO text. This is THE day boundary for every daily
-// ceiling in the app — the per-domain sending caps and the automation's shared
-// ceiling both roll over here, so they agree with each other and with the
-// `sent_at` timestamps in the sends ledger (also ISO UTC, so a plain string
-// comparison is a correct date comparison).
-export function startOfDayIso(): string {
-  const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
 }
 
 export async function ensureSchema() {
@@ -133,12 +63,6 @@ export async function ensureSchema() {
   // error is swallowed, so this is idempotent.
   try { await q(`ALTER TABLE contacts ADD COLUMN category TEXT`); } catch { /* already exists */ }
   try { await q(`ALTER TABLE contacts ADD COLUMN phone TEXT`); } catch { /* already exists */ }
-  // WHO this contact is: a prospective 'customer' (we sell them DNA ERP) or a
-  // prospective 'partner' (we sell them the Makers program). It rides in from
-  // the discovery source that found them, and it decides which automation lane
-  // — and which email — they get. NULL on every pre-existing row, and every
-  // read treats NULL as 'customer', which is what the app was before this.
-  try { await q(`ALTER TABLE contacts ADD COLUMN audience TEXT`); } catch { /* already exists */ }
 
   await q(`CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
@@ -157,9 +81,17 @@ export async function ensureSchema() {
     daily_cap INTEGER NOT NULL DEFAULT 40,
     sent_today INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+  )`);
+  // Per-domain tracking host (e.g. t.dna-erp.com, CNAME'd to this backend) so
+  // click/open/unsubscribe links and images match the sending domain.
+  try { await q(`ALTER TABLE domains ADD COLUMN tracking_host TEXT`); } catch { /* already exists */ }
+  // Remote images re-served from the tracking host: id -> original URL.
+  await q(`CREATE TABLE IF NOT EXISTS email_assets (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`);
-
   await q(`CREATE TABLE IF NOT EXISTS sends (
     id TEXT PRIMARY KEY,
     contact_id TEXT,
@@ -190,76 +122,10 @@ export async function ensureSchema() {
   // Backfill: legacy opened rows had no counter — treat as one open.
   try { await q(`UPDATE sends SET open_count = 1 WHERE opened = 1 AND open_count = 0`); } catch { /* ignore */ }
 
-  // Follow-up ladder: which rung of a sequence a send belongs to.
-  //   followup_step   0 = the original email · 1 = first retry · 2 = second retry
-  //   followup_branch why the retry went out — 'no_open' | 'no_click'
-  // Step 0 is what makes a send the START of a sequence, so the engine can count
-  // "emails in THIS sequence" instead of every email the contact has ever had
-  // (a contact mailed in an old campaign must still be followable-up today).
-  try { await q(`ALTER TABLE sends ADD COLUMN followup_step INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE sends ADD COLUMN followup_branch TEXT`); } catch { /* exists */ }
-  // The follow-up scan groups the whole sends table by contact, so both of these
-  // are on its hot path.
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_contact ON sends(contact_id)`); } catch { /* ignore */ }
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_sent_at ON sends(sent_at)`); } catch { /* ignore */ }
-  // Every send job opens by asking "how much has each domain sent today?", which
-  // is a GROUP BY over exactly these two columns.
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_sends_domain_sent_at ON sends(domain_id, sent_at)`); } catch { /* ignore */ }
-
   await q(`CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
   )`);
-
-  // Long-lived, individually revocable credentials for non-human callers — an
-  // agent driving the UI in a fresh browser profile, a scripted API client.
-  //
-  // ONLY THE HASH IS STORED. The plaintext key is shown exactly once, at the
-  // moment it is minted, and is unrecoverable afterwards. A leaked database
-  // therefore yields no usable credential, and the blast radius of any single
-  // key is one DELETE — unlike the shared password, which cannot be rotated for
-  // one caller without locking out every other.
-  //
-  // `prefix` is the first few plaintext characters, kept in the clear purely so
-  // the UI can say WHICH key it is listing. `last_used_at`/`last_used_ip` exist
-  // so that a key being used by someone unexpected is visible rather than silent.
-  await q(`CREATE TABLE IF NOT EXISTS access_keys (
-    id TEXT PRIMARY KEY,
-    label TEXT NOT NULL,
-    key_hash TEXT NOT NULL,
-    prefix TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT,
-    last_used_at TEXT,
-    last_used_ip TEXT,
-    revoked INTEGER NOT NULL DEFAULT 0
-  )`);
-  // Every authenticated request carrying a key looks it up by hash.
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_access_keys_hash ON access_keys(key_hash)`); } catch { /* ignore */ }
-
-  // `domains.sent_today` is DEAD — per-domain daily usage is now counted from the
-  // sends ledger instead (see `domainUsageToday` in send.ts).
-  //
-  // It was a mutable counter that only ever went up: the one and only thing that
-  // reset it was a human pressing "Reset daily counts" in Settings. So the daily
-  // cap quietly behaved as a LIFETIME cap, and once every domain reached it the
-  // sender aborted every batch with "All domains hit their daily cap" and never
-  // recovered on its own. Counting rows in the ledger cannot drift like that: it
-  // rolls over at midnight UTC by itself and it survives restarts.
-  //
-  // Zero the abandoned column ONCE so a database still carrying those stale
-  // (usually maxed-out) numbers doesn't display them. Guarded by a flag so it
-  // runs on the first boot after this change and never again.
-  try {
-    const done = await getSetting("domain_usage_derived_v1");
-    if (!done) {
-      const rows = await q(`UPDATE domains SET sent_today = 0 WHERE sent_today <> 0 RETURNING id`);
-      if (rows.length) {
-        console.log(`[db] cleared the stale sent_today counter on ${rows.length} domain(s) — daily usage is now derived from the sends ledger and resets at midnight UTC`);
-      }
-      await setSetting("domain_usage_derived_v1", new Date().toISOString());
-    }
-  } catch { /* non-fatal */ }
 
   // Persistent crawl ledger: remembers every domain we've ever scanned so we
   // never waste time (or rate-limit budget) re-crawling the same site.
@@ -301,27 +167,6 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN cursor INTEGER NOT NULL DEFAULT 1`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN empty_streak INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  // STALENESS — "this source ran again and still fetched nobody".
-  //
-  // Deliberately NOT `empty_streak`, which is walk bookkeeping: it means "these
-  // pages held no more listings" (it drives `exhausted`), it is reset by a
-  // manual Run now, and it never applies to map areas at all. What a human
-  // wants to know is simpler and blunter: how many completed runs in a row have
-  // added zero NEW leads to the pool, because two of those in a row means the
-  // source is spent and should be replaced.
-  //   barren_runs   consecutive completed runs that added nothing new
-  //   last_found    new leads the most recent completed run added
-  //   last_found_at when this source last actually produced a lead
-  // A run that ERRORED, was rate-limited or was stopped mid-flight is not
-  // counted — that is a blocked source, not a stale one, and the two need
-  // different fixes.
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN barren_runs INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN last_found INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN last_found_at TEXT`); } catch { /* exists */ }
-  // Set when the bot switched a spent source off ITSELF, so the row can say so
-  // rather than looking like someone paused it by hand. Cleared the moment a
-  // human switches it back on or re-aims it.
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN auto_off INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   // Consecutive rate-limit blocks, so the pause escalates (3 → 6 → 12 → 24 → 30
   // min) instead of jumping straight to the source's full interval. A search
   // that hit a per-minute ceiling recovers in minutes, not an hour.
@@ -346,29 +191,6 @@ export async function ensureSchema() {
   // instead of leaving a finished source looking stuck.
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_tiles INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovery_sources ADD COLUMN osm_available INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  // WHO this source is hunting: 'customer' (companies we sell DNA ERP to) or
-  // 'partner' (accounting firms, VARs, consultancies we sell the Makers program
-  // to). Every lead it files inherits the tag, so the two audiences can never be
-  // emailed the same pitch by accident. Existing sources default to 'customer'.
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
-  // Web-search sources once had an option to also walk Common Crawl's index of
-  // the country's own ccTLD. RETIRED — see SWEEP_COUNTRY_ENABLED in
-  // discovery.ts. A ccTLD is a list of every host in a country, not a list of
-  // its businesses: it filed `alabama.qa`, `agdoha2030.qa` and `akhlaquna.qa`
-  // as company leads, each named after its own hostname, and buried the real
-  // results. The column is kept so old rows still read, but nothing sets it.
-  try { await q(`ALTER TABLE discovery_sources ADD COLUMN sweep_country INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  // Clear it wherever it survives. Unguarded on purpose this time: the option
-  // no longer exists in the UI or the API, so there is no "user turned it back
-  // on" case to protect — anything still set to 1 is a leftover. Sources that
-  // were mid-pass restart their plan, which is right: without the index pages
-  // the plan is shorter, so the old cursor pointed at the wrong step.
-  try {
-    const rows = await q(`UPDATE discovery_sources SET sweep_country=0, cursor=1, exhausted=0 WHERE sweep_country=1 RETURNING id`);
-    if (rows.length) {
-      console.log(`[db] country sweep retired — cleared on ${rows.length} source(s); they now run as pure keyword searches`);
-    }
-  } catch { /* non-fatal */ }
 
   // The growing pool of companies the bot has found, awaiting your review.
   // dedup_key (domain / email / name+city) keeps the same company from being
@@ -406,286 +228,8 @@ export async function ensureSchema() {
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN next_enrich_at TEXT`); } catch { /* exists */ }
   try { await q(`ALTER TABLE discovered_leads ADD COLUMN enrich_status TEXT`); } catch { /* exists */ }
-  // MANUAL RECOVERY BOOKKEEPING — the columns that stop "Re-check emails" being
-  // an infinite loop.
-  //
-  // enrichOne() parks a lead it has given up on as
-  //   enriched=1, enrich_status='blocked'|'error', next_enrich_at=NULL
-  // and that was ALSO the exact predicate the re-check tool selected on. So the
-  // marker meaning "we gave up" doubled as "please try me again": every press
-  // re-queued the same rows, spent a crawl (or six) each against the same
-  // datacenter IP that had already been refused, parked them with an identical
-  // status, and left the badge reading the number it started with. Nothing
-  // anywhere recorded that a recovery pass had happened at all.
-  //   recheck_count  how many manual recovery passes this row has been through
-  //   recheck_key    the bypass capability that was in place for the last one
-  //   recheck_at     when that pass ran (so a disabled button can say why)
-  // `recheck_key` is the important one: re-crawling a Cloudflare wall from the
-  // same IP with the same (or no) key cannot produce a different answer, so a
-  // row is only offered again once the OPERATOR changes something — a key added
-  // or removed, a proxy configured.
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_count INTEGER NOT NULL DEFAULT 0`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_key TEXT`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN recheck_at TEXT`); } catch { /* exists */ }
-  // The same bookkeeping for "Repair company names", which had the identical
-  // shape of bug: `countBadNames()` counted every unusable name, but the repair
-  // can only fix the ones it can look up in a directory or derive from a
-  // domain. Everything else stayed bad, stayed counted, and re-walked EVERY
-  // directory source from page 1 on the next press to rebuild an identical
-  // index. `name_fix_key` records the setup a failed attempt ran under, so a
-  // row is only retried once the directory sources or the naming rules change.
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
-  try { await q(`ALTER TABLE contacts ADD COLUMN name_fix_key TEXT`); } catch { /* exists */ }
-  // WHEN this lead became emailable — the moment an address was first stored on
-  // it, whether it arrived listed on a directory card or was found by a crawl
-  // two days later.
-  //
-  // `created_at` cannot answer that question, which is the whole reason this
-  // column exists. A lead discovered on Monday and enriched on Wednesday would
-  // be credited to Monday, so "are we finding enough emailable leads per hour?"
-  // would lag by however long the crawl queue happens to be — and the queue is
-  // days long whenever the crawler is being walled, which is exactly when the
-  // number matters most.
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN email_at TEXT`); } catch { /* exists */ }
-  // The fill-rate window scans on this column alone.
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_email_at ON discovered_leads(email_at)`); } catch { /* ignore */ }
-  // Rows that already had an address get their discovery time. It's the best
-  // answer available for history that predates the column, and it is only ever
-  // read for windows that reach back before this deploy. Guarded by a flag so a
-  // large pool isn't re-scanned on every boot.
-  try {
-    const done = await getSetting("email_at_backfill_v1");
-    if (!done) {
-      const pending = (await q(
-        `SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads
-          WHERE email IS NOT NULL AND email <> '' AND email_at IS NULL`
-      ))[0]?.n ?? 0;
-      if (Number(pending) > 0) {
-        await q(
-          `UPDATE discovered_leads SET email_at = created_at
-            WHERE email IS NOT NULL AND email <> '' AND email_at IS NULL`
-        );
-        console.log(`[db] fill rate → stamped ${Number(pending).toLocaleString()} existing lead(s) with when their email first landed`);
-      }
-      await setSetting("email_at_backfill_v1", new Date().toISOString());
-    }
-  } catch { /* non-fatal */ }
   // Due-lead scan hits (enriched=0, next_enrich_at) on every enrich tick.
   try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_enrich ON discovered_leads(enriched, next_enrich_at)`); } catch { /* ignore */ }
-  // Domain lookups (the pool-domain backfill + junk sweeps scan by domain).
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_domain ON discovered_leads(domain)`); } catch { /* ignore */ }
-  // Customer or partner — copied from the source that found this lead, and
-  // carried onto the contact when it's approved. NULL = discovered before the
-  // tag existed, and is read everywhere as 'customer'.
-  try { await q(`ALTER TABLE discovered_leads ADD COLUMN audience TEXT`); } catch { /* exists */ }
-  // The automation counts and drains the pool one audience at a time.
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_discovered_leads_audience ON discovered_leads(audience)`); } catch { /* ignore */ }
-
-  /* ------------------------- Pool domain ledger ------------------------ */
-
-  // ONE permanent row per domain the discovery pool has ever considered.
-  //
-  // discovered_leads.dedup_key cannot do this job on its own: when enrichment
-  // finds an address we promote the key from "d:<domain>" to "e:<email>" (so a
-  // future lead carrying that address collides). That promotion FREES the
-  // domain key — so the next search query re-inserts the very same site and we
-  // crawl all six of its pages again. In production roughly one crawl in five
-  // was a re-crawl of a domain we had already resolved.
-  //
-  // This ledger is the durable claim. It outlives the lead row, so approving,
-  // deleting or retiring a lead can never make its domain crawlable again.
-  //   outcome: seen | found | empty | blocked | junk
-  await q(`CREATE TABLE IF NOT EXISTS pool_domains (
-    domain TEXT PRIMARY KEY,
-    outcome TEXT NOT NULL DEFAULT 'seen',
-    first_seen_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  )`);
-
-  /* ---------------------- Search query saturation ---------------------- */
-
-  // Per (source, query, page): how many consecutive passes it produced nothing
-  // new, and the earliest time it is worth asking again.
-  //
-  // A country/city/keyword pair saturates — after a few passes "civil
-  // contractor Fujairah UAE" has surfaced everything the engine will show us,
-  // and in the production log whole batches came back "+0 new" while still
-  // costing a request each and counting against the engine's rate limit.
-  //
-  // Deliberately a COOL-OFF, not a permanent skip: sites get published, so a
-  // saturated query becomes useful again later. The wait doubles (6h → 72h max)
-  // and resets to zero the moment the query yields anything.
-  await q(`CREATE TABLE IF NOT EXISTS search_query_stats (
-    source_id TEXT NOT NULL,
-    q TEXT NOT NULL,
-    offset_n INTEGER NOT NULL DEFAULT 0,
-    zero_streak INTEGER NOT NULL DEFAULT 0,
-    retry_after TEXT,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (source_id, q, offset_n)
-  )`);
-
-  /* --------------------------- Automation ledger ------------------------ */
-  // Every automation run (auto-approve a batch of emailable leads → email them)
-  // is written here, so "when did it last run, and what did it do?" is always
-  // answerable — including the runs that were skipped, and why.
-  await q(`CREATE TABLE IF NOT EXISTS automation_runs (
-    id TEXT PRIMARY KEY,
-    started_at TEXT NOT NULL,
-    finished_at TEXT,
-    trigger TEXT NOT NULL DEFAULT 'auto',
-    status TEXT NOT NULL DEFAULT 'running',
-    threshold INTEGER NOT NULL DEFAULT 0,
-    pool_count INTEGER NOT NULL DEFAULT 0,
-    approved INTEGER NOT NULL DEFAULT 0,
-    contacts_added INTEGER NOT NULL DEFAULT 0,
-    sent INTEGER NOT NULL DEFAULT 0,
-    failed INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0,
-    template_names TEXT,
-    job_id TEXT,
-    note TEXT,
-    error TEXT
-  )`);
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at)`); } catch { /* ignore */ }
-  // Which lane the run belongs to — 'customer' or 'partner'. The two lanes have
-  // their own trigger, templates and cooldown, so every run has to say which one
-  // it was, or the ledger (and the cooldown that reads it) mixes them up.
-  try { await q(`ALTER TABLE automation_runs ADD COLUMN audience TEXT NOT NULL DEFAULT 'customer'`); } catch { /* exists */ }
-
-  /* -------------------------- Follow-up ledger ------------------------- */
-  // One row per follow-up pass (the sweep that emails everyone whose retry is
-  // due). Mirrors automation_runs on purpose: same shape, same reasoning —
-  // "what did it do, and why did it refuse?" must always be answerable.
-  await q(`CREATE TABLE IF NOT EXISTS followup_runs (
-    id TEXT PRIMARY KEY,
-    started_at TEXT NOT NULL,
-    finished_at TEXT,
-    trigger TEXT NOT NULL DEFAULT 'auto',
-    status TEXT NOT NULL DEFAULT 'running',
-    due_count INTEGER NOT NULL DEFAULT 0,
-    queued INTEGER NOT NULL DEFAULT 0,
-    sent INTEGER NOT NULL DEFAULT 0,
-    failed INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0,
-    no_open INTEGER NOT NULL DEFAULT 0,
-    no_click INTEGER NOT NULL DEFAULT 0,
-    retry1 INTEGER NOT NULL DEFAULT 0,
-    retry2 INTEGER NOT NULL DEFAULT 0,
-    template_names TEXT,
-    job_id TEXT,
-    note TEXT,
-    error TEXT
-  )`);
-  try { await q(`CREATE INDEX IF NOT EXISTS idx_followup_runs_started ON followup_runs(started_at)`); } catch { /* ignore */ }
-}
-
-/* ---------------------- Search query saturation ------------------------ */
-
-const ZERO_STREAK_BEFORE_COOLOFF = 2;
-const COOLOFF_BASE_H = 6;
-const COOLOFF_MAX_H = 72;
-
-/** Queries for this source that are still cooling off right now. */
-export async function loadSaturatedQueries(sourceId: string): Promise<Set<string>> {
-  const rows = await q(
-    `SELECT q, offset_n FROM search_query_stats
-      WHERE source_id=? AND retry_after IS NOT NULL AND retry_after > ?`,
-    [sourceId, nowIso()]
-  );
-  return new Set(rows.map((r) => `${r.q}|${r.offset_n}`));
-}
-
-/**
- * Record what a query produced. Anything above zero clears the streak
- * immediately, so a query only cools off while it is genuinely exhausted.
- */
-export async function recordQueryYield(
-  sourceId: string,
-  queryText: string,
-  offset: number,
-  foundNew: number
-): Promise<void> {
-  const now = nowIso();
-  if (foundNew > 0) {
-    await q(
-      `INSERT INTO search_query_stats (source_id,q,offset_n,zero_streak,retry_after,updated_at)
-       VALUES (?,?,?,0,NULL,?)
-       ON CONFLICT (source_id,q,offset_n) DO UPDATE SET zero_streak=0, retry_after=NULL, updated_at=?`,
-      [sourceId, queryText, offset, now, now]
-    );
-    return;
-  }
-  const prev = (await q(
-    `SELECT zero_streak FROM search_query_stats WHERE source_id=? AND q=? AND offset_n=?`,
-    [sourceId, queryText, offset]
-  ))[0];
-  const streak = (Number(prev?.zero_streak) || 0) + 1;
-  let retryAfter: string | null = null;
-  if (streak >= ZERO_STREAK_BEFORE_COOLOFF) {
-    const hours = Math.min(COOLOFF_MAX_H, COOLOFF_BASE_H * 2 ** (streak - ZERO_STREAK_BEFORE_COOLOFF));
-    retryAfter = new Date(Date.now() + hours * 3_600_000).toISOString();
-  }
-  await q(
-    `INSERT INTO search_query_stats (source_id,q,offset_n,zero_streak,retry_after,updated_at)
-     VALUES (?,?,?,?,?,?)
-     ON CONFLICT (source_id,q,offset_n) DO UPDATE SET zero_streak=?, retry_after=?, updated_at=?`,
-    [sourceId, queryText, offset, streak, retryAfter, now, streak, retryAfter, now]
-  );
-}
-
-/* -------------------------- Pool domain ledger ------------------------- */
-
-/**
- * Atomically CLAIM a domain for the discovery pool.
- *
- * Returns true only for the caller that inserted the row. Two search sources
- * running concurrently can hand us the same domain in the same millisecond, so
- * a SELECT-then-INSERT would let both through; the unique PK makes the insert
- * itself the arbiter.
- */
-export async function claimPoolDomain(domain: string, outcome = "seen"): Promise<boolean> {
-  const d = (domain || "").trim().toLowerCase();
-  if (!d) return false;
-  const now = nowIso();
-  const rows = await q(
-    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
-     VALUES (?,?,?,?)
-     ON CONFLICT (domain) DO NOTHING RETURNING domain`,
-    [d, outcome, now, now]
-  );
-  return rows.length > 0;
-}
-
-/** Record how a domain ended up (found / empty / blocked / junk). Never unclaims. */
-export async function closePoolDomain(domain: string, outcome: string): Promise<void> {
-  const d = (domain || "").trim().toLowerCase();
-  if (!d) return;
-  const now = nowIso();
-  await q(
-    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
-     VALUES (?,?,?,?)
-     ON CONFLICT (domain) DO UPDATE SET outcome = ?, updated_at = ?`,
-    [d, outcome, now, now, outcome, now]
-  );
-}
-
-/**
- * Seed the ledger from what the pool already holds. Runs on every boot and is
- * idempotent — without it, the ~9k domains discovered before this table existed
- * would all be treated as brand new and re-crawled once each.
- */
-export async function backfillPoolDomains(): Promise<number> {
-  const now = nowIso();
-  const rows = await q(
-    `INSERT INTO pool_domains (domain,outcome,first_seen_at,updated_at)
-     SELECT DISTINCT lower(domain), 'seen', ?, ?
-       FROM discovered_leads
-      WHERE domain IS NOT NULL AND domain <> ''
-     ON CONFLICT (domain) DO NOTHING RETURNING domain`,
-    [now, now]
-  );
-  return rows.length;
 }
 
 /* ---------------------------- Crawl ledger ---------------------------- */

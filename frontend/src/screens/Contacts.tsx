@@ -1,11 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type AdoptableSummary, type Contact } from "../lib/api";
+import { api, type Contact, type CompanyCount, type CompanyMode } from "../lib/api";
 import { Button, Card, Field, Input, Modal, Select, Spinner, StatusPill, Textarea, toast, cn } from "../lib/ui";
 import { downloadCsv, parseContacts, CONTACTS_TEMPLATE, type ParsedContact } from "../lib/csv";
 import Crawler from "./Crawler";
 
 const FILTERS = ["all", "new", "sent", "unsubscribed", "bounced"];
 const PAGE_SIZES = [25, 50, 100];
+
+// Company filter. `exact` = one company (picked from the list or clicked in the
+// table); `contains` = every company whose name contains the typed text.
+type CompanyPick = { value: string; mode: CompanyMode };
+const NO_COMPANY = "__none__";
+
+function companyLabel(p: CompanyPick) {
+  if (p.value === NO_COMPANY) return "No company";
+  return p.mode === "contains" ? `contains “${p.value}”` : p.value;
+}
+// Reads after a count: "12 contacts at Acme Trading".
+function companyScope(p: CompanyPick) {
+  if (p.value === NO_COMPANY) return "with no company";
+  return p.mode === "contains" ? `at companies containing “${p.value}”` : `at ${p.value}`;
+}
+const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 
 // Compact relative time for the "Last opened" column.
 function timeAgo(iso?: string | null) {
@@ -30,6 +46,7 @@ export default function Contacts() {
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [categories, setCategories] = useState<string[]>([]);
   const [search, setSearch] = useState("");
+  const [company, setCompany] = useState<CompanyPick | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectAllMatching, setSelectAllMatching] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
@@ -50,6 +67,17 @@ export default function Contacts() {
 
   const headerCbRef = useRef<HTMLInputElement>(null);
 
+  // The one filter object every list / export / bulk-by-filter call sends, so
+  // "Delete all N" removes exactly the rows the table is showing.
+  const filterArgs = {
+    status: filter,
+    q: search,
+    category: categoryFilter,
+    company: company?.value,
+    companyMode: company?.mode,
+  };
+  const otherFilters = filter !== "all" || categoryFilter !== "all" || !!search.trim();
+
   async function loadCategories() {
     try { setCategories((await api.getCategories()).categories || []); } catch { /* ignore */ }
   }
@@ -58,7 +86,7 @@ export default function Contacts() {
   async function load() {
     setLoading(true);
     try {
-      const r = await api.getContacts({ status: filter, q: search, category: categoryFilter, limit: pageSize, cursor });
+      const r = await api.getContacts({ ...filterArgs, limit: pageSize, cursor });
       setContacts(r.contacts);
       setTotal(r.total);
       setFilteredTotal(r.filteredTotal);
@@ -83,7 +111,7 @@ export default function Contacts() {
     const t = setTimeout(load, search ? 300 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, search, categoryFilter, pageSize, cursor, reloadTick]);
+  }, [filter, search, categoryFilter, company, pageSize, cursor, reloadTick]);
 
   // Reset to the first page whenever the result set changes (filter/search/size).
   function resetPaging() {
@@ -108,7 +136,15 @@ export default function Contacts() {
   function changeFilter(f: string) { setFilter(f); resetPaging(); }
   function changeCategory(v: string) { setCategoryFilter(v); resetPaging(); }
   function changeSearch(v: string) { setSearch(v); resetPaging(); }
+  function changeCompany(v: CompanyPick | null) { setCompany(v); resetPaging(); }
   function changePageSize(n: number) { setPageSize(n); resetPaging(); }
+  function clearFilters() {
+    setFilter("all");
+    setCategoryFilter("all");
+    setSearch("");
+    setCompany(null);
+    resetPaging();
+  }
 
   function nextPage() {
     if (!nextCursor || loading) return;
@@ -143,8 +179,6 @@ export default function Contacts() {
     }
   }, [selected, pageAllSelected, selectAllMatching]);
 
-  const filterArgs = { status: filter, q: search, category: categoryFilter };
-
   function toggleAll() {
     if (headerChecked) {
       setSelected(new Set());
@@ -162,14 +196,35 @@ export default function Contacts() {
     });
   }
 
-  async function removeSelected() {
-    const count = selectionCount;
+  // Delete EVERY contact matching the current filters, resolved server-side with
+  // the same WHERE the list uses — not just the rows loaded on this page.
+  async function deleteMatching() {
+    const count = filteredTotal;
     if (!count) return;
-    if (!confirm(`Delete ${count.toLocaleString()} contact(s)? This cannot be undone.`)) return;
+    const scope = company
+      ? ` ${companyScope(company)}${otherFilters ? " (within your other filters)" : ""}`
+      : otherFilters ? " matching your filters" : " — your ENTIRE contact list";
+    if (!confirm(`Delete all ${plural(count, "contact")}${scope}? This cannot be undone.`)) return;
     try {
-      if (selectAllMatching) await api.deleteContactsMatching(filterArgs);
-      else await api.deleteContacts([...selected]);
-      toast(`Deleted ${count.toLocaleString()} contact(s)`, "success");
+      const r = await api.deleteContactsMatching(filterArgs);
+      toast(`Deleted ${plural(r.deleted ?? count, "contact")}${company ? ` ${companyScope(company)}` : ""}`, "success");
+      // Nothing is left under that company, so drop the filter rather than
+      // leaving an empty table behind.
+      if (company) setCompany(null);
+      refreshFromStart();
+    } catch (e: any) {
+      toast(e.message, "error");
+    }
+  }
+
+  async function removeSelected() {
+    if (selectAllMatching) return deleteMatching();
+    const count = selected.size;
+    if (!count) return;
+    if (!confirm(`Delete ${plural(count, "contact")}? This cannot be undone.`)) return;
+    try {
+      await api.deleteContacts([...selected]);
+      toast(`Deleted ${plural(count, "contact")}`, "success");
       refreshFromStart();
     } catch (e: any) {
       toast(e.message, "error");
@@ -245,75 +300,106 @@ export default function Contacts() {
         ))}
       </div>
 
-      <UnreachableBanner onDone={refreshFromStart} />
-
-      {/* Toolbar — stacked on a phone (search first, because that is what you
-          reach for), one row from lg up exactly as before. */}
-      <div className="mb-3 space-y-2 lg:flex lg:flex-wrap lg:items-center lg:gap-2 lg:space-y-0">
-        <Input
-          type="search"
-          placeholder="Search email or company…"
-          value={search}
-          onChange={(e) => changeSearch(e.target.value)}
-          className="w-full lg:order-3 lg:ml-auto lg:h-9 lg:w-64"
-        />
-
-        <div className="-mx-4 overflow-x-auto px-4 no-scrollbar lg:order-1 lg:mx-0 lg:overflow-visible lg:px-0">
-          <div className="inline-flex rounded-full border border-line bg-paper p-1">
-            {FILTERS.map((f) => (
-              <button
-                key={f}
-                onClick={() => changeFilter(f)}
-                className={cn(
-                  "shrink-0 rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize transition-colors lg:px-3 lg:py-1",
-                  filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
-                )}
-              >
-                {f}
-              </button>
-            ))}
-          </div>
+      {/* Toolbar */}
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="flex rounded-full border border-line bg-paper p-1">
+          {FILTERS.map((f) => (
+            <button
+              key={f}
+              onClick={() => changeFilter(f)}
+              className={cn(
+                "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
+                filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+              )}
+            >
+              {f}
+            </button>
+          ))}
         </div>
-
         {categories.length > 0 && (
           <Select
             value={categoryFilter}
             onChange={(e) => changeCategory(e.target.value)}
-            className="w-full lg:order-2 lg:h-9 lg:w-44"
+            className="h-9 w-44"
           >
             <option value="all">All categories</option>
             {categories.map((c) => <option key={c} value={c}>{c}</option>)}
             <option value="__none__">Uncategorized</option>
           </Select>
         )}
-
-        {selectionCount > 0 && (
-          <div className="flex items-center gap-2 lg:order-4">
-            {categories.length > 0 && (
-              <BulkCategory categories={categories} onApply={applyCategory} />
-            )}
-            {/* bulk-set assigns a category; clearing is done via Edit */}
-            <Button variant="danger" size="sm" onClick={removeSelected} className="flex-1 lg:flex-none">
-              Delete {selectionCount.toLocaleString()}
-            </Button>
-          </div>
-        )}
+        <CompanyFilter
+          value={company}
+          onChange={changeCompany}
+          status={filter}
+          category={categoryFilter}
+          refreshKey={reloadTick}
+        />
+        <div className="ml-auto flex items-center gap-2">
+          {selectionCount > 0 && (
+            <>
+              {categories.length > 0 && (
+                <BulkCategory categories={categories} onApply={applyCategory} />
+              )}
+              {/* bulk-set assigns a category; clearing is done via Edit */}
+              <Button variant="danger" size="sm" onClick={removeSelected}>
+                Delete {selectionCount.toLocaleString()}
+              </Button>
+            </>
+          )}
+          <Input
+            placeholder="Search email or company…"
+            value={search}
+            onChange={(e) => changeSearch(e.target.value)}
+            className="h-9 w-64"
+          />
+        </div>
       </div>
 
       {/* Table */}
       <Card className="overflow-hidden">
         {/* Select-all-matching banner */}
         {selectAllMatching ? (
-          <div className="flex flex-wrap items-center justify-center gap-1.5 border-b border-line bg-ink/[0.03] px-4 py-2 text-[13px]">
+          <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 border-b border-line bg-ink/[0.03] px-4 py-2 text-[13px]">
             <span className="text-ink/70">
-              All <span className="font-semibold text-ink">{filteredTotal.toLocaleString()}</span> contacts matching your filters are selected.
+              All <span className="font-semibold text-ink">{filteredTotal.toLocaleString()}</span>{" "}
+              {filteredTotal === 1 ? "contact" : "contacts"}{" "}
+              {company ? <span className="font-semibold text-ink">{companyScope(company)}</span> : "matching your filters"}{" "}
+              {filteredTotal === 1 ? "is" : "are"} selected.
             </span>
+            <Button variant="danger" size="sm" className="h-7 px-3" onClick={deleteMatching}>
+              Delete all {filteredTotal.toLocaleString()}
+            </Button>
             <button
               onClick={() => { setSelectAllMatching(false); setSelected(new Set()); }}
               className="font-semibold text-ink underline underline-offset-2 hover:opacity-70"
             >
               Clear selection
             </button>
+          </div>
+        ) : company && !loading ? (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-ink/[0.03] px-4 py-2.5 text-[13px]">
+            <span className="mono-label rounded-full bg-ink px-2 py-0.5 text-[10px] text-cream">Company</span>
+            <span className="min-w-0 text-ink/70">
+              <span className="font-semibold text-ink">{plural(filteredTotal, "contact")}</span>{" "}
+              <span className="font-semibold text-ink">{companyScope(company)}</span>
+              {otherFilters && <span className="text-muted"> · within your other filters</span>}
+            </span>
+            <button
+              onClick={() => changeCompany(null)}
+              className="text-ink/50 underline underline-offset-2 hover:text-ink"
+            >
+              Clear
+            </button>
+            {filteredTotal > 0 && (
+              <div className="ml-auto flex items-center gap-2">
+                <Button variant="outline" size="sm" className="h-7 px-3" onClick={() => setSelectAllMatching(true)}>
+                  Select all {filteredTotal.toLocaleString()}
+                </Button>
+                <Button variant="danger" size="sm" className="h-7 px-3" onClick={deleteMatching}>
+                  Delete all {filteredTotal.toLocaleString()}
+                </Button>
+              </div>
+            )}
           </div>
         ) : canOfferAllMatching ? (
           <div className="flex flex-wrap items-center justify-center gap-1.5 border-b border-line bg-ink/[0.03] px-4 py-2 text-[13px]">
@@ -334,44 +420,15 @@ export default function Contacts() {
             <Spinner /> Loading…
           </div>
         ) : contacts.length === 0 ? (
-          <Empty onFind={() => setCrawlOpen(true)} />
+          total > 0 ? <NoMatches onClear={clearFilters} /> : <Empty onFind={() => setCrawlOpen(true)} />
         ) : (
           <>
-            {/* Phone / tablet: one card per contact. Ten columns cannot be made
-                to work at 390px, and a sideways-scrolling table is not a fix —
-                the columns that matter (who, where, state) go up top and the
-                rest reads underneath. */}
-            <ul className="divide-y divide-line-soft lg:hidden">
-              <li className="flex items-center gap-3 border-b border-line bg-ink/[0.02] px-4 py-2.5">
-                <input
-                  type="checkbox"
-                  checked={headerChecked}
-                  onChange={toggleAll}
-                  aria-label="Select all on this page"
-                  className="h-[18px] w-[18px] accent-ink"
-                />
-                <span className="text-[13px] text-ink/70">
-                  {headerChecked ? "Deselect all" : "Select all on page"}
-                </span>
-                <span className="mono-label ml-auto text-muted">{contacts.length}</span>
-              </li>
-              {contacts.map((c) => (
-                <ContactCard
-                  key={c.id}
-                  contact={c}
-                  selected={selectAllMatching || selected.has(c.id)}
-                  onToggle={() => toggle(c.id)}
-                  onEdit={() => setEditing(c)}
-                />
-              ))}
-            </ul>
-
-            <div className="hidden overflow-x-auto lg:block">
+            <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="w-10 px-4 py-3">
-                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="h-[18px] w-[18px] accent-ink" />
+                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
                     </th>
                     <th className="px-2 py-3">Email</th>
                     <th className="px-2 py-3">Company</th>
@@ -398,7 +455,20 @@ export default function Contacts() {
                           />
                         </td>
                         <td className="px-2 py-2.5 font-medium">{c.email}</td>
-                        <td className="px-2 py-2.5 text-ink/70">{c.company || "—"}</td>
+                        <td className="px-2 py-2.5 text-ink/70">
+                          {c.company ? (
+                            <button
+                              type="button"
+                              onClick={() => changeCompany({ value: c.company as string, mode: "exact" })}
+                              title={`Show only contacts at ${c.company}`}
+                              className="max-w-[240px] truncate text-left underline-offset-2 decoration-ink/30 transition-colors hover:text-ink hover:underline"
+                            >
+                              {c.company}
+                            </button>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
                         <td className="px-2 py-2.5 text-ink/70">
                           {c.phone ? <span className="tabular-nums">{c.phone}</span> : <span className="text-muted">—</span>}
                         </td>
@@ -456,44 +526,27 @@ export default function Contacts() {
             </div>
 
             {/* Pagination footer */}
-            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2.5 border-t border-line px-4 py-3 text-[13px]">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-[13px]">
               <div className="text-muted">
                 Showing <span className="font-medium text-ink">{rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()}</span>{" "}
                 of <span className="font-medium text-ink">{filteredTotal.toLocaleString()}</span>
               </div>
-              <div className="flex items-center gap-2 text-muted">
-                <span className="hidden sm:inline">Per page</span>
-                <Select
-                  value={String(pageSize)}
-                  onChange={(e) => changePageSize(Number(e.target.value))}
-                  className="h-9 w-[74px] py-0 sm:h-8"
-                  aria-label="Rows per page"
-                >
-                  {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
-                </Select>
-              </div>
-              <div className="flex w-full items-center gap-1.5 sm:w-auto">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={prevPage}
-                  disabled={pageIndex === 0 || loading}
-                  className="flex-1 sm:flex-none"
-                >
-                  Prev
-                </Button>
-                <span className="min-w-[84px] shrink-0 text-center text-muted">
-                  Page {pageIndex + 1} / {totalPages.toLocaleString()}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={nextPage}
-                  disabled={!nextCursor || loading}
-                  className="flex-1 sm:flex-none"
-                >
-                  Next
-                </Button>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2 text-muted">
+                  <span>Per page</span>
+                  <Select value={String(pageSize)} onChange={(e) => changePageSize(Number(e.target.value))} className="h-8 w-[72px]">
+                    {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </Select>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Button variant="outline" size="sm" onClick={prevPage} disabled={pageIndex === 0 || loading}>
+                    Prev
+                  </Button>
+                  <span className="min-w-[84px] text-center text-muted">Page {pageIndex + 1} / {totalPages.toLocaleString()}</span>
+                  <Button variant="outline" size="sm" onClick={nextPage} disabled={!nextCursor || loading}>
+                    Next
+                  </Button>
+                </div>
               </div>
             </div>
           </>
@@ -528,86 +581,13 @@ export function Header({
   actions?: React.ReactNode;
 }) {
   return (
-    <div className="mb-5 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between sm:gap-4">
-      <div className="min-w-0">
-        <h1 className="font-clash text-[26px] font-semibold leading-tight tracking-tight sm:text-3xl">
-          {title}
-        </h1>
-        {subtitle && <p className="mt-1 text-[13px] text-muted sm:text-sm">{subtitle}</p>}
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <h1 className="font-clash text-3xl font-semibold tracking-tight">{title}</h1>
+        {subtitle && <p className="mt-1 text-sm text-muted">{subtitle}</p>}
       </div>
-      {actions && (
-        // Four buttons will not fit across a 390px screen. Rather than let them
-        // wrap into a ragged block, they become a swipeable rail that bleeds to
-        // both edges — the same trick the filter pills use below.
-        <div className="-mx-4 flex items-center gap-2 overflow-x-auto px-4 pb-0.5 no-scrollbar [&>*]:shrink-0 sm:mx-0 sm:overflow-visible sm:px-0">
-          {actions}
-        </div>
-      )}
+      <div className="flex items-center gap-2">{actions}</div>
     </div>
-  );
-}
-
-/* --------------------------- Contact card --------------------------- */
-
-// The sub-lg row. Tapping the body opens the editor, which is the mobile
-// equivalent of the Edit button that appears on hover in the table; the
-// checkbox stays a separate target so selecting never opens anything.
-function ContactCard({
-  contact: c,
-  selected,
-  onToggle,
-  onEdit,
-}: {
-  contact: Contact;
-  selected: boolean;
-  onToggle: () => void;
-  onEdit: () => void;
-}) {
-  const meta = [c.country, c.role_based ? "role" : "personal"].filter(Boolean);
-  return (
-    <li className={cn("flex gap-3 px-4 py-3 transition-colors", selected && "bg-ink/[0.03]")}>
-      <input
-        type="checkbox"
-        checked={selected}
-        onChange={onToggle}
-        aria-label={`Select ${c.email}`}
-        className="mt-1 h-[18px] w-[18px] shrink-0 accent-ink"
-      />
-      <button onClick={onEdit} className="min-w-0 flex-1 text-left active:opacity-70">
-        <div className="flex items-start justify-between gap-2">
-          <span className="truncate text-[14px] font-medium">{c.email}</span>
-          <span className="shrink-0">
-            <StatusPill status={c.status} />
-          </span>
-        </div>
-
-        <div className="mt-0.5 truncate text-[13px] text-ink/70">{c.company || "—"}</div>
-
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-muted">
-          {c.category && (
-            <span className="rounded-full bg-ink/[0.06] px-2 py-0.5 font-medium text-ink/70">
-              {c.category}
-            </span>
-          )}
-          {c.phone && <span className="tabular-nums">{c.phone}</span>}
-          {meta.map((m) => (
-            <span key={m}>{m}</span>
-          ))}
-          {c.last_opened_at && (
-            <span className="inline-flex items-center gap-1 text-ink/60">
-              <span className="h-1.5 w-1.5 rounded-full bg-good" />
-              opened {timeAgo(c.last_opened_at)}
-              {(c.open_count || 0) > 1 && <span className="tabular-nums">·{c.open_count}×</span>}
-            </span>
-          )}
-          {(c.click_count || 0) > 0 && (
-            <span className="rounded bg-good/10 px-1.5 py-0.5 text-[10px] font-medium text-good">
-              clicked
-            </span>
-          )}
-        </div>
-      </button>
-    </li>
   );
 }
 
@@ -626,6 +606,270 @@ function Empty({ onFind }: { onFind: () => void }) {
   );
 }
 
+function NoMatches({ onClear }: { onClear: () => void }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+      <div className="font-clash text-lg font-semibold">No contacts match these filters</div>
+      <p className="max-w-sm text-sm text-muted">Try another company, status or category, or clear the filters.</p>
+      <Button size="sm" variant="outline" onClick={onClear} className="mt-1">
+        Clear filters
+      </Button>
+    </div>
+  );
+}
+
+/* --------------------------- Company filter ------------------------- */
+
+// Searchable company picker. Lists every company on file (scoped to the
+// current status/category tab) with how many contacts each has; typing offers
+// "any company containing …" on top, which catches spelling variants like
+// "Acme Trading" and "ACME Trading W.L.L." in one go.
+const COMPANY_LIST_LIMIT = 50;
+
+interface CompanyOption {
+  key: string;
+  pick: CompanyPick | null; // null = clear the filter
+  label: React.ReactNode;
+  n?: number;
+}
+
+function highlightMatch(name: string, term: string): React.ReactNode {
+  if (!term) return name;
+  const i = name.toLowerCase().indexOf(term.toLowerCase());
+  if (i < 0) return name;
+  return (
+    <>
+      {name.slice(0, i)}
+      <mark className="rounded-[3px] bg-[#fbe7b0] text-ink">{name.slice(i, i + term.length)}</mark>
+      {name.slice(i + term.length)}
+    </>
+  );
+}
+
+function CompanyFilter({
+  value,
+  onChange,
+  status,
+  category,
+  refreshKey,
+}: {
+  value: CompanyPick | null;
+  onChange: (v: CompanyPick | null) => void;
+  status: string;
+  category: string;
+  refreshKey: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [active, setActive] = useState(0);
+  const [data, setData] = useState<{
+    companies: CompanyCount[];
+    totalCompanies: number;
+    matching: number;
+    noCompany: number;
+  } | null>(null);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const term = text.trim();
+
+  // Fetch while open; debounce typing.
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    setBusy(true);
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.getContactCompanies({ status, category, search: term, limit: COMPANY_LIST_LIMIT });
+        if (alive) setData(r);
+      } catch {
+        if (alive) setData(null);
+      } finally {
+        if (alive) setBusy(false);
+      }
+    }, term ? 200 : 0);
+    return () => { alive = false; clearTimeout(t); };
+  }, [open, term, status, category, refreshKey]);
+
+  // Close on outside click.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Reset the keyboard cursor whenever the list changes.
+  useEffect(() => { setActive(0); }, [term, open]);
+
+  const options: CompanyOption[] = [];
+  if (term) {
+    if ((data?.matching ?? 0) > 0) {
+      options.push({
+        key: "contains",
+        pick: { value: term, mode: "contains" },
+        label: <>Any company containing <span className="font-semibold">“{term}”</span></>,
+        n: data?.matching,
+      });
+    }
+  } else if (value) {
+    options.push({ key: "all", pick: null, label: <span className="text-ink/60">All companies</span> });
+  }
+  for (const c of data?.companies || []) {
+    options.push({
+      key: `c:${c.company.toLowerCase()}`,
+      pick: { value: c.company, mode: "exact" },
+      label: highlightMatch(c.company, term),
+      n: c.n,
+    });
+  }
+  if (!term && (data?.noCompany ?? 0) > 0) {
+    options.push({
+      key: "none",
+      pick: { value: NO_COMPANY, mode: "exact" },
+      label: <span className="italic text-ink/60">No company</span>,
+      n: data?.noCompany,
+    });
+  }
+
+  // Keep the keyboard-highlighted row in view.
+  useEffect(() => {
+    listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  const isCurrent = (p: CompanyPick | null) =>
+    p === null
+      ? !value
+      : !!value && value.mode === p.mode && value.value.toLowerCase() === p.value.toLowerCase();
+
+  function choose(o: CompanyOption) {
+    onChange(o.pick);
+    setOpen(false);
+    setText("");
+  }
+
+  function onKey(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((a) => Math.min(options.length - 1, a + 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((a) => Math.max(0, a - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const o = options[active];
+      if (o) choose(o);
+    } else if (e.key === "Escape") {
+      setOpen(false);
+    }
+  }
+
+  const shown = data?.companies.length ?? 0;
+  const totalCompanies = data?.totalCompanies ?? 0;
+
+  return (
+    <div ref={boxRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title={value ? `Company: ${companyLabel(value)}` : "Filter by company"}
+        className={cn(
+          "flex h-9 w-56 items-center gap-2 rounded-xl border pl-3 text-left text-sm transition-colors",
+          value ? "border-ink bg-ink pr-9 text-cream" : "border-line bg-white pr-3 text-ink hover:border-ink/30"
+        )}
+      >
+        <span className={cn("mono-label shrink-0 text-[10px]", value ? "text-cream/55" : "text-muted")}>Company</span>
+        <span className="min-w-0 flex-1 truncate">
+          {value ? companyLabel(value) : <span className="text-muted">All</span>}
+        </span>
+        {!value && (
+          <svg viewBox="0 0 12 12" className="h-3 w-3 shrink-0 text-muted" aria-hidden="true">
+            <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        )}
+      </button>
+      {value && (
+        <button
+          type="button"
+          onClick={() => onChange(null)}
+          aria-label="Clear company filter"
+          title="Clear company filter"
+          className="absolute right-1.5 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded-full text-[11px] text-cream/70 transition-colors hover:bg-cream/15 hover:text-cream"
+        >
+          ✕
+        </button>
+      )}
+
+      {open && (
+        <div className="absolute left-0 top-full z-30 mt-1.5 w-[min(21rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-line bg-paper shadow-[0_22px_48px_-20px_rgba(11,11,11,0.35)]">
+          <div className="border-b border-line p-2">
+            <input
+              autoFocus
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={onKey}
+              placeholder="Search companies…"
+              className="w-full rounded-lg bg-ink/[0.04] px-3 py-2 text-sm text-ink outline-none transition-colors placeholder:text-muted/80 focus:bg-ink/[0.065]"
+            />
+          </div>
+
+          <div ref={listRef} role="listbox" className="max-h-72 overflow-y-auto py-1">
+            {options.map((o, i) => {
+              const current = isCurrent(o.pick);
+              return (
+                <button
+                  key={o.key}
+                  type="button"
+                  role="option"
+                  aria-selected={current}
+                  data-idx={i}
+                  onMouseEnter={() => setActive(i)}
+                  onClick={() => choose(o)}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] transition-colors",
+                    i === active ? "bg-ink/[0.06]" : "",
+                    o.key === "contains" && "border-b border-line-soft"
+                  )}
+                >
+                  <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", current ? "bg-ink" : "bg-ink/10")} />
+                  <span className={cn("min-w-0 flex-1 truncate", current && "font-semibold")}>{o.label}</span>
+                  {o.n != null && <span className="shrink-0 tabular-nums text-xs text-muted">{o.n.toLocaleString()}</span>}
+                </button>
+              );
+            })}
+            {options.length === 0 && (
+              <div className="flex items-center justify-center gap-2 px-3 py-7 text-center text-[13px] text-muted">
+                {busy ? (
+                  <><Spinner className="h-3.5 w-3.5" /> Loading companies…</>
+                ) : term ? (
+                  <>No company matches “{term}”</>
+                ) : (
+                  <>No companies on file yet</>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between gap-3 border-t border-line px-3 py-2 text-[11px] text-muted">
+            <span className="truncate">
+              {data
+                ? totalCompanies > shown
+                  ? `Top ${shown} of ${plural(totalCompanies, "company", "companies")} — type to narrow`
+                  : `${plural(totalCompanies, "company", "companies")}${term ? " match" : ""}`
+                : "\u00a0"}
+            </span>
+            <span className="hidden shrink-0 sm:inline">↑↓ · Enter</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ----------------------------- Add modal ---------------------------- */
 
 function BulkCategory({ categories, onApply }: { categories: string[]; onApply: (cat: string) => void }) {
@@ -638,9 +882,7 @@ function BulkCategory({ categories, onApply }: { categories: string[]; onApply: 
         setVal("");
         if (v) onApply(v);
       }}
-      /* Shares a row with the Delete button, so it flexes rather than
-         claiming the full width the way a stacked control would. */
-      className="min-w-0 flex-1 text-[13px] sm:h-8 sm:w-40 sm:flex-none"
+      className="h-8 w-40 text-[13px]"
     >
       <option value="">Set category…</option>
       {categories.map((c) => <option key={c} value={c}>{c}</option>)}
@@ -684,7 +926,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
   return (
     <Modal open={open} onClose={onClose} title="Add contact">
       <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Email">
             <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} placeholder="name@company.com" />
           </Field>
@@ -692,7 +934,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
             <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
           </Field>
         </div>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
           </Field>
@@ -700,7 +942,7 @@ function AddModal({ open, onClose, onDone, categories }: { open: boolean; onClos
             <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
           </Field>
         </div>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Industry">
             <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
           </Field>
@@ -722,11 +964,6 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
   const [fileName, setFileName] = useState("");
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
-  // Where the rows land. "pool" is the default because it is what almost
-  // everybody means by importing: the automation only ever reads the review
-  // pool, so a CSV sent straight to Contacts can never be emailed by the bot.
-  const [dest, setDest] = useState<"pool" | "contacts">("pool");
-  const [audience, setAudience] = useState<"customer" | "partner">("customer");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const parsed = useMemo<ParsedContact[]>(() => (csv.trim() ? parseContacts(csv) : []), [csv]);
@@ -764,30 +1001,23 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
     if (!valid.length) return toast("No valid rows to import", "error");
     setBusy(true);
     try {
-      const rows = valid.map((c) => ({
-        email: c.email,
-        company: c.company || undefined,
-        country: c.country || undefined,
-        industry: c.industry || undefined,
-        category: c.category || undefined,
-        phone: c.phone || undefined,
-        source: "csv",
-      }));
-
-      if (dest === "pool") {
-        const r = await api.importToPool(rows, { audience, label: fileName || "CSV import" });
-        const parts = [`${r.added} queued for the automation`];
-        if (r.duplicate) parts.push(`${r.duplicate} already known`);
-        if (r.invalid) parts.push(`${r.invalid} unmailable`);
-        toast(parts.join(" · "), "success");
-      } else {
-        // upsert=true: existing contacts are UPDATED (status preserved), new ones added.
-        const r = await api.bulkContacts(rows, true, audience);
-        const parts = [`${r.added} added`];
-        if (r.updated) parts.push(`${r.updated} updated`);
-        if (r.skipped) parts.push(`${r.skipped} unchanged`);
-        toast(parts.join(" · "), "success");
-      }
+      // upsert=true: existing contacts are UPDATED (status preserved), new ones added.
+      const r = await api.bulkContacts(
+        valid.map((c) => ({
+          email: c.email,
+          company: c.company || undefined,
+          country: c.country || undefined,
+          industry: c.industry || undefined,
+          category: c.category || undefined,
+          phone: c.phone || undefined,
+          source: "csv",
+        })),
+        true
+      );
+      const parts = [`${r.added} added`];
+      if (r.updated) parts.push(`${r.updated} updated`);
+      if (r.skipped) parts.push(`${r.skipped} unchanged`);
+      toast(parts.join(" · "), "success");
       reset();
       onDone();
       onClose();
@@ -863,79 +1093,11 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           </details>
         </div>
 
-        {/* Step 3 — destination. The single most consequential choice in this
-            modal, and the one that used to be made silently and wrongly. */}
-        <div>
-          <div className="mb-2 flex items-center gap-3">
-            <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
-            <div className="text-[13px] font-semibold text-ink">Where should these go?</div>
-          </div>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            <button
-              type="button"
-              onClick={() => setDest("pool")}
-              className={cn(
-                "rounded-xl border px-4 py-3 text-left transition-colors",
-                dest === "pool" ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40"
-              )}
-            >
-              <div className="flex items-center gap-2">
-                <span className={cn("h-2 w-2 rounded-full", dest === "pool" ? "bg-ink" : "bg-ink/20")} />
-                <span className="text-[13px] font-semibold text-ink">Review pool</span>
-                <span className="rounded-full bg-[#e7f6ec] px-2 py-0.5 text-[10px] font-medium text-[#1f8b4c]">
-                  automation
-                </span>
-              </div>
-              <div className="mt-1 text-xs leading-relaxed text-muted">
-                The bot emails them in batches, on its own schedule, respecting each
-                country's sending window and your daily limit.
-              </div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setDest("contacts")}
-              className={cn(
-                "rounded-xl border px-4 py-3 text-left transition-colors",
-                dest === "contacts" ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40"
-              )}
-            >
-              <div className="flex items-center gap-2">
-                <span className={cn("h-2 w-2 rounded-full", dest === "contacts" ? "bg-ink" : "bg-ink/20")} />
-                <span className="text-[13px] font-semibold text-ink">Contacts only</span>
-              </div>
-              <div className="mt-1 text-xs leading-relaxed text-muted">
-                Stored, but the automation will never touch them. You email them
-                yourself from the Send screen.
-              </div>
-            </button>
-          </div>
-
-          <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-ink/[0.02] px-3 py-2">
-            <span className="text-xs font-medium text-ink/70">Pitch these as</span>
-            {(["customer", "partner"] as const).map((a) => (
-              <button
-                key={a}
-                type="button"
-                onClick={() => setAudience(a)}
-                className={cn(
-                  "rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition-colors",
-                  audience === a ? "bg-ink text-cream" : "text-ink/60 hover:bg-ink/[0.06]"
-                )}
-              >
-                {a}s
-              </button>
-            ))}
-            <span className="text-xs text-muted">
-              — decides which lane, and which template, they get.
-            </span>
-          </div>
-        </div>
-
-        {/* Step 4 — preview */}
+        {/* Step 3 — preview */}
         {parsed.length > 0 && (
           <div>
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">04</span>
+              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
               <div className="text-[13px] font-semibold text-ink">Review</div>
               <div className="ml-1 flex flex-wrap gap-1.5">
                 <Chip tone="good">{valid.length} ready</Chip>
@@ -943,16 +1105,14 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                 {invalid.length > 0 && <Chip tone="bad">{invalid.length} invalid</Chip>}
               </div>
             </div>
-            <div className="touch-scroll max-h-56 overflow-auto rounded-xl border border-line">
+            <div className="max-h-56 overflow-auto rounded-xl border border-line">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-paper">
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="px-3 py-2">Email</th>
                     <th className="px-2 py-2">Company</th>
-                    {/* The email column carries the invalid/duplicate markers,
-                        so on a phone it takes the room these two would have. */}
-                    <th className="hidden px-2 py-2 sm:table-cell">Phone</th>
-                    <th className="hidden px-2 py-2 sm:table-cell">Category</th>
+                    <th className="px-2 py-2">Phone</th>
+                    <th className="px-2 py-2">Category</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -969,8 +1129,8 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
                           {dup && <span className="ml-2 text-[11px] text-muted">dup</span>}
                         </td>
                         <td className="px-2 py-1.5 text-ink/70">{r.company || "—"}</td>
-                        <td className="hidden px-2 py-1.5 tabular-nums text-ink/70 sm:table-cell">{r.phone || "—"}</td>
-                        <td className="hidden px-2 py-1.5 text-ink/70 sm:table-cell">{r.category || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70 tabular-nums">{r.phone || "—"}</td>
+                        <td className="px-2 py-1.5 text-ink/70">{r.category || "—"}</td>
                       </tr>
                     );
                   })}
@@ -987,16 +1147,12 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
           {csv.trim() ? (
             <button onClick={reset} className="text-xs font-medium text-ink/50 underline hover:text-ink">Clear</button>
           ) : (
-            <span className="text-xs text-muted">
-              {dest === "pool"
-                ? "Anyone already in Contacts or the pool is skipped, so re-importing is safe."
-                : "Existing contacts are updated (their status is kept); new ones are added."}
-            </span>
+            <span className="text-xs text-muted">Existing contacts are updated (their status is kept); new ones are added.</span>
           )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={close}>Cancel</Button>
             <Button loading={busy} onClick={submit} disabled={!valid.length}>
-              {dest === "pool" ? "Queue" : "Import"} {valid.length || ""} contact{valid.length === 1 ? "" : "s"}
+              Import {valid.length || ""} contact{valid.length === 1 ? "" : "s"}
             </Button>
           </div>
         </div>
@@ -1046,7 +1202,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
   return (
     <Modal open onClose={onClose} title="Edit contact">
       <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Email">
             <Input value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
           </Field>
@@ -1054,7 +1210,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
             <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+974 5012 3456" />
           </Field>
         </div>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Company">
             <Input value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} />
           </Field>
@@ -1062,7 +1218,7 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
             <Input value={f.country} onChange={(e) => setF({ ...f, country: e.target.value })} />
           </Field>
         </div>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-2 gap-3">
           <Field label="Industry">
             <Input value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} />
           </Field>
@@ -1082,118 +1238,5 @@ function EditModal({ contact, categories, onClose, onDone }: { contact: Contact;
         </div>
       </div>
     </Modal>
-  );
-}
-
-/* ------------------- Contacts the automation cannot see ------------------ */
-
-/**
- * Contacts imported before the pool route existed are invisible to the bot:
- * every lane counts the review pool and nothing else. They are not broken and
- * not lost — they have simply never been queued, and there was previously no
- * way to tell from this screen, because a contact the bot will email tomorrow
- * and one it will never email look identical in the table.
- *
- * Shown only when there is something to do, and it disappears for good once
- * the backfill has run.
- */
-function UnreachableBanner({ onDone }: { onDone: () => void }) {
-  const [info, setInfo] = useState<AdoptableSummary | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
-  const [dismissed, setDismissed] = useState(false);
-
-  async function load() {
-    try {
-      setInfo(await api.getAdoptable());
-    } catch {
-      /* a failure here must never break the Contacts screen */
-    }
-  }
-  useEffect(() => { load(); }, []);
-
-  async function queueThem() {
-    setBusy(true);
-    setProgress({ done: 0, total: info?.imported || 0 });
-    try {
-      const { jobId, total } = await api.adoptContacts({ importedOnly: true });
-      setProgress({ done: 0, total });
-      // Poll until the job settles. A 30k backfill is chunked server-side, so
-      // this reports real movement rather than an indeterminate spinner.
-      for (;;) {
-        await new Promise((r) => setTimeout(r, 700));
-        const job = await api.adoptContactsJob(jobId);
-        setProgress({ done: job.processed || 0, total: job.total || total });
-        if (job.status === "done") {
-          const r = job.result || {};
-          toast(
-            `${(r.added || 0).toLocaleString()} contact(s) queued — the automation will email them in batches.`,
-            "success"
-          );
-          break;
-        }
-        if (job.status === "error") {
-          toast(job.error || "The backfill failed", "error");
-          break;
-        }
-      }
-      await load();
-      onDone();
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setBusy(false);
-      setProgress(null);
-    }
-  }
-
-  if (dismissed || !info || info.imported < 1) return null;
-
-  const pct = progress && progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
-
-  return (
-    <Card className="mb-6 border-ink/15 bg-ink/[0.02] px-4 py-3.5">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded-full bg-[#fdf3e3] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[#9a6b16]">
-              not queued
-            </span>
-            <span className="text-[13px] font-semibold text-ink">
-              {info.imported.toLocaleString()} imported contact{info.imported === 1 ? " has" : "s have"} never been emailed
-            </span>
-          </div>
-          <p className="mt-1 text-xs leading-relaxed text-muted">
-            The automation only reads the review pool, so contacts imported straight
-            into this list were never picked up. Queue them and the bot will email
-            them in its normal batches — same daily limit, same sending windows.
-            {info.alreadyEmailed > 0 && (
-              <>
-                {" "}
-                The {info.alreadyEmailed.toLocaleString()} already emailed are left alone.
-              </>
-            )}
-          </p>
-          {progress && (
-            <div className="mt-2">
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink/10">
-                <div className="h-full rounded-full bg-ink transition-all" style={{ width: `${pct}%` }} />
-              </div>
-              <div className="mt-1 text-[11px] tabular-nums text-muted">
-                {progress.done.toLocaleString()} of {progress.total.toLocaleString()} queued
-              </div>
-            </div>
-          )}
-        </div>
-        <div className="flex shrink-0 gap-2">
-          <Button variant="ghost" size="sm" onClick={() => setDismissed(true)} disabled={busy}>
-            Not now
-          </Button>
-          <Button size="sm" loading={busy} onClick={queueThem}>
-            Queue for automation
-          </Button>
-        </div>
-      </div>
-    </Card>
   );
 }

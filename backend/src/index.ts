@@ -11,43 +11,14 @@ import { crawlMany, type CrawlOptions } from "./crawler";
 import { crawlDirectoryMany, type DirectoryOptions } from "./crawler/directory";
 import { parsePdf } from "./crawler/pdf";
 import { enrichCompany } from "./enrich";
-import {
-  fetchViaProxy, fetchViaReader, parseReaderKeys, readerKeyHealth, maskReaderKey,
-  getTransportStats, archiveHealth, type ScrapeProvider,
-} from "./crawler/fetcher";
+import { fetchViaProxy, fetchViaReader, type ScrapeProvider } from "./crawler/fetcher";
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { cleanEmail, isValidEmail } from "./crawler/validate";
 import { sendEmail, getResendKey } from "./resend";
 import { renderTemplate, wrapHtml } from "./template";
-import { runSendJob, buildFrom, isEmail, domainUsageToday, resetDomainUsage } from "./send";
-import {
-  discoveredWhere,
-  approveLeads,
-  importLeadsToPool,
-  adoptContactsToPool,
-  countAdoptableContacts,
-  countStrandedLeads,
-  requeueStrandedLeads,
-  normalizeAudience,
-  NO_COUNTRY,
-} from "./pool";
-import {
-  startAutomationWorker,
-  getAutomationStatus,
-  setAutomationConfig,
-  startAutomationRun,
-} from "./automation";
-import { setSchedule, type CountryRule } from "./schedule";
-import {
-  startFollowUpWorker,
-  getFollowUpStatus,
-  setFollowUpConfig,
-  startFollowUpRun,
-  MAX_STEPS,
-} from "./followup";
 import { findLeads, geocodeSuggest, LEAD_CATEGORIES } from "./leads";
-import { backfillCountries } from "./country";
-import { searchCompanies, searchEngineHealth } from "./search";
+import { backfillCountries, normalizeCountry } from "./country";
+import { searchCompanies } from "./search";
 import { SCRAPE_PROVIDERS, getProxyConfig, getReaderKey } from "./config";
 import {
   startDiscoveryWorker,
@@ -63,12 +34,8 @@ import {
   rejectContentLeads,
   repairEscapedEmails,
   repairPageTitleNames,
-  sweepNonProspectLeads,
-  STALE_AFTER_RUNS,
-  STALE_OFF_AFTER_RUNS,
 } from "./discovery";
-import { repairLeadNames, countBadNames, clearFreemailCompanyNames } from "./repair";
-import { getFillRate } from "./fillrate";
+import { repairLeadNames, countBadNames } from "./repair";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -77,19 +44,11 @@ import {
   isAuthConfigured,
   getUsername,
   setCredentials,
-  looksLikeAccessKey,
-  verifyAccessKey,
-  sessionFromAccessKey,
-  createAccessKey,
-  listAccessKeys,
-  revokeAccessKey,
 } from "./auth";
 
 await ensureSchema();
 await seedAuthFromEnv();
 startDiscoveryWorker(); // always-on company discovery (browser-independent)
-startAutomationWorker(); // auto-approve a full pool → auto-send (browser-independent)
-startFollowUpWorker(); // retry ladder — nobody gets one email and silence
 
 // Give every lead and contact one canonical country. Rows saved before the
 // country was resolved properly are blank (the source's Country box was left
@@ -116,11 +75,6 @@ rejectContentLeads().catch((e) => console.error(`[cleanup] ${String(e?.message |
 repairEscapedEmails().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 // And rewrite company names that are really page headlines ("FCCSA - Home").
 repairPageTitleNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
-// One-time: an older "Repair company names" derived a name from the contact's
-// email domain without excluding shared mailboxes, so contacts on gmail were
-// filed as a company called "Gmail" — which then rendered into {{company}} in a
-// real cold email. Blank the ones that are demonstrably that bug's output.
-clearFreemailCompanyNames().catch((e) => console.error(`[cleanup] ${String(e?.message || e)}`));
 
 const app = new Hono();
 app.use(
@@ -135,23 +89,7 @@ app.use(
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * Health, and — deliberately — which BUILD is answering.
- *
- * Every other `/api/*` path sits behind the auth middleware, which returns 401
- * for a route that does not exist just as readily as for one that does. That
- * makes "did my deploy actually land?" unanswerable from outside: probing a
- * newly-added endpoint returns 401 either way. Railway injects the commit it
- * built, so the honest answer is simply to publish it here.
- *
- * Nothing secret: the repo is public and this is a bare commit SHA.
- */
-const BUILD_REV =
-  process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ||
-  process.env.SOURCE_COMMIT?.slice(0, 7) ||
-  process.env.GIT_COMMIT?.slice(0, 7) ||
-  "dev";
-app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now(), rev: BUILD_REV }));
+app.get("/api/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
 /* ------------------------------- Auth ------------------------------- */
 // Public endpoints (also hit by email recipients, so they must NOT require a token).
@@ -160,48 +98,18 @@ const PUBLIC_API = new Set([
   "/api/auth/login",
   "/api/auth/status",
   "/api/auth/setup",
-  // Presenting a valid access key IS the proof of identity here, so this
-  // endpoint cannot itself sit behind the token gate.
-  "/api/auth/exchange",
   "/api/open",
   "/api/click",
   "/api/unsubscribe",
 ]);
 
-/** Best-effort client IP, for the access-key audit trail only. */
-const clientIp = (c: any) =>
-  (c.req.header("x-forwarded-for") || "").split(",")[0].trim() ||
-  c.req.header("x-real-ip") ||
-  "";
-
 // Gate every /api/* route except the public ones above.
-//
-// Two credentials are accepted on the same header. A session token is what the
-// browser gets after a password login; an access key is a standing credential
-// held by a machine. They are told apart by shape (`dna_…` with no dot), so the
-// wrong kind is never checked against the wrong verifier.
 app.use("/api/*", async (c, next) => {
   if (c.req.method === "OPTIONS") return next();
   if (PUBLIC_API.has(c.req.path)) return next();
-
   const header = c.req.header("Authorization") || "";
-  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-  // A dedicated header too, because some API clients reserve Authorization.
-  const presented = bearer || c.req.header("x-api-key") || "";
-
-  if (looksLikeAccessKey(presented)) {
-    const label = await verifyAccessKey(presented, clientIp(c));
-    if (!label) return c.json({ error: "Unauthorized" }, 401);
-    // Key holders must not be able to mint more keys or change the password —
-    // that would make revocation meaningless, since a stolen key could simply
-    // issue itself a replacement or lock the owner out.
-    if (c.req.path.startsWith("/api/auth/keys") || c.req.path === "/api/account") {
-      return c.json({ error: "Access keys cannot manage credentials. Sign in with your password." }, 403);
-    }
-    return next();
-  }
-
-  if (!(await verifyToken(presented))) return c.json({ error: "Unauthorized" }, 401);
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!(await verifyToken(token))) return c.json({ error: "Unauthorized" }, 401);
   return next();
 });
 
@@ -232,58 +140,6 @@ app.post("/api/auth/setup", async (c) => {
   return c.json({ token, username: u });
 });
 
-/**
- * Trade an access key for an ordinary short-lived session token.
- *
- * This is the landing point for `https://app/?k=<key>`: the SPA calls it once on
- * boot, stores the returned token like any other session, and scrubs the key out
- * of the address bar. The key itself never becomes the session — so a token
- * lifted from the agent's browser expires in hours and cannot mint more.
- *
- * Rate-limited because this is the one public endpoint that accepts a guessable
- * secret. 256 bits is not guessable, but an unthrottled oracle is still a gift.
- */
-const exchangeHits = new Map<string, { n: number; resetAt: number }>();
-app.post("/api/auth/exchange", async (c) => {
-  const ip = clientIp(c);
-  const now = Date.now();
-  // Bucket unattributable requests together rather than letting them share the
-  // empty-string key with nothing; the audit trail keeps the real (blank) value.
-  const bucket = exchangeHits.get(ip || "unknown");
-  if (!bucket || now > bucket.resetAt) {
-    exchangeHits.set(ip || "unknown", { n: 1, resetAt: now + 60_000 });
-  } else if (++bucket.n > 20) {
-    return c.json({ error: "Too many attempts. Wait a minute." }, 429);
-  }
-  if (exchangeHits.size > 5000) exchangeHits.clear(); // crude, unbounded-growth guard
-
-  const { key } = await c.req.json().catch(() => ({}));
-  const token = await sessionFromAccessKey(String(key || ""), ip);
-  if (!token) return c.json({ error: "Invalid or expired access key" }, 401);
-  return c.json({ token, username: await getUsername() });
-});
-
-/* --------------------- Access key management -------------------- */
-// Password-authenticated only — the middleware above blocks key holders here.
-
-app.get("/api/auth/keys", async (c) => c.json({ keys: await listAccessKeys() }));
-
-app.post("/api/auth/keys", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const label = String(b.label || "").trim();
-  const days = Number(b.expiresInDays) || 0;
-  if (!label) return c.json({ error: "Give the key a label so you know what it's for" }, 400);
-  const { id, key, row } = await createAccessKey(label, days);
-  // `key` is returned exactly once. It is not recoverable from the database.
-  return c.json({ id, key, row });
-});
-
-app.delete("/api/auth/keys/:id", async (c) => {
-  const ok = await revokeAccessKey(c.req.param("id"));
-  if (!ok) return c.json({ error: "Key not found" }, 404);
-  return c.json({ ok: true });
-});
-
 // Reaching here means the middleware already validated the token.
 app.get("/api/auth/me", async (c) => c.json({ ok: true, username: await getUsername() }));
 
@@ -308,18 +164,51 @@ app.post("/api/account", async (c) => {
 
 /* ----------------------------- Contacts ----------------------------- */
 
+// "No company on file" bucket for the company filter.
+const NO_COMPANY = "__none__";
+
+// Escape LIKE wildcards so a company called "100% Steel" or "A_B" matches
+// literally. Paired with `ESCAPE '\'`, which SQLite and Postgres both honour.
+function likeEscape(s: string) {
+  return s.replace(/[\\%_]/g, (m) => "\\" + m);
+}
+
+interface ContactFilter {
+  status?: string | null;
+  q?: string | null;
+  category?: string | null;
+  // Company filter. `exact` (default) = this one company, case/space-insensitive,
+  // which is what picking a name from the list or clicking it in the table does.
+  // `contains` = every company whose name contains the text ("acme" catches
+  // "Acme Trading" and "ACME Trading W.L.L."). NO_COMPANY = rows with none.
+  company?: string | null;
+  companyMode?: string | null;
+}
+
 // Shared, portable WHERE builder used by list / export / bulk-by-filter so the
 // exact same filter can be re-applied server-side (e.g. "delete all matching").
-function contactWhere(opts: { status?: string | null; q?: string | null; category?: string | null }) {
+function contactWhere(opts: ContactFilter) {
   const where: string[] = [];
   const params: any[] = [];
   const status = opts.status;
   const search = opts.q;
   const category = opts.category;
+  const company = String(opts.company ?? "").trim();
   if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
   if (category && category !== "all") {
     if (category === "__none__") where.push(`(category IS NULL OR category = '')`);
     else { where.push(`category = ?`); params.push(category); }
+  }
+  if (company) {
+    if (company === NO_COMPANY) {
+      where.push(`(company IS NULL OR trim(company) = '')`);
+    } else if (opts.companyMode === "contains") {
+      where.push(`lower(company) LIKE ? ESCAPE '\\'`);
+      params.push(`%${likeEscape(company.toLowerCase())}%`);
+    } else {
+      where.push(`lower(trim(company)) = ?`);
+      params.push(company.toLowerCase());
+    }
   }
   if (search) {
     const like = `%${String(search).toLowerCase()}%`;
@@ -351,7 +240,13 @@ app.get("/api/contacts", async (c) => {
   const limit = clamp(Number(c.req.query("limit") || 50), 1, 200);
   const cursor = decodeCursor(c.req.query("cursor"));
 
-  const { where, params, clause } = contactWhere({ status, q: search, category });
+  const { where, params, clause } = contactWhere({
+    status,
+    q: search,
+    category,
+    company: c.req.query("company"),
+    companyMode: c.req.query("companyMode"),
+  });
 
   // Keyset page: everything strictly "after" the cursor in (created_at DESC, id DESC).
   const pageWhere = [...where];
@@ -409,6 +304,55 @@ app.get("/api/contacts", async (c) => {
   });
 });
 
+// Company names for the company filter picker, with how many contacts each has.
+// Scoped to the status/category tab being viewed, but NOT to the company or
+// free-text filter — otherwise the picker could only ever list the current pick.
+// Names are grouped case/space-insensitively, so "Acme Trading" and
+// "ACME TRADING " are one company (matching the `exact` filter above).
+app.get("/api/contacts/companies", async (c) => {
+  const search = String(c.req.query("search") || "").trim().toLowerCase();
+  const limit = clamp(Number(c.req.query("limit") || 40), 1, 200);
+  const { where, params } = contactWhere({ status: c.req.query("status"), category: c.req.query("category") });
+
+  const named = [...where, `company IS NOT NULL`, `trim(company) <> ''`];
+  const namedParams = [...params];
+  if (search) {
+    named.push(`lower(company) LIKE ? ESCAPE '\\'`);
+    namedParams.push(`%${likeEscape(search)}%`);
+  }
+  const namedClause = `WHERE ${named.join(" AND ")}`;
+
+  const companies = await q(
+    // MAX picks the display spelling: lowercase sorts after uppercase, so it
+    // prefers "Acme Trading" over "ACME TRADING" when both are on file.
+    `SELECT MAX(trim(company)) AS company, CAST(count(*) AS INTEGER) AS n
+       FROM contacts ${namedClause}
+      GROUP BY lower(trim(company))
+      ORDER BY n DESC, MIN(lower(trim(company))) ASC
+      LIMIT ?`,
+    [...namedParams, limit]
+  );
+  // `matching` = contacts the "contains <search>" option would select.
+  const agg = (await q(
+    `SELECT CAST(count(DISTINCT lower(trim(company))) AS INTEGER) AS companies,
+            CAST(count(*) AS INTEGER) AS n
+       FROM contacts ${namedClause}`,
+    namedParams
+  ))[0] || {};
+  const none = (await q(
+    `SELECT CAST(count(*) AS INTEGER) AS n FROM contacts
+      WHERE ${[...where, `(company IS NULL OR trim(company) = '')`].join(" AND ")}`,
+    params
+  ))[0] || {};
+
+  return c.json({
+    companies: companies.map((r) => ({ company: String(r.company), n: Number(r.n) || 0 })),
+    totalCompanies: Number(agg.companies) || 0,
+    matching: Number(agg.n) || 0,
+    noCompany: Number(none.n) || 0,
+  });
+});
+
 app.post("/api/contacts", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   // Normalise first: pasted addresses arrive wrapped in markup ("<a@b.com>"),
@@ -438,9 +382,9 @@ app.post("/api/contacts/bulk", async (c) => {
     if (!email || !isValidEmail(email)) { skipped++; continue; }
 
     const ins = await q(
-      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,audience,status,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
-      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.phone || null, it.role_based ? 1 : 0, it.source || "import", normalizeAudience(it.audience ?? b.audience), nowIso()]
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, it.company || null, it.country || null, it.industry || null, it.category || null, it.phone || null, it.role_based ? 1 : 0, it.source || "import", nowIso()]
     );
     if (ins.length) { added++; continue; }
 
@@ -509,7 +453,11 @@ app.post("/api/categories", async (c) => {
 app.post("/api/contacts/delete", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = contactWhere({ status: b.status, q: b.q, category: b.category });
+    // MUST carry every filter the list applies — including company — or
+    // "Delete all N at Acme" would wipe far more than the N rows on screen.
+    const { clause, params } = contactWhere({
+      status: b.status, q: b.q, category: b.category, company: b.company, companyMode: b.companyMode,
+    });
     const before = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts ${clause}`, params);
     await q(`DELETE FROM contacts ${clause}`, params);
     return c.json({ deleted: before[0]?.n ?? 0 });
@@ -527,7 +475,9 @@ app.post("/api/contacts/set-category", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   const value = String(b.value ?? "").trim() || null;
   if (b.all === true) {
-    const { clause, params } = contactWhere({ status: b.status, q: b.q, category: b.category });
+    const { clause, params } = contactWhere({
+      status: b.status, q: b.q, category: b.category, company: b.company, companyMode: b.companyMode,
+    });
     const before = await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts ${clause}`, params);
     await q(`UPDATE contacts SET category = ? ${clause}`, [value, ...params]);
     return c.json({ updated: before[0]?.n ?? 0 });
@@ -544,6 +494,8 @@ app.get("/api/contacts/export", async (c) => {
     status: c.req.query("status"),
     q: c.req.query("q"),
     category: c.req.query("category"),
+    company: c.req.query("company"),
+    companyMode: c.req.query("companyMode"),
   });
   // `email` first and `category`/`phone` early so it's easy to edit and re-import.
   const rows = await q(`SELECT email,company,country,industry,category,phone,role_based,status,source,created_at FROM contacts ${clause} ORDER BY created_at DESC`, params);
@@ -588,17 +540,9 @@ app.delete("/api/templates/:id", async (c) => {
 });
 
 /* ------------------------------ Domains ----------------------------- */
-// `sent_today` is not stored — it is counted from the sends ledger for the
-// current cap window, so it rolls over at midnight UTC without anything having
-// to reset it. The column of the same name is dead; always overlay the real
-// figure before a domain row leaves the API.
-async function withUsage(rows: any[]): Promise<any[]> {
-  const usage = await domainUsageToday();
-  return rows.map((d) => ({ ...d, sent_today: usage.get(String(d.id)) ?? 0 }));
-}
 
 app.get("/api/domains", async (c) => {
-  return c.json({ domains: await withUsage(await q(`SELECT * FROM domains ORDER BY created_at`)) });
+  return c.json({ domains: await q(`SELECT * FROM domains ORDER BY created_at`) });
 });
 
 app.post("/api/domains", async (c) => {
@@ -607,11 +551,13 @@ app.post("/api/domains", async (c) => {
   const fromEmail = resolveFromEmail(b.from_email, domain);
   if (!domain) return c.json({ error: "Domain is required" }, 400);
   if (!isEmail(fromEmail)) return c.json({ error: `From email must be a full address like no-reply@${domain}` }, 400);
+  const tracking = resolveTrackingHost(b.tracking_host, domain);
+  if ("error" in tracking) return c.json({ error: tracking.error }, 400);
   const rows = await q(
-    `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,created_at) VALUES (?,?,?,?,?,1,?) RETURNING *`,
-    [uid(), domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, nowIso()]
+    `INSERT INTO domains (id,domain,from_name,from_email,daily_cap,active,tracking_host,created_at) VALUES (?,?,?,?,?,1,?,?) RETURNING *`,
+    [uid(), domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, tracking.host, nowIso()]
   );
-  return c.json({ domain: (await withUsage(rows))[0] });
+  return c.json({ domain: rows[0] });
 });
 
 app.put("/api/domains/:id", async (c) => {
@@ -620,12 +566,38 @@ app.put("/api/domains/:id", async (c) => {
   const fromEmail = resolveFromEmail(b.from_email, domain);
   if (!domain) return c.json({ error: "Domain is required" }, 400);
   if (!isEmail(fromEmail)) return c.json({ error: `From email must be a full address like no-reply@${domain}` }, 400);
+  const tracking = resolveTrackingHost(b.tracking_host, domain);
+  if ("error" in tracking) return c.json({ error: tracking.error }, 400);
   const rows = await q(
-    `UPDATE domains SET domain=?, from_name=?, from_email=?, daily_cap=?, active=? WHERE id=? RETURNING *`,
-    [domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, c.req.param("id")]
+    `UPDATE domains SET domain=?, from_name=?, from_email=?, daily_cap=?, active=?, tracking_host=? WHERE id=? RETURNING *`,
+    [domain, String(b.from_name || "DNA Outreach").trim(), fromEmail, Number(b.daily_cap) || 40, b.active !== false ? 1 : 0, tracking.host, c.req.param("id")]
   );
   if (!rows.length) return c.json({ error: "not found" }, 404);
-  return c.json({ domain: (await withUsage(rows))[0] });
+  return c.json({ domain: rows[0] });
+});
+
+// Confirm a tracking host actually reaches THIS backend over HTTPS (DNS CNAME
+// in place + Railway custom domain added + TLS certificate issued).
+app.post("/api/domains/check-tracking", async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  const host = normalizeHost(b.host);
+  if (!host) return c.json({ error: "Enter a tracking host first, e.g. t.dna-erp.com" }, 400);
+  try {
+    const res = await fetch(`https://${host}/api/health`, { signal: AbortSignal.timeout(10000), redirect: "manual" });
+    const data: any = await res.json().catch(() => null);
+    if (res.ok && data?.ok === true) return c.json({ ok: true, host });
+    return c.json({
+      error: `https://${host} answered (HTTP ${res.status}) but it isn't this backend. Check the CNAME points to the Railway target shown for this custom domain.`,
+    }, 502);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    const hint = /certificate|ssl|tls/i.test(msg)
+      ? "DNS works but the HTTPS certificate isn't issued yet — Railway usually finishes within a few minutes."
+      : /timeout|timed out|abort/i.test(msg)
+        ? "No response in 10s — the CNAME may still be propagating."
+        : "The host doesn't resolve yet — add the CNAME record Railway gave you, then retry.";
+    return c.json({ error: `${hint} (${msg})` }, 502);
+  }
 });
 
 app.delete("/api/domains/:id", async (c) => {
@@ -633,11 +605,8 @@ app.delete("/api/domains/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-// Caps clear themselves at midnight UTC. This is the manual override for "I know
-// those sends don't count, let me carry on now" — it moves the start of the
-// counting window to this moment rather than zeroing anything.
 app.post("/api/domains/reset-counts", async (c) => {
-  await resetDomainUsage();
+  await q(`UPDATE domains SET sent_today = 0`);
   return c.json({ ok: true });
 });
 
@@ -662,55 +631,8 @@ app.get("/api/settings", async (c) => {
       // Free crawler is always on; a key just raises the free rate limit.
       configured: !!(await getSetting("jina_api_key")),
       fromEnv: !!process.env.JINA_API_KEY,
-      // The pool, one entry per key. Keys are added and removed individually,
-      // so the UI never has to show or re-send one that is already stored —
-      // and each is listed only as a masked fingerprint.
-      keys: readerKeyHealth(parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "")),
-      savedKeys: parseReaderKeys((await getSetting("jina_api_key")) || process.env.JINA_API_KEY || "").length,
-    },
-    // Where the crawler's pages ACTUALLY came from since this process booted.
-    // Without it, "is the reader still doing all the work?" was unanswerable —
-    // and that question is the whole point of the free tiers.
-    transports: {
-      pages: getTransportStats(),
-      archives: archiveHealth(),
-      searchEngines: searchEngineHealth(),
     },
   });
-});
-
-/* ----------------------- Reader key pool (add/remove) ------------------- */
-// Deliberately append/remove rather than "save the whole field". The single
-// text box replaced everything it held, and because it was a password input
-// that cleared itself, adding a second key silently destroyed the first.
-
-app.post("/api/settings/reader-key", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const incoming = parseReaderKeys(String(b.key || ""));
-  if (!incoming.length) return c.json({ error: "Paste a key first." }, 400);
-
-  const existing = parseReaderKeys((await getSetting("jina_api_key")) || "");
-  const merged = [...existing];
-  let added = 0;
-  let duplicates = 0;
-  for (const k of incoming) {
-    if (merged.includes(k)) { duplicates++; continue; }
-    merged.push(k);
-    added++;
-  }
-  await setSetting("jina_api_key", merged.join(","));
-  return c.json({ ok: true, added, duplicates, total: merged.length });
-});
-
-app.delete("/api/settings/reader-key", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const masked = String(b.masked || "");
-  if (!masked) return c.json({ error: "Which key?" }, 400);
-  const existing = parseReaderKeys((await getSetting("jina_api_key")) || "");
-  const kept = existing.filter((k) => maskReaderKey(k) !== masked);
-  if (kept.length === existing.length) return c.json({ error: "That key is no longer saved." }, 404);
-  await setSetting("jina_api_key", kept.join(","));
-  return c.json({ ok: true, total: kept.length });
 });
 
 app.post("/api/settings", async (c) => {
@@ -772,8 +694,7 @@ app.post("/api/settings/test-email", async (c) => {
   const html = wrapHtml(
     `<p style="font-family:Arial,Helvetica,sans-serif">This is a test email from your DNA Outreach app.</p>
      <p style="font-family:Arial,Helvetica,sans-serif">If you're reading this, Resend is connected and your sending domain works. You're ready to run real campaigns.</p>`,
-    "#",
-    ""
+    { unsubUrl: "#" }
   );
   const result = await sendEmail({ from, to, subject: "DNA Outreach — test email", html, replyTo: replyTo || undefined });
   if (!result.ok) return c.json({ error: result.error || "Send failed" }, 502);
@@ -1120,13 +1041,10 @@ app.post("/api/import/pdf", async (c) => {
 
 app.post("/api/send", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  // One template, or several that rotate across the recipients.
-  const templateIds: string[] = (Array.isArray(b.templateIds) ? b.templateIds : [b.templateId])
-    .map((x: any) => String(x || "").trim())
-    .filter(Boolean);
+  const templateId = String(b.templateId || "");
   let contactIds: string[] = Array.isArray(b.contactIds) ? b.contactIds : [];
   const perMinute = clamp(Number(b.perMinute) || 20, 1, 120);
-  if (!templateIds.length) return c.json({ error: "templateId required" }, 400);
+  if (!templateId) return c.json({ error: "templateId required" }, 400);
 
   // "Send to all matching" — resolve recipients server-side from the same filter
   // the recipient list uses, so you can target 100k+ without shipping every id.
@@ -1148,7 +1066,7 @@ app.post("/api/send", async (c) => {
 
   (async () => {
     try {
-      await runSendJob(job, templateIds, contactIds, perMinute);
+      await runSendJob(job, templateId, contactIds, perMinute);
       // Don't override an error status that runSendJob set intentionally.
       if (job.status === "running") { job.status = "done"; job.progress = 1; }
     } catch (e: any) {
@@ -1166,9 +1084,108 @@ app.get("/api/send/:id", (c) => {
   return c.json(serializeJob(job));
 });
 
-// The send pipeline (domain rotation, caps, pacing, tracking links, the sends
-// ledger) lives in ./send so the manual sender and the automation are the
-// same code path.
+async function runSendJob(job: Job, templateId: string, contactIds: string[], perMinute: number) {
+  const tpl = (await q(`SELECT * FROM templates WHERE id=?`, [templateId]))[0];
+  if (!tpl) { job.status = "error"; job.error = "template not found"; return; }
+
+  const activeDomains = await q(`SELECT * FROM domains WHERE active=1 ORDER BY created_at`);
+  const appUrl = ((await getSetting("app_url")) || process.env.APP_URL || "").replace(/\/+$/, "");
+  const replyTo = (await getSetting("reply_to")) || "";
+  const dryRun = !(await getResendKey());
+  if (dryRun) log(job, { level: "warn", msg: "No Resend key set — running in DRY-RUN (nothing is actually sent)." });
+
+  // Validate each active domain's sender up front so a misconfigured "From email"
+  // gives a clear, actionable error instead of a cryptic Resend rejection per email.
+  const domains: any[] = [];
+  for (const d of activeDomains) {
+    const r = buildFrom(d);
+    if ("error" in r) log(job, { level: "warn", msg: r.error });
+    else { d.__from = r.from; domains.push(d); }
+  }
+  if (!dryRun && activeDomains.length && !domains.length) {
+    job.status = "error";
+    job.error = "Every active sending domain has an invalid \"From email\". Fix it in Settings → Sending domains (use a full address like outreach@yourdomain.com), then try again.";
+    log(job, { level: "fail", msg: job.error });
+    return;
+  }
+  if (!activeDomains.length) log(job, { level: "warn", msg: "No sending domains configured — using Resend's test sender (onboarding@resend.dev)." });
+  if (!dryRun && !appUrl && domains.some((d) => !d.tracking_host)) log(job, { level: "warn", msg: "App URL not set in Settings — unsubscribe & open-tracking links will not work. Add it before real sends." });
+  for (const d of domains) {
+    if (!d.tracking_host) {
+      log(job, {
+        level: "warn",
+        msg: `${d.domain} has no tracking host — links, images & unsubscribe will point to ${appUrl ? hostOf(appUrl) || appUrl : "nothing"}, which doesn't match the sender. Add t.${d.domain} in Settings → Sending domains.`,
+      });
+    }
+  }
+
+  const delayMs = dryRun ? 120 : Math.round(60000 / perMinute);
+  let di = 0;
+
+  for (const cid of contactIds) {
+    if (job.status === "error") break;
+    const contact = (await q(`SELECT * FROM contacts WHERE id=?`, [cid]))[0];
+    if (!contact) { job.result.skipped++; job.processed++; continue; }
+    if (contact.status === "unsubscribed" || contact.status === "bounced") {
+      job.result.skipped++;
+      job.processed++;
+      job.progress = job.total ? job.processed / job.total : 1;
+      log(job, { level: "skip", msg: `Skipped ${contact.email} (${contact.status})` });
+      continue;
+    }
+
+    let domain: any = null;
+    if (domains.length) {
+      for (let k = 0; k < domains.length; k++) {
+        const cand = domains[(di + k) % domains.length];
+        if (cand.sent_today < cand.daily_cap) { domain = cand; di = (di + k + 1) % domains.length; break; }
+      }
+      if (!domain) { log(job, { level: "warn", msg: "All domains hit their daily cap — stopping." }); break; }
+    }
+
+    const from = domain ? domain.__from : "DNA Outreach <onboarding@resend.dev>";
+    const subject = renderTemplate(tpl.subject, contact);
+    const sendId = uid();
+    // Everything that points back at us uses the sending domain's tracking host
+    // (t.dna-erp.com) so URLs + images align with the From domain.
+    const base = trackingBase(domain, appUrl);
+    const unsub = base ? `${base}/api/unsubscribe?c=${contact.id}` : "";
+    const pixel = base ? `${base}/api/open?s=${sendId}` : "";
+    const clickBase = base ? `${base}/api/click?s=${sendId}` : "";
+    const assets = new Map<string, string>();
+    const html = wrapHtml(renderTemplate(tpl.body, contact), { unsubUrl: unsub, pixelUrl: pixel, clickBase, assetBase: base, assets });
+    await registerAssets(assets);
+
+    const result = await sendEmail({
+      from, to: contact.email, subject, html,
+      replyTo: replyTo || undefined,
+      headers: unsub
+        ? { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" }
+        : undefined,
+    });
+
+    const status = result.ok ? (result.dryRun ? "sent (dry-run)" : "sent") : "failed";
+    await q(
+      `INSERT INTO sends (id,contact_id,contact_email,template_id,domain_id,subject,status,error,sent_at,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [sendId, contact.id, contact.email, tpl.id, domain?.id ?? null, subject, status, result.error ?? null, nowIso(), nowIso()]
+    );
+
+    if (result.ok) {
+      job.result.sent++;
+      await q(`UPDATE contacts SET status='sent' WHERE id=? AND status='new'`, [contact.id]);
+      if (domain) { await q(`UPDATE domains SET sent_today = sent_today + 1 WHERE id=?`, [domain.id]); domain.sent_today++; }
+      log(job, { level: "sent", msg: `${status} → ${contact.email}` });
+    } else {
+      job.result.failed++;
+      log(job, { level: "fail", msg: `failed → ${contact.email}: ${result.error}` });
+    }
+
+    job.processed++;
+    job.progress = job.total ? job.processed / job.total : 1;
+    if (job.processed < job.total) await sleep(delayMs);
+  }
+}
 
 /* --------------------------- Tracking / opt-out --------------------- */
 
@@ -1230,6 +1247,59 @@ app.get("/api/unsubscribe", async (c) => {
   .card{background:#fff;border:1px solid #e3dcce;border-radius:16px;padding:40px;max-width:420px;text-align:center}</style></head>
   <body><div class="card"><h2>You're unsubscribed</h2><p>You won't receive further emails from us. Sorry to see you go.</p></div></body></html>`);
 });
+
+// Image host: re-serves template images from the sending domain's tracking host
+// (e.g. https://t.dna-erp.com/i/<id>.webp). Only ids registered at send time
+// are served, so this can't be abused as an open proxy. Bytes are cached in
+// memory; Gmail's image proxy caches on its side too, so upstream hits are rare.
+const ASSET_TTL_MS = 12 * 60 * 60 * 1000;
+const ASSET_CACHE_MAX = 80;
+const ASSET_MAX_BYTES = 8 * 1024 * 1024;
+const assetCache = new Map<string, { body: ArrayBuffer; type: string; at: number }>();
+
+app.get("/i/:file", async (c) => {
+  const id = c.req.param("file").replace(/\.[a-z0-9]+$/i, "");
+  if (!/^[a-f0-9]{20}$/.test(id)) return c.text("Not found", 404);
+
+  let hit = assetCache.get(id);
+  if (!hit || Date.now() - hit.at > ASSET_TTL_MS) {
+    const row = (await q(`SELECT url FROM email_assets WHERE id=?`, [id]))[0];
+    if (!row) return c.text("Not found", 404);
+    try {
+      const res = await fetch(row.url, { signal: AbortSignal.timeout(15000) });
+      const type = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      // Raster images only — SVG can carry script and isn't rendered by Gmail anyway.
+      if (!res.ok || !type.startsWith("image/") || type.includes("svg")) {
+        if (hit) return assetResponse(hit); // serve the stale copy rather than a broken image
+        return c.text("Image unavailable", 502);
+      }
+      const body = await res.arrayBuffer();
+      if (body.byteLength > ASSET_MAX_BYTES) return c.text("Image too large", 502);
+      hit = { body, type, at: Date.now() };
+      assetCache.delete(id);
+      assetCache.set(id, hit);
+      if (assetCache.size > ASSET_CACHE_MAX) {
+        const oldest = assetCache.keys().next().value;
+        if (oldest) assetCache.delete(oldest);
+      }
+    } catch {
+      if (hit) return assetResponse(hit);
+      return c.text("Image unavailable", 502);
+    }
+  }
+  return assetResponse(hit);
+});
+
+function assetResponse(hit: { body: ArrayBuffer; type: string }) {
+  return new Response(hit.body, {
+    headers: {
+      "Content-Type": hit.type,
+      "Content-Length": String(hit.body.byteLength),
+      "Cache-Control": "public, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
 
 /* ---------------------------- Lead Finder --------------------------- */
 
@@ -1336,13 +1406,7 @@ app.post("/api/crawl/check", async (c) => {
 // pool (discovered_leads). It runs while the process is up — no browser needed.
 
 // Live status: bot on/off, source counts, and the review-pool breakdown.
-// `fill` rides along rather than living on its own endpoint: this is already
-// the Discovery screen's poll, and a rate that arrives one request later than
-// the counts it is about would be read against the wrong pool.
-app.get("/api/discovery/status", async (c) => {
-  const [status, fill] = await Promise.all([getDiscoveryStatus(), getFillRate()]);
-  return c.json({ ...status, fill });
-});
+app.get("/api/discovery/status", async (c) => c.json(await getDiscoveryStatus()));
 
 // Flip the global bot switch and/or the "auto-find emails" behaviour.
 app.post("/api/discovery/toggle", async (c) => {
@@ -1358,16 +1422,6 @@ app.post("/api/discovery/toggle", async (c) => {
 app.post("/api/discovery/re-enrich", async (c) => {
   const r = await reEnrichBlocked();
   return c.json(r);
-});
-// ---- Purge leads that could never have been prospects ----
-// The same sweep that runs at boot, on demand. Needed because the rules that
-// decide "this was never a company" get tighter over time — most recently after
-// a search engine spent a while answering a different question than the one it
-// was asked — and the rows filed under the old rules are still sitting in the
-// queue costing a full crawl each to disprove.
-app.post("/api/discovery/purge-junk", async (c) => {
-  const swept = await sweepNonProspectLeads();
-  return c.json({ swept });
 });
 // ---- Repair company names saved by the old (broken) directory harvester ----
 // It used to store the card's tel: link as the company name. This re-reads the
@@ -1408,14 +1462,7 @@ app.get("/api/discovery/sources", async (c) => {
     [archived ? 1 : 0]
   );
   const archivedCount = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=1`))[0]?.n ?? 0;
-  // How many LIVE sources have run themselves dry (see STALE_AFTER_RUNS). Sent
-  // with every list so the tab can flag them without a second request, and so
-  // the count is identical to the one the Overview shows.
-  const staleCount = (await q(
-    `SELECT CAST(count(*) AS INTEGER) AS n FROM discovery_sources WHERE archived=0 AND barren_runs >= ?`,
-    [STALE_AFTER_RUNS]
-  ))[0]?.n ?? 0;
-  return c.json({ sources, archivedCount, staleCount, staleAfterRuns: STALE_AFTER_RUNS, staleOffAfterRuns: STALE_OFF_AFTER_RUNS });
+  return c.json({ sources, archivedCount });
 });
 
 app.post("/api/discovery/sources", async (c) => {
@@ -1424,10 +1471,6 @@ app.post("/api/discovery/sources", async (c) => {
   const category = String(b.category || "Companies (general)").trim();
   const interval = clamp(Number(b.intervalMinutes) || 360, 15, 100000);
   const enabled = b.enabled === false ? 0 : 1;
-  // Who this source is hunting. Every lead it files inherits the tag, and the
-  // automation runs a separate lane per audience — so a partner directory can
-  // never be emailed the customer pitch.
-  const audience = String(b.audience || "").trim().toLowerCase() === "partner" ? "partner" : "customer";
 
   // Web-search source: runs free-text searches (industry × the country and its
   // cities), pages through the results, and streams every company site into the
@@ -1437,19 +1480,11 @@ app.post("/api/discovery/sources", async (c) => {
     const keywords = String(b.keywords || "").trim();
     if (!location && !keywords) return c.json({ error: "Enter a country/city and/or some keywords to search for" }, 400);
     const limit = clamp(Number(b.limit) || 100, 20, 300);
-    // The ccTLD "sweep the whole country's web" option is RETIRED. It listed
-    // every host under .qa/.sa/.ae rather than every business, so it filed
-    // parked domains, portals and campaign sites as companies and drowned the
-    // real results. The column stays for history; nothing may switch it on
-    // again, and the planner ignores it either way (see SWEEP_COUNTRY_ENABLED
-    // in discovery.ts). A stray `sweepCountry: true` from an old client is
-    // simply dropped rather than rejected.
-    const sweep = 0;
     const rows = await q(
       `INSERT INTO discovery_sources
-        (id,type,location,keywords,category,audience,limit_n,interval_minutes,enabled,cursor,sweep_country,next_run_at,created_at)
-       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) RETURNING *`,
-      [uid(), location, keywords || null, category, audience, limit, interval, enabled, sweep, nowIso(), nowIso()]
+        (id,type,location,keywords,category,limit_n,interval_minutes,enabled,cursor,next_run_at,created_at)
+       VALUES (?, 'search', ?, ?, ?, ?, ?, ?, 1, ?, ?) RETURNING *`,
+      [uid(), location, keywords || null, category, limit, interval, enabled, nowIso(), nowIso()]
     );
     return c.json({ source: rows[0] });
   }
@@ -1464,9 +1499,9 @@ app.post("/api/discovery/sources", async (c) => {
     const limit = clamp(Number(b.limit) || 100, 20, 300); // leads per batch
     const rows = await q(
       `INSERT INTO discovery_sources
-        (id,type,base_url,cursor,exhausted,location,place_json,category,audience,limit_n,interval_minutes,enabled,next_run_at,created_at)
-       VALUES (?, 'directory', ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      [uid(), url, initialCursor(url), country, category, audience, limit, interval, enabled, nowIso(), nowIso()]
+        (id,type,base_url,cursor,exhausted,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
+       VALUES (?, 'directory', ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      [uid(), url, initialCursor(url), country, category, limit, interval, enabled, nowIso(), nowIso()]
     );
     return c.json({ source: rows[0] });
   }
@@ -1478,9 +1513,9 @@ app.post("/api/discovery/sources", async (c) => {
   const placeJson = b.place && typeof b.place === "object" ? JSON.stringify(b.place) : null;
   const rows = await q(
     `INSERT INTO discovery_sources
-      (id,type,location,place_json,category,audience,limit_n,interval_minutes,enabled,next_run_at,created_at)
-     VALUES (?, 'osm', ?,?,?,?,?,?,?,?,?) RETURNING *`,
-    [uid(), location, placeJson, category, audience, limit, interval, enabled, nowIso(), nowIso()]
+      (id,type,location,place_json,category,limit_n,interval_minutes,enabled,next_run_at,created_at)
+     VALUES (?, 'osm', ?,?,?,?,?,?,?,?) RETURNING *`,
+    [uid(), location, placeJson, category, limit, interval, enabled, nowIso(), nowIso()]
   );
   return c.json({ source: rows[0] });
 });
@@ -1493,13 +1528,6 @@ app.put("/api/discovery/sources/:id", async (c) => {
   const location = b.location != null ? String(b.location).trim() : existing.location;
   const category = b.category != null ? String(b.category).trim() : existing.category;
   const keywords = b.keywords != null ? String(b.keywords).trim() : existing.keywords;
-  // Re-tagging a source only changes what it files FROM NOW ON — leads it has
-  // already put in the pool keep the tag they were found under, which is right:
-  // they were found by a search aimed at that audience.
-  const audience =
-    b.audience != null
-      ? (String(b.audience).trim().toLowerCase() === "partner" ? "partner" : "customer")
-      : (existing.audience || "customer");
   const limit = b.limit != null ? clamp(Number(b.limit), 5, 500) : existing.limit_n;
   const interval = b.intervalMinutes != null ? clamp(Number(b.intervalMinutes), 15, 100000) : existing.interval_minutes;
   const enabled = typeof b.enabled === "boolean" ? (b.enabled ? 1 : 0) : existing.enabled;
@@ -1511,14 +1539,6 @@ app.put("/api/discovery/sources/:id", async (c) => {
   let cursor = existing.cursor;
   let exhausted = existing.exhausted;
   let emptyStreak = existing.empty_streak;
-  // Re-aiming a source is how you "replace" it, so it earns a clean slate on the
-  // stale counter: judging the new URL / keywords / area by the old one's dry
-  // runs would flag it the moment it was fixed. Merely pausing, renaming or
-  // re-scheduling it changes nothing about what it can find, so those don't.
-  let barrenRuns = Number(existing.barren_runs) || 0;
-  const reAimed =
-    (b.url != null || b.base_url != null || b.keywords != null || b.location != null ||
-     b.category != null || b.place !== undefined);
   if (existing.type === "directory") {
     if (b.url != null || b.base_url != null) {
       let url = String(b.url ?? b.base_url ?? "").trim();
@@ -1528,14 +1548,10 @@ app.put("/api/discovery/sources/:id", async (c) => {
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   } else if (existing.type === "search") {
     // Changing what/where we search restarts the query plan from the top.
-    // Clearing a leftover country-sweep flag counts too: it SHORTENS the plan,
-    // and a cursor pointing into a plan that shrank under it resumes at the
-    // wrong step.
     const changed =
       (b.keywords != null && String(b.keywords).trim() !== String(existing.keywords || "")) ||
       (b.location != null && String(b.location).trim() !== String(existing.location || "")) ||
-      (b.category != null && String(b.category).trim() !== String(existing.category || "")) ||
-      Number(existing.sweep_country ?? 0) === 1;
+      (b.category != null && String(b.category).trim() !== String(existing.category || ""));
     if (changed) { cursor = 1; exhausted = 0; emptyStreak = 0; }
     if (enabled && !existing.enabled) { exhausted = 0; emptyStreak = 0; } // re-enable ⇒ resume
   }
@@ -1544,31 +1560,11 @@ app.put("/api/discovery/sources/:id", async (c) => {
   // stop scheduling the next one.
   if (!enabled && existing.enabled) stopSource(id);
 
-  // Retired (see the POST handler): saving a search source clears any sweep
-  // flag it was still carrying, so the column drains itself as sources are
-  // edited and nothing can turn it back on.
-  const sweepCountry = 0;
-  const changedAim =
-    reAimed &&
-    (String(baseUrl || "") !== String(existing.base_url || "") ||
-     String(keywords || "") !== String(existing.keywords || "") ||
-     location !== existing.location ||
-     category !== existing.category ||
-     String(placeJson || "") !== String(existing.place_json || ""));
-  // Switching a source back on BY HAND is the other clean slate. Without it the
-  // bot would run it once, see the same dry result, and switch it straight off
-  // again — which reads as the toggle being broken. Turning it on is an explicit
-  // "try again", so it gets a full set of runs to prove itself, and it re-flags
-  // at STALE_AFTER_RUNS if it can't. Only a real 0 → 1 transition counts, so
-  // saving an already-on source doesn't quietly wipe its history.
-  const switchedOnByHand = typeof b.enabled === "boolean" && b.enabled && !Number(existing.enabled);
-  if (changedAim || switchedOnByHand) barrenRuns = 0;
-  const autoOff = changedAim || switchedOnByHand ? 0 : Number(existing.auto_off) || 0;
   const rows = await q(
     `UPDATE discovery_sources
-       SET location=?, place_json=?, category=?, audience=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?, sweep_country=?, barren_runs=?, auto_off=?
+       SET location=?, place_json=?, category=?, keywords=?, limit_n=?, interval_minutes=?, enabled=?, base_url=?, cursor=?, exhausted=?, empty_streak=?
      WHERE id=? RETURNING *`,
-    [location, placeJson, category, audience, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, sweepCountry, barrenRuns, autoOff, id]
+    [location, placeJson, category, keywords || null, limit, interval, enabled, baseUrl, cursor, exhausted, emptyStreak, id]
   );
   return c.json({ source: rows[0] });
 });
@@ -1624,42 +1620,52 @@ app.post("/api/discovery/sources/:id/run", async (c) => {
 
 // ---- The review pool ----
 
-// `discoveredWhere` / `approveLeads` / `NO_COUNTRY` / `ROLE_RE` live in ./pool,
-// so the buttons below and the automation approve through ONE path.
+// Portable WHERE builder for the pool (status + country + free-text search).
+// Every bulk action reuses this, so "Approve all" acts on EXACTLY the rows the
+// table is showing — including the country filter.
+function discoveredWhere(opts: { status?: string | null; q?: string | null; hasEmail?: boolean; country?: string | null }) {
+  const where: string[] = [];
+  const params: any[] = [];
+  const status = opts.status;
+  const search = opts.q;
+  const country = String(opts.country || "").trim();
+  if (status && status !== "all") { where.push(`status = ?`); params.push(status); }
+  if (opts.hasEmail) where.push(`(email IS NOT NULL AND email <> '')`);
+  if (country) {
+    // "—" is the explicit "no country on file" bucket, so those leads are
+    // reviewable rather than invisible.
+    if (country === NO_COUNTRY) where.push(`(country IS NULL OR country = '')`);
+    else { where.push(`lower(country) = ?`); params.push(country.toLowerCase()); }
+  }
+  if (search) {
+    const like = `%${String(search).toLowerCase()}%`;
+    where.push(`(lower(name) LIKE ? OR lower(email) LIKE ? OR lower(domain) LIKE ? OR lower(category) LIKE ?)`);
+    params.push(like, like, like, like);
+  }
+  return { where, params, clause: where.length ? `WHERE ${where.join(" AND ")}` : "" };
+}
+const NO_COUNTRY = "__none__";
 
 app.get("/api/discovery/leads", async (c) => {
   const status = c.req.query("status") || "pending";
   const search = c.req.query("q");
   const country = c.req.query("country");
-  // customer | partner | "" (both). Applied server-side so every bulk button
-  // acts on exactly the rows on screen.
-  const audience = c.req.query("audience");
   const hasEmail = c.req.query("hasEmail") === "1";
   const limit = clamp(Number(c.req.query("limit") || 100), 1, 500);
-  const { clause, params } = discoveredWhere({ status, q: search, hasEmail, country, audience });
+  const { clause, params } = discoveredWhere({ status, q: search, hasEmail, country });
   const leads = await q(
     `SELECT * FROM discovered_leads ${clause} ORDER BY created_at DESC LIMIT ?`,
     [...params, limit]
   );
   const counts = await q(`SELECT status, CAST(count(*) AS INTEGER) AS n FROM discovered_leads GROUP BY status`);
   const filteredTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
-  // How many leads in the CURRENT tab + country + audience + search are
-  // approvable — that is exactly what the "Approve all" button will act on.
-  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true, country, audience });
+  // How many leads in the CURRENT tab + country + search are approvable — that
+  // is exactly what the "Approve all" button will act on.
+  const ap = discoveredWhere({ status: "pending", q: search, hasEmail: true, country });
   const approvableTotal = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${ap.clause}`, ap.params))[0]?.n ?? 0;
-  // How the whole tab splits between the two pitches, so the filter can show
-  // real counts rather than making you click to find out.
-  const aw = discoveredWhere({ status, q: search, hasEmail, country });
-  const audienceRows = await q(
-    `SELECT CASE WHEN lower(COALESCE(audience,'customer')) = 'partner' THEN 'partner' ELSE 'customer' END AS audience,
-            CAST(count(*) AS INTEGER) AS n
-       FROM discovered_leads ${aw.clause}
-      GROUP BY CASE WHEN lower(COALESCE(audience,'customer')) = 'partner' THEN 'partner' ELSE 'customer' END`,
-    aw.params
-  );
   // Every country present in this tab, with counts, so the filter lists real
   // options for the WHOLE pool — not just the page that happens to be loaded.
-  const cw = discoveredWhere({ status, audience });
+  const cw = discoveredWhere({ status });
   const countries = await q(
     `SELECT COALESCE(NULLIF(country, ''), '${NO_COUNTRY}') AS country, CAST(count(*) AS INTEGER) AS n
        FROM discovered_leads ${cw.clause}
@@ -1670,7 +1676,7 @@ app.get("/api/discovery/leads", async (c) => {
   // Where the leads in this exact view stand. Without this, a pool of 1,387 that
   // shows 107 "with email only" looks like the bot found 107 — when it actually
   // found 1,387 and is still turning the rest into email addresses.
-  const bw = discoveredWhere({ status, q: search, country, audience });
+  const bw = discoveredWhere({ status, q: search, country });
   const b = (await q(
     `SELECT
         CAST(SUM(CASE WHEN email IS NOT NULL AND email <> '' THEN 1 ELSE 0 END) AS INTEGER) AS withEmail,
@@ -1686,35 +1692,66 @@ app.get("/api/discovery/leads", async (c) => {
     queued: Number(b.queued) || 0,         // no site yet — we'll search the web for one
     noEmail: Number(b.noEmail) || 0,       // looked everywhere, none published
   };
-  return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown, audiences: audienceRows });
+  return c.json({ leads, counts, filteredTotal, approvableTotal, countries, breakdown });
 });
+
+const ROLE_RE = /^(info|sales|contact|support|admin|office|enquir|inquir|hello|mail|team|marketing|hr|jobs|career|reception)/i;
 
 // Approve leads → create Contacts (only ones with an email) and mark 'approved'.
 // Accepts an explicit id list, or every matching pending lead (`all:true`).
-// Each new contact is filed under the audience of the lead it came from, so the
-// customer / partner split survives approval.
 app.post("/api/discovery/leads/approve", async (c) => {
   const b = await c.req.json().catch(() => ({}));
-  const r = await approveLeads({
-    ids: Array.isArray(b.ids) ? b.ids : undefined,
-    all: b.all === true,
-    q: b.q,
-    filterCountry: b.filterCountry,
-    filterAudience: b.filterAudience ?? b.audience,
-    category: b.category,
-    country: b.country,
-  });
-  // `adopted` are existing contacts that had never been emailed and were taken
-  // into the batch rather than dropped as duplicates — reported separately so
-  // the UI's counts stay honest about what was created vs. what was reused.
-  return c.json({ added: r.added, adopted: r.adopted, skipped: r.skipped });
+  const category = String(b.category ?? "").trim() || null;
+  // Optional country override applied to every approved contact (blank = keep
+  // each lead's own). Normalised so an override always matches the spelling the
+  // filter and the Contacts list use.
+  const rawCountry = String(b.country ?? "").trim();
+  const country = normalizeCountry(rawCountry) || rawCountry || null;
+
+  let leads: any[];
+  if (b.all === true) {
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, hasEmail: true, country: b.filterCountry });
+    leads = await q(`SELECT * FROM discovered_leads ${clause} LIMIT 5000`, params);
+  } else {
+    const ids: string[] = Array.isArray(b.ids) ? b.ids : [];
+    if (!ids.length) return c.json({ added: 0, skipped: 0 });
+    const ph = ids.map(() => "?").join(",");
+    leads = await q(`SELECT * FROM discovered_leads WHERE id IN (${ph})`, ids);
+  }
+
+  let added = 0, skipped = 0;
+  const approvedIds: string[] = [];
+  const seenEmails = new Set<string>(); // guards against the same email twice in one batch
+  for (const l of leads) {
+    const email = cleanEmail(String(l.email || "")) || "";
+    approvedIds.push(l.id); // approving marks it handled even if it has no email
+    // A malformed address ("//info@x.com", "%20info@x.com") is unmailable —
+    // approve the lead but never promote the junk into Contacts.
+    if (!email || !isValidEmail(email)) { skipped++; continue; }
+    // Never attempt the same email twice in one request. The contacts.email
+    // UNIQUE constraint (ON CONFLICT DO NOTHING) is the hard guarantee; this just
+    // keeps the counts honest and avoids redundant inserts.
+    if (seenEmails.has(email)) { skipped++; continue; }
+    seenEmails.add(email);
+    const ins = await q(
+      `INSERT INTO contacts (id,email,company,country,industry,category,phone,role_based,source,status,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,'new',?) ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [uid(), email, l.name || l.domain || null, country || l.country || null, l.category || null, category || l.category || null, l.phone || null, ROLE_RE.test(email) ? 1 : 0, "discovery", nowIso()]
+    );
+    if (ins.length) added++; else skipped++; // skipped = already an existing Contact
+  }
+  if (approvedIds.length) {
+    const ph = approvedIds.map(() => "?").join(",");
+    await q(`UPDATE discovered_leads SET status='approved' WHERE id IN (${ph})`, approvedIds);
+  }
+  return c.json({ added, skipped });
 });
 
 // Reject leads (dismiss from the pool) — by ids or every matching pending lead.
 app.post("/api/discovery/leads/reject", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, country: b.filterCountry, audience: b.filterAudience ?? b.audience });
+    const { clause, params } = discoveredWhere({ status: "pending", q: b.q, country: b.filterCountry });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`UPDATE discovered_leads SET status='rejected' ${clause}`, params);
     return c.json({ rejected: before });
@@ -1730,7 +1767,7 @@ app.post("/api/discovery/leads/reject", async (c) => {
 app.post("/api/discovery/leads/delete", async (c) => {
   const b = await c.req.json().catch(() => ({}));
   if (b.all === true) {
-    const { clause, params } = discoveredWhere({ status: b.status, q: b.q, country: b.filterCountry, audience: b.filterAudience ?? b.audience });
+    const { clause, params } = discoveredWhere({ status: b.status, q: b.q, country: b.filterCountry });
     const before = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM discovered_leads ${clause}`, params))[0]?.n ?? 0;
     await q(`DELETE FROM discovered_leads ${clause}`, params);
     return c.json({ deleted: before });
@@ -1740,249 +1777,6 @@ app.post("/api/discovery/leads/delete", async (c) => {
   const ph = ids.map(() => "?").join(",");
   await q(`DELETE FROM discovered_leads WHERE id IN (${ph})`, ids);
   return c.json({ deleted: ids.length });
-});
-
-/* ------------------- importing straight into the pool ------------------ */
-
-// Why this exists: the automation lanes count `discovered_leads` and nothing
-// else, so a CSV written into `contacts` (which is what /api/contacts/bulk
-// does) can never enter the queue. Importing HERE puts the same rows in front
-// of the automation with every rail intact — batching, cooldown, the daily
-// ceiling and the per-country send windows.
-app.post("/api/pool/import", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const items: any[] = Array.isArray(b.contacts) ? b.contacts : [];
-  if (!items.length) return c.json({ error: "no rows to import" }, 400);
-  const r = await importLeadsToPool(items, {
-    audience: b.audience,
-    label: b.label || "CSV import",
-    category: b.category,
-    country: b.country,
-  });
-  return c.json(r);
-});
-
-// How many contacts could still be queued — the preview behind the backfill
-// button, sharing its predicate so the number offered is the number delivered.
-app.get("/api/pool/adoptable", async (c) => {
-  return c.json(await countAdoptableContacts());
-});
-
-// ONE-TIME BACKFILL for contacts imported before the pool route existed.
-// Runs as a job: 30,000 rows is well past what a request should hold open.
-app.post("/api/pool/adopt-contacts", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const summary = await countAdoptableContacts();
-  const importedOnly = b.importedOnly !== false;
-  const total = importedOnly ? summary.imported : summary.adoptable;
-  if (!total) return c.json({ error: "No contacts are waiting to be queued." }, 400);
-
-  const job = createJob("import", total);
-  job.result = { added: 0, duplicate: 0, invalid: 0, scanned: 0 };
-  log(job, { level: "info", msg: `Queueing ${total.toLocaleString()} never-emailed contact(s) into the review pool.` });
-
-  (async () => {
-    try {
-      const r = await adoptContactsToPool({
-        importedOnly,
-        audience: b.audience,
-        category: b.category,
-        country: b.country,
-        limit: b.limit,
-        onProgress: (done, all) => {
-          job.processed = done;
-          job.total = all;
-          job.progress = all ? done / all : 1;
-        },
-      });
-      job.result = r;
-      log(job, {
-        level: "info",
-        msg:
-          `Queued ${r.added.toLocaleString()} contact(s). ` +
-          `${r.duplicate.toLocaleString()} were already in the pool, ${r.invalid.toLocaleString()} had an unmailable address. ` +
-          `They will be emailed in batches by whichever lane owns them — nothing goes out all at once.`,
-      });
-      if (job.status === "running") { job.status = "done"; job.progress = 1; }
-    } catch (e: any) {
-      job.status = "error";
-      job.error = String(e?.message || e);
-      log(job, { level: "fail", msg: job.error });
-    }
-  })();
-
-  return c.json({ jobId: job.id, total });
-});
-
-app.get("/api/pool/adopt-contacts/:id", (c) => {
-  const job = getJob(c.req.param("id"));
-  if (!job) return c.json({ error: "job not found" }, 404);
-  return c.json(serializeJob(job));
-});
-
-/* --------------------- stranded-lead recovery ------------------------ */
-// Leads that were approved into a batch that then sent nothing.
-//
-// The automation used to approve a batch without first asking whether the
-// sending domains could deliver it. Once they were capped out for the day, every
-// run drained another N leads out of the pool and emailed none of them — and
-// because the lanes only ever count leads that are still 'pending', those people
-// were never looked at again. This puts them back.
-//
-// The gap is closed at the source now (the automation checks capacity before
-// approving, and hands back anything a batch didn't reach), so this is a
-// one-off clean-up for pools that were drained before that shipped. It stays
-// available because it is cheap, idempotent, and the honest answer to "did we
-// lose anyone?" is a number you should be able to look up.
-
-app.get("/api/pool/stranded", async (c) => {
-  return c.json({ stranded: await countStrandedLeads() });
-});
-
-app.post("/api/pool/stranded/requeue", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const before = await countStrandedLeads();
-  if (!before) return c.json({ error: "No stranded leads — nothing to recover." }, 400);
-  const requeued = await requeueStrandedLeads(Number(b.limit) || undefined);
-  console.log(`[pool] recovered ${requeued} stranded lead(s) back to pending`);
-  return c.json({ requeued, remaining: await countStrandedLeads() });
-});
-
-/* ----------------------------- Automation --------------------------- */
-// Hands-free outreach: when the review pool holds N leads that have an email,
-// approve that batch into Contacts and email them with the chosen template(s).
-// Config + live status + the run ledger come back in one call so the Settings
-// screen renders the whole panel from a single poll.
-
-app.get("/api/automation", async (c) => c.json(await getAutomationStatus()));
-
-app.post("/api/automation", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  // One lane's worth of settings. Anything absent is left exactly as it is, so
-  // the UI can save a single field of a single lane without touching the other.
-  const lane = (v: any) => {
-    if (!v || typeof v !== "object") return undefined;
-    return {
-      enabled: typeof v.enabled === "boolean" ? v.enabled : undefined,
-      threshold: v.threshold != null ? Number(v.threshold) : undefined,
-      templateIds: Array.isArray(v.templateIds) ? v.templateIds.map((x: any) => String(x)) : undefined,
-      templateMode: v.templateMode === "split" ? "split" as const : v.templateMode === "rotate" ? "rotate" as const : undefined,
-      category: typeof v.category === "string" ? v.category : undefined,
-      country: typeof v.country === "string" ? v.country : undefined,
-    };
-  };
-  await setAutomationConfig({
-    enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
-    customer: lane(b.customer),
-    partner: lane(b.partner),
-    perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
-    dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
-    cooldownMinutes: b.cooldownMinutes != null ? Number(b.cooldownMinutes) : undefined,
-    requireResend: typeof b.requireResend === "boolean" ? b.requireResend : undefined,
-  });
-  // The sending windows ride along on the same save, so the Automation card is
-  // still one screen with one Save button.
-  if (b.schedule && typeof b.schedule === "object") {
-    const s = b.schedule;
-    const win = (v: any) =>
-      v && typeof v === "object"
-        ? {
-            start: v.start != null ? Number(v.start) : undefined,
-            end: v.end != null ? Number(v.end) : undefined,
-            days: Array.isArray(v.days) ? v.days.map((d: any) => Number(d)) : undefined,
-          }
-        : undefined;
-    // A country posted as null means "go back to the default window".
-    let countries: Record<string, CountryRule | null> | undefined;
-    if (s.countries && typeof s.countries === "object") {
-      countries = {};
-      for (const [k, v] of Object.entries<any>(s.countries)) {
-        if (v === null) { countries[k] = null; continue; }
-        if (!v || typeof v !== "object") continue;
-        countries[k] = {
-          ...win(v),
-          timezone: typeof v.timezone === "string" ? v.timezone : undefined,
-          paused: v.paused === true,
-        };
-      }
-    }
-    await setSchedule({
-      enabled: typeof s.enabled === "boolean" ? s.enabled : undefined,
-      window: win(s.window),
-      countries,
-      fallbackTimezone: typeof s.fallbackTimezone === "string" ? s.fallbackTimezone : undefined,
-      sendUnknown: typeof s.sendUnknown === "boolean" ? s.sendUnknown : undefined,
-    });
-  }
-  return c.json(await getAutomationStatus());
-});
-
-// Run one lane right now — ignores the trigger count and the cooldown (that's
-// the point of a manual run) but still respects every safety check: a template
-// must be chosen, Resend must be connected, and the daily ceiling still applies.
-app.post("/api/automation/run", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  const r = await startAutomationRun("manual", String(b.audience || "customer"));
-  if (!r.started) return c.json({ error: r.error || r.note || "Nothing to do right now" }, 400);
-  return c.json({ ...r, status: await getAutomationStatus() });
-});
-
-/* ---------------------------- Follow-up ladder ---------------------- */
-// Retries: a contact who never opened gets a different email a few hours later,
-// and a contact who opened but never clicked gets another angle — up to a hard
-// ceiling of 3 emails per sequence. Config + who's due + the ledger come back in
-// one call so the Settings card renders from a single poll.
-
-// Normalise a ladder posted by the UI: exactly MAX_STEPS rungs, numbers as
-// numbers, ids as strings. The engine clamps the values again on save.
-function parseLadder(input: any): { templateId: string; delayHours: number }[] | undefined {
-  if (!Array.isArray(input)) return undefined;
-  const out: { templateId: string; delayHours: number }[] = [];
-  for (let i = 0; i < MAX_STEPS; i++) {
-    const s = input[i] || {};
-    out.push({ templateId: String(s.templateId || ""), delayHours: Number(s.delayHours) || 0 });
-  }
-  return out;
-}
-
-// One audience's pair of ladders. Absent branches are left exactly as they are,
-// so saving the partner lane can never touch the customer lane — which is the
-// bug this shape exists to make impossible.
-function parseLane(input: any) {
-  if (!input || typeof input !== "object") return undefined;
-  const noOpen = parseLadder(input.noOpen);
-  const noClick = parseLadder(input.noClick);
-  if (!noOpen && !noClick) return undefined;
-  return { noOpen, noClick };
-}
-
-app.get("/api/followup", async (c) => c.json(await getFollowUpStatus()));
-
-app.post("/api/followup", async (c) => {
-  const b = await c.req.json().catch(() => ({}));
-  await setFollowUpConfig({
-    enabled: typeof b.enabled === "boolean" ? b.enabled : undefined,
-    maxEmails: b.maxEmails != null ? Number(b.maxEmails) : undefined,
-    customer: parseLane(b.customer),
-    partner: parseLane(b.partner),
-    // Legacy flat payload (an older frontend) → the customer lane.
-    noOpen: b.customer ? undefined : parseLadder(b.noOpen),
-    noClick: b.customer ? undefined : parseLadder(b.noClick),
-    perMinute: b.perMinute != null ? Number(b.perMinute) : undefined,
-    dailyLimit: b.dailyLimit != null ? Number(b.dailyLimit) : undefined,
-    batchSize: b.batchSize != null ? Number(b.batchSize) : undefined,
-    lookbackDays: b.lookbackDays != null ? Number(b.lookbackDays) : undefined,
-    requireResend: typeof b.requireResend === "boolean" ? b.requireResend : undefined,
-  });
-  return c.json(await getFollowUpStatus());
-});
-
-// Send everything that is due right now, without waiting for the next tick.
-// It can't "skip ahead" — a retry that isn't due yet is still not due.
-app.post("/api/followup/run", async (c) => {
-  const r = await startFollowUpRun("manual");
-  if (!r.started) return c.json({ error: r.error || r.note || "Nothing is due right now" }, 400);
-  return c.json({ ...r, status: await getFollowUpStatus() });
 });
 
 /* ------------------------------ History ----------------------------- */
@@ -2039,83 +1833,13 @@ app.get("/api/overview", async (c) => {
   const totalContacts = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM contacts`))[0]?.n ?? 0;
   const totalSends = (await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM sends`))[0]?.n ?? 0;
 
-  // ---- Emails sent, day by day -------------------------------------------
-  // THE SERIES IS BUILT HERE, COMPLETE, INCLUDING THE EMPTY DAYS. It used to
-  // return only the days that had rows and leave the browser to line them up
-  // against a locally-computed calendar — which quietly dropped a bucket
-  // whenever the viewer's clock sat on the other side of midnight UTC from the
-  // server's.
-  //
-  // Two more corrections while we're here:
-  //  · it counted EVERY row in `sends`, including failures and still-queued
-  //    rows, so the chart disagreed with the "Emails sent" card above it,
-  //    which only counts `sent*`;
-  //  · it bucketed on `created_at` (when the row was queued), so a send queued
-  //    before midnight and delivered after it landed on the wrong day.
-  const DAYS = 14;
-  const now = new Date();
-  const startMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - (DAYS - 1) * 86400000;
-  const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-  const series = new Map<string, { d: string; n: number; sent: number; failed: number; opens: number; clicks: number }>();
-  for (let i = 0; i < DAYS; i++) {
-    const d = dayKey(startMs + i * 86400000);
-    series.set(d, { d, n: 0, sent: 0, failed: 0, opens: 0, clicks: 0 });
-  }
-  const recent = await q(
-    `SELECT COALESCE(sent_at, created_at) AS t, status, opened, click_count
-       FROM sends
-      WHERE COALESCE(sent_at, created_at) >= ?`,
-    [new Date(startMs).toISOString()]
-  );
-  for (const r of recent) {
-    const bucket = series.get(String(r.t ?? "").slice(0, 10));
-    if (!bucket) continue;
-    const status = String(r.status || "");
-    if (status.startsWith("sent")) {
-      bucket.sent++;
-      bucket.n++; // `n` = what the chart plots, kept for older clients
-      if (Number(r.opened) === 1) bucket.opens++;
-      if (Number(r.click_count) > 0) bucket.clicks++;
-    } else if (status === "failed" || status === "bounced") {
-      bucket.failed++;
-    }
-  }
-  const daily = [...series.values()];
+  const cutoff = new Date(Date.now() - 14 * 86400000).toISOString();
+  const recent = await q(`SELECT created_at FROM sends WHERE created_at > ?`, [cutoff]);
+  const bucket: Record<string, number> = {};
+  for (const r of recent) { const d = String(r.created_at).slice(0, 10); bucket[d] = (bucket[d] || 0) + 1; }
+  const daily = Object.entries(bucket).map(([d, n]) => ({ d, n })).sort((a, b) => (a.d < b.d ? -1 : 1));
 
-  // ---- Sources that have stopped producing --------------------------------
-  // Surfaced here so the number you act on ("replace these") is visible from
-  // the front page, not only inside the Discovery tab.
-  const staleRows = await q(
-    `SELECT id, type, location, base_url, keywords, category, audience, runs, total_found,
-            barren_runs, last_found_at, last_run_at, enabled, auto_off
-       FROM discovery_sources
-      WHERE archived=0 AND barren_runs >= ?
-      ORDER BY barren_runs DESC, last_run_at DESC`,
-    [STALE_AFTER_RUNS]
-  );
-  const sourceCounts = (await q(
-    `SELECT CAST(count(*) AS INTEGER) AS total,
-            CAST(sum(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS INTEGER) AS active
-       FROM discovery_sources WHERE archived=0`
-  ))[0] || {};
-
-  return c.json({
-    contacts, sends, opens, clicks, totalContacts, totalSends,
-    daily,
-    windowDays: DAYS,
-    // Are emailable leads arriving fast enough to keep the automation running?
-    // The same snapshot the Discovery tab reads — one computation, so the two
-    // screens can never quote different numbers.
-    fill: await getFillRate(),
-    sources: {
-      total: Number(sourceCounts.total) || 0,
-      active: Number(sourceCounts.active) || 0,
-      stale: staleRows.length,
-      staleAfterRuns: STALE_AFTER_RUNS,
-      staleOffAfterRuns: STALE_OFF_AFTER_RUNS,
-      staleList: staleRows.slice(0, 8),
-    },
-  });
+  return c.json({ contacts, sends, opens, clicks, totalContacts, totalSends, daily });
 });
 
 /* ------------------------------ Helpers ----------------------------- */
@@ -2123,12 +1847,48 @@ app.get("/api/overview", async (c) => {
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)); }
 function shorten(u: string) { try { const x = new URL(u); return x.hostname + x.pathname; } catch { return u; } }
 
-// `isEmail` / `buildFrom` live in ./send — the send pipeline owns them, so the
-// manual sender, the test email and the automation agree on a valid sender.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function isEmail(s: string) { return EMAIL_RE.test(String(s || "").trim()); }
 
 // Clean a domain input: strip protocol, path, and leading www.
 function normalizeDomain(s: string) {
   return String(s || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/^www\./i, "").toLowerCase();
+}
+
+// Clean a hostname input: strip protocol, path, port and trailing dot. Keeps
+// subdomains (unlike normalizeDomain, which drops "www.").
+function normalizeHost(s: string) {
+  return String(s || "").trim().replace(/^https?:\/\//i, "").replace(/[/?#].*$/, "").replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
+}
+
+// Tracking host must sit on the sending domain (the whole point is alignment).
+function resolveTrackingHost(input: any, domain: string): { host: string | null } | { error: string } {
+  const host = normalizeHost(input);
+  if (!host) return { host: null };
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
+    return { error: `"${host}" isn't a valid hostname. Use something like t.${domain || "yourdomain.com"}` };
+  }
+  if (domain && host !== domain && !host.endsWith(`.${domain}`)) {
+    return { error: `Tracking host must be on ${domain} (e.g. t.${domain}) — otherwise links still won't match the sending domain.` };
+  }
+  return { host };
+}
+
+// Base URL for a send's links, pixel and images: the domain's tracking host
+// when configured, else the global App URL (Railway default host).
+function trackingBase(domain: any, appUrl: string): string {
+  const host = normalizeHost(domain?.tracking_host || "");
+  return host ? `https://${host}` : appUrl;
+}
+
+// Record images rewritten by hostImages() so /i/:file is allowed to serve them.
+const registeredAssets = new Set<string>();
+async function registerAssets(assets: Map<string, string>) {
+  for (const [id, url] of assets) {
+    if (registeredAssets.has(id)) continue;
+    await q(`INSERT INTO email_assets (id,url,created_at) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING`, [id, url, nowIso()]);
+    registeredAssets.add(id);
+  }
 }
 
 // Resolve a From email: if the user typed only a mailbox ("no-reply"), attach the domain.
@@ -2136,6 +1896,24 @@ function resolveFromEmail(input: string, domain: string) {
   let v = String(input || "").trim();
   if (v && !v.includes("@") && domain) v = `${v}@${domain}`;
   return v.toLowerCase();
+}
+
+// Build an RFC-5322-safe "Name <email>" sender from a domain row.
+// Returns { from } on success or { error } with a clear, actionable message.
+function buildFrom(domain: any): { from: string } | { error: string } {
+  const email = String(domain?.from_email || "").trim();
+  if (!isEmail(email)) {
+    return {
+      error:
+        `Sending domain "${domain?.domain || "?"}" has an invalid "From email" (${email ? `"${email}"` : "empty"}). ` +
+        `It must be a full address like outreach@yourdomain.com. Fix it in Settings → Sending domains.`,
+    };
+  }
+  let name = String(domain?.from_name || "").trim();
+  if (!name) return { from: email };
+  // Quote the display name when it contains characters that would break the header.
+  if (/[",:;<>@\\]/.test(name)) name = `"${name.replace(/["\\]/g, "").trim()}"`;
+  return { from: `${name} <${email}>` };
 }
 
 function csvCell(v: any): string {

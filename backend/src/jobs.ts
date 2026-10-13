@@ -1,9 +1,7 @@
 // Lightweight in-memory job store for long-running tasks (crawl + send).
 // The frontend polls GET /api/<type>/:id to show live progress.
 
-// "import" covers the one-time backfill that queues already-held contacts
-// into the review pool — long enough to need progress, like a crawl or a send.
-export type JobType = "crawl" | "send" | "import";
+export type JobType = "crawl" | "send";
 
 export interface Job {
   id: string;

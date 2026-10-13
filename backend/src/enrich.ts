@@ -12,9 +12,9 @@
 
 import { searchCompanies, searchRaw, type RawHit } from "./search";
 import { crawlSite, type CrawlOptions } from "./crawler";
-import { fetchPage, fetchViaProxy, fetchViaReader, fetchViaArchives, type ProxyConfig } from "./crawler/fetcher";
+import { fetchPage, fetchViaProxy, fetchViaReader, type ProxyConfig } from "./crawler/fetcher";
 import { extractContactFromProfile, isProfileHost, isJunkHost } from "./crawler/profiles";
-import { cleanEmail, isValidEmail, isJunk, isRole, roleRank, hasMx } from "./crawler/validate";
+import { cleanEmail, isValidEmail, isJunk, isRole, hasMx } from "./crawler/validate";
 import { registrableDomain, hostOf } from "./crawler/urls";
 
 // An email that belongs to the COMPANY, not to a platform it's listed on. A
@@ -254,10 +254,7 @@ function pickEmail(emails: string[]): { email: string; role: boolean } | null {
     if (e && isValidEmail(e) && !isJunk(e) && isCompanyEmail(e)) good.push(e);
   }
   if (!good.length) return null;
-  // Best-quality inbox first: a named individual, then info/sales, then the
-  // service desk, with hr@ and abuse@/no-reply@ last — rather than treating
-  // every role address as equivalent.
-  good.sort((a, b) => roleRank(a) - roleRank(b) || a.localeCompare(b));
+  good.sort((a, b) => Number(isRole(b)) - Number(isRole(a)) || a.localeCompare(b));
   return { email: good[0], role: isRole(good[0]) };
 }
 
@@ -285,16 +282,10 @@ async function fetchProfileHtml(url: string, proxy?: ProxyConfig, readerKey?: st
   // 1) Plain direct fetch — free, works for most directory pages.
   const d = await fetchPage(url, 15000).catch(() => null);
   if (d?.ok && d.html && !d.blocked) return d.html;
-  // 2) The free archives — Common Crawl and the Wayback Machine have very
-  //    likely already stored this page, and reading their copy costs nothing.
-  //    Ahead of the reader deliberately: the reader is metered.
-  const arc = await fetchViaArchives(url).catch(() => null);
-  if (arc?.ok && arc.html) return arc.html;
-  // 3) Jina reader (renders JS) — good for JS-heavy directories/listings, but
-  //    it spends tokens, so it only runs when the free tiers came up empty.
+  // 2) FREE reader (renders JS) — good for JS-heavy directories/listings.
   const rd = await fetchViaReader(url, undefined, readerKey).catch(() => null);
   if (rd?.ok && rd.html) return rd.html;
-  // 4) Paid scraping proxy, only if the user configured one.
+  // 3) Paid scraping proxy, only if the user configured one.
   if (proxy) {
     const p = await fetchViaProxy(url, proxy).catch(() => null);
     if (p?.ok && p.html) return p.html;

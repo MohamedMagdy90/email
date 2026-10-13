@@ -2,28 +2,9 @@ const BASE = (import.meta as any).env?.VITE_API_URL || "";
 
 /* ------------------------------- Auth ------------------------------- */
 const TOKEN_KEY = "dna_auth_token";
-
-// Storage is not always there. Inside an iframe with third-party storage
-// partitioned off — an embedded preview, an intranet portal — and in Safari's
-// private mode, `localStorage` doesn't return null, it THROWS. Unguarded, that
-// threw on the very first line of the auth check, so the app fell through to a
-// login screen that could never be got past: signing in also writes the token,
-// so it threw again, every time.
-//
-// The session falls back to memory. It doesn't survive a reload, which is the
-// honest cost of having nowhere to write it, and the app works.
-let memoryToken = "";
-export const getToken = () => {
-  try { return localStorage.getItem(TOKEN_KEY) || memoryToken; } catch { return memoryToken; }
-};
-export const setToken = (t: string) => {
-  memoryToken = t;
-  try { localStorage.setItem(TOKEN_KEY, t); } catch { /* memory only */ }
-};
-export const clearToken = () => {
-  memoryToken = "";
-  try { localStorage.removeItem(TOKEN_KEY); } catch { /* memory only */ }
-};
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
+export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
 
 function authHeaders(): Record<string, string> {
   const t = getToken();
@@ -35,20 +16,6 @@ function onUnauthorized() {
   window.dispatchEvent(new Event("dna-unauthorized"));
 }
 
-/* ------------------------------ audience ------------------------------- */
-
-// Who a company is to us: someone we sell DNA ERP to ('customer'), or someone
-// we sell the Makers program to ('partner'). It's set on the discovery source,
-// rides the lead into Contacts, and decides which automation lane emails them.
-// Anything discovered before the tag existed reads as 'customer'.
-export type Audience = "customer" | "partner";
-
-// How the crawler got a page. The first three are free and unlimited-ish; the
-// last two are metered, and keeping their share small is the whole game.
-export type TransportName = "direct" | "commoncrawl" | "archive" | "reader" | "proxy";
-export const FREE_TRANSPORTS: TransportName[] = ["direct", "commoncrawl", "archive"];
-export const PAID_TRANSPORTS: TransportName[] = ["reader", "proxy"];
-
 export interface Contact {
   id: string;
   email: string;
@@ -59,8 +26,6 @@ export interface Contact {
   phone?: string;
   role_based?: boolean;
   source?: string;
-  /** customer | partner — inherited from the discovery source that found them. */
-  audience?: string | null;
   status: string;
   created_at: string;
   // Engagement (rolled up across all sends to this contact)
@@ -71,17 +36,21 @@ export interface Contact {
   last_clicked_at?: string | null;
 }
 
-/** A standing credential for a machine caller. The secret itself is never
- *  returned by the list endpoint — only `prefix`, enough to identify it. */
-export interface AccessKey {
-  id: string;
-  label: string;
-  prefix: string;
-  created_at: string;
-  expires_at: string | null;
-  last_used_at: string | null;
-  last_used_ip: string | null;
-  revoked: number;
+// Company filter for the Contacts list. `exact` = one company (case/space-
+// insensitive); `contains` = every company whose name contains the text.
+// value "__none__" = contacts with no company on file.
+export type CompanyMode = "exact" | "contains";
+export interface ContactFilterArgs {
+  status?: string;
+  q?: string;
+  category?: string;
+  company?: string;
+  companyMode?: CompanyMode;
+}
+
+export interface CompanyCount {
+  company: string;
+  n: number;
 }
 
 export interface Template {
@@ -101,6 +70,9 @@ export interface Domain {
   daily_cap: number;
   sent_today: number;
   active: boolean;
+  // Subdomain of `domain` (e.g. t.dna-erp.com) CNAME'd to the backend. Links,
+  // images and unsubscribe use it so they match the sending domain.
+  tracking_host?: string | null;
 }
 
 export interface SendRow {
@@ -117,24 +89,8 @@ export interface SendRow {
   click_count?: number;
   first_clicked_at?: string | null;
   last_clicked_at?: string | null;
-  // Which rung of the follow-up ladder this send was (0 / absent = the original).
-  followup_step?: number;
-  followup_branch?: string | null; // no_open | no_click
   sent_at?: string;
   created_at: string;
-}
-
-/**
- * How many contacts are sitting in the database that the automation has never
- * been able to reach — imported straight into Contacts, which no lane reads.
- */
-export interface AdoptableSummary {
-  /** Never emailed, not opted out, and not already queued. */
-  adoptable: number;
-  /** Of those, the ones that arrived by import rather than by hand. */
-  imported: number;
-  /** Contacts emailed at least once — context for the number above. */
-  alreadyEmailed: number;
 }
 
 export interface Job {
@@ -185,61 +141,6 @@ export interface ParsedRow {
   website?: string;
 }
 
-/* ------------------------------ Fill rate ------------------------------ */
-
-// Is discovery feeding the automation fast enough to keep it running?
-//
-// Every other number on Discovery and Overview is a LEVEL — how many leads are
-// pending, how many contacts exist. A level can't answer "will this still be
-// sending tomorrow?", because a pool of 4,000 with nothing coming in and a pool
-// of 400 with plenty coming in look identical right up until the first stops.
-//
-// The target isn't configured anywhere: a lane approves `threshold` leads and
-// can only fire once per `cooldownMinutes`, so it eats threshold / cooldown —
-// 150 every 3 hours is 8.3 every 10 minutes.
-
-export type FillStatus = "ok" | "slow" | "starved" | "idle";
-
-export interface FillRateLane {
-  audience: Audience;
-  /** Master switch AND this lane's switch are on — i.e. it is consuming. */
-  live: boolean;
-  /** Emailable leads arriving, per `unitMinutes`. */
-  rate: number;
-  /** What this lane eats, per `unitMinutes`. Reported even when it's off. */
-  required: number;
-  ratio: number;
-  status: FillStatus;
-  found: number;
-  ready: number;
-  threshold: number;
-  /** How long the leads on hand keep this lane fed. null = no demand. */
-  coverMinutes: number | null;
-  /** Until the next batch is full at this rate. 0 = full, null = never. */
-  etaMinutes: number | null;
-  /** One count per `bucketMinutes`, oldest first. */
-  series: number[];
-}
-
-export interface FillRate {
-  lanes: FillRateLane[];
-  rate: number;
-  required: number;
-  ratio: number;
-  status: FillStatus;
-  unitMinutes: number;
-  windowMinutes: number;
-  coveredMinutes: number;
-  bucketMinutes: number;
-  /** Too little history to judge — a fresh pool, or the bot just came on. */
-  warming: boolean;
-  /** Why it's short, when it is: bot off · no sources · all dry · no emails. */
-  reason: string | null;
-  /** The shared daily ceiling, not the batch size, is what caps the demand. */
-  cappedByDaily: boolean;
-  measuredAt: string;
-}
-
 /* --------------------------- Discovery bot -------------------------- */
 
 export interface DiscoveryStatus {
@@ -247,42 +148,18 @@ export interface DiscoveryStatus {
   autoEnrich: boolean;
   sources: number;
   activeSources: number;
-  // Sources that have completed `staleAfterRuns` runs in a row without adding a
-  // single new lead. Optional: a frontend can be newer than the API it talks to.
-  staleSources?: number;
-  staleAfterRuns?: number;
-  staleOffAfterRuns?: number;
   leads: { pending: number; approved: number; rejected: number; withEmail: number; total: number };
   pendingEnrich: number;
   // Pending, email-less leads still auto-retrying after a block/error.
   blocked: number;
   // Pending, email-less leads WITH a website that were given up on / predate
-  // retry-tracking AND that a re-check could still plausibly change — the count
-  // that drives the recovery button. A lead drops out of here once a manual
-  // pass has been spent on it under the current bypass setup.
+  // retry-tracking — the count "Re-check" re-queues (drives the recovery button).
   recoverable: number;
-  // Parked leads a pass has already been spent on without the answer changing.
-  // Not lost: adding or changing a Jina key / proxy re-arms every one of them.
-  // Optional — a frontend can be newer than the API it talks to.
-  stuck?: number;
-  lastRecheckAt?: string | null;
   // Is a scalable Cloudflare bypass configured, and how often has the free reader
   // been rate-limited — drives the "add a key/proxy" nudge.
-  bypass: {
-    readerKeyed: boolean;
-    proxy: boolean;
-    readerRateLimited: number;
-    // Key health as the fetcher actually observed it — a key saved in Settings
-    // is not necessarily a key that still has tokens.
-    readerKeysConfigured: number;
-    readerKeysLive: number;
-    readerKeyRejected: boolean;
-  };
+  bypass: { readerKeyed: boolean; proxy: boolean; readerRateLimited: number };
   nextRunAt: string | null;
   lastLeadAt: string | null;
-  // Emailable leads arriving vs what the automation consumes. Optional: a
-  // frontend can be newer than the API it is talking to.
-  fill?: FillRate;
 }
 
 export interface DiscoverySource {
@@ -290,16 +167,6 @@ export interface DiscoverySource {
   type?: "osm" | "directory" | "search";
   base_url?: string | null;
   keywords?: string | null; // web-search sources: custom keywords (blank = from category)
-  /**
-   * RETIRED. Web-search sources could once also walk Common Crawl's index of
-   * the country's own ccTLD. It listed every host in a country rather than
-   * every business, so it filed portals and parked domains as companies. The
-   * backend now ignores the column and clears it on boot; kept on the type
-   * only because old rows still send it.
-   */
-  sweep_country?: number;
-  /** customer | partner — every lead this source files inherits it. */
-  audience?: string | null;
   cursor?: number;
   exhausted?: number; // 0 | 1
   // Directory sources: the exact URL the next batch resumes from (any pager shape).
@@ -324,25 +191,8 @@ export interface DiscoverySource {
   last_error?: string | null;
   runs: number;
   total_found: number;
-  // STALENESS — completed runs in a row that added nothing new, how many new
-  // leads the last completed run added, and when it last produced anything.
-  // A blocked or errored run doesn't count: that's a different problem.
-  barren_runs?: number;
-  last_found?: number;
-  last_found_at?: string | null;
-  /** 1 when the BOT switched this off for being spent, not a person. */
-  auto_off?: number;
   created_at: string;
 }
-
-/** Has this source run itself dry? (mirrors STALE_AFTER_RUNS on the server) */
-export const STALE_AFTER_RUNS = 2;
-/** …and after this many dry runs the bot switches it off by itself. */
-export const STALE_OFF_AFTER_RUNS = 4;
-export const isStaleSource = (s: DiscoverySource, after = STALE_AFTER_RUNS) =>
-  (s.barren_runs ?? 0) >= after;
-/** Switched off by the bot for being spent — not paused by a person. */
-export const isAutoOff = (s: DiscoverySource) => !s.enabled && !!s.auto_off;
 
 export interface DiscoveredLead {
   id: string;
@@ -354,8 +204,6 @@ export interface DiscoveredLead {
   city?: string | null;
   country?: string | null;
   category?: string | null;
-  /** customer | partner — copied from the source that found it. */
-  audience?: string | null;
   source_label?: string | null;
   status: string;
   enriched: number;
@@ -365,251 +213,6 @@ export interface DiscoveredLead {
   // Enrichment retry state.
   retry_count?: number;
   enrich_status?: string | null; // found | empty | blocked | error
-}
-
-/* ------------------------------ Automation ----------------------------- */
-
-// The automation runs as TWO independent lanes — customer and partner — fed by
-// the audience tag on each discovery source. Each lane has its own switch,
-// trigger count, templates and cooldown; the guard rails below them (rate,
-// daily ceiling, gap, Resend) are shared, because the sending domains are.
-
-export interface AutomationLaneConfig {
-  enabled: boolean;
-  /** Trigger point AND batch size: approve + email this many at a time. */
-  threshold: number;
-  /** Template(s) this lane sends — several rotate. */
-  templateIds: string[];
-  /** rotate = one template per run · split = alternate per recipient. */
-  templateMode: "rotate" | "split";
-  category: string;
-  country: string;
-}
-
-export interface AutomationConfig {
-  /** Master switch — off means neither lane runs. */
-  enabled: boolean;
-  customer: AutomationLaneConfig;
-  partner: AutomationLaneConfig;
-  perMinute: number;
-  /** Max emails per day across both lanes (0 = no ceiling). */
-  dailyLimit: number;
-  /** Minimum gap between two runs of the SAME lane. */
-  cooldownMinutes: number;
-  /** Refuse to run without a Resend key (never auto-"dry-run"). */
-  requireResend: boolean;
-}
-
-export interface AutomationRun {
-  id: string;
-  started_at: string;
-  finished_at: string | null;
-  trigger: string;   // auto | manual
-  status: string;    // running | done | error | skipped
-  audience?: string; // customer | partner
-  threshold: number;
-  pool_count: number;
-  approved: number;
-  contacts_added: number;
-  sent: number;
-  failed: number;
-  skipped: number;
-  template_names: string | null;
-  job_id: string | null;
-  note: string | null;
-  error: string | null;
-}
-
-export interface AutomationLaneStatus {
-  audience: Audience;
-  config: AutomationLaneConfig;
-  /** Pending leads of this audience that already have an email. */
-  ready: number;
-  /** Of those, the ones whose country is inside its sending window now. */
-  readyNow: number;
-  remaining: number;
-  running: boolean;
-  sentToday: number;
-  nextEligibleAt: string | null;
-  /** When the soonest held-back country opens (null = nothing held). */
-  windowOpensAt: string | null;
-  lastRun: AutomationRun | null;
-  templates: { id: string; name: string; type: string }[];
-  blockers: string[];
-}
-
-/* ---------------------------- Sending windows -------------------------- */
-
-// Outreach lands at the recipient's local desk, not on the server's clock, so
-// every country carries its own time zone and its own working hours.
-
-export interface SendWindow {
-  /** Minutes past local midnight. 9am = 540. */
-  start: number;
-  end: number;
-  /** Local weekdays the window is open on. 0 = Sunday. */
-  days: number[];
-}
-
-export interface CountryRule extends Partial<SendWindow> {
-  timezone?: string;
-  /** Hold this country entirely. */
-  paused?: boolean;
-}
-
-export interface ScheduleConfig {
-  enabled: boolean;
-  window: SendWindow;
-  countries: Record<string, CountryRule>;
-  fallbackTimezone: string;
-  sendUnknown: boolean;
-}
-
-export interface ScheduleCountryStatus {
-  /** Canonical country name, or `__none__`. */
-  country: string;
-  timezone: string;
-  /** "14:05" where they are, right now. */
-  localTime: string;
-  localDay: number;
-  open: boolean;
-  paused: boolean;
-  nextOpenAt: string | null;
-  window: SendWindow;
-  /** This country has its own rule rather than the default. */
-  custom: boolean;
-  ready: number;
-  customerReady: number;
-  partnerReady: number;
-}
-
-export interface ScheduleStatus {
-  config: ScheduleConfig;
-  countries: ScheduleCountryStatus[];
-  /** Leads sitting in a country whose window is shut. */
-  holding: number;
-  sendable: number;
-  summary: string;
-}
-
-export interface AutomationStatus {
-  config: AutomationConfig;
-  lanes: AutomationLaneStatus[]; // [customer, partner]
-  /** Both lanes combined. */
-  ready: number;
-  running: boolean;
-  sentToday: number;
-  dailyRemaining: number | null;
-  /**
-   * What the sending DOMAINS can still deliver today — a separate ceiling from
-   * `dailyRemaining`, and the one that tends to run out first. null = uncapped.
-   */
-  capacityRemaining: number | null;
-  lastRun: AutomationRun | null;
-  runs: AutomationRun[];
-  /** Blockers that stop both lanes. */
-  blockers: string[];
-  /** Per-country sending windows + the local clock in each. */
-  schedule: ScheduleStatus;
-}
-
-/* ---------------------------- Follow-up ladder ------------------------- */
-
-export type FollowUpBranch = "no_open" | "no_click";
-
-export interface FollowUpStepConfig {
-  /** Template sent at this rung. Blank = the rung is off. */
-  templateId: string;
-  /** Hours to wait after the PREVIOUS email before this one goes out. */
-  delayHours: number;
-}
-
-/**
- * One audience's ladder. Customers and partners get different pitches, so they
- * get different retries — and saving one must never overwrite the other.
- */
-export interface FollowUpLadder {
-  noOpen: FollowUpStepConfig[];  // [first retry, second retry]
-  noClick: FollowUpStepConfig[];
-}
-
-export interface FollowUpConfig {
-  enabled: boolean;
-  /** Ceiling per sequence, including the original email (2 or 3). */
-  maxEmails: number;
-  customer: FollowUpLadder;
-  partner: FollowUpLadder;
-  perMinute: number;
-  dailyLimit: number;
-  batchSize: number;
-  /** Sequences whose last email is older than this are abandoned. */
-  lookbackDays: number;
-  requireResend: boolean;
-  /** Legacy mirror of the customer lane — read-only as far as the UI cares. */
-  noOpen?: FollowUpStepConfig[];
-  noClick?: FollowUpStepConfig[];
-}
-
-export interface FollowUpRun {
-  id: string;
-  started_at: string;
-  finished_at: string | null;
-  trigger: string;   // auto | manual
-  status: string;    // running | done | error | skipped
-  due_count: number;
-  queued: number;
-  sent: number;
-  failed: number;
-  skipped: number;
-  no_open: number;
-  no_click: number;
-  retry1: number;
-  retry2: number;
-  template_names: string | null;
-  job_id: string | null;
-  note: string | null;
-  error: string | null;
-}
-
-export interface FollowUpRung {
-  audience: Audience;
-  branch: FollowUpBranch;
-  step: number;                  // 1 = first retry, 2 = second
-  templateId: string;
-  templateName: string | null;   // null = the template was deleted
-  delayHours: number;
-  due: number;
-  waiting: number;
-  nextDueAt: string | null;
-  // What this rung has produced so far, all time.
-  sent: number;
-  opened: number;
-  clicked: number;
-}
-
-export interface FollowUpStatus {
-  config: FollowUpConfig;
-  running: boolean;
-  dueNow: number;
-  waiting: number;
-  /** In a sequence, but the rung they'd take has no template. */
-  unconfigured: number;
-  /** Due, but held until their country's sending window opens. */
-  holding: number;
-  holdingUntil: string | null;
-  sentToday: number;
-  dailyRemaining: number | null;
-  /** App URL set = opens/clicks are actually tracked. */
-  trackingReady: boolean;
-  lastRun: FollowUpRun | null;
-  runs: FollowUpRun[];
-  rungs: FollowUpRung[];
-  totals: { retries: number; opened: number; clicked: number };
-  templates: { id: string; name: string; type: string }[];
-  blockers: string[];
-  /** Per lane, so an empty partner ladder can't hide behind a full one. */
-  laneBlockers: { audience: Audience; blockers: string[] }[];
-  dueSample: { email: string; audience: Audience; branch: FollowUpBranch; step: number; dueAt: string }[];
 }
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -684,40 +287,18 @@ export const api = {
     if (data.token) setToken(data.token);
     return data;
   },
-
-  /* --------------------------- access keys --------------------------- */
-
-  /** Trade a `?k=` access key for a normal session. Used once, on boot. */
-  exchangeKey: async (key: string) => {
-    const res = await fetch(`${BASE}/api/auth/exchange`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key }),
-    });
-    if (!res.ok) {
-      const e = await res.json().catch(() => ({}));
-      throw new Error(e.error || "Access key rejected");
-    }
-    const data = (await res.json()) as { token: string; username: string };
-    setToken(data.token);
-    return data;
-  },
-  listKeys: () => req<{ keys: AccessKey[] }>(`/api/auth/keys`),
-  /** The plaintext `key` in the response is shown once and never returned again. */
-  createKey: (label: string, expiresInDays = 0) =>
-    req<{ id: string; key: string; row: AccessKey }>(`/api/auth/keys`, {
-      method: "POST",
-      body: JSON.stringify({ label, expiresInDays }),
-    }),
-  revokeKey: (id: string) => req<{ ok: boolean }>(`/api/auth/keys/${id}`, { method: "DELETE" }),
   logout: () => clearToken(),
 
   // contacts (keyset pagination via opaque `cursor`)
-  getContacts: (params: { status?: string; q?: string; category?: string; limit?: number; cursor?: string } = {}) => {
+  getContacts: (params: ContactFilterArgs & { limit?: number; cursor?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.category) qs.set("category", params.category);
+    if (params.company) {
+      qs.set("company", params.company);
+      qs.set("companyMode", params.companyMode || "exact");
+    }
     if (params.limit) qs.set("limit", String(params.limit));
     if (params.cursor) qs.set("cursor", params.cursor);
     return req<{
@@ -728,63 +309,34 @@ export const api = {
       nextCursor: string | null;
     }>(`/api/contacts?${qs.toString()}`);
   },
+  // Company names (with contact counts) for the company filter picker, scoped
+  // to the status/category tab being viewed.
+  getContactCompanies: (params: { status?: string; category?: string; search?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.status) qs.set("status", params.status);
+    if (params.category) qs.set("category", params.category);
+    if (params.search) qs.set("search", params.search);
+    if (params.limit) qs.set("limit", String(params.limit));
+    return req<{
+      companies: CompanyCount[];
+      totalCompanies: number;
+      matching: number;
+      noCompany: number;
+    }>(`/api/contacts/companies?${qs.toString()}`);
+  },
   addContact: (c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts`, { method: "POST", body: JSON.stringify(c) }),
   updateContact: (id: string, c: Partial<Contact>) =>
     req<{ contact: Contact }>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(c) }),
-  bulkContacts: (contacts: Partial<Contact>[], upsert = false, audience?: string) =>
+  bulkContacts: (contacts: Partial<Contact>[], upsert = false) =>
     req<{ added: number; updated?: number; skipped: number }>(`/api/contacts/bulk`, {
       method: "POST",
-      body: JSON.stringify({ contacts, upsert, audience }),
+      body: JSON.stringify({ contacts, upsert }),
     }),
-  /**
-   * Import into the REVIEW POOL instead of straight into Contacts.
-   *
-   * The automation lanes count pool rows and nothing else, so this is the only
-   * import route the bot can actually see. Rows written to Contacts directly
-   * are reachable only by a manual campaign.
-   */
-  importToPool: (
-    contacts: Partial<Contact>[],
-    opts: { audience?: string; label?: string; category?: string; country?: string } = {}
-  ) =>
-    req<{ added: number; duplicate: number; invalid: number }>(`/api/pool/import`, {
-      method: "POST",
-      body: JSON.stringify({ contacts, ...opts }),
-    }),
-
-  /**
-   * Preview for the backfill button — shares the backfill's own predicate.
-   */
-  getAdoptable: () => req<AdoptableSummary>(`/api/pool/adoptable`),
-
-  /** One-time: queue already-held, never-emailed contacts into the pool. */
-  adoptContacts: (opts: { importedOnly?: boolean; audience?: string; category?: string; country?: string } = {}) =>
-    req<{ jobId: string; total: number }>(`/api/pool/adopt-contacts`, {
-      method: "POST",
-      body: JSON.stringify(opts),
-    }),
-
-  adoptContactsJob: (id: string) => req<Job>(`/api/pool/adopt-contacts/${id}`),
-
-  /**
-   * Leads that were approved into a batch that then sent nothing — approved,
-   * turned into a contact, never emailed, and dropped out of the pool. Counted
-   * so the damage from a capped-out day is a number you can look at.
-   */
-  getStranded: () => req<{ stranded: number }>(`/api/pool/stranded`),
-
-  /** Put those leads back to 'pending' so a lane can pick them up again. */
-  requeueStranded: (limit?: number) =>
-    req<{ requeued: number; remaining: number }>(`/api/pool/stranded/requeue`, {
-      method: "POST",
-      body: JSON.stringify(limit ? { limit } : {}),
-    }),
-
   deleteContacts: (ids: string[]) =>
     req<{ deleted: number }>(`/api/contacts/delete`, { method: "POST", body: JSON.stringify({ ids }) }),
   // Delete EVERY contact matching the current filter ("select all N matching").
-  deleteContactsMatching: (filter: { status?: string; q?: string; category?: string }) =>
+  deleteContactsMatching: (filter: ContactFilterArgs) =>
     req<{ deleted: number }>(`/api/contacts/delete`, {
       method: "POST",
       body: JSON.stringify({ all: true, ...filter }),
@@ -792,7 +344,7 @@ export const api = {
   // Set/clear category on ids, or on every row matching a filter (`all:true`).
   setContactsCategory: (
     value: string,
-    target: { ids?: string[]; all?: boolean; status?: string; q?: string; category?: string }
+    target: { ids?: string[]; all?: boolean } & ContactFilterArgs
   ) =>
     req<{ updated: number }>(`/api/contacts/set-category`, {
       method: "POST",
@@ -820,6 +372,8 @@ export const api = {
     req<{ domain: Domain }>(`/api/domains/${id}`, { method: "PUT", body: JSON.stringify(d) }),
   deleteDomain: (id: string) => req(`/api/domains/${id}`, { method: "DELETE" }),
   resetCounts: () => req(`/api/domains/reset-counts`, { method: "POST" }),
+  checkTrackingHost: (host: string) =>
+    req<{ ok: boolean; host: string }>(`/api/domains/check-tracking`, { method: "POST", body: JSON.stringify({ host }) }),
 
   // settings
   getSettings: () =>
@@ -828,35 +382,8 @@ export const api = {
       appUrl: string;
       replyTo: string;
       scrape: { configured: boolean; provider: string; mode: "blocked" | "always"; premium: boolean };
-      reader: {
-        configured: boolean;
-        fromEnv: boolean;
-        savedKeys: number;
-        // One entry per key in the pool. `masked` is a fingerprint, never the
-        // key itself — it is also the handle used to delete one.
-        keys: { masked: string; live: boolean; status: number }[];
-      };
-      // Where the crawler's pages actually came from since the server booted.
-      // `direct`, `commoncrawl` and `archive` are free; `reader` and `proxy`
-      // cost money — which is the whole point of reporting the split.
-      transports: {
-        pages: Record<TransportName, { calls: number; ok: number }>;
-        archives: { source: string; fails: number; downForMs: number }[];
-        searchEngines: { engine: string; live: boolean; restingForMs: number; note?: string }[];
-      };
+      reader: { configured: boolean; fromEnv: boolean };
     }>(`/api/settings`),
-
-  // Add ONE key to the pool. Appends — it never replaces what is stored.
-  addReaderKey: (key: string) =>
-    req<{ ok: boolean; added: number; duplicates: number; total: number }>(`/api/settings/reader-key`, {
-      method: "POST",
-      body: JSON.stringify({ key }),
-    }),
-  removeReaderKey: (masked: string) =>
-    req<{ ok: boolean; total: number }>(`/api/settings/reader-key`, {
-      method: "DELETE",
-      body: JSON.stringify({ masked }),
-    }),
   saveSettings: (s: {
     resend_api_key?: string;
     app_url?: string;
@@ -901,40 +428,6 @@ export const api = {
   startSend: (body: any) => req<{ jobId: string }>(`/api/send`, { method: "POST", body: JSON.stringify(body) }),
   getSend: (id: string) => req<Job>(`/api/send/${id}`),
 
-  // automation — auto-approve a full pool, then auto-send
-  getAutomation: () => req<AutomationStatus>(`/api/automation`),
-  // Lanes are patched independently: send only the one you changed.
-  saveAutomation: (cfg: Partial<Omit<AutomationConfig, "customer" | "partner">> & {
-    customer?: Partial<AutomationLaneConfig>;
-    partner?: Partial<AutomationLaneConfig>;
-    // Sending windows ride along on the same save. A country mapped to null
-    // goes back to the default window.
-    schedule?: Partial<Omit<ScheduleConfig, "countries">> & {
-      countries?: Record<string, CountryRule | null>;
-    };
-  }) => req<AutomationStatus>(`/api/automation`, { method: "POST", body: JSON.stringify(cfg) }),
-  runAutomation: (audience: Audience = "customer") =>
-    req<{ started: boolean; audience?: Audience; runId?: string; jobId?: string; approved?: number; status: AutomationStatus }>(
-      `/api/automation/run`,
-      { method: "POST", body: JSON.stringify({ audience }) }
-    ),
-
-  // follow-up ladder — retry whoever didn't open / didn't click
-  getFollowUp: () => req<FollowUpStatus>(`/api/followup`),
-  // Ladders are patched per audience: send only the lane you changed, and the
-  // other one is left exactly as it was.
-  saveFollowUp: (
-    cfg: Partial<Omit<FollowUpConfig, "customer" | "partner">> & {
-      customer?: Partial<FollowUpLadder>;
-      partner?: Partial<FollowUpLadder>;
-    }
-  ) => req<FollowUpStatus>(`/api/followup`, { method: "POST", body: JSON.stringify(cfg) }),
-  runFollowUp: () =>
-    req<{ started: boolean; runId?: string; jobId?: string; queued?: number; status: FollowUpStatus }>(
-      `/api/followup/run`,
-      { method: "POST", body: "{}" }
-    ),
-
   // lead finder
   getLeadCategories: () => req<{ categories: string[] }>(`/api/leads/categories`),
   geocode: (q: string) =>
@@ -963,20 +456,13 @@ export const api = {
     req<DiscoveryStatus>(`/api/discovery/toggle`, { method: "POST", body: JSON.stringify(body) }),
   // Re-queue leads whose email couldn't be read (Cloudflare wall / reader rate
   // limit) so the bot tries them again — the historical "no email" recovery.
-  // `reset` = re-queued now · `stuck` = parked leads this setup can't help ·
-  // `reArmed` = of the reset, how many a newly-added key/proxy unlocked.
-  reEnrichDiscovery: () =>
-    req<{ reset: number; stuck?: number; reArmed?: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
+  reEnrichDiscovery: () => req<{ reset: number }>(`/api/discovery/re-enrich`, { method: "POST", body: "{}" }),
   // Company names saved by the old directory harvester could be the card's phone
   // number. Count them, and repair them by re-reading the directory sources.
-  // `leads`/`contacts` = names the repair can still recover · `stuck*` = ones
-  // already proven unrecoverable from the directory sources you have configured.
-  getBadNameCount: () =>
-    req<{ leads: number; contacts: number; stuckLeads?: number; stuckContacts?: number }>(`/api/discovery/bad-names`),
+  getBadNameCount: () => req<{ leads: number; contacts: number }>(`/api/discovery/bad-names`),
   repairNames: () => req<{ jobId: string }>(`/api/discovery/repair-names`, { method: "POST", body: "{}" }),
-  purgeJunkLeads: () => req<{ swept: number }>(`/api/discovery/purge-junk`, { method: "POST", body: "{}" }),
   getDiscoverySources: (archived = false) =>
-    req<{ sources: DiscoverySource[]; archivedCount: number; staleCount?: number; staleAfterRuns?: number; staleOffAfterRuns?: number }>(
+    req<{ sources: DiscoverySource[]; archivedCount: number }>(
       `/api/discovery/sources${archived ? "?archived=1" : ""}`
     ),
   // Retire a source without deleting it — the bot stops scheduling it, but its
@@ -991,25 +477,23 @@ export const api = {
     url?: string;
     keywords?: string;
     category?: string;
-    audience?: Audience;
     limit?: number;
     intervalMinutes?: number;
     place?: Place | null;
     enabled?: boolean;
   }) => req<{ source: DiscoverySource }>(`/api/discovery/sources`, { method: "POST", body: JSON.stringify(body) }),
-  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; audience: Audience; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
+  updateDiscoverySource: (id: string, body: Partial<{ location: string; url: string; keywords: string; category: string; limit: number; intervalMinutes: number; enabled: boolean; place: Place | null }>) =>
     req<{ source: DiscoverySource }>(`/api/discovery/sources/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteDiscoverySource: (id: string) => req(`/api/discovery/sources/${id}`, { method: "DELETE" }),
   runDiscoverySource: (id: string) =>
     req<{ started?: boolean; found?: number }>(`/api/discovery/sources/${id}/run`, { method: "POST", body: "{}" }),
-  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number; country?: string; audience?: string } = {}) => {
+  getDiscoveryLeads: (params: { status?: string; q?: string; hasEmail?: boolean; limit?: number; country?: string } = {}) => {
     const qs = new URLSearchParams();
     if (params.status) qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.hasEmail) qs.set("hasEmail", "1");
     if (params.limit) qs.set("limit", String(params.limit));
     if (params.country) qs.set("country", params.country);
-    if (params.audience) qs.set("audience", params.audience);
     return req<{
       leads: DiscoveredLead[];
       counts: { status: string; n: number }[];
@@ -1018,25 +502,27 @@ export const api = {
       // Every country present in the current tab, with a count — "__none__" is
       // the bucket for leads with no country on file.
       countries: { country: string; n: number }[];
-      // How this tab splits between the two pitches.
-      audiences: { audience: string; n: number }[];
       // Where the leads in this exact view stand on their way to an email.
       breakdown: { withEmail: number; crawling: number; queued: number; noEmail: number };
     }>(`/api/discovery/leads?${qs.toString()}`);
   },
-  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string; filterAudience?: string }) =>
+  approveDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; category?: string; country?: string; filterCountry?: string }) =>
     req<{ added: number; skipped: number }>(`/api/discovery/leads/approve`, { method: "POST", body: JSON.stringify(body) }),
-  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; filterCountry?: string; filterAudience?: string }) =>
+  rejectDiscoveryLeads: (body: { ids?: string[]; all?: boolean; q?: string; filterCountry?: string }) =>
     req<{ rejected: number }>(`/api/discovery/leads/reject`, { method: "POST", body: JSON.stringify(body) }),
-  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string; filterCountry?: string; filterAudience?: string }) =>
+  deleteDiscoveryLeads: (body: { ids?: string[]; all?: boolean; status?: string; q?: string; filterCountry?: string }) =>
     req<{ deleted: number }>(`/api/discovery/leads/delete`, { method: "POST", body: JSON.stringify(body) }),
 
   // export
-  exportContacts: async (params: { status?: string; q?: string; category?: string } = {}) => {
+  exportContacts: async (params: ContactFilterArgs = {}) => {
     const qs = new URLSearchParams();
     if (params.status && params.status !== "all") qs.set("status", params.status);
     if (params.q) qs.set("q", params.q);
     if (params.category && params.category !== "all") qs.set("category", params.category);
+    if (params.company) {
+      qs.set("company", params.company);
+      qs.set("companyMode", params.companyMode || "exact");
+    }
     const res = await fetch(`${BASE}/api/contacts/export?${qs.toString()}`, {
       headers: { ...authHeaders() },
     });
@@ -1064,28 +550,7 @@ export const api = {
       clicks: number;
       totalContacts: number;
       totalSends: number;
-      /** One entry PER DAY, oldest first, empty days included — the server
-       *  builds the calendar so the browser's time zone can't shift a bucket.
-       *  `n` == `sent` (kept as the plotted value for older clients). */
-      daily: { d: string; n: number; sent?: number; failed?: number; opens?: number; clicks?: number }[];
-      windowDays?: number;
-      /** The same fill-rate snapshot the Discovery tab reads — one computation
-       *  on the server, so the two screens can't quote different numbers. */
-      fill?: FillRate;
-      /** Discovery sources at a glance, including the ones that have run dry. */
-      sources?: {
-        total: number;
-        active: number;
-        stale: number;
-        staleAfterRuns: number;
-        staleOffAfterRuns?: number;
-        staleList: {
-          id: string; type?: string; location: string; base_url?: string | null;
-          category?: string; audience?: string | null; runs?: number; total_found?: number;
-          barren_runs?: number; last_found_at?: string | null; last_run_at?: string | null;
-          enabled?: number; auto_off?: number;
-        }[];
-      };
+      daily: { d: string; n: number }[];
     }>(`/api/overview`),
 
   // history + stats

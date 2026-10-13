@@ -1,4 +1,4 @@
-import { fetchWithRetry, archivedPagesFor, type ProxyConfig, type BlockReason } from "./fetcher";
+import { fetchWithRetry, type ProxyConfig } from "./fetcher";
 import {
   normalizeSeed,
   hostOf,
@@ -65,10 +65,6 @@ export interface SiteResult {
   phone?: string; // site-level best phone (mobile preferred)
   phoneMobile?: boolean;
   note?: string;
-  // WHY the crawl was blocked, machine-readable. The caller needs to tell a
-  // permanent wall (Cloudflare / 403) from a transient one (429 / timeout):
-  // retrying the former six times is six guaranteed-wasted crawls.
-  blockReason?: BlockReason;
 }
 
 // Strip tags to plain lowercase text and report which keywords appear in it.
@@ -126,52 +122,30 @@ export async function crawlSite(
   const origin = new URL(seed).origin;
   const siteHost = hostOf(seed);
   const siteDomain = registrableDomain(siteHost);
-
-  // robots.txt and sitemap.xml used to be fetched BEFORE the first page. On a
-  // Cloudflare-walled site that is six guaranteed-challenged requests (one for
-  // robots, five sitemap candidates) spent to learn what the homepage alone
-  // tells us. Both are now deferred until the seed actually answers.
-  //
-  // The trade-off: the homepage is fetched before robots.txt is read. A root
-  // page is essentially never disallowed, and robots is still enforced for
-  // every subsequent page — so politeness is preserved where it matters.
-  let robots: { allow: (path: string) => boolean } = { allow: () => true };
-  let expanded = false;
+  const robots = respectRobots ? await loadRobots(origin) : { allow: () => true };
 
   const visited = new Set<string>();
   const queue: { url: string; depth: number }[] = [{ url: seed, depth: 0 }];
+  for (const p of SEED_PATHS) {
+    try { queue.push({ url: new URL(p, origin).toString(), depth: 1 }); } catch {}
+  }
 
-  // Queue the contact-page guesses + anything the sitemap knows about. Called
-  // once, only after we know the site is reachable.
-  const expandQueue = async (withSitemap: boolean): Promise<void> => {
-    if (expanded) return;
-    expanded = true;
-    if (respectRobots) {
-      try { robots = await loadRobots(origin); } catch { /* keep allow-all */ }
-    }
-    for (const p of SEED_PATHS) {
-      try { queue.push({ url: new URL(p, origin).toString(), depth: 1 }); } catch {}
-    }
-    if (withSitemap && useSitemap) {
-      try {
-        const smUrls = await discoverFromSitemap(origin, seed, 8, Math.min(timeoutMs, 8000));
-        for (const u of smUrls) queue.push({ url: u, depth: 1 });
-      } catch {}
-    }
-  };
+  // Jump straight to contact-like pages listed in the sitemap (even unlinked ones).
+  if (useSitemap) {
+    try {
+      const smUrls = await discoverFromSitemap(origin, seed, 8, Math.min(timeoutMs, 8000));
+      for (const u of smUrls) queue.push({ url: u, depth: 1 });
+    } catch {}
+  }
 
   const emailMap = new Map<string, FoundEmail>();
   let pagesCrawled = 0;
   let blockedHits = 0;
-  let lastBlockReason: BlockReason | undefined;
-  // The reader COSTS MONEY per page, so it gets the tightest budget of the lot:
-  // one page per site, spent on the single most promising one. The free archives
-  // are what should be doing this work, and they are tried first.
-  let readerBudget = 1;
-  let archiveBudget = 3;
-  // Set when an address had to come out of an archive rather than the live site
-  // — worth saying out loud, because a snapshot can be out of date.
-  let archivedFrom: "commoncrawl" | "archive" | null = null;
+  let lastBlockReason: string | undefined;
+  // The free reader that gets us past Cloudflare is rate-limited, so cap how many
+  // blocked pages we escalate per site — and spend that budget on the pages most
+  // likely to hold the email (the homepage's footer + contact/about pages).
+  let readerBudget = 2;
 
   while (queue.length && pagesCrawled < maxPages) {
     // Crawl the most promising (contact-like, shallow) pages first.
@@ -192,38 +166,16 @@ export async function crawlSite(
     // instead of one Cloudflare site burning it on every sub-page.
     const contactLike = depth === 0 || scoreLink(norm) >= 6;
     const allowReader = readerBudget > 0 && contactLike;
-    // Wayback is the last free resort and costs ~10s a call, so it gets the
-    // same treatment as the reader: only high-value pages, only a couple per
-    // site. Unbudgeted, a six-page crawl of a walled site would sit there for a
-    // minute re-fetching snapshots of pages that hold no address anyway.
-    const allowArchive = archiveBudget > 0 && contactLike;
-    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy, readerKey, allowReader, allowArchive);
+    const res = await fetchWithRetry(norm, 2, timeoutMs, proxy, readerKey, allowReader);
     if (allowReader && (res.via === "reader" || (!res.ok && res.blocked))) readerBudget--;
-    if (allowArchive && (res.via === "archive" || (!res.ok && res.blocked))) archiveBudget--;
     pagesCrawled++;
 
     if (!res.ok) {
       if (res.blocked || res.status === 403 || res.status === 429) { blockedHits++; if (res.blockReason) lastBlockReason = res.blockReason; }
       onPage?.({ url: norm, found: 0, status: res.status });
-      // The seed failed. A BLOCK means the whole origin is walled — every
-      // contact-page guess and every sitemap URL behind it would be refused the
-      // same way, so stop here instead of burning nine more challenged
-      // requests. A plain error (404 / timeout) might just be a missing root
-      // page, so still try the cheap contact paths — but never the sitemap.
-      if (!expanded) {
-        if (res.blocked) break;
-        await expandQueue(false);
-      }
       await sleep(politenessMs);
       continue;
     }
-
-    // The site answered: now it is worth paying for robots + the sitemap.
-    // But sitemap discovery uses PLAIN fetches only — so if this page reached
-    // us through the reader, an archive snapshot or the proxy, direct requests
-    // to that origin are walled and all five sitemap probes would be refused.
-    // Skip them and rely on the contact-path guesses instead.
-    if (!expanded) await expandQueue(res.via === "direct");
 
     if (keywords.length) for (const k of matchKeywords(res.html, keywords)) matchedKw.add(k);
 
@@ -261,51 +213,6 @@ export async function crawlSite(
       }
     }
     await sleep(politenessMs);
-  }
-
-  /* ---------------------- last free resort: the archives ------------------
-   * The live crawl came back with nothing AND we were walled. No amount of
-   * re-asking changes that — the refusal is about our IP, not the page. But
-   * Common Crawl or the Wayback Machine has very likely already stored this
-   * company's contact page, and reading their copy needs no key, costs no
-   * tokens and answers exactly the same question.
-   *
-   * This is also the only path that can reach a page we were never able to
-   * LINK to: the archives are indexes, so they can hand us /contact directly
-   * without the walled homepage ever telling us it exists.
-   */
-  if (!emailMap.size && (blockedHits > 0 || pagesCrawled === 0) && siteDomain) {
-    const archived = await archivedPagesFor(siteDomain, 4).catch(() => []);
-    let read = 0;
-    for (const page of archived) {
-      if (read >= 3 || emailMap.size) break;
-      const res = await page.fetch().catch(() => null);
-      if (!res?.ok || !res.html) continue;
-      read++;
-      pagesCrawled++;
-
-      for (const ph of extractPhones(res.html, { defaultCountry: region, hostname: siteHost })) {
-        const prev = sitePhones.get(ph.number);
-        if (!prev || (ph.isMobile && !prev.isMobile)) sitePhones.set(ph.number, ph);
-      }
-
-      let found = 0;
-      for (const h of extractEmails(res.html)) {
-        const c = cleanEmail(h.email);
-        if (!c || !isValidEmail(c) || isJunk(c) || emailMap.has(c)) continue;
-        emailMap.set(c, {
-          email: c,
-          role_based: isRole(c),
-          method: h.method,
-          confidence: METHOD_CONFIDENCE[h.method] ?? "low",
-          source: page.url,
-          domain: siteDomain,
-        });
-        found++;
-      }
-      if (found) archivedFrom = page.source;
-      onPage?.({ url: page.url, found, status: 200 });
-    }
   }
 
   let emails = [...emailMap.values()];
@@ -373,17 +280,13 @@ export async function crawlSite(
   // A short reason, so the caller can tell a recoverable block (retry later, or
   // add a key/proxy) from a site that simply lists no email.
   let note: string | undefined;
-  if (archivedFrom && emails.length) {
-    // Say it plainly. The site never answered us — this address came out of a
-    // stored copy, so it is real but it can be out of date.
-    note = `site blocked the crawler — address recovered from ${archivedFrom === "commoncrawl" ? "Common Crawl" : "the Wayback Machine"}`;
-  } else if (status === "blocked") {
+  if (status === "blocked") {
     // Only suggest a key when there isn't one. Advising "try a Jina key" to
     // someone who already added one reads like the key isn't working, when in
     // fact this site simply blocks the reader too.
-    const advice = readerKey || proxy ? "" : " (a scraping proxy is the only thing that opens these)";
+    const advice = readerKey || proxy ? "" : " (try a free Jina key or a scraping proxy)";
     note =
-      lastBlockReason === "cloudflare" ? `Cloudflare challenge blocked the crawler, and no archive holds the page${advice}` :
+      lastBlockReason === "cloudflare" ? `Cloudflare challenge blocked the crawler${advice}` :
       lastBlockReason === "rate-limited" ? "site rate-limited the crawler (HTTP 429)" :
       lastBlockReason === "forbidden" ? "site refused the crawler (HTTP 403 bot protection)" :
       "blocked by bot protection";
@@ -392,7 +295,6 @@ export async function crawlSite(
   return {
     seed, site: siteHost, status, pagesCrawled, emails, matchedKeywords, note,
     phone: sitePhone?.formatted, phoneMobile: sitePhone ? sitePhone.type === "mobile" : undefined,
-    blockReason: lastBlockReason,
   };
 }
 

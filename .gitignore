@@ -6,18 +6,9 @@ dist/
 **/.pgdata/
 data.sqlite
 **/data.sqlite*
-.backup/
-**/.backup/
 *.log
 .env
 .env.*
 .DS_Store
 .same-test/
 .commit-msg.txt
-
-# Build artifacts from the deploy tool
-output/
-**/output/
-# Dev-mode service worker output from vite-plugin-pwa
-dev-dist/
-**/dev-dist/

@@ -1,44 +1,25 @@
-// The crawler's transport ladder.
-//
-// Every fetch escalates through tiers, cheapest first, and stops at the first
-// one that returns a real page:
-//
-//   1. direct         free, unlimited      — a plain browser-shaped request
-//   2. Common Crawl   free, unlimited      — someone already crawled it
-//   3. Wayback        free, rate-limited   — someone already archived it
-//   4. Jina reader    PAID (token budget)  — renders JS, solves soft walls
-//   5. scraping proxy PAID (per request)   — residential IPs, solves hard walls
-//
-// The order matters more than anything else in this file. The reader used to be
-// tier 2, so it absorbed essentially every blocked fetch in the system and the
-// Jina keys kept hitting HTTP 402. Both archives answer the same question — "what
-// does this page say?" — for nothing, and between them they cover the large
-// majority of the sites that wall a datacenter IP. The reader is now what you
-// fall back to when the free corpora genuinely don't have the page.
+// Robust HTTP fetching for the crawler.
+// Handles: timeouts, retries with backoff, realistic browser headers,
+// redirect following, non-HTML skipping, a hard response-size cap, bot-wall
+// detection, and an OPTIONAL scraping proxy (ScrapingBee / ScraperAPI / ZenRows)
+// that renders JavaScript so Cloudflare-protected sites become crawlable.
 
-import {
-  rawFetch, browserHeaders, pickUserAgent, sleep,
-  getTransportStats, resetTransportStats,
-  type FetchResult, type BlockReason, type Via, type TransportStat,
-} from "./http";
-import { fetchViaArchives, fetchViaCommonCrawl, fetchViaWayback, archivedPagesFor, archiveHealth, type ArchivedPage } from "./archives";
-
-// Re-exported so the rest of the app keeps importing everything from ./fetcher.
-export type { FetchResult, BlockReason, Via, TransportStat, ArchivedPage };
-export {
-  fetchViaArchives, fetchViaCommonCrawl, fetchViaWayback, archivedPagesFor, archiveHealth,
-  getTransportStats, resetTransportStats,
-};
-
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const MAX_BYTES = 3_000_000; // 3 MB per page
 const PROXY_TIMEOUT_MS = 70_000; // JS rendering + antibot solving can be slow
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /* ── Free-reader rate limiter ─────────────────────────────────────────────
- * The Jina reader (r.jina.ai) renders JavaScript and gets past soft walls, but
- * WITHOUT an API key it allows only ~20 requests/minute, and WITH one it spends
- * tokens you have to pay for. We SERIALIZE reader reservations so calls are
- * spaced under the limit: 429 storms become an orderly queue. Only the slot
- * reservation is serialized — the actual network fetch still runs concurrently
- * the moment a slot is granted.
+ * The free Jina reader (r.jina.ai) is the crawler's only no-cost way past a
+ * Cloudflare "Just a moment" wall — but WITHOUT an API key it allows only
+ * ~20 requests/minute. At the discovery bot's scale that cap is hit constantly,
+ * and every resulting 429 looks exactly like "this site has no email". We fix
+ * that by SERIALIZING reader reservations so calls are spaced just under the
+ * free limit (and much faster once a key raises it): 429 storms become an
+ * orderly queue. Only the slot reservation is serialized — the actual network
+ * fetch still runs concurrently the moment a slot is granted.
  */
 const READER_RPM_NOKEY = Math.max(1, Number(process.env.READER_RPM) || 15); // < 20/min free cap
 const READER_RPM_KEYED = Math.max(1, Number(process.env.READER_RPM_KEYED) || 120);
@@ -58,136 +39,51 @@ async function reserveReaderSlot(keyed: boolean): Promise<void> {
   return wait;
 }
 
-/* ── Reader key pool ───────────────────────────────────────────────────────
- * A Jina key that is out of tokens (401/402) is WORSE than no key: every call
- * fails, and we pace at the keyed 120/min as if it worked. Production lost
- * hours to exactly that — the key died mid-run, throughput fell to the free
- * 15/min, and the UI still displayed "Jina key active · 120 pages/min".
- *
- * So: accept a LIST of keys (comma/whitespace separated). Each is tracked
- * independently — one running dry rotates to the next instead of dropping the
- * whole crawler to the free tier. A rejected key is re-tested periodically in
- * case it was topped up.
- */
+// A key that is out of tokens (Jina answers 401/402) is WORSE than no key: every
+// call fails, and we pace at the keyed 120/min as if it worked. The free keyless
+// tier still serves ~20/min, so once the key is rejected we stop sending it and
+// fall back — re-testing occasionally in case it gets topped up.
 const READER_KEY_RECHECK_MS = 30 * 60_000;
-
-interface KeyState { rejectedAt: number; status: number }
-const keyState = new Map<string, KeyState>();
-let keyCursor = 0;
-
-/** Split a settings value / env var into individual keys. */
-export function parseReaderKeys(raw: string): string[] {
-  return [...new Set(String(raw || "").split(/[\s,;]+/).map((k) => k.trim()).filter(Boolean))];
-}
-
-function keyIsUsable(key: string): boolean {
-  const st = keyState.get(key);
-  if (!st) return true;
-  if (Date.now() - st.rejectedAt > READER_KEY_RECHECK_MS) {
-    keyState.delete(key); // give a topped-up key another chance
+let readerKeyRejected = false;
+let readerKeyRejectedAt = 0;
+let readerKeyRejectStatus = 0;
+function readerKeyUsable(key: string): boolean {
+  if (!key) return false;
+  if (!readerKeyRejected) return true;
+  if (Date.now() - readerKeyRejectedAt > READER_KEY_RECHECK_MS) {
+    readerKeyRejected = false; // give a topped-up key another chance
     return true;
   }
   return false;
 }
 
-/** Next usable key from the pool, round-robin, or "" when all are spent. */
-function nextUsableKey(keys: string[]): string {
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[(keyCursor + i) % keys.length];
-    if (keyIsUsable(k)) {
-      keyCursor = (keyCursor + i + 1) % keys.length;
-      return k;
-    }
-  }
-  return "";
-}
-
-function markKeyRejected(key: string, status: number): void {
-  if (!key || keyState.has(key)) return;
-  keyState.set(key, { rejectedAt: Date.now(), status });
-}
-
-/**
- * A short, non-secret fingerprint for a key, so the UI can list and delete
- * individual keys without ever displaying one in full.
- * "jina_1a2b3c4d5e6f7g8h" → "jina_1a2…7g8h"
- */
-export function maskReaderKey(key: string): string {
-  const k = String(key || "").trim();
-  if (k.length <= 12) return k.replace(/.(?=.{3})/g, "•");
-  return `${k.slice(0, 8)}…${k.slice(-4)}`;
-}
-
-/** Per-key health, for the Settings list. Never returns the key itself. */
-export function readerKeyHealth(keys: string[]): { masked: string; live: boolean; status: number }[] {
-  return keys.map((k) => ({
-    masked: maskReaderKey(k),
-    live: keyIsUsable(k),
-    status: keyState.get(k)?.status ?? 0,
-  }));
-}
-
 // Reader health, surfaced in the Discovery UI so the operator knows when the
 // free tier is saturated and it's time to add a free key or a scraping proxy.
 let readerCalls = 0;
-let readerSaved = 0;
 let reader429s = 0;
 let reader429At = 0;
-let readerKeysConfigured = 0;
-
-/** A page a free tier served that would otherwise have cost a reader call. */
-export function noteReaderSaved(): void { readerSaved++; }
-
-export interface ReaderStats {
-  calls: number;
-  /** Blocked pages the FREE tiers rescued — i.e. reader calls not made. */
-  saved: number;
-  rateLimited: number;
-  lastRateLimitedAt: string | null;
-  keysConfigured: number;
-  keysLive: number;
-  /** True only when keys ARE configured and every one of them is spent. */
-  keyRejected: boolean;
-  keyRejectedStatus: number;
-}
-
-/**
- * Reader health.
- *
- * Pass the CONFIGURED keys (from Settings) so the answer is correct even before
- * the first reader call — otherwise a freshly booted server reports "no keys"
- * while several are sitting in the database.
- */
-export function getReaderStats(configuredKeys?: string[]): ReaderStats {
-  const keys = configuredKeys ?? [];
-  const configured = keys.length || readerKeysConfigured;
-  let status = 0;
-  let rejected = 0;
-  for (const k of keys) {
-    if (keyIsUsable(k)) continue;
-    rejected++;
-    status = keyState.get(k)?.status ?? status;
-  }
-  // No list supplied (internal callers): fall back to whatever the last reader
-  // call observed.
-  if (!keys.length) {
-    for (const [k, st] of keyState) {
-      if (keyIsUsable(k)) continue;
-      rejected++;
-      status = st.status;
-    }
-  }
-  const keysLive = Math.max(0, configured - rejected);
+export function getReaderStats(): { calls: number; rateLimited: number; lastRateLimitedAt: string | null; keyRejected: boolean; keyRejectedStatus: number } {
   return {
     calls: readerCalls,
-    saved: readerSaved,
     rateLimited: reader429s,
     lastRateLimitedAt: reader429At ? new Date(reader429At).toISOString() : null,
-    keysConfigured: configured,
-    keysLive,
-    keyRejected: configured > 0 && keysLive === 0,
-    keyRejectedStatus: status,
+    keyRejected: readerKeyRejected,
+    keyRejectedStatus: readerKeyRejectStatus,
   };
+}
+
+export type BlockReason = "cloudflare" | "rate-limited" | "forbidden" | "blocked";
+
+export interface FetchResult {
+  ok: boolean;
+  status: number;
+  url: string; // final URL after redirects (the TARGET url, even when proxied)
+  html: string;
+  contentType: string;
+  error?: string;
+  blocked?: boolean; // request was refused by bot protection (not a normal 404/5xx)
+  blockReason?: BlockReason;
+  via?: "direct" | "proxy" | "reader"; // how the page was fetched
 }
 
 export type ScrapeProvider = "scrapingbee" | "scraperapi" | "zenrows";
@@ -198,6 +94,46 @@ export interface ProxyConfig {
   mode: "blocked" | "always"; // retry only blocked pages, or route everything
   renderJs?: boolean; // default true
   premium?: boolean; // premium/stealth proxy — needed for Cloudflare (default true)
+}
+
+// Recognise the common bot-walls from a response's headers + body snippet so we
+// can tell the user *why* a site couldn't be crawled instead of a bare "403".
+function detectBlock(status: number, headers: Headers, bodySnippet: string): BlockReason | undefined {
+  const server = (headers.get("server") || "").toLowerCase();
+  const cfMitigated = (headers.get("cf-mitigated") || "").toLowerCase();
+  const body = bodySnippet.toLowerCase();
+  const looksCloudflare =
+    server.includes("cloudflare") ||
+    cfMitigated === "challenge" ||
+    /just a moment|challenge-platform|cf[-_]chl|__cf_|turnstile|attention required|cloudflare/.test(body);
+  const looksChallenge =
+    /you have been blocked|access denied|are you a robot|verify you are human|captcha|please enable (?:js|javascript)/.test(body);
+  if (status === 403 || status === 429 || status === 503) {
+    if (looksCloudflare) return "cloudflare";
+    if (status === 429) return "rate-limited";
+    if (looksChallenge) return "blocked";
+    return "forbidden";
+  }
+  return undefined;
+}
+
+// Does a 200 body actually look like an unsolved challenge page?
+// Two flavours, both served with HTTP 200 so the status code tells us nothing:
+//   • Cloudflare's "Just a moment…" interstitial (usually via an under-powered proxy)
+//   • a bare reCAPTCHA/hCaptcha auto-submit page, which WAFs (Imperva, F5, Akamai)
+//     return once you've asked for a few pages too quickly
+// Both are tiny compared to a real page, so the size cap keeps false positives
+// away from genuine pages that merely embed a captcha in a contact form.
+function bodyIsChallenge(html: string): boolean {
+  if (html.length > 30_000) return false;
+  const b = html.toLowerCase();
+  const cloudflare =
+    /just a moment|challenge-platform|cf[-_]chl|turnstile/.test(b) &&
+    /enable javascript|cloudflare|checking your browser/.test(b);
+  const captchaWall =
+    html.length < 10_000 &&
+    /recaptcha|hcaptcha|captcha_form|g-recaptcha|are you a robot|verify you are human/.test(b);
+  return cloudflare || captchaWall;
 }
 
 // Build the provider request URL that wraps a target URL. All three providers
@@ -219,13 +155,87 @@ export function buildProxyUrl(cfg: ProxyConfig, target: string): string {
   }
 }
 
-/** A plain, browser-shaped request. Free and unlimited — always tier one. */
-export async function fetchPage(url: string, timeoutMs = 15000, attempt = 0): Promise<FetchResult> {
+// Low-level fetch with timeout + streaming size cap. `reportUrl` overrides the
+// URL reported in the result (proxy fetches report the TARGET, not the proxy).
+async function rawFetch(
+  fetchUrl: string,
+  opts: { timeoutMs: number; headers: Record<string, string>; reportUrl?: string; via?: "direct" | "proxy" | "reader" }
+): Promise<FetchResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  const via = opts.via || "direct";
+  try {
+    const res = await fetch(fetchUrl, { redirect: "follow", signal: controller.signal, headers: opts.headers });
+    const contentType = res.headers.get("content-type") || "";
+    const finalUrl = opts.reportUrl || res.url || fetchUrl;
+
+    if (!res.ok) {
+      // Peek at a little of the body to recognise bot-protection interstitials.
+      let snippet = "";
+      try { snippet = (await res.text()).slice(0, 4000); } catch { /* ignore */ }
+      const blockReason = detectBlock(res.status, res.headers, snippet);
+      return { ok: false, status: res.status, url: finalUrl, html: "", contentType, blocked: !!blockReason, blockReason, via };
+    }
+
+    // Only parse HTML/XML/text; skip binaries (PDFs, images, etc.)
+    if (contentType && !/(text\/html|application\/xhtml|text\/plain|application\/xml|\+xml|application\/json)/i.test(contentType)) {
+      return { ok: false, status: res.status, url: finalUrl, html: "", contentType, error: "non-html", via };
+    }
+
+    // Stream with a size cap so a huge file can't blow up memory.
+    const reader = res.body?.getReader();
+    let html = "";
+    if (!reader) {
+      html = (await res.text()).slice(0, MAX_BYTES);
+    } else {
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          received += value.length;
+          if (received > MAX_BYTES) { try { await reader.cancel(); } catch {} break; }
+        }
+      }
+      const buf = new Uint8Array(Math.min(received, MAX_BYTES));
+      let offset = 0;
+      for (const c of chunks) {
+        if (offset >= buf.length) break;
+        const slice = c.subarray(0, Math.min(c.length, buf.length - offset));
+        buf.set(slice, offset);
+        offset += slice.length;
+      }
+      html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+    }
+
+    // A 200 can still be an unsolved challenge / captcha wall — treat as blocked
+    // whichever transport served it, so the crawl reports WHY it went quiet
+    // instead of silently recording an empty page.
+    if (bodyIsChallenge(html)) {
+      const reason: BlockReason = /cloudflare|turnstile|cf[-_]chl/i.test(html) ? "cloudflare" : "blocked";
+      return { ok: false, status: 403, url: finalUrl, html: "", contentType, blocked: true, blockReason: reason, via };
+    }
+
+    return { ok: true, status: res.status, url: finalUrl, html, contentType, via };
+  } catch (e: any) {
+    const isTimeout = e?.name === "AbortError";
+    return { ok: false, status: 0, url: opts.reportUrl || fetchUrl, html: "", contentType: "", error: isTimeout ? "timeout" : String(e?.message || e), via };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function fetchPage(url: string, timeoutMs = 15000): Promise<FetchResult> {
   return rawFetch(url, {
     timeoutMs,
-    // Rotate the fingerprint between attempts: a site that refuses one browser
-    // profile often serves another, and this costs nothing to try.
-    headers: browserHeaders(pickUserAgent(attempt), attempt > 0 ? "https://www.google.com/" : undefined),
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Upgrade-Insecure-Requests": "1",
+    },
   });
 }
 
@@ -244,18 +254,19 @@ export async function fetchViaProxy(target: string, cfg: ProxyConfig, timeoutMs 
   return r;
 }
 
-// ── Jina Reader (https://r.jina.ai) ────────────────────────────────────────
-// Fetches a URL, RENDERS JavaScript, and returns clean HTML, so JS-heavy and
-// soft-walled sites become crawlable. Keys are metered and cost money, which is
-// exactly why this now sits BELOW the free archives in the ladder.
+// ── Free reader fallback (Jina Reader, https://r.jina.ai) ──────────────────
+// A no-key, free service that fetches a URL, RENDERS JavaScript, and returns
+// clean HTML — so JS-heavy / Cloudflare-"soft"-blocked sites become crawlable
+// WITHOUT a paid scraping proxy. An optional JINA_API_KEY (also free) raises the
+// rate limit. It can't defeat hard LOGIN walls (Facebook/Instagram), but those
+// are unreachable by paid proxies too.
 const READER_TIMEOUT_MS = 45_000;
 const READER_ENABLED = process.env.DISABLE_READER !== "1";
 const READER_KEY = process.env.JINA_API_KEY || "";
 
 export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_MS, apiKey?: string): Promise<FetchResult> {
-  const keys = parseReaderKeys(apiKey || READER_KEY);
-  readerKeysConfigured = keys.length;
-
+  const rawKey = (apiKey || READER_KEY || "").trim();
+  const key = readerKeyUsable(rawKey) ? rawKey : "";
   const call = async (withKey: string): Promise<FetchResult> => {
     await reserveReaderSlot(!!withKey); // pace calls under the rate limit (queue, don't 429)
     readerCalls++;
@@ -268,44 +279,29 @@ export async function fetchViaReader(target: string, timeoutMs = READER_TIMEOUT_
     return rawFetch(`https://r.jina.ai/${target}`, { timeoutMs, headers, reportUrl: target, via: "reader" });
   };
 
-  // Walk the key pool. 401 = bad key, 402 = out of tokens; either way that key
-  // is dead weight, so retire it and try the NEXT one rather than dropping the
-  // whole crawler to the free tier. Only when every key is spent do we fall
-  // back keyless — which still serves ~20/min and is far better than failing.
-  let r: FetchResult | null = null;
-  for (let i = 0; i <= keys.length; i++) {
-    const key = nextUsableKey(keys);
-    r = await call(key);
-    if (!key) break;                                   // already on the free tier
-    if (r.ok || (r.status !== 401 && r.status !== 402)) break;
-    markKeyRejected(key, r.status);
-    const live = getReaderStats().keysLive;
-    console.warn(
-      `[reader] Jina key ${i + 1}/${keys.length} rejected (HTTP ${r.status}${r.status === 402 ? " — out of tokens" : " — invalid"}). ` +
-        (live > 0
-          ? `Rotating to the next key (${live} still live).`
-          : `No keys left — falling back to the free tier (~${READER_RPM_NOKEY}/min). The free archives still run, so crawling continues.`)
-    );
+  let r = await call(key);
+  // 401 = bad key, 402 = out of tokens. Either way the key is dead weight: drop
+  // it and retry this same call on the free tier rather than reporting a block.
+  if (!r.ok && key && (r.status === 401 || r.status === 402)) {
+    if (!readerKeyRejected) {
+      readerKeyRejected = true;
+      readerKeyRejectedAt = Date.now();
+      readerKeyRejectStatus = r.status;
+      console.warn(
+        `[reader] Jina key rejected (HTTP ${r.status}${r.status === 402 ? " — out of tokens" : " — invalid"}). ` +
+          `Falling back to the free tier (~${READER_RPM_NOKEY}/min). Top up or remove the key in Settings → Crawler.`
+      );
+    }
+    r = await call("");
   }
-
-  if (r && !r.ok && (r.status === 401 || r.status === 402 || r.status === 429)) {
+  if (!r.ok && (r.status === 401 || r.status === 402 || r.status === 429)) {
     if (r.status === 429) { reader429s++; reader429At = Date.now(); }
-    r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit)" : "");
+    r.error = `reader ${r.status}` + (r.status === 429 ? " (free rate limit — add a free JINA_API_KEY or a scraping proxy)" : "");
   }
-  return r as FetchResult;
+  return r;
 }
 
-/* ------------------------------ the ladder ----------------------------- */
-
-export async function fetchWithRetry(
-  url: string,
-  tries = 2,
-  timeoutMs = 15000,
-  proxy?: ProxyConfig,
-  readerKey?: string,
-  allowReader = true,
-  allowArchive = true
-): Promise<FetchResult> {
+export async function fetchWithRetry(url: string, tries = 2, timeoutMs = 15000, proxy?: ProxyConfig, readerKey?: string, allowReader = true): Promise<FetchResult> {
   // "always" mode: route every request through the proxy (with one transient retry).
   if (proxy && proxy.mode === "always") {
     let p = await fetchViaProxy(url, proxy);
@@ -316,10 +312,10 @@ export async function fetchWithRetry(
     return p;
   }
 
-  // Tier 1 — direct, with a fresh browser fingerprint on each attempt.
+  // Otherwise try direct first…
   let last: FetchResult | null = null;
   for (let i = 0; i < tries; i++) {
-    const r = await fetchPage(url, timeoutMs, i);
+    const r = await fetchPage(url, timeoutMs);
     if (r.ok) return r;
     last = r;
     const transient = r.status === 0 || r.status === 429 || r.status >= 500;
@@ -327,35 +323,20 @@ export async function fetchWithRetry(
     await sleep(400 * (i + 1));
   }
 
-  // A wall, or a site we simply couldn't reach. Both are cases where somebody
-  // else's copy of the page is just as good as ours — and free.
-  const worthArchiving = !!last && (last.blocked || last.status === 0);
-  if (!last || !worthArchiving) return last as FetchResult;
-
-  // Tier 2 + 3 — the free archives. Unmetered, so they go first; `allowArchive`
-  // only exists so a caller can keep a long crawl from spending seconds per page
-  // on snapshots of pages that hold no address anyway.
-  if (allowArchive) {
-    const arc = await fetchViaArchives(url).catch(() => null);
-    if (arc?.ok && arc.html) {
-      noteReaderSaved();
-      return arc;
+  // …and if a bot-wall blocked us, escalate: FREE reader first, then the paid
+  // proxy only if one is configured (so most sites cost nothing to crawl). The
+  // reader escalation is gated by `allowReader` so callers can spend the scarce
+  // (rate-limited) free-reader budget only on their highest-value pages.
+  if (last && last.blocked) {
+    if (READER_ENABLED && allowReader) {
+      const rd = await fetchViaReader(url, READER_TIMEOUT_MS, readerKey).catch(() => null);
+      if (rd?.ok && rd.html) return rd;
+    }
+    if (proxy) {
+      const p = await fetchViaProxy(url, proxy);
+      if (p.ok) return p;
+      return last.blocked ? last : p; // keep original block info if proxy also failed
     }
   }
-
-  // Tier 4 — the paid reader. Only now, and only when the caller says this page
-  // is worth a token.
-  if (READER_ENABLED && allowReader) {
-    const rd = await fetchViaReader(url, READER_TIMEOUT_MS, readerKey).catch(() => null);
-    if (rd?.ok && rd.html) return rd;
-  }
-
-  // Tier 5 — the paid proxy.
-  if (proxy) {
-    const p = await fetchViaProxy(url, proxy);
-    if (p.ok) return p;
-    return last.blocked ? last : p; // keep original block info if the proxy also failed
-  }
-
-  return last;
+  return last as FetchResult;
 }
