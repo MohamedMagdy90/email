@@ -1,0 +1,10 @@
+# Same rules as netlify.toml, but shipped INSIDE the build output.
+# netlify.toml only applies when Netlify builds from the repo; a pre-built
+# upload (CI, drag-and-drop, zip) never sees it, and the app would then have
+# no backend at all. This file travels with dist/ either way.
+
+# API -> Railway backend. Same-origin for the browser, so no CORS.
+/api/*  https://email-production-3c14.up.railway.app/api/:splat  200!
+
+# SPA fallback. Must stay last.
+/*      /index.html  200
