@@ -99,7 +99,7 @@ export default function History() {
               onClick={() => setFilter(f)}
               className={cn(
                 "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
-                filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+                filter === f ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55 hover:text-ink"
               )}
             >
               {f}

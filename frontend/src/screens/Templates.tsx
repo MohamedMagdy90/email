@@ -117,7 +117,7 @@ function Group({
           <Card key={t.id} className="group flex flex-col p-4">
             <div className="mb-2 flex items-start justify-between gap-2">
               <div className="font-clash text-base font-semibold">{t.name}</div>
-              <Badge className={t.type === "partner" ? "bg-[#efe9ff] text-[#6b4ec7]" : "bg-[#eaf3ff] text-[#2563a8]"}>
+              <Badge className={t.type === "partner" ? "bg-pub text-puf" : "bg-inb text-inf"}>
                 {t.type}
               </Badge>
             </div>
@@ -197,7 +197,7 @@ function Editor({
                 onClick={() => setTab(x)}
                 className={cn(
                   "rounded-full px-3 py-1 text-[13px] font-medium capitalize",
-                  tab === x ? "bg-ink text-cream" : "text-ink/55"
+                  tab === x ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55"
                 )}
               >
                 {x}
@@ -209,7 +209,7 @@ function Editor({
               <button
                 key={tag}
                 onClick={() => insertTag(tag)}
-                className="rounded-md border border-line bg-white px-2 py-1 font-mono text-[11px] text-ink/70 hover:border-ink/40"
+                className="rounded-md border border-line bg-sunk px-2 py-1 font-mono text-[11px] text-ink/70 hover:border-ink/40"
               >
                 {`{{${tag}}}`}
               </button>
@@ -226,13 +226,13 @@ function Editor({
             className="font-mono text-xs"
           />
         ) : (
-          <div className="rounded-xl border border-line bg-white p-5">
+          <div className="rounded-xl border border-line bg-sunk p-5">
             <div className="mb-3 border-b border-line-soft pb-2 text-sm">
               <span className="text-muted">Subject: </span>
               <span className="font-medium">{render(t.subject, SAMPLE)}</span>
             </div>
             <div
-              className="prose-sm max-w-none text-sm leading-relaxed [&_a]:text-[#2563a8] [&_p]:mb-3"
+              className="prose-sm max-w-none text-sm leading-relaxed [&_a]:text-inf [&_p]:mb-3"
               dangerouslySetInnerHTML={{ __html: render(t.body, SAMPLE) }}
             />
           </div>

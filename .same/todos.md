@@ -1,3 +1,41 @@
+# Outreach v2 (2026-10-20) — full plan in `.same/outreach-v2-plan.md`
+
+## Phase 0 — DNA console UI port (DONE)
+- [x] Design system from dna-erp-api `partner_console.PAGE` + `leads_console.CSS` (dark default,
+      light on `html[data-theme=light]`, shared `dnaConsoleTheme` key, set before first paint)
+- [x] Tailwind tokens (ink/cream/paper/line/muted...) remapped to DNA vars + new semantic tokens
+      (brand/onbrand/sunk/hov/okb/wnb/dgb/inb/pub/tlb/keep1...)
+- [x] Codemod: every hard-coded hex + ink fills in all screens -> semantic tokens
+- [x] Shell: sticky brand bar (DNA lockup, divider, mark on light disc, "Outreach console"),
+      who-block (theme toggle, avatar, account, sign out), title row slot, underline tabs
+- [x] `PageHeader` portals each screen's title/subtitle/actions into the shell title row
+- [x] DNA gate for Login + Setup; DNA toast; DNA modal; quiet `.stab.on` style for filters
+- [x] Local env: corrupt SQLite parked in `.same/corrupt-db-backup-10/`, deps reinstalled, ONE dev server
+- [ ] USER: eyeball both themes in the preview (screenshot tool could not capture this preview)
+
+## Decisions (2026-10-20)
+Instantly engine · 6 mailboxes, 2 vendors (Zapmail + Mailforge) · Gemini key later · Reacher self-hosted ·
+Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
+
+## v2 foundation (DONE — integrator)
+- [x] `.same/ref/instantly-api-notes.md` from the official OpenAPI spec (+ tz enum: no Asia/Riyadh -> Asia/Baghdad)
+- [x] `v2/schema.ts` (11 tables) · `v2/events.ts` · `v2/llm.ts` (Gemini+search / Groq / OpenRouter, pacing,
+      budget, mock) · `v2/instantly.ts` · `v2/verify.ts` (built-in + Reacher, name-pattern finder) ·
+      `v2/agent-settings.ts` (tone/auto-reply/policy/KB) · `v2/core-routes.ts` · `v2/index.ts` loader
+- [x] backend tsconfig `types: ["bun"]` + `@types/bun` (TS 6 no longer auto-includes @types)
+- [x] Frontend: `req` exported, `lib/v2/core.ts`, stub screens, tabs (agent group | classic), inbox badge
+- [x] `.same/v2-contracts.md` — binding contract for the workstreams
+- GOTCHA: the platform supervisor logs to /tmp/dev.log — never delete it, never start a 2nd `bun run dev`
+
+## v2 workstreams (parallel task agents)
+- [ ] A Mailboxes — sync, health snapshots, readiness gate, ramp, auto-pause, UI
+- [ ] B Inbox — poll Unibox, threads, classify, fully-automatic replies, Inbox UI, playground endpoint
+- [ ] C Campaigns — offer -> ICP -> discover -> research -> contact -> verify -> write -> Instantly, UI
+- [ ] D Agent tab — voice/tone, auto-reply, KB, sending policy, integrations, playground UI, activity
+- [ ] Integrate: static imports, typecheck, end-to-end mock run, design review, version
+
+---
+
 # Contacts — filter by company + select all / delete all (2026-10-13)
 Working on top of the restored 789febf code.
 - [x] Backend `contactWhere` gains `company` + `companyMode` (`exact` = case/space-insensitive

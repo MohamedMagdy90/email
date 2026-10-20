@@ -6,7 +6,7 @@ import {
   type DiscoveredLead,
   type Place,
 } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, toast, cn } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, toast, cn } from "../lib/ui";
 import { LocationAutocomplete } from "./Crawler";
 
 const FALLBACK_CATS = [
@@ -279,26 +279,21 @@ export default function Discovery() {
 
   return (
     <div className="space-y-8">
-      {/* Header + master switch */}
-      <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="mono-label text-muted">02 · Discovery</div>
-          <h1 className="mt-1 font-clash text-3xl font-semibold tracking-tight">Auto-discovery</h1>
-          <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
-            A background bot that keeps finding companies for you — running on the server, even when this tab is closed.
-            It drops everything into a review pool below; you approve the good ones into Contacts.
-          </p>
-        </div>
-
-        <BotSwitch
-          running={running}
-          nextRunAt={status?.nextRunAt ?? null}
-          activeSources={status?.activeSources ?? 0}
-          onToggle={toggleBot}
-          readerKeyed={status?.bypass?.readerKeyed}
-          proxied={status?.bypass?.proxy}
-        />
-      </div>
+      {/* Header + master switch (portalled into the shell's title row) */}
+      <PageHeader
+        title="Auto-discovery"
+        subtitle="A background bot that keeps finding companies for you — running on the server, even when this tab is closed. Everything lands in the review pool below; approve the good ones into Contacts."
+        actions={
+          <BotSwitch
+            running={running}
+            nextRunAt={status?.nextRunAt ?? null}
+            activeSources={status?.activeSources ?? 0}
+            onToggle={toggleBot}
+            readerKeyed={status?.bypass?.readerKeyed}
+            proxied={status?.bypass?.proxy}
+          />
+        }
+      />
 
       {/* Stat strip */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -310,9 +305,9 @@ export default function Discovery() {
 
       {/* Bad-name repair */}
       {badNames && (badNames.leads > 0 || badNames.contacts > 0) && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#9b6bff]/35 bg-[#f6f1ff] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-3 rounded-2xl border border-puf/35 bg-pub px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#9b6bff]/15 font-clash text-[#6c43c5]">✎</span>
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-puf/15 font-clash text-puf">✎</span>
             <div>
               <div className="text-sm font-semibold text-ink">
                 {badNames.leads.toLocaleString()} lead{badNames.leads === 1 ? "" : "s"} and {badNames.contacts.toLocaleString()} contact{badNames.contacts === 1 ? "" : "s"} have broken company names
@@ -331,9 +326,9 @@ export default function Discovery() {
 
       {/* Paused-with-sources nudge — the #1 reason "scanning stops": the bot is off. */}
       {!running && (status?.activeSources ?? 0) > 0 && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#e0b354]/50 bg-[#fdf6e7] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-3 rounded-2xl border border-warn/50 bg-wnb px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#e0b354]/25 font-clash text-[#b06b16]">!</span>
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-warn/25 font-clash text-warn">!</span>
             <div>
               <div className="text-sm font-semibold text-ink">The bot is paused — your sources aren’t scanning</div>
               <div className="text-xs leading-relaxed text-muted">
@@ -352,9 +347,9 @@ export default function Discovery() {
           bot crawls their sites again. Shown whenever there's anything to recover
           OR anything still auto-retrying, so the button is never hidden when needed. */}
       {((status?.recoverable ?? 0) > 0 || (status?.blocked ?? 0) > 0) && (
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#5a86c2]/40 bg-[#eef4fb] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-3 rounded-2xl border border-inf/40 bg-inb px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
-            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-[#5a86c2]/20 font-clash text-[#2f5a94]">↻</span>
+            <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-inf/20 font-clash text-inf">↻</span>
             <div>
               <div className="text-sm font-semibold text-ink">
                 {(status?.recoverable ?? 0) > 0
@@ -450,7 +445,7 @@ export default function Discovery() {
                 <button
                   key={t}
                   onClick={() => setTab(t)}
-                  className={cn("rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize transition-colors", tab === t ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
+                  className={cn("rounded-full px-3.5 py-1.5 text-[13px] font-medium capitalize transition-colors", tab === t ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55 hover:text-ink")}
                 >
                   {t} {t === "pending" && counts.pending ? `· ${counts.pending}` : ""}
                 </button>
@@ -514,10 +509,10 @@ export default function Discovery() {
           {/* action bar */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <label className="flex items-center gap-2 text-[13px] font-medium">
-              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-ink" disabled={!leads.length} />
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="accent-brand" disabled={!leads.length} />
               {picked.size ? `${picked.size} selected` : `${filteredTotal.toLocaleString()} in view`}
               {tab === "pending" && (
-                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-ink bg-ink text-cream" : "border-line text-ink/55 hover:text-ink")}>
+                <button type="button" onClick={() => setOnlyEmail((v) => !v)} className={cn("ml-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors", onlyEmail ? "border-brand bg-brand text-onbrand" : "border-line text-ink/55 hover:text-ink")}>
                   {onlyEmail ? "With email only" : "Show all"}
                 </button>
               )}
@@ -594,7 +589,7 @@ export default function Discovery() {
                 {leads.map((l) => (
                   <tr key={l.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.02]">
                     <td className="px-5 py-2.5">
-                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="accent-ink" />
+                      <input type="checkbox" checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="accent-brand" />
                     </td>
                     <td className="px-1 py-2.5">
                       <div className="font-medium leading-tight">{l.name || l.domain}</div>
@@ -611,7 +606,7 @@ export default function Discovery() {
                             title={l.country === country ? "Clear the country filter" : `Show only ${l.country}`}
                             className={cn(
                               "max-w-[9rem] truncate rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
-                              l.country === country ? "bg-ink text-cream" : "bg-ink/[0.06] text-ink/65 hover:bg-ink/10 hover:text-ink"
+                              l.country === country ? "bg-tlb text-accent" : "bg-ink/[0.06] text-ink/65 hover:bg-ink/10 hover:text-ink"
                             )}
                           >
                             {l.country}
@@ -659,7 +654,7 @@ export default function Discovery() {
 
 function BotSwitch({ running, nextRunAt, activeSources, onToggle, readerKeyed, proxied }: { running: boolean; nextRunAt: string | null; activeSources: number; onToggle: (on: boolean) => void; readerKeyed?: boolean; proxied?: boolean }) {
   return (
-    <div className={cn("w-full shrink-0 rounded-2xl border p-4 sm:w-[300px]", running ? "border-good/40 bg-good/[0.06]" : "border-line bg-paper")}>
+    <div className={cn("w-full shrink-0 rounded-xl border px-4 py-3 text-left sm:w-[300px]", running ? "border-keepl bg-keep1" : "border-line-soft bg-paper")}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <span className={cn("relative grid h-9 w-9 place-items-center rounded-xl", running ? "bg-good/15" : "bg-ink/[0.06]")}>
@@ -852,7 +847,7 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
               disabled={!!editing && (editing.type || "osm") !== t}
               onClick={() => setType(t)}
               className={cn("rounded-full px-3 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-30",
-                type === t ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
+                type === t ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55 hover:text-ink")}
             >
               {label}
             </button>
@@ -946,11 +941,11 @@ function SourceModal({ open, onClose, cats, editing, onSaved }: { open: boolean;
 
 function Stat({ label, value, accent, hint }: { label: string; value: number; accent?: boolean; hint?: string }) {
   return (
-    <div className={cn("rounded-2xl border p-4", accent ? "border-ink bg-ink text-cream" : "border-line bg-paper")}>
-      <div className={cn("mono-label", accent ? "text-cream/50" : "text-muted")}>{label}</div>
+    <div className={cn("hb", accent && "keep")}>
+      <div className="mono-label">{label}</div>
       <div className="mt-1 flex items-baseline gap-1.5">
         <span className="font-clash text-2xl font-semibold tabular-nums">{value.toLocaleString()}</span>
-        {hint && <span className={cn("text-[11px]", accent ? "text-cream/50" : "text-muted")}>{hint}</span>}
+        {hint && <span className="text-[11px] text-muted">{hint}</span>}
       </div>
     </div>
   );
@@ -964,7 +959,7 @@ function Switch({ checked, onChange, small }: { checked: boolean; onChange: (v: 
       className={cn("relative shrink-0 rounded-full transition-colors", small ? "h-5 w-9" : "h-6 w-11", checked ? "bg-good" : "bg-ink/15")}
       aria-pressed={checked}
     >
-      <span className={cn("absolute top-0.5 rounded-full bg-white shadow transition-all", small ? "h-4 w-4" : "h-5 w-5", checked ? (small ? "left-[18px]" : "left-[22px]") : "left-0.5")} />
+      <span className={cn("absolute top-0.5 rounded-full bg-sunk shadow transition-all", small ? "h-4 w-4" : "h-5 w-5", checked ? (small ? "left-[18px]" : "left-[22px]") : "left-0.5")} />
     </button>
   );
 }
@@ -993,9 +988,9 @@ function EmailCell({ lead }: { lead: DiscoveredLead }) {
 function ConfidenceTag({ c }: { c?: string | null }) {
   if (!c) return null;
   const map: Record<string, string> = {
-    verified: "bg-[#e7f6ec] text-[#1f8b4c]",
-    listed: "bg-[#e7f6ec] text-[#1f8b4c]",
-    likely: "bg-[#eaf3ff] text-[#2563a8]",
+    verified: "bg-okb text-good",
+    listed: "bg-okb text-good",
+    likely: "bg-inb text-inf",
     guess: "bg-ink/[0.06] text-ink/50",
   };
   return <span className={cn("inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium", map[c] || "bg-ink/[0.06] text-ink/50")}>{c}</span>;
@@ -1003,9 +998,9 @@ function ConfidenceTag({ c }: { c?: string | null }) {
 
 function StatusChip({ status }: { status: string }) {
   const map: Record<string, string> = {
-    approved: "bg-[#e7f6ec] text-[#1f8b4c]",
+    approved: "bg-okb text-good",
     rejected: "bg-ink/[0.06] text-ink/45",
-    pending: "bg-[#fef3e2] text-[#b06b16]",
+    pending: "bg-wnb text-warn",
   };
   return <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-medium capitalize", map[status] || "bg-ink/[0.06] text-ink/60")}>{status}</span>;
 }
@@ -1034,7 +1029,7 @@ function ArchivedRow({ s, onRestore, onDelete }: { s: DiscoverySource; onRestore
       <div className="flex shrink-0 items-center gap-1">
         <button
           onClick={onRestore}
-          className="rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:border-ink hover:bg-ink hover:text-cream"
+          className="rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink/70 transition-colors hover:border-brand hover:bg-brand hover:text-onbrand"
           title="Restore — the bot picks it up again from where it stopped"
         >
           Restore

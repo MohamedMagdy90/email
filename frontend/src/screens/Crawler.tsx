@@ -476,7 +476,7 @@ export default function Crawler({
               <button
                 key={m}
                 onClick={() => { setMode(m); setCompanies([]); }}
-                className={cn("rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors", mode === m ? "bg-ink text-cream" : "text-ink/55 hover:text-ink")}
+                className={cn("rounded-full px-4 py-1.5 text-[13px] font-medium transition-colors", mode === m ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55 hover:text-ink")}
               >
                 {label}
               </button>
@@ -531,7 +531,7 @@ export default function Crawler({
             <div className="rounded-xl border border-line">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-ink" />
+                  <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} className="accent-brand" />
                   {companies.length} found · <span className="text-good">{newCount} new</span>
                   {knownCount > 0 && <span className="text-muted">· {knownCount} known</span>}
                 </label>
@@ -560,7 +560,7 @@ export default function Crawler({
                   const known = c.inContacts || c.crawled;
                   return (
                     <div key={c.website || c.email || c.name} className={cn("flex items-center gap-3 border-b border-line-soft px-3 py-2 last:border-0", known && "opacity-60")}>
-                      <input type="checkbox" disabled={!c.hasWebsite} checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="accent-ink disabled:opacity-30" />
+                      <input type="checkbox" disabled={!c.hasWebsite} checked={pickedCos.has(c.website)} onChange={() => toggleCo(c.website)} className="accent-brand disabled:opacity-30" />
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm font-medium">{c.name}</div>
                         <div className="truncate text-xs text-muted">
@@ -681,7 +681,7 @@ export default function Crawler({
               </label>
 
               {pdfFile && !pdfParsing && pdfRows.length === 0 && pdfDiag && (
-                <div className="rounded-xl border border-[#f0c98a] bg-[#fff6e8] p-3 text-xs text-[#8a5a12]">
+                <div className="rounded-xl border border-wnl bg-wnb p-3 text-xs text-warn">
                   <div className="font-semibold">
                     {pdfDiag.reason === "scanned" ? "This PDF looks scanned (no selectable text)" : "Couldn't detect company listings"}
                   </div>
@@ -691,7 +691,7 @@ export default function Crawler({
                       : "We read the text but its layout didn't match. Make sure the Country above is filled in, then re-upload. If it still fails, copy the sample below and send it to me so I can tune the parser to this file."}
                   </div>
                   {pdfDiag.sample.length > 0 && (
-                    <div className="mt-2 max-h-32 overflow-y-auto rounded-lg bg-white/70 p-2 font-mono text-[10px] leading-relaxed text-ink/70">
+                    <div className="mt-2 max-h-32 overflow-y-auto rounded-lg bg-sunk p-2 font-mono text-[10px] leading-relaxed text-ink/70">
                       {pdfDiag.sample.slice(0, 25).map((l, i) => <div key={i} className="truncate">{l || "\u00a0"}</div>)}
                     </div>
                   )}
@@ -763,7 +763,7 @@ export default function Crawler({
               <div className="flex items-center gap-2">
                 <Input value={mustMention} onChange={(e) => setMustMention(e.target.value)} placeholder="auto partner, spare parts" className="flex-1" />
                 {mustMention.trim() && (
-                  <button type="button" onClick={() => setRequireKeyword((v) => !v)} className={cn("shrink-0 rounded-full border px-3 py-2 text-xs font-medium transition-colors", requireKeyword ? "border-ink bg-ink text-cream" : "border-line text-ink/60 hover:text-ink")}>
+                  <button type="button" onClick={() => setRequireKeyword((v) => !v)} className={cn("shrink-0 rounded-full border px-3 py-2 text-xs font-medium transition-colors", requireKeyword ? "border-brand bg-brand text-onbrand" : "border-line text-ink/60 hover:text-ink")}>
                     {requireKeyword ? "Required" : "Optional"}
                   </button>
                 )}
@@ -823,7 +823,7 @@ export default function Crawler({
               className={cn(
                 "rounded-lg border px-3 py-2.5 text-xs",
                 dirBlocked
-                  ? "border-[#f0c98a] bg-[#fff6e8] text-[#8a5a12]"
+                  ? "border-wnl bg-wnb text-warn"
                   : "border-line bg-cream text-ink/70"
               )}
             >
@@ -834,18 +834,18 @@ export default function Crawler({
             </div>
           )}
 
-          <div ref={logRef} className="h-24 overflow-y-auto rounded-xl bg-ink px-3 py-2.5 font-mono text-[11px] leading-relaxed text-cream/80">
+          <div ref={logRef} className="h-24 overflow-y-auto rounded-xl border border-line-soft bg-sunk px-3 py-2.5 font-mono text-[11px] leading-relaxed text-ink-soft">
             {(job?.logs || []).map((l, i) => (
-              <div key={i} className={cn(l.level === "hit" && "text-[#7ee7a6]", l.level === "warn" && "text-[#ffcf7a]", l.level === "fail" && "text-[#ff9a8a]")}>{l.msg}</div>
+              <div key={i} className={cn(l.level === "hit" && "text-good", l.level === "warn" && "text-warn", l.level === "fail" && "text-bad")}>{l.msg}</div>
             ))}
-            {!job?.logs?.length && <span className="text-cream/40">Starting…</span>}
+            {!job?.logs?.length && <span className="text-muted">Starting…</span>}
           </div>
 
           {isDirJob && leads.length > 0 && (
             <div className="rounded-xl border border-line">
               <div className="flex items-center justify-between border-b border-line px-3 py-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="accent-ink" />
+                  <input type="checkbox" checked={allLeadsSelected} onChange={toggleAllLeads} className="accent-brand" />
                   {leads.length} lead(s) · <span className="text-muted">{leadsWithPhone} with phone</span>
                   {dirAdded.size > 0 && <span className="text-good">· {dirAdded.size} added</span>}
                 </label>
@@ -863,7 +863,7 @@ export default function Crawler({
                       return (
                         <tr key={k} className={cn("border-b border-line-soft last:border-0", added && "opacity-60")}>
                           <td className="w-8 px-3 py-2">
-                            <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-ink disabled:opacity-30" />
+                            <input type="checkbox" disabled={!l.email || added} checked={dirSelected.has(k)} onChange={() => toggleLead(k)} className="accent-brand disabled:opacity-30" />
                           </td>
                           <td className="px-1 py-2">
                             <div className="font-medium leading-tight">{l.name || l.domain}</div>
@@ -897,7 +897,7 @@ export default function Crawler({
             <div className="rounded-xl border border-line">
               <div className="flex items-center justify-between border-b border-line px-3 py-2">
                 <label className="flex items-center gap-2 text-[13px] font-medium">
-                  <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(results.map((r) => r.email)))} className="accent-ink" />
+                  <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(results.map((r) => r.email)))} className="accent-brand" />
                   Select all ({results.length})
                 </label>
                 <div className="flex items-center gap-3">
@@ -910,7 +910,7 @@ export default function Crawler({
                   <tbody>
                     {results.map((r) => (
                       <tr key={r.email} className="border-b border-line-soft last:border-0">
-                        <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="accent-ink" /></td>
+                        <td className="w-8 px-3 py-2"><input type="checkbox" checked={selected.has(r.email)} onChange={() => toggle(r.email)} className="accent-brand" /></td>
                         <td className="px-1 py-2 font-medium">
                           {r.email}
                           {r.keywordsMatched && r.keywordsMatched.length > 0 && (
@@ -1050,9 +1050,9 @@ export function LocationAutocomplete({
 
 function Tag({ children, tone }: { children: React.ReactNode; tone: "green" | "blue" | "amber" | "gray" }) {
   const tones = {
-    green: "bg-[#e7f6ec] text-[#1f8b4c]",
-    blue: "bg-[#eaf3ff] text-[#2563a8]",
-    amber: "bg-[#fef3e2] text-[#b06b16]",
+    green: "bg-okb text-good",
+    blue: "bg-inb text-inf",
+    amber: "bg-wnb text-warn",
     gray: "bg-ink/[0.06] text-ink/50",
   };
   return <span className={cn("inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium", tones[tone])}>{children}</span>;
@@ -1090,8 +1090,8 @@ function ConfidenceTag({ c }: { c?: "high" | "medium" | "low" | "guessed" }) {
 function Toggle({ label, hint, checked, onChange }: { label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <button type="button" onClick={() => onChange(!checked)} className="flex items-start gap-2 text-left text-[13px] font-medium text-ink/80">
-      <span className={cn("relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors", checked ? "bg-ink" : "bg-ink/15")}>
-        <span className={cn("absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all", checked ? "left-[18px]" : "left-0.5")} />
+      <span className={cn("relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors", checked ? "bg-brand" : "bg-ink/15")}>
+        <span className={cn("absolute top-0.5 h-4 w-4 rounded-full bg-sunk transition-all", checked ? "left-[18px]" : "left-0.5")} />
       </span>
       <span>
         {label}

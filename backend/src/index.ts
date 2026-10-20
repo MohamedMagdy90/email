@@ -36,6 +36,7 @@ import {
   repairPageTitleNames,
 } from "./discovery";
 import { repairLeadNames, countBadNames } from "./repair";
+import { mountV2, startV2Workers } from "./v2";
 import {
   seedAuthFromEnv,
   verifyCredentials,
@@ -1930,6 +1931,11 @@ function serializeJob(job: Job) {
   };
 }
 
+/* ---------------------- Outreach v2 (AI agent) ---------------------- */
+// Mailbox pool (Instantly), AI lead engine + campaigns, reply inbox. Mounted
+// BEFORE the static catch-all below so /api/v2/* never falls through to it.
+await mountV2(app);
+startV2Workers();
 /* ------------------ Static frontend (single-process) ---------------- */
 // Serves the built frontend (frontend/dist) so the whole app can run as one
 // server on one port. In the split deploy (Netlify + Railway) this simply

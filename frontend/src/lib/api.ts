@@ -215,7 +215,8 @@ export interface DiscoveredLead {
   enrich_status?: string | null; // found | empty | blocked | error
 }
 
-async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
+// Exported so the v2 API modules (lib/v2/*.ts) share auth + error handling.
+export async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
     headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers as any) },
@@ -247,6 +248,7 @@ export const api = {
     setToken(data.token);
     return data;
   },
+  me: () => req<{ ok: boolean; username: string | null }>("/api/auth/me"),
   checkAuth: async (): Promise<boolean> => {
     if (!getToken()) return false;
     try {

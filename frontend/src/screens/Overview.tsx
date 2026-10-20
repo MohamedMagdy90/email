@@ -3,14 +3,15 @@ import { api } from "../lib/api";
 import { Card, Spinner } from "../lib/ui";
 import { Header } from "./Contacts";
 
+// DNA console status palette (CSS variables, so the chart follows the theme).
 const STATUS_COLORS: Record<string, string> = {
-  new: "#c9c1b2",
-  sent: "#36a2ff",
-  "sent (dry-run)": "#ffb020",
-  unsubscribed: "#a99f8d",
-  bounced: "#d64545",
-  failed: "#d64545",
-  queued: "#d8cfbf",
+  new: "var(--ac)",
+  sent: "var(--inf)",
+  "sent (dry-run)": "var(--wnf)",
+  unsubscribed: "var(--mut3)",
+  bounced: "var(--dgf)",
+  failed: "var(--dgf)",
+  queued: "var(--line3)",
 };
 
 export default function Overview() {
@@ -30,7 +31,7 @@ export default function Overview() {
     );
   }
 
-  const contactSeg = (data?.contacts || []).map((r: any) => ({ label: r.status, value: r.n, color: STATUS_COLORS[r.status] || "#c9c1b2" }));
+  const contactSeg = (data?.contacts || []).map((r: any) => ({ label: r.status, value: r.n, color: STATUS_COLORS[r.status] || "var(--mut3)" }));
   const sentCount = (data?.sends || []).reduce((a: number, r: any) => a + (String(r.status).startsWith("sent") ? r.n : 0), 0);
   const failed = (data?.sends || []).find((r: any) => r.status === "failed")?.n || 0;
   const unsub = (data?.contacts || []).find((r: any) => r.status === "unsubscribed")?.n || 0;
@@ -53,10 +54,12 @@ export default function Overview() {
 
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
         {cards.map((c) => (
-          <Card key={c.label} className="px-5 py-4">
-            <div className="font-clash text-3xl font-semibold">{typeof c.value === "number" ? c.value.toLocaleString() : c.value}</div>
-            <div className="mono-label mt-1 text-muted">{c.label}</div>
-          </Card>
+          <div key={c.label} className={c.label === "Emails sent" ? "hb keep" : "hb"}>
+            <div className="mono-label mb-2">{c.label}</div>
+            <div className="text-[1.62rem] font-bold leading-none tracking-[-0.02em] tabular-nums">
+              {typeof c.value === "number" ? c.value.toLocaleString() : c.value}
+            </div>
+          </div>
         ))}
       </div>
 
@@ -132,7 +135,7 @@ function Donut({ segments, total }: { segments: { label: string; value: number; 
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
       <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
-        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#ece6da" strokeWidth={stroke} />
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" style={{ stroke: "var(--sunk)" }} strokeWidth={stroke} />
         {segments.map((s, i) => {
           const frac = total ? s.value / total : 0;
           const dash = frac * C;
@@ -143,7 +146,7 @@ function Donut({ segments, total }: { segments: { label: string; value: number; 
               cy={size / 2}
               r={r}
               fill="none"
-              stroke={s.color}
+              style={{ stroke: s.color }}
               strokeWidth={stroke}
               strokeDasharray={`${dash} ${C - dash}`}
               strokeDashoffset={-acc * C}
@@ -153,10 +156,10 @@ function Donut({ segments, total }: { segments: { label: string; value: number; 
           return el;
         })}
       </g>
-      <text x="50%" y="47%" textAnchor="middle" className="font-clash" style={{ fontSize: 30, fontWeight: 600, fill: "#0b0b0b" }}>
+      <text x="50%" y="47%" textAnchor="middle" className="font-clash" style={{ fontSize: 30, fontWeight: 700, fill: "var(--txt)" }}>
         {total}
       </text>
-      <text x="50%" y="60%" textAnchor="middle" style={{ fontSize: 11, letterSpacing: "0.15em", fill: "#837c6f" }}>
+      <text x="50%" y="60%" textAnchor="middle" style={{ fontSize: 10, letterSpacing: "0.12em", fill: "var(--mut)" }}>
         TOTAL
       </text>
     </svg>
@@ -173,7 +176,7 @@ function Bars({ data }: { data: { label: string; value: number }[] }) {
         <div key={i} className="group flex flex-1 flex-col items-center gap-1.5">
           <div className="relative flex w-full flex-1 items-end">
             <div
-              className="w-full rounded-t-md bg-ink/85 transition-all group-hover:bg-ink"
+              className="w-full rounded-t-[5px] bg-gradient-to-b from-brand to-[var(--netg)] opacity-90 transition-opacity group-hover:opacity-100"
               style={{ height: `${(d.value / max) * 100}%`, minHeight: d.value ? 4 : 0 }}
               title={`${d.label}: ${d.value}`}
             />

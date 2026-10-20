@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Contact, type CompanyCount, type CompanyMode } from "../lib/api";
-import { Button, Card, Field, Input, Modal, Select, Spinner, StatusPill, Textarea, toast, cn } from "../lib/ui";
+import { Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, StatusPill, Textarea, toast, cn } from "../lib/ui";
 import { downloadCsv, parseContacts, CONTACTS_TEMPLATE, type ParsedContact } from "../lib/csv";
 import Crawler from "./Crawler";
 
@@ -309,7 +309,7 @@ export default function Contacts() {
               onClick={() => changeFilter(f)}
               className={cn(
                 "rounded-full px-3 py-1 text-[13px] font-medium capitalize transition-colors",
-                filter === f ? "bg-ink text-cream" : "text-ink/55 hover:text-ink"
+                filter === f ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55 hover:text-ink"
               )}
             >
               {f}
@@ -378,7 +378,7 @@ export default function Contacts() {
           </div>
         ) : company && !loading ? (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-ink/[0.03] px-4 py-2.5 text-[13px]">
-            <span className="mono-label rounded-full bg-ink px-2 py-0.5 text-[10px] text-cream">Company</span>
+            <span className="mono-label rounded-full bg-brand px-2 py-0.5 text-[10px] text-onbrand">Company</span>
             <span className="min-w-0 text-ink/70">
               <span className="font-semibold text-ink">{plural(filteredTotal, "contact")}</span>{" "}
               <span className="font-semibold text-ink">{companyScope(company)}</span>
@@ -428,7 +428,7 @@ export default function Contacts() {
                 <thead>
                   <tr className="border-b border-line text-left mono-label text-muted">
                     <th className="w-10 px-4 py-3">
-                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
+                      <input ref={headerCbRef} type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-brand" />
                     </th>
                     <th className="px-2 py-3">Email</th>
                     <th className="px-2 py-3">Company</th>
@@ -451,7 +451,7 @@ export default function Contacts() {
                             type="checkbox"
                             checked={isSel}
                             onChange={() => toggle(c.id)}
-                            className="accent-ink"
+                            className="accent-brand"
                           />
                         </td>
                         <td className="px-2 py-2.5 font-medium">{c.email}</td>
@@ -580,15 +580,8 @@ export function Header({
   subtitle?: string;
   actions?: React.ReactNode;
 }) {
-  return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="font-clash text-3xl font-semibold tracking-tight">{title}</h1>
-        {subtitle && <p className="mt-1 text-sm text-muted">{subtitle}</p>}
-      </div>
-      <div className="flex items-center gap-2">{actions}</div>
-    </div>
-  );
+  // Rendered into the DNA shell's title row (see PageHeader in lib/ui).
+  return <PageHeader title={title} subtitle={subtitle} actions={actions} />;
 }
 
 function Empty({ onFind }: { onFind: () => void }) {
@@ -640,7 +633,7 @@ function highlightMatch(name: string, term: string): React.ReactNode {
   return (
     <>
       {name.slice(0, i)}
-      <mark className="rounded-[3px] bg-[#fbe7b0] text-ink">{name.slice(i, i + term.length)}</mark>
+      <mark className="rounded-[3px] bg-wnb text-ink">{name.slice(i, i + term.length)}</mark>
       {name.slice(i + term.length)}
     </>
   );
@@ -779,10 +772,10 @@ function CompanyFilter({
         title={value ? `Company: ${companyLabel(value)}` : "Filter by company"}
         className={cn(
           "flex h-9 w-56 items-center gap-2 rounded-xl border pl-3 text-left text-sm transition-colors",
-          value ? "border-ink bg-ink pr-9 text-cream" : "border-line bg-white pr-3 text-ink hover:border-ink/30"
+          value ? "border-brand bg-brand pr-9 text-onbrand" : "border-line bg-sunk pr-3 text-ink hover:border-ink/30"
         )}
       >
-        <span className={cn("mono-label shrink-0 text-[10px]", value ? "text-cream/55" : "text-muted")}>Company</span>
+        <span className={cn("mono-label shrink-0 text-[10px]", value ? "text-onbrand/55" : "text-muted")}>Company</span>
         <span className="min-w-0 flex-1 truncate">
           {value ? companyLabel(value) : <span className="text-muted">All</span>}
         </span>
@@ -798,7 +791,7 @@ function CompanyFilter({
           onClick={() => onChange(null)}
           aria-label="Clear company filter"
           title="Clear company filter"
-          className="absolute right-1.5 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded-full text-[11px] text-cream/70 transition-colors hover:bg-cream/15 hover:text-cream"
+          className="absolute right-1.5 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded-full text-[11px] text-onbrand/70 transition-colors hover:bg-onbrand/15 hover:text-onbrand"
         >
           ✕
         </button>
@@ -835,7 +828,7 @@ function CompanyFilter({
                     o.key === "contains" && "border-b border-line-soft"
                   )}
                 >
-                  <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", current ? "bg-ink" : "bg-ink/10")} />
+                  <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", current ? "bg-brand" : "bg-ink/10")} />
                   <span className={cn("min-w-0 flex-1 truncate", current && "font-semibold")}>{o.label}</span>
                   {o.n != null && <span className="shrink-0 tabular-nums text-xs text-muted">{o.n.toLocaleString()}</span>}
                 </button>
@@ -1034,7 +1027,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
         {/* Step 1 — template */}
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-ink/[0.02] px-4 py-3">
           <div className="flex items-start gap-3">
-            <span className="mono-label mt-0.5 rounded-md bg-ink px-1.5 py-0.5 text-cream">01</span>
+            <span className="mono-label mt-0.5 rounded-md bg-brand px-1.5 py-0.5 text-onbrand">01</span>
             <div>
               <div className="text-[13px] font-semibold text-ink">Get the template</div>
               <div className="text-xs text-muted">Download it, fill in your contacts in Excel or Google Sheets, then upload it below.</div>
@@ -1046,7 +1039,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
         {/* Step 2 — upload / paste */}
         <div>
           <div className="mb-2 flex items-center gap-3">
-            <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">02</span>
+            <span className="mono-label rounded-md bg-brand px-1.5 py-0.5 text-onbrand">02</span>
             <div className="text-[13px] font-semibold text-ink">Upload or paste your data</div>
           </div>
 
@@ -1062,7 +1055,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
             onClick={() => fileRef.current?.click()}
             className={cn(
               "flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed px-4 py-6 text-center transition-colors",
-              dragOver ? "border-ink bg-ink/[0.04]" : "border-line hover:border-ink/40 hover:bg-ink/[0.02]"
+              dragOver ? "border-brand bg-brand/[0.04]" : "border-line hover:border-ink/40 hover:bg-ink/[0.02]"
             )}
           >
             <div className="prism-bar h-1 w-10 rounded-full opacity-60" />
@@ -1097,7 +1090,7 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
         {parsed.length > 0 && (
           <div>
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              <span className="mono-label rounded-md bg-ink px-1.5 py-0.5 text-cream">03</span>
+              <span className="mono-label rounded-md bg-brand px-1.5 py-0.5 text-onbrand">03</span>
               <div className="text-[13px] font-semibold text-ink">Review</div>
               <div className="ml-1 flex flex-wrap gap-1.5">
                 <Chip tone="good">{valid.length} ready</Chip>
@@ -1164,9 +1157,9 @@ function ImportModal({ open, onClose, onDone }: { open: boolean; onClose: () => 
 function Chip({ tone, children }: { tone: "good" | "bad" | "muted"; children: React.ReactNode }) {
   const cls =
     tone === "good"
-      ? "bg-[#e7f6ec] text-[#1f8b4c]"
+      ? "bg-okb text-good"
       : tone === "bad"
-      ? "bg-[#fde8e8] text-[#c0392b]"
+      ? "bg-dgb text-bad"
       : "bg-ink/[0.06] text-ink/55";
   return <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-medium", cls)}>{children}</span>;
 }

@@ -226,9 +226,9 @@ export default function Send() {
                   <span>skipped {job.result.skipped}</span>
                 </div>
               )}
-              <div ref={logRef} className="h-24 overflow-y-auto rounded-lg bg-ink px-2.5 py-2 font-mono text-[11px] leading-relaxed text-cream/80">
+              <div ref={logRef} className="h-24 overflow-y-auto rounded-lg border border-line-soft bg-sunk px-2.5 py-2 font-mono text-[11px] leading-relaxed text-ink-soft">
                 {(job.logs || []).map((l, i) => (
-                  <div key={i} className={cn(l.level === "sent" && "text-[#7ee7a6]", l.level === "fail" && "text-[#ff9a8a]", l.level === "warn" && "text-[#ffcf7a]")}>{l.msg}</div>
+                  <div key={i} className={cn(l.level === "sent" && "text-good", l.level === "fail" && "text-bad", l.level === "warn" && "text-warn")}>{l.msg}</div>
                 ))}
               </div>
             </Card>
@@ -241,7 +241,7 @@ export default function Send() {
             <div className="flex items-center gap-2">
               <div className="flex rounded-full border border-line bg-cream p-1">
                 {["new", "all"].map((f) => (
-                  <button key={f} onClick={() => changeFilter(f)} className={cn("rounded-full px-3 py-1 text-[13px] font-medium capitalize", filter === f ? "bg-ink text-cream" : "text-ink/55")}>{f}</button>
+                  <button key={f} onClick={() => changeFilter(f)} className={cn("rounded-full px-3 py-1 text-[13px] font-medium capitalize", filter === f ? "bg-hov text-ink ring-1 ring-inset ring-line-strong" : "text-ink/55")}>{f}</button>
                 ))}
               </div>
               {categories.length > 0 && (
@@ -253,7 +253,7 @@ export default function Send() {
               )}
             </div>
             <label className="flex items-center gap-2 text-[13px]">
-              <input type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-ink" />
+              <input type="checkbox" checked={headerChecked} onChange={toggleAll} className="accent-brand" />
               Select all {filteredTotal.toLocaleString()}
             </label>
           </div>
@@ -276,7 +276,7 @@ export default function Send() {
                   {contacts.map((c) => (
                     <tr key={c.id} className="border-b border-line-soft last:border-0 hover:bg-ink/[0.015]">
                       <td className="w-8 px-4 py-2.5">
-                        <input type="checkbox" checked={selectAllMatching || selected.has(c.id)} onChange={() => toggle(c.id)} className="accent-ink" />
+                        <input type="checkbox" checked={selectAllMatching || selected.has(c.id)} onChange={() => toggle(c.id)} className="accent-brand" />
                       </td>
                       <td className="px-1 py-2.5 font-medium">{c.email}</td>
                       <td className="px-1 py-2.5 text-ink/60">{c.company || "—"}</td>
@@ -312,7 +312,7 @@ function Banner({ tone, children }: { tone: "warn" | "info"; children: React.Rea
   return (
     <div className={cn(
       "mb-5 rounded-xl border px-4 py-3 text-[13px]",
-      tone === "warn" ? "border-[#f0d9b5] bg-[#fdf6ea] text-[#8a5a12]" : "border-[#bcd7f5] bg-[#eef5fd] text-[#245b91]"
+      tone === "warn" ? "border-wnl bg-wnb text-warn" : "border-inf/30 bg-inb text-inf"
     )}>
       {children}
     </div>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { cn, Toaster, Spinner } from "./lib/ui";
+import { HeadSlot, Logo, Mark, Spinner, ThemeButton, Toaster } from "./lib/ui";
 import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
 import Setup from "./screens/Setup";
@@ -10,23 +10,76 @@ import Templates from "./screens/Templates";
 import Send from "./screens/Send";
 import History from "./screens/History";
 import Settings from "./screens/Settings";
+import Inbox from "./screens/Inbox";
+import Campaigns from "./screens/Campaigns";
+import Mailboxes from "./screens/Mailboxes";
+import Agent from "./screens/Agent";
+import { req } from "./lib/api";
 
-type Tab = "overview" | "discovery" | "contacts" | "templates" | "send" | "history" | "settings";
+type Tab =
+  | "inbox"
+  | "campaigns"
+  | "mailboxes"
+  | "agent"
+  | "overview"
+  | "discovery"
+  | "contacts"
+  | "templates"
+  | "send"
+  | "history"
+  | "settings";
 
-const NAV: { id: Tab; label: string; num: string }[] = [
-  { id: "overview", label: "Overview", num: "01" },
-  { id: "discovery", label: "Discovery", num: "02" },
-  { id: "contacts", label: "Contacts", num: "03" },
-  { id: "templates", label: "Templates", num: "04" },
-  { id: "send", label: "Send", num: "05" },
-  { id: "history", label: "History", num: "06" },
-  { id: "settings", label: "Settings", num: "07" },
+// AI agent first (v2), then the classic tools after a divider.
+const TABS: { id: Tab; label: string; group: "agent" | "classic" }[] = [
+  { id: "inbox", label: "Inbox", group: "agent" },
+  { id: "campaigns", label: "Campaigns", group: "agent" },
+  { id: "mailboxes", label: "Mailboxes", group: "agent" },
+  { id: "agent", label: "Agent", group: "agent" },
+  { id: "overview", label: "Overview", group: "classic" },
+  { id: "discovery", label: "Discovery", group: "classic" },
+  { id: "contacts", label: "Contacts", group: "classic" },
+  { id: "templates", label: "Templates", group: "classic" },
+  { id: "send", label: "Send", group: "classic" },
+  { id: "history", label: "History", group: "classic" },
+  { id: "settings", label: "Settings", group: "classic" },
 ];
 
+// Other screens can jump tabs: window.dispatchEvent(new CustomEvent("dna-tab", { detail: "agent" }))
+const TAB_EVENT = "dna-tab";
+
+const TAB_KEY = "dnaOutreachTab";
+
+function initials(name: string) {
+  const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
+  return ((parts[0]?.[0] || "") + (parts[1]?.[0] || "")).toUpperCase() || "?";
+}
+
+function initialTab(): Tab {
+  try {
+    const t = localStorage.getItem(TAB_KEY) as Tab | null;
+    if (t && TABS.some((x) => x.id === t)) return t;
+  } catch {
+    /* private mode */
+  }
+  return "inbox";
+}
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTabState] = useState<Tab>(initialTab);
   const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
   const [needsSetup, setNeedsSetup] = useState(false);
+  const [username, setUsername] = useState("");
+  const [headEl, setHeadEl] = useState<HTMLDivElement | null>(null);
+
+  function setTab(t: Tab) {
+    setTabState(t);
+    try {
+      localStorage.setItem(TAB_KEY, t);
+    } catch {
+      /* private mode */
+    }
+    window.scrollTo({ top: 0 });
+  }
 
   useEffect(() => {
     (async () => {
@@ -43,88 +96,144 @@ export default function App() {
     return () => window.removeEventListener("dna-unauthorized", onUnauth);
   }, []);
 
+  useEffect(() => {
+    if (!authed) return;
+    api
+      .me()
+      .then((r) => setUsername(r.username || ""))
+      .catch(() => {});
+  }, [authed]);
+
+  // Any screen can switch tabs (e.g. "Connect Instantly" -> Agent tab).
+  useEffect(() => {
+    const h = (e: Event) => {
+      const t = (e as CustomEvent).detail as Tab;
+      if (TABS.some((x) => x.id === t)) setTab(t);
+    };
+    window.addEventListener(TAB_EVENT, h);
+    return () => window.removeEventListener(TAB_EVENT, h);
+  }, []);
+
+  // Inbox badge: unread + needs-a-human counts, polled like the leads console.
+  const [inboxCount, setInboxCount] = useState<{ unread: number; needsHuman: number }>({ unread: 0, needsHuman: 0 });
+  useEffect(() => {
+    if (!authed) return;
+    let alive = true;
+    const poll = () => {
+      if (document.hidden) return;
+      req<{ unread: number; needsHuman: number }>("/api/v2/inbox/counts")
+        .then((r) => alive && setInboxCount({ unread: Number(r.unread) || 0, needsHuman: Number(r.needsHuman) || 0 }))
+        .catch(() => {});
+    };
+    poll();
+    const t = setInterval(poll, 20000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [authed]);
+
   function logout() {
     clearToken();
     setAuthed(false);
-    setTab("overview");
   }
 
   if (authed === null) {
     return (
-      <div className="grid h-screen w-screen place-items-center bg-ink">
-        <Spinner className="h-6 w-6 text-cream/60" />
+      <div className="grid h-screen w-screen place-items-center">
+        <Spinner className="h-6 w-6 text-muted" />
       </div>
     );
   }
 
   if (needsSetup && !authed) {
-    return <Setup onSuccess={() => { setNeedsSetup(false); setAuthed(true); }} />;
+    return (
+      <Setup
+        onSuccess={() => {
+          setNeedsSetup(false);
+          setAuthed(true);
+        }}
+      />
+    );
   }
 
   if (!authed) return <Login onSuccess={() => setAuthed(true)} />;
 
+  const who = username || "admin";
+
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-cream">
-      {/* Sidebar */}
-      <aside className="flex w-[248px] shrink-0 flex-col bg-ink text-cream">
-        <div className="flex items-center gap-3 px-6 py-6">
-          <div className="prism-bar grid h-9 w-9 place-items-center rounded-xl">
-            <span className="font-clash text-sm font-bold text-ink">D</span>
+    <div className="min-h-screen pb-16">
+      {/* ---- brand bar ---- */}
+      <div className="bar">
+        <div className="w">
+          <div className="brand">
+            <Logo />
+            <div className="bd" />
+            <Mark />
+            <div className="bn">
+              <i>Sales &amp; outreach</i>
+              Outreach console
+            </div>
           </div>
-          <div className="leading-tight">
-            <div className="font-clash text-[15px] font-semibold tracking-tight">DNA</div>
-            <div className="mono-label text-cream/50">Outreach</div>
+          <div className="who">
+            <ThemeButton />
+            <div className="av">{initials(who)}</div>
+            <div className="meta-lines">
+              <b>{who}</b>
+              Administrator &middot;{" "}
+              <button type="button" className="lk" onClick={() => setTab("settings")}>
+                account
+              </button>{" "}
+              &middot;{" "}
+              <button type="button" className="lk" onClick={logout}>
+                sign out
+              </button>
+            </div>
           </div>
         </div>
+      </div>
 
-        <nav className="mt-2 flex flex-1 flex-col gap-1 px-3">
-          {NAV.map((n) => {
-            const active = tab === n.id;
+      <div className="w">
+        {/* Title row — each screen portals its own title/subtitle/actions here */}
+        <div className="head" ref={setHeadEl} />
+
+        <nav className="tabs" aria-label="Sections">
+          {TABS.map((t, i) => {
+            const badge = t.id === "inbox" ? inboxCount.unread + inboxCount.needsHuman : 0;
+            const divider = i > 0 && TABS[i - 1].group !== t.group;
             return (
-              <button
-                key={n.id}
-                onClick={() => setTab(n.id)}
-                className={cn(
-                  "group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors",
-                  active ? "bg-white/[0.08] text-cream" : "text-cream/55 hover:bg-white/[0.05] hover:text-cream/90"
-                )}
-              >
-                {active && (
-                  <span className="prism-bar absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full" />
-                )}
-                <span className="mono-label w-6 text-cream/30">{n.num}</span>
-                <span className="font-medium">{n.label}</span>
-              </button>
+              <span key={t.id} className="contents">
+                {divider && <span className="tabsep" aria-hidden="true" />}
+                <button
+                  type="button"
+                  className={tab === t.id ? "tab on" : "tab"}
+                  onClick={() => setTab(t.id)}
+                  aria-current={tab === t.id ? "page" : undefined}
+                >
+                  {t.label}
+                  {badge > 0 && <span className="badge">{badge > 99 ? "99+" : badge}</span>}
+                </button>
+              </span>
             );
           })}
         </nav>
 
-        <div className="px-3 pb-3">
-          <button
-            onClick={logout}
-            className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-cream/55 transition-colors hover:bg-white/[0.05] hover:text-cream/90"
-          >
-            <span className="mono-label w-6 text-cream/30">↩</span>
-            <span className="font-medium">Log out</span>
-          </button>
-        </div>
-        <div className="px-6 pb-5 text-[11px] leading-relaxed text-cream/35">
-          Cold outreach — send from secondary domains, never your primary.
-        </div>
-      </aside>
-
-      {/* Main */}
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-6xl px-8 py-8">
-          {tab === "overview" && <Overview />}
-          {tab === "discovery" && <Discovery />}
-          {tab === "contacts" && <Contacts />}
-          {tab === "templates" && <Templates />}
-          {tab === "send" && <Send />}
-          {tab === "history" && <History />}
-          {tab === "settings" && <Settings />}
-        </div>
-      </main>
+        <HeadSlot.Provider value={headEl}>
+          <main>
+            {tab === "inbox" && <Inbox />}
+            {tab === "campaigns" && <Campaigns />}
+            {tab === "mailboxes" && <Mailboxes />}
+            {tab === "agent" && <Agent />}
+            {tab === "overview" && <Overview />}
+            {tab === "discovery" && <Discovery />}
+            {tab === "contacts" && <Contacts />}
+            {tab === "templates" && <Templates />}
+            {tab === "send" && <Send />}
+            {tab === "history" && <History />}
+            {tab === "settings" && <Settings />}
+          </main>
+        </HeadSlot.Provider>
+      </div>
 
       <Toaster />
     </div>

@@ -71,7 +71,7 @@ export default function Settings() {
         <Card className="space-y-4 p-5">
           <div className="flex items-center justify-between">
             <div className="font-clash text-lg font-semibold">Resend</div>
-            <Badge className={resendOn ? "bg-[#e7f6ec] text-[#1f8b4c]" : "bg-[#fdf6ea] text-[#8a5a12]"}>
+            <Badge className={resendOn ? "bg-okb text-good" : "bg-wnb text-warn"}>
               {resendOn ? "connected" : "not connected"}
             </Badge>
           </div>
@@ -143,22 +143,22 @@ export default function Settings() {
                     <div className="font-clash text-base font-semibold">{d.domain}</div>
                     <div className="text-[13px] text-muted">{d.from_name} &lt;{d.from_email}&gt;</div>
                   </div>
-                  <Badge className={d.active ? "bg-[#e7f6ec] text-[#1f8b4c]" : "bg-ink/[0.06] text-ink/50"}>
+                  <Badge className={d.active ? "bg-okb text-good" : "bg-ink/[0.06] text-ink/50"}>
                     {d.active ? "active" : "paused"}
                   </Badge>
                 </div>
                 {d.tracking_host ? (
-                  <div className="mt-2 flex items-center gap-1.5 text-xs text-[#1f8b4c]">
-                    <span className="h-1.5 w-1.5 rounded-full bg-[#1f8b4c]" />
+                  <div className="mt-2 flex items-center gap-1.5 text-xs text-good">
+                    <span className="h-1.5 w-1.5 rounded-full bg-good" />
                     Links &amp; images via {d.tracking_host}
                   </div>
                 ) : (
                   <button
                     type="button"
                     onClick={() => setEditing(d)}
-                    className="mt-2 flex items-center gap-1.5 text-left text-xs text-[#8a5a12] hover:underline"
+                    className="mt-2 flex items-center gap-1.5 text-left text-xs text-warn hover:underline"
                   >
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#d99a2b]" />
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" />
                     No tracking host — links &amp; images won't match {d.domain}. Add one
                   </button>
                 )}
@@ -168,7 +168,7 @@ export default function Settings() {
                       <span>Today</span><span>{d.sent_today}/{d.daily_cap}</span>
                     </div>
                     <div className="h-1.5 overflow-hidden rounded-full bg-ink/[0.07]">
-                      <div className={cn("h-full rounded-full", d.sent_today >= d.daily_cap ? "bg-bad" : "bg-ink")} style={{ width: `${Math.min(100, (d.sent_today / Math.max(1, d.daily_cap)) * 100)}%` }} />
+                      <div className={cn("h-full rounded-full", d.sent_today >= d.daily_cap ? "bg-bad" : "bg-brand")} style={{ width: `${Math.min(100, (d.sent_today / Math.max(1, d.daily_cap)) * 100)}%` }} />
                     </div>
                   </div>
                   <Button size="sm" variant="outline" onClick={() => setEditing(d)}>Edit</Button>
@@ -333,7 +333,7 @@ function ReaderCard() {
     <Card className="space-y-4 p-5">
       <div className="flex items-center justify-between">
         <div className="font-clash text-lg font-semibold">Free reader <span className="text-muted">(no payment)</span></div>
-        <Badge className="bg-[#e7f6ec] text-[#1f8b4c]">{keyed ? "on · keyed" : "on · free"}</Badge>
+        <Badge className="bg-okb text-good">{keyed ? "on · keyed" : "on · free"}</Badge>
       </div>
       <p className="text-[13px] text-muted">
         The crawler already fetches JavaScript-heavy and Cloudflare-blocked pages for free through a
@@ -424,7 +424,7 @@ function ScrapeProxyCard() {
     <Card className="space-y-4 p-5">
       <div className="flex items-center justify-between">
         <div className="font-clash text-lg font-semibold">Scraping proxy</div>
-        <Badge className={on ? "bg-[#e7f6ec] text-[#1f8b4c]" : "bg-[#fdf6ea] text-[#8a5a12]"}>
+        <Badge className={on ? "bg-okb text-good" : "bg-wnb text-warn"}>
           {on ? "connected" : "not connected"}
         </Badge>
       </div>
@@ -474,7 +474,7 @@ function ScrapeProxyCard() {
               checked={premium}
               onChange={(e) => setPremium(e.target.checked)}
               disabled={!provider}
-              className="accent-ink"
+              className="accent-brand"
             />
             Premium / stealth mode <span className="text-muted">(needed for Cloudflare)</span>
           </label>
@@ -675,7 +675,7 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
           {hostMismatch ? (
             <div className="mt-1.5 text-xs text-bad">Must be {root} or a subdomain of it — otherwise links still won't match the sender.</div>
           ) : check ? (
-            <div className={cn("mt-1.5 text-xs", check.ok ? "text-[#1f8b4c]" : "text-bad")}>{check.msg}</div>
+            <div className={cn("mt-1.5 text-xs", check.ok ? "text-good" : "text-bad")}>{check.msg}</div>
           ) : (
             <div className="mt-1.5 text-xs text-muted">
               Click links, images, the open pixel and the unsubscribe link are served from this host so they match the sending domain. Leave blank to use the App URL.
@@ -693,7 +693,7 @@ function DomainModal({ domain, onClose, onSaved }: { domain: Domain; onClose: ()
         </div>
 
         <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="accent-ink" />
+          <input type="checkbox" checked={!!d.active} onChange={(e) => setD({ ...d, active: e.target.checked })} className="accent-brand" />
           Active (include in rotation)
         </label>
         <div className="flex justify-end gap-2 pt-1">

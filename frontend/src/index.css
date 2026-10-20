@@ -1,86 +1,257 @@
 @import "tailwindcss";
 
-@theme {
-  --font-clash: "Clash Display", ui-sans-serif, system-ui, sans-serif;
-  --font-satoshi: "Satoshi", ui-sans-serif, system-ui, sans-serif;
+/* ==========================================================================
+   DNA console design system — ported from MohamedMagdy90/dna-erp-api
+   (partner_console.PAGE + leads_console.CSS). Dark is the default and the
+   identity of the console; light is an override on <html data-theme="light">,
+   applied before first paint by the snippet in index.html.
 
-  --color-ink: #0b0b0b;
-  --color-ink-soft: #1a1a1a;
-  --color-cream: #f2eee6;
-  --color-paper: #fbf9f4;
-  --color-line: #e3dcce;
-  --color-line-soft: #ece6da;
-  --color-muted: #837c6f;
-  --color-accent: #ff5a36;
-  --color-good: #1f9d55;
-  --color-warn: #d9822b;
-  --color-bad: #d64545;
-}
-
+   Two rules carried over from the original:
+   - --ac is the accent as *text* or a border, --acb is the accent as a *fill*.
+     Identical in dark, deliberately not in light (#00d4aa on white is ~1.9:1).
+   - every status has a foreground AND a background; both move together.
+   ========================================================================== */
 :root {
+  --bg: #08090c; --bar: #0a0b0f; --surf: #0d1015; --surf2: #0a0c10; --sunk: #101319;
+  --hov: #151921;
+  --line0: #14171d; --line1: #191c22; --line2: #232830; --line3: #2a3039;
+  --txt: #e8eaed; --txt2: #b9c0c9; --txt3: #9aa2ad;
+  --mut: #7d848f; --mut2: #6b7280; --mut3: #575e69;
+  --ac: #00d4aa; --acb: #00d4aa; --ach: #25e3bd; --acf: #06121a; --acdim: #2c7c68;
+  --netg: #0c6b59; --avb: #12262230; --avl: #1d4f45;
+  --okf: #4ade9e; --okb: #0a2b20; --okl: #13503c; --tlb: #0a3324;
+  --keep1: #08221c; --keep2: #0b1116; --keepl: #17493d; --dropb: #0d1a18;
+  --dgf: #ff7b72; --dgb: #38181c; --dgl: #47262b; --dgh: #2a1618;
+  --wnf: #ffc94d; --wnb: #3d2f0a; --wnl: #3a3113; --wnd: #8a7333;
+  --wbb: #1a1408; --wbf: #e2c98c;
+  --orf: #ffa94d; --orb: #38220a;
+  --inf: #4dd0ff; --inb: #0a2f3d; --blf: #6bb6ff; --blb: #12283d;
+  --puf: #b49bff; --pub: #241d3d; --plb: #191d24;
+  --ring: rgba(255, 255, 255, 0.08); --shadow: rgba(0, 0, 0, 0.45);
+  --disc: #f2f3f5;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f4f6f8; --bar: #ffffff; --surf: #ffffff; --surf2: #f7f9fb; --sunk: #f1f4f7;
+  --hov: #eceff3;
+  --line0: #edf0f4; --line1: #e2e6ec; --line2: #d6dbe3; --line3: #c3cad4;
+  --txt: #0f1319; --txt2: #39414d; --txt3: #56606d;
+  --mut: #6b7480; --mut2: #79828e; --mut3: #98a0ab;
+  /* --acb darker than brand teal on purpose: white on #00a98b is 2.98:1,
+     #00806a takes it to 4.89:1. */
+  --ac: #00735e; --acb: #00806a; --ach: #006b57; --acf: #ffffff; --acdim: #6a9f92;
+  --netg: #046e5b; --avb: #dff3ee; --avl: #a4dacd;
+  --okf: #0f6b42; --okb: #e4f7ec; --okl: #b3e4c8; --tlb: #dcf4ec;
+  --keep1: #e6f7f1; --keep2: #ffffff; --keepl: #aee0d2; --dropb: #ddf3ec;
+  --dgf: #b3261e; --dgb: #fdeae8; --dgl: #f2c3be; --dgh: #fbdedb;
+  --wnf: #855e00; --wnb: #fdf0cf; --wnl: #ecd9a2; --wnd: #a08644;
+  --wbb: #fdf4de; --wbf: #755612;
+  --orf: #94570b; --orb: #fdeeda;
+  --inf: #0a5d7a; --inb: #e1f3fa; --blf: #175690; --blb: #e6f0fa;
+  --puf: #57409f; --pub: #eee9fc; --plb: #eaedf2;
+  --ring: rgba(0, 0, 0, 0.08); --shadow: rgba(0, 0, 0, 0.14);
   color-scheme: light;
 }
 
-* {
-  border-color: var(--color-line);
+/* Tailwind tokens -> DNA variables. The screens were written against
+   ink / cream / paper / line / muted, so those names are kept and now resolve
+   to the console palette (and follow the theme switch at runtime). */
+@theme inline {
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-clash: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-satoshi: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-ink: var(--txt);
+  --color-ink-soft: var(--txt2);
+  --color-cream: var(--bg);
+  --color-paper: var(--surf);
+  --color-surf2: var(--surf2);
+  --color-sunk: var(--sunk);
+  --color-hov: var(--hov);
+  --color-line: var(--line2);
+  --color-line-soft: var(--line1);
+  --color-line-strong: var(--line3);
+  --color-muted: var(--mut);
+  --color-accent: var(--ac);
+  --color-brand: var(--acb);
+  --color-brand-hover: var(--ach);
+  --color-onbrand: var(--acf);
+  --color-good: var(--okf);
+  --color-okb: var(--okb);
+  --color-okl: var(--okl);
+  --color-warn: var(--wnf);
+  --color-wnb: var(--wnb);
+  --color-wnl: var(--wnl);
+  --color-bad: var(--dgf);
+  --color-dgb: var(--dgb);
+  --color-dgl: var(--dgl);
+  --color-inf: var(--inf);
+  --color-inb: var(--inb);
+  --color-puf: var(--puf);
+  --color-pub: var(--pub);
+  --color-orf: var(--orf);
+  --color-orb: var(--orb);
+  --color-tlb: var(--tlb);
+  --color-keep1: var(--keep1);
+  --color-keepl: var(--keepl);
 }
 
-html,
-body,
-#root {
-  height: 100%;
-}
-
+* { border-color: var(--line2); }
+html, body, #root { min-height: 100%; }
 body {
   margin: 0;
-  font-family: var(--font-satoshi);
-  background: var(--color-cream);
-  color: var(--color-ink);
+  background: var(--bg);
+  color: var(--txt);
+  font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
 }
+::selection { background: color-mix(in oklab, var(--acb) 35%, transparent); }
 
-.font-clash {
-  font-family: var(--font-clash);
-  letter-spacing: -0.02em;
-}
+/* Headings keep the class name the screens use, restyled to the console's
+   650-weight, tight-tracked heading. */
+.font-clash { font-weight: 650; letter-spacing: -0.02em; }
 
-.prism-bar {
-  background: linear-gradient(
-    90deg,
-    #ff5a36,
-    #ffb020,
-    #3ddc84,
-    #36a2ff,
-    #a15cff
-  );
-}
-
-.prism-text {
-  background: linear-gradient(90deg, #ff5a36, #ffb020, #3ddc84, #36a2ff, #a15cff);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-/* Thin, refined scrollbars */
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-thumb {
-  background: #d8cfbf;
-  border-radius: 999px;
-  border: 3px solid var(--color-cream);
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #c7bca8;
-}
-
-/* Mono label used across the DNA brand */
+/* The console's micro-label: uppercase, wide tracking, muted. */
 .mono-label {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.68rem;
   text-transform: uppercase;
-  letter-spacing: 0.18em;
-  font-size: 11px;
+  letter-spacing: 0.09em;
+  font-weight: 600;
 }
+
+/* The old prism gradient becomes the console accent. */
+.prism-bar { background: linear-gradient(90deg, var(--acb), var(--netg)); }
+.prism-text { color: var(--ac); }
+
+/* Scrollbars — thin, dark-aware. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line3); border-radius: 999px; border: 3px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--mut3); }
+::-webkit-scrollbar-track { background: transparent; }
+
+input, select, textarea { color-scheme: inherit; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
+
+/* ============================== shell ===================================== */
+.w { max-width: 1400px; margin: 0 auto; padding: 0 20px; }
+.bar {
+  border-bottom: 1px solid var(--line1);
+  background: var(--bar);
+  position: sticky; top: 0; z-index: 30;
+  backdrop-filter: saturate(140%) blur(8px);
+}
+.bar .w {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+  min-height: 62px; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px;
+}
+.brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+.brand .logo { height: 30px; width: auto; display: block; }
+.brand .bd { width: 1px; height: 24px; background: var(--line3); flex: 0 0 1px; }
+/* The mark is a black 3D render on near-black surfaces; it sits on a light
+   disc so it is visible at all (same trick as the partner console). */
+.mk {
+  flex: 0 0 auto; width: 32px; height: 32px; border-radius: 50%; background: var(--disc);
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+.mk img { height: 19px; width: 19px; display: block; }
+.brand .bn { font-size: 0.9rem; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
+.brand .bn i {
+  display: block; font-style: normal; font-size: 0.66rem; font-weight: 600; color: var(--ac);
+  letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 1px;
+}
+.who { display: flex; align-items: center; gap: 12px; font-size: 0.78rem; color: var(--mut); }
+.who .av {
+  width: 30px; height: 30px; border-radius: 50%; background: var(--avb); border: 1px solid var(--avl);
+  color: var(--ac); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.76rem;
+}
+.who b { color: var(--txt); display: block; font-size: 0.82rem; font-weight: 600; }
+.who .lk { color: var(--mut); border-bottom: 1px solid var(--line3); cursor: pointer; background: none; padding: 0; font: inherit; }
+.who .lk:hover { color: var(--txt); }
+.thm {
+  background: transparent; border: 1px solid var(--line3); color: var(--mut);
+  width: 32px; height: 32px; padding: 0; border-radius: 8px; display: flex;
+  align-items: center; justify-content: center; flex: 0 0 auto; cursor: pointer;
+}
+.thm:hover { background: var(--hov); color: var(--txt); }
+
+.head { padding: 26px 0 4px; }
+.head h1 { font-size: 1.32rem; letter-spacing: -0.02em; font-weight: 650; }
+.head .sub { color: var(--mut); font-size: 0.85rem; margin-top: 5px; max-width: 760px; }
+.head-row { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; align-items: center; }
+.hacts { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+.tabs { display: flex; gap: 4px; margin: 20px 0 22px; border-bottom: 1px solid var(--line1); flex-wrap: wrap; }
+.tab {
+  background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--mut);
+  padding: 11px 15px; font-size: 0.88rem; font-weight: 600; cursor: pointer; border-radius: 0;
+  display: inline-flex; align-items: center; margin-bottom: -1px;
+}
+.tab:hover { color: var(--txt); }
+.tab.on { color: var(--ac); border-bottom-color: var(--ac); }
+.badge {
+  display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 6px; border-radius: 20px;
+  background: var(--acb); color: var(--acf); font-size: 0.68rem; font-weight: 800; text-align: center;
+}
+.livep {
+  display: inline-flex; align-items: center; gap: 7px; font-size: 0.72rem; color: var(--mut);
+  border: 1px solid var(--line2); border-radius: 20px; padding: 4px 10px; white-space: nowrap;
+}
+.livep i { width: 7px; height: 7px; border-radius: 50%; background: var(--mut3); display: inline-block; }
+.livep.open i { background: var(--okf); box-shadow: 0 0 0 3px var(--okb); }
+
+/* ---- dashboard tiles (partner console .hb) ---- */
+.hb {
+  background: var(--surf); border: 1px solid var(--line1); border-radius: 14px; padding: 18px 20px;
+  position: relative; overflow: hidden;
+}
+.hb::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--line2), transparent);
+}
+.hb .mono-label { color: var(--mut); }
+.hb.keep { background: linear-gradient(150deg, var(--keep1), var(--keep2)); border-color: var(--keepl); }
+.hb.keep, .hb.keep .mono-label { color: var(--ac); }
+
+/* ---- sign-in gate ---- */
+.gate { max-width: 430px; margin: 0 auto; padding: 9vh 20px 40px; }
+.gate .gl { text-align: center; margin-bottom: 26px; }
+.gate .gl .logo { height: 38px; width: auto; margin: 0 auto; display: block; }
+.gate .gl p { margin-top: 12px; font-size: 0.68rem; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ac); font-weight: 700; }
+.gate .mk { width: 44px; height: 44px; margin: 0 auto 14px; }
+.gate .mk img { height: 26px; width: 26px; }
+.gtop { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+
+/* ---- toast ---- */
+.toast {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 95;
+  padding: 11px 16px; border-radius: 10px; font-size: 0.85rem; max-width: min(560px, calc(100vw - 32px));
+  box-shadow: 0 12px 32px var(--shadow); animation: toast-in 0.18s ease-out;
+}
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 16px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* ---- phones ---- */
+@media (max-width: 860px) {
+  .w { padding: 0 14px; }
+  .bar .w { min-height: 56px; gap: 12px; padding-top: 8px; padding-bottom: 8px; }
+  .brand .logo { height: 24px; }
+  .brand .bd, .brand .mk { display: none; }
+  .brand .bn { font-size: 0.82rem; }
+  .who { gap: 9px; font-size: 0.74rem; }
+  .who .av { width: 26px; height: 26px; font-size: 0.7rem; }
+  .who .meta-lines { display: none; }
+  .head { padding: 18px 0 2px; }
+  .head h1 { font-size: 1.16rem; }
+  .head .sub { font-size: 0.8rem; }
+  /* Seven tabs wrapping is a wall of buttons. Scroll them. */
+  .tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 16px 0 18px; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 0 0 auto; padding: 10px 13px; font-size: 0.85rem; white-space: nowrap; }
+  .gate { padding: 5vh 16px 0; }
+  /* 16px or iOS zooms the page in on every tap into a field. */
+  input, select, textarea { font-size: 16px !important; }
+}
+
+/* Divider between the AI-agent tabs and the classic tools. */
+.tabsep { width: 1px; align-self: center; height: 18px; background: var(--line2); margin: 0 8px; flex: 0 0 1px; }
