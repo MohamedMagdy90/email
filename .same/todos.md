@@ -28,7 +28,21 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
 - GOTCHA: the platform supervisor logs to /tmp/dev.log — never delete it, never start a 2nd `bun run dev`
 
 ## v2 workstreams (parallel task agents)
-- [ ] A Mailboxes — sync, health snapshots, readiness gate, ramp, auto-pause, UI
+- [x] A Mailboxes — sync, health snapshots, readiness gate, ramp, auto-pause, UI (2026-10-20, NOT pushed yet)
+      backend/src/v2/mailboxes/: policy.ts (pure gate/ramp/pause), view.ts (pure view), service.ts
+      (sync + evaluate + push to Instantly + manual actions + getSendableMailboxes/syncMailboxes),
+      example.ts (preview pool run through the real policy), module.ts (routes + 30-min worker).
+      Adds columns mailboxes.target_custom, mailboxes.missing_since. Policy in settings `mailbox_policy`,
+      last sync in `mailbox_last_sync`.
+      Gate: connected · warmup on · MX/SPF/DKIM/DMARC · 14 days (7 pre-warmed) · 95% inbox (>=20 emails/7d).
+      Ramp 10 → +3/day → 30, auto-start unless held. Pause: Instantly error/paused, warmup banned,
+      DNS fail, inbox < 90%, bounces > 3% after >= 50 sends counted SINCE THE CURRENT RAMP STARTED
+      (so a resumed mailbox gets a clean slate). Pause is sticky; Resume re-gates and restarts the ramp.
+      Keep-warmup-on re-enables warmup each sync. Removed-from-Instantly mailboxes pause + "missing".
+      Verified: 33/33 simulation checks against a fake Instantly on SQLite AND PGlite (Postgres 18);
+      HTTP routes; both tsc clean; screenshots desktop/mobile/light via headless Chromium.
+      GOTCHA: `touch backend/src/index.ts` does NOT trigger bun --watch — restart the ONE dev server.
+      GOTCHA: 3 dev supervisors were running at once (DB corruption cause); pkill doesn't stop them, kill -9 does.
 - [ ] B Inbox — poll Unibox, threads, classify, fully-automatic replies, Inbox UI, playground endpoint
 - [ ] C Campaigns — offer -> ICP -> discover -> research -> contact -> verify -> write -> Instantly, UI
 - [ ] D Agent tab — voice/tone, auto-reply, KB, sending policy, integrations, playground UI, activity
