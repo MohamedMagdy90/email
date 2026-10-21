@@ -43,7 +43,26 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
       HTTP routes; both tsc clean; screenshots desktop/mobile/light via headless Chromium.
       GOTCHA: `touch backend/src/index.ts` does NOT trigger bun --watch — restart the ONE dev server.
       GOTCHA: 3 dev supervisors were running at once (DB corruption cause); pkill doesn't stop them, kill -9 does.
-- [ ] B Inbox — poll Unibox, threads, classify, fully-automatic replies, Inbox UI, playground endpoint
+- [x] B Inbox (2026-10-21, built directly, pushed to main)
+  - Backend `backend/src/v2/inbox/`: classify.ts (latestReply quote-stripper incl. Arabic Gmail headers,
+    STRONG rules first: bounce / legal / short unsubscribe / auto-reply OOO + return date — never wait on a
+    key; then AI (fast tier, JSON); weak rules only without AI; else needs_human conf 0), writer.ts (reply
+    prompt = voicePrompt + KB + per-category guide + history + research; checkReply guardrails: placeholders,
+    foreign links, "as an AI", discount not in KB, too long -> held as draft), service.ts (sync received +
+    manual sends every 3 min, per-thread history backfill via `threads.backfilled_at`, process -> decideReply()
+    -> silent | handoff(+draft) | draft | schedule; send due replies from the SAME eaccount in-thread;
+    supersede / already-answered / paused / settings-changed re-checks before sending; 72h stale -> draft;
+    retry 429/5xx x3; outcomes -> prospects + Instantly interest + block list; manual actions; views),
+    example.ts (8 fictional Gulf threads run through the live rules), module.ts (routes + 20s worker).
+  - Adds columns: messages.send_attempts / ai_source / ai_meta, threads.instantly_campaign_id / backfilled_at.
+  - `/counts.unread` excludes needs_human threads, so the shell badge (unread + needsHuman) counts once.
+  - Frontend: `lib/v2/inbox.ts`, `screens/Inbox.tsx` (setup + live rules board, example mode, 3-pane inbox,
+    agent card with confidence / correct-category / approve / edit / rewrite chips / send now / don't send,
+    composer, lead panel, "Test a reply" playground), `index.css` ib-* classes (height measured in JS).
+  - Verified: 76/76 e2e checks (fake Instantly + mock LLM, own SQLite), HTTP smoke on the dev server,
+    both tsc, vite build, screenshots dark/light/Arabic/390px.
+  - Env after every snapshot restore: data.sqlite corrupt + node_modules empty + .git empty -> park DB in
+    `.same/corrupt-db-backup-N/`, re-clone .git, `bun install` x3, ONE `bun run dev`.
 - [ ] C Campaigns — offer -> ICP -> discover -> research -> contact -> verify -> write -> Instantly, UI
 - [x] D Agent tab (2026-10-21, built directly, NOT pushed)
   - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
@@ -64,7 +83,7 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
     screenshots dark + light + 390px via headless Chromium (libs unpacked to /tmp, no root).
   - Env (twice this session): snapshot restore corrupts data.sqlite + empties node_modules ->
     `.same/corrupt-db-backup-11/`, `-12/`; reinstall; ONE `bun run dev` (log /tmp/dev.log).
-  - Known: shell polls `/api/v2/inbox/counts` -> 404 until workstream B exists (console noise only).
+  - (Resolved by B: `/api/v2/inbox/counts` now exists.)
 - [ ] Integrate: static imports, typecheck, end-to-end mock run, design review, version
 
 ---
