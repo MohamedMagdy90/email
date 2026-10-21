@@ -63,7 +63,55 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
     both tsc, vite build, screenshots dark/light/Arabic/390px.
   - Env after every snapshot restore: data.sqlite corrupt + node_modules empty + .git empty -> park DB in
     `.same/corrupt-db-backup-N/`, re-clone .git, `bun install` x3, ONE `bun run dev`.
-- [ ] C Campaigns — offer -> ICP -> discover -> research -> contact -> verify -> write -> Instantly, UI
+- [ ] C Campaigns — AI lead engine (STARTED 2026-10-21). Spec: `.same/campaigns-spec.md` (BINDING).
+      API types + client: `frontend/src/lib/v2/campaigns.ts` (written first; backend views must match it).
+  - [x] C0 Spec + typed client (integrator)
+  - [x] C1 Backend `backend/src/v2/campaigns/` (built directly, no task agents — user's request)
+        Files: types, schema, suppression, web, offer, icp, discover, research, contact, qualify (verify +
+        score), writer, sender, service (views/CRUD/actions/runPass/worker), module (routes).
+        Tests: `.same-test/cp-test.ts` 47/47 on SQLite (fake web + fake Instantly + mock LLM, real routes).
+        Postgres (PGlite socket) crashed the container (exit 137) -> not run; SQL reviewed by hand.
+        Run: `cd backend && SQLITE_PATH=/tmp/cp-test.sqlite V2_WORKERS=0 DISABLE_READER=1 bun ../.same-test/cp-test.ts`
+        Held, not skipped: no-person-without-Gemini (24h) and unverifiable guess without Reacher (12h).
+        GOTCHA: container restarts wipe /tmp, node_modules, .git and REVERT terminal (sed/python) edits made
+        since the last snapshot. Use the file tools for edits.
+    - [x] types.ts + idempotent columns (prospects.written_at / approved_at / stage_changed_at, ...)
+    - [x] suppression.ts — NEVER contact: old `contacts.status IN ('unsubscribed','bounced')`, prospects
+          unsubscribed/bounced/complaint/legal in ANY campaign, anyone contacted by another campaign in the
+          last 90 days, excluded domains, our own domains (dna.systems, agent website, mailbox domains)
+    - [x] offer.ts — learn the offer from the website (reader fetch + AI), fallback = agent knowledge base
+    - [x] icp.ts — propose segments (industry x country x size, titles, search queries, fit + why);
+          no-AI fallback = sensible defaults per kind (customer / partner)
+    - [x] discover.ts — Gemini search grounding, else free web search (searchRaw); dedupe by registrable
+          domain; drop directories / social / junk / excluded; segment cursor + exhausted
+    - [x] research.ts — home/about/team/contact pages -> AI JSON (description, industry, size, city,
+          people + titles, hooks, emails on site); reuse research < 90 days; heuristic fallback without AI
+    - [x] contact.ts — decision maker by title priority; LinkedIn URL via search only (never scrape
+          LinkedIn); findEmail() patterns; role address only if policy allows
+    - [x] verify step — verifyEmail(); policy: valid ok, catch-all within share cap, unknown only if
+          allowUnverifiedGuesses, risky/invalid skipped
+    - [x] score.ts — AI fit score 0-100 vs segment + offer; below minFitScore -> skipped (parked)
+    - [x] writer.ts — first email + up to 2 follow-ups (observation / outcome / question, no links in
+          email 1, voicePrompt, EN/AR); guardrails (placeholders, links, "as an AI", invented numbers, length)
+    - [x] review — reviewFirst (default on): written emails wait for approval; approve / edit / rewrite / skip
+    - [x] sender.ts — one Instantly campaign per campaign, copy in custom variables (subject_1, body_1..3),
+          text-only, no open/link tracking, stop on reply, unsubscribe header, schedule by country
+          (Asia/Baghdad, Sun-Thu in the Gulf), email_list = getSendableMailboxes(); push within capacity;
+          hold approved leads while no mailbox is sending; sync lead status -> sent
+    - [x] service.ts worker (60s tick, per-step budgets, daily caps, backoff, events) + module.ts routes
+    - [x] Tests: fake Instantly + mock LLM + fake web, own SQLite; SQLite AND Postgres (PGlite)
+  - [x] C2 Frontend (built directly): `screens/Campaigns.tsx` (list + routing) + `screens/campaigns/`
+        {parts, forms, Wizard, Leads (review / table / lead panel), CampaignView (funnel, blockers, tabs)}.
+        tsc + vite build clean. Live smoke on the dev server (no AI): real dna.systems read (5 pages),
+        fallback offer + default segments, free search found real companies; listicles / lead databases /
+        setup agencies / government now dropped at discovery (search.ts blocklists + isContentTitle).
+  - (spec) list was: list, new-campaign wizard (offer -> ideal
+        customers -> rules -> launch checklist), campaign view (funnel, leads table + lead panel, review
+        queue, segments, offer, settings, activity), not-connected states, dark/light, 390px
+  - [x] C3 Integrate: both tsc, vite build, 47/47 test, live smoke on the dev server, version
+        (screenshot tool can't log in — USER to eyeball the Campaigns tab)
+  - [ ] C4 Push (2026-10-21) + Netlify republish only once Railway serves the new backend
+        (Railway has not auto-deployed since e06d231 — new screens against the old API = 404s)
 - [x] D Agent tab (2026-10-21, built directly, NOT pushed)
   - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
     `decideReply(settings, {category, confidence, autoRepliesInThread})` -> send|draft|handoff|silent + reason
