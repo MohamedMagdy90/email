@@ -85,7 +85,24 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
     `.same/corrupt-db-backup-11/`, `-12/`; reinstall; ONE `bun run dev` (log /tmp/dev.log).
   - (Resolved by B: `/api/v2/inbox/counts` now exists.)
 - [ ] Integrate: static imports, typecheck, end-to-end mock run, design review, version
-
+## Old Resend console removed (2026-10-21, pushed to main; Netlify NOT republished)
+- [x] Frontend: tabs Overview / Discovery / Contacts / Templates / Send / History / Settings deleted with
+      their screens + `lib/csv.ts` + `lib/starters.ts`; `lib/api.ts` = auth + `req` only. Shell = 4 v2 tabs.
+      "account" in the brand bar opens `screens/Account.tsx` (change username / password).
+- [x] Backend `index.ts` = health, auth, `/api/account`, legacy links, v2 mount, static. Unknown `/api/*` -> 404.
+      Deleted: discovery, enrich, leads, repair, resend, template, jobs, crawler/{index,directory,pdf,phones,
+      robots,sitemap}. Removed `unpdf`. No discovery worker, no boot-time cleanup jobs.
+- [x] KEPT (v2 uses them or Campaigns is contracted to reuse them): auth, config, country (minus backfill),
+      search (Company type inlined), crawler/{fetcher,extract,urls,validate,profiles}.
+- [x] Legacy links for emails ALREADY sent: GET + POST (RFC 8058 one-click) `/api/unsubscribe?c=` marks the
+      contact unsubscribed AND blocks the address in Instantly when connected; `/api/click` redirects only for
+      a real `sends.id` and http(s) targets. Open pixel + `/i/:file` image host removed.
+- [x] `ensureSchema()` only creates `settings`. Old tables (contacts, sends, templates, domains, email_assets,
+      crawled_domains, discovery_sources, discovered_leads) are NOT dropped — data stays in Postgres.
+- [ ] Campaigns (C) must exclude old opt-outs: `contacts.status IN ('unsubscribed','bounced')`.
+- [ ] Deploy needs BOTH: push (Railway backend) AND republish the Netlify zip — the live frontend still has
+      the old tabs, which would 404 against the new backend.
+- [ ] Optional later: drop the old tables in Postgres once nobody needs the data.
 ---
 
 # Contacts — filter by company + select all / delete all (2026-10-13)

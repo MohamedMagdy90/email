@@ -12,7 +12,15 @@
 import { registrableDomain, hostOf } from "./crawler/urls";
 import { isProfileHost, isJunkHost } from "./crawler/profiles";
 import { fetchViaReader, fetchViaProxy, type ProxyConfig } from "./crawler/fetcher";
-import type { Company } from "./leads";
+// A company found by web search (same shape the old lead finder used).
+export interface Company {
+  name: string;
+  website: string;
+  city: string;
+  email: string | null;
+  phone: string | null;
+  hasWebsite: boolean;
+}
 
 const UAS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",

@@ -3,45 +3,20 @@ import { HeadSlot, Logo, Mark, Spinner, ThemeButton, Toaster } from "./lib/ui";
 import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
 import Setup from "./screens/Setup";
-import Overview from "./screens/Overview";
-import Discovery from "./screens/Discovery";
-import Contacts from "./screens/Contacts";
-import Templates from "./screens/Templates";
-import Send from "./screens/Send";
-import History from "./screens/History";
-import Settings from "./screens/Settings";
 import Inbox from "./screens/Inbox";
 import Campaigns from "./screens/Campaigns";
 import Mailboxes from "./screens/Mailboxes";
 import Agent from "./screens/Agent";
+import AccountDialog from "./screens/Account";
 import { req } from "./lib/api";
 
-type Tab =
-  | "inbox"
-  | "campaigns"
-  | "mailboxes"
-  | "agent"
-  | "overview"
-  | "discovery"
-  | "contacts"
-  | "templates"
-  | "send"
-  | "history"
-  | "settings";
+type Tab = "inbox" | "campaigns" | "mailboxes" | "agent";
 
-// AI agent first (v2), then the classic tools after a divider.
-const TABS: { id: Tab; label: string; group: "agent" | "classic" }[] = [
-  { id: "inbox", label: "Inbox", group: "agent" },
-  { id: "campaigns", label: "Campaigns", group: "agent" },
-  { id: "mailboxes", label: "Mailboxes", group: "agent" },
-  { id: "agent", label: "Agent", group: "agent" },
-  { id: "overview", label: "Overview", group: "classic" },
-  { id: "discovery", label: "Discovery", group: "classic" },
-  { id: "contacts", label: "Contacts", group: "classic" },
-  { id: "templates", label: "Templates", group: "classic" },
-  { id: "send", label: "Send", group: "classic" },
-  { id: "history", label: "History", group: "classic" },
-  { id: "settings", label: "Settings", group: "classic" },
+const TABS: { id: Tab; label: string }[] = [
+  { id: "inbox", label: "Inbox" },
+  { id: "campaigns", label: "Campaigns" },
+  { id: "mailboxes", label: "Mailboxes" },
+  { id: "agent", label: "Agent" },
 ];
 
 // Other screens can jump tabs: window.dispatchEvent(new CustomEvent("dna-tab", { detail: "agent" }))
@@ -70,6 +45,7 @@ export default function App() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [username, setUsername] = useState("");
   const [headEl, setHeadEl] = useState<HTMLDivElement | null>(null);
+  const [accountOpen, setAccountOpen] = useState(false);
 
   function setTab(t: Tab) {
     setTabState(t);
@@ -181,7 +157,7 @@ export default function App() {
             <div className="meta-lines">
               <b>{who}</b>
               Administrator &middot;{" "}
-              <button type="button" className="lk" onClick={() => setTab("settings")}>
+              <button type="button" className="lk" onClick={() => setAccountOpen(true)}>
                 account
               </button>{" "}
               &middot;{" "}
@@ -198,22 +174,19 @@ export default function App() {
         <div className="head" ref={setHeadEl} />
 
         <nav className="tabs" aria-label="Sections">
-          {TABS.map((t, i) => {
+          {TABS.map((t) => {
             const badge = t.id === "inbox" ? inboxCount.unread + inboxCount.needsHuman : 0;
-            const divider = i > 0 && TABS[i - 1].group !== t.group;
             return (
-              <span key={t.id} className="contents">
-                {divider && <span className="tabsep" aria-hidden="true" />}
-                <button
-                  type="button"
-                  className={tab === t.id ? "tab on" : "tab"}
-                  onClick={() => setTab(t.id)}
-                  aria-current={tab === t.id ? "page" : undefined}
-                >
-                  {t.label}
-                  {badge > 0 && <span className="badge">{badge > 99 ? "99+" : badge}</span>}
-                </button>
-              </span>
+              <button
+                key={t.id}
+                type="button"
+                className={tab === t.id ? "tab on" : "tab"}
+                onClick={() => setTab(t.id)}
+                aria-current={tab === t.id ? "page" : undefined}
+              >
+                {t.label}
+                {badge > 0 && <span className="badge">{badge > 99 ? "99+" : badge}</span>}
+              </button>
             );
           })}
         </nav>
@@ -224,17 +197,11 @@ export default function App() {
             {tab === "campaigns" && <Campaigns />}
             {tab === "mailboxes" && <Mailboxes />}
             {tab === "agent" && <Agent />}
-            {tab === "overview" && <Overview />}
-            {tab === "discovery" && <Discovery />}
-            {tab === "contacts" && <Contacts />}
-            {tab === "templates" && <Templates />}
-            {tab === "send" && <Send />}
-            {tab === "history" && <History />}
-            {tab === "settings" && <Settings />}
           </main>
         </HeadSlot.Provider>
       </div>
 
+      <AccountDialog open={accountOpen} username={who} onClose={() => setAccountOpen(false)} onRenamed={setUsername} />
       <Toaster />
     </div>
   );
