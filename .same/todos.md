@@ -45,7 +45,26 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
       GOTCHA: 3 dev supervisors were running at once (DB corruption cause); pkill doesn't stop them, kill -9 does.
 - [ ] B Inbox — poll Unibox, threads, classify, fully-automatic replies, Inbox UI, playground endpoint
 - [ ] C Campaigns — offer -> ICP -> discover -> research -> contact -> verify -> write -> Instantly, UI
-- [ ] D Agent tab — voice/tone, auto-reply, KB, sending policy, integrations, playground UI, activity
+- [x] D Agent tab (2026-10-21, built directly, NOT pushed)
+  - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
+    `decideReply(settings, {category, confidence, autoRepliesInThread})` -> send|draft|handoff|silent + reason
+    + delay (THE function the Inbox workstream must call), `resolveAgentSettings(patch)` (preview, never writes);
+    sanitize now filters hand-off ids to known + always adds locked, coerces booleans, caps string lengths;
+    getAgentSettings clones the defaults (sanitize used to mutate DEFAULT_AGENT_SETTINGS in place).
+    `agent-preview.ts`: fixed fictional prospect + inbound question, `buildSamplePrompt`, `readSample`.
+    `testProvider(p, key?)`, `testReacher(override?)`; `/integrations/test` accepts key/url/secret (test
+    BEFORE save); `/integrations` adds `instantly.mailboxes {total, sending}`.
+    Routes: `GET /api/v2/agent/meta`, `POST /api/v2/agent/rules/preview`, `POST /api/v2/agent/voice/preview`.
+  - Frontend: `lib/v2/agent.ts`; `screens/Agent.tsx` = 3 tile-tabs (Connections / Voice & tone / Auto-reply)
+    · one draft + sticky save bar (Cmd/Ctrl+S, beforeunload) · live prompt with changed-line flash · sample
+    writer (needs AI key) · rule board + scenario tester against the UNSAVED draft.
+  - GLOBAL FIX: `index.css` `* { border-color }` moved into `@layer base`. Unlayered, it beat every Tailwind
+    border utility app-wide (border-accent/brand/keepl/wnl, focus:border-accent all rendered grey).
+  - Verified: 55/55 logic checks (mock LLM, own SQLite), 13/13 HTTP checks (fake Reacher), both tsc,
+    screenshots dark + light + 390px via headless Chromium (libs unpacked to /tmp, no root).
+  - Env (twice this session): snapshot restore corrupts data.sqlite + empties node_modules ->
+    `.same/corrupt-db-backup-11/`, `-12/`; reinstall; ONE `bun run dev` (log /tmp/dev.log).
+  - Known: shell polls `/api/v2/inbox/counts` -> 404 until workstream B exists (console noise only).
 - [ ] Integrate: static imports, typecheck, end-to-end mock run, design review, version
 
 ---

@@ -97,7 +97,12 @@
   --color-keepl: var(--keepl);
 }
 
-* { border-color: var(--line2); }
+/* Default border colour. MUST live in a layer: unlayered CSS beats every
+   Tailwind utility, which silently turned border-accent / border-brand /
+   focus:border-accent / border-wnl … grey everywhere. */
+@layer base {
+  * { border-color: var(--line2); }
+}
 html, body, #root { min-height: 100%; }
 body {
   margin: 0;
@@ -252,6 +257,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
   /* 16px or iOS zooms the page in on every tap into a field. */
   input, select, textarea { font-size: 16px !important; }
 }
+
+/* Agent tab: unsaved-changes bar slides up from the bottom edge. */
+.savebar { animation: savebar-in 0.22s ease-out; }
+@keyframes savebar-in { from { transform: translateY(100%); } to { transform: translateY(0); } }
 
 /* Divider between the AI-agent tabs and the classic tools. */
 .tabsep { width: 1px; align-self: center; height: 18px; background: var(--line2); margin: 0 8px; flex: 0 0 1px; }

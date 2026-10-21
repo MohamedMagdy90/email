@@ -94,8 +94,11 @@ async function reacherCheck(email: string, cfg: { url: string; secret: string })
 }
 
 /** Is the Reacher server reachable and answering? */
-export async function testReacher(): Promise<{ ok: boolean; error?: string; sample?: string }> {
-  const cfg = await getReacherConfig();
+export async function testReacher(
+  /** Test these values instead of the saved ones (checked before saving). */
+  override?: { url: string; secret?: string }
+): Promise<{ ok: boolean; error?: string; sample?: string }> {
+  const cfg = override?.url ? { url: override.url.trim().replace(/\/+$/, ""), secret: (override.secret || "").trim() } : await getReacherConfig();
   if (!cfg) return { ok: false, error: "No Reacher URL saved" };
   const r = await reacherCheck("postmaster@gmail.com", cfg);
   if (!r) return { ok: false, error: `Could not reach ${cfg.url}/v0/check_email (check the URL, secret and that the server is running)` };

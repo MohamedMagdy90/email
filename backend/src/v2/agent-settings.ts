@@ -61,6 +61,206 @@ export interface AgentSettings {
   language: "auto" | "en" | "ar";
 }
 
+/* --------------------------- reply categories --------------------------- */
+// What the inbox classifier can call a reply, and what the agent does with it.
+// The Inbox workstream classifies into these ids and calls decideReply().
+//   reply   the agent writes an answer (subject to mode, hand-off, guardrails)
+//   silent  housekeeping only — no email goes out (stop / block / pause)
+//   human   always handed to a person; can't be switched to automatic
+
+export type ReplyCategoryId =
+  | "interested"
+  | "question"
+  | "not_now"
+  | "referral"
+  | "not_interested"
+  | "negotiation"
+  | "complaint"
+  | "legal"
+  | "needs_human"
+  | "unsubscribe"
+  | "out_of_office"
+  | "bounce";
+
+export interface ReplyCategory {
+  id: ReplyCategoryId;
+  label: string;
+  /** What the prospect's message looks like. */
+  description: string;
+  kind: "reply" | "silent" | "human";
+  /** Low-risk: "Safe replies only" mode may send these without approval. */
+  safe: boolean;
+  /** Always handed to a person, whatever the settings say. */
+  locked?: boolean;
+  /** What the agent writes / does when it handles it automatically. */
+  handling: string;
+}
+
+export const REPLY_CATEGORIES: ReplyCategory[] = [
+  {
+    id: "interested",
+    label: "Interested",
+    description: "Wants a call, a demo or the next step.",
+    kind: "reply",
+    safe: false,
+    handling: "Proposes a time and adds your booking link.",
+  },
+  {
+    id: "question",
+    label: "Question",
+    description: "Asks about price, features, Arabic, ZATCA, fit.",
+    kind: "reply",
+    safe: false,
+    handling: "Answers from the knowledge base only, then asks one question back.",
+  },
+  {
+    id: "not_now",
+    label: "Not now",
+    description: "Timing is wrong, asks you to come back later.",
+    kind: "reply",
+    safe: true,
+    handling: "Thanks them and confirms when it will check back.",
+  },
+  {
+    id: "referral",
+    label: "Referral",
+    description: "Points to a colleague who handles this.",
+    kind: "reply",
+    safe: true,
+    handling: "Thanks them and asks for a short intro to that person.",
+  },
+  {
+    id: "not_interested",
+    label: "Not interested",
+    description: "A clear, polite no.",
+    kind: "reply",
+    safe: true,
+    handling: "Stops the sequence. Sends a one-line thank-you only if you allow it.",
+  },
+  {
+    id: "negotiation",
+    label: "Negotiation",
+    description: "Discounts, contracts, payment terms, custom deals.",
+    kind: "reply",
+    safe: false,
+    handling: "Answers within the knowledge base; never offers a discount.",
+  },
+  {
+    id: "complaint",
+    label: "Complaint",
+    description: "Annoyed, or says the email is spam.",
+    kind: "reply",
+    safe: false,
+    handling: "Apologises briefly and confirms they won't be emailed again.",
+  },
+  {
+    id: "legal",
+    label: "Legal or data request",
+    description: "Data-protection requests, legal language, threats.",
+    kind: "human",
+    safe: false,
+    locked: true,
+    handling: "Always comes to you. The sequence stops straight away.",
+  },
+  {
+    id: "needs_human",
+    label: "Unclear",
+    description: "Doesn't fit anything above, or the agent can't tell.",
+    kind: "human",
+    safe: false,
+    locked: true,
+    handling: "Always comes to you.",
+  },
+  {
+    id: "unsubscribe",
+    label: "Unsubscribe",
+    description: "Asks to stop or be removed.",
+    kind: "silent",
+    safe: true,
+    handling: "Stops everything and blocks the address in Instantly. No reply.",
+  },
+  {
+    id: "out_of_office",
+    label: "Out of office",
+    description: "Auto-responder: away, on leave, changed jobs.",
+    kind: "silent",
+    safe: true,
+    handling: "Pauses the sequence until their return date. No reply.",
+  },
+  {
+    id: "bounce",
+    label: "Bounce",
+    description: "Delivery failure from a mail server.",
+    kind: "silent",
+    safe: true,
+    handling: "Marks the address undeliverable. No reply.",
+  },
+];
+
+export type ReplyAction = "send" | "draft" | "handoff" | "silent";
+
+export interface ReplyDecision {
+  action: ReplyAction;
+  /** Plain-English why, shown in the UI and logged by the inbox. */
+  reason: string;
+  /** For `send`: wait a random number of minutes in this window first. */
+  delayMinutes?: [number, number];
+}
+
+/**
+ * The one place that decides what happens to a classified reply.
+ * Pure — no I/O — so the Agent tab can preview it with unsaved settings.
+ */
+export function decideReply(
+  s: AgentSettings,
+  input: { category: string; confidence?: number; autoRepliesInThread?: number }
+): ReplyDecision {
+  const cat = REPLY_CATEGORIES.find((c) => c.id === input.category) || REPLY_CATEGORIES.find((c) => c.id === "needs_human")!;
+  const a = s.autoReply;
+  const rawConf = Number(input.confidence ?? 1);
+  const confidence = Number.isFinite(rawConf) ? Math.min(1, Math.max(0, rawConf)) : 0; // garbage -> hand to a human
+  const rawSent = Number(input.autoRepliesInThread ?? 0);
+  const sent = Number.isFinite(rawSent) ? Math.max(0, Math.floor(rawSent)) : 0;
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+
+  // Housekeeping happens even with auto-reply off — it protects the domains.
+  if (cat.kind === "silent") return { action: "silent", reason: cat.handling };
+  if (cat.id === "not_interested" && !a.acknowledgeNotInterested) {
+    return { action: "silent", reason: "Stops the sequence and sends nothing, because acknowledging a no is switched off." };
+  }
+  if (cat.locked) return { action: "handoff", reason: `${cat.label} always comes to you.` };
+  if (!a.enabled) return { action: "handoff", reason: "Auto-reply is off, so every reply waits for you." };
+  if (a.handoffCategories.includes(cat.id)) return { action: "handoff", reason: `You chose to handle ${cat.label.toLowerCase()} replies yourself.` };
+  if (confidence < a.minConfidence) {
+    return {
+      action: "handoff",
+      reason: `The agent is only ${pct(confidence)} sure this is "${cat.label}", under your ${pct(a.minConfidence)} bar.`,
+    };
+  }
+  if (sent >= a.maxPerThread) {
+    return {
+      action: "handoff",
+      reason:
+        a.maxPerThread === 0
+          ? "Auto-replies per thread is set to 0, so the agent never sends on its own."
+          : `The agent already sent ${sent} auto-repl${sent === 1 ? "y" : "ies"} in this thread (limit ${a.maxPerThread}).`,
+    };
+  }
+  if (a.mode === "drafts") return { action: "draft", reason: "Drafts only: the reply is written and waits for you to press send." };
+  if (a.mode === "safe" && !cat.safe) {
+    return { action: "draft", reason: `Safe replies only: ${cat.label.toLowerCase()} is not on the low-risk list, so it's drafted for approval.` };
+  }
+  const delay: [number, number] = [a.delayMinMinutes, a.delayMaxMinutes];
+  return {
+    action: "send",
+    reason:
+      delay[1] > 0
+        ? `Sent ${delay[0] === delay[1] ? `${delay[0]}` : `${delay[0]}–${delay[1]}`} minutes after it arrives, from the same mailbox and thread.`
+        : "Sent straight away, from the same mailbox and thread.",
+    delayMinutes: delay,
+  };
+}
+
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
   senderName: "",
   senderTitle: "",
@@ -128,6 +328,19 @@ function sanitize(s: AgentSettings): AgentSettings {
   s.autoReply.delayMinMinutes = clamp(s.autoReply.delayMinMinutes, 0, 600, d.autoReply.delayMinMinutes);
   s.autoReply.delayMaxMinutes = Math.max(s.autoReply.delayMinMinutes, clamp(s.autoReply.delayMaxMinutes, 0, 1440, d.autoReply.delayMaxMinutes));
   if (!Array.isArray(s.autoReply.handoffCategories)) s.autoReply.handoffCategories = d.autoReply.handoffCategories;
+  // Known ids only, de-duplicated; the locked ones are always in the list.
+  const known = new Set<string>(REPLY_CATEGORIES.map((c) => c.id));
+  const locked = REPLY_CATEGORIES.filter((c) => c.locked).map((c) => c.id);
+  s.autoReply.handoffCategories = [...new Set([...s.autoReply.handoffCategories.map(String).filter((c) => known.has(c)), ...locked])];
+  s.autoReply.enabled = !!s.autoReply.enabled;
+  s.autoReply.acknowledgeNotInterested = !!s.autoReply.acknowledgeNotInterested;
+  s.sending.allowRoleAddresses = !!s.sending.allowRoleAddresses;
+  s.sending.allowUnverifiedGuesses = !!s.sending.allowUnverifiedGuesses;
+  for (const k of ["senderName", "senderTitle", "companyName", "website", "signature", "bookingLink", "knowledgeBase"] as const) {
+    s[k] = String(s[k] ?? "").slice(0, k === "knowledgeBase" ? 20000 : k === "signature" ? 2000 : 300);
+  }
+  s.tone.styleNotes = String(s.tone.styleNotes ?? "").slice(0, 2000);
+  s.tone.avoid = String(s.tone.avoid ?? "").slice(0, 2000);
   s.sending.maxCatchAllShare = clamp(s.sending.maxCatchAllShare, 0, 1, d.sending.maxCatchAllShare);
   s.sending.minFitScore = clamp(s.sending.minFitScore, 0, 100, d.sending.minFitScore);
   if (!["auto", "en", "ar"].includes(s.language)) s.language = d.language;
@@ -136,7 +349,15 @@ function sanitize(s: AgentSettings): AgentSettings {
 
 export async function getAgentSettings(): Promise<AgentSettings> {
   const saved = parseJson<Partial<AgentSettings>>(await getSetting("agent_settings"), {});
-  return sanitize(mergeDeep(DEFAULT_AGENT_SETTINGS, saved));
+  // Clone: sanitize() writes in place and must never touch the shared defaults.
+  return sanitize(mergeDeep(structuredClone(DEFAULT_AGENT_SETTINGS), saved));
+}
+
+/** Saved settings with an unsaved patch on top — for previews. Never writes. */
+export async function resolveAgentSettings(patch?: Partial<AgentSettings> | null): Promise<AgentSettings> {
+  const base = await getAgentSettings();
+  if (!patch || typeof patch !== "object") return base;
+  return sanitize(mergeDeep(base, structuredClone(patch)));
 }
 
 export async function saveAgentSettings(patch: Partial<AgentSettings>): Promise<AgentSettings> {

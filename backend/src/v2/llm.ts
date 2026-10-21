@@ -409,9 +409,13 @@ export async function aiStatus() {
 }
 
 /** Fire one tiny prompt at one provider to validate a key. */
-export async function testProvider(provider: LlmProvider): Promise<{ ok: boolean; model?: string; error?: string; ms?: number }> {
+export async function testProvider(
+  provider: LlmProvider,
+  /** Test this key instead of the saved one (checked before saving). */
+  keyOverride?: string
+): Promise<{ ok: boolean; model?: string; error?: string; ms?: number }> {
   const cfg = await getLlmConfig();
-  const key = cfg.keys[provider];
+  const key = (keyOverride || "").trim() || cfg.keys[provider];
   if (!key) return { ok: false, error: "No key saved" };
   const t0 = Date.now();
   const req: LlmRequest = { prompt: 'Reply with the JSON {"ok":true}', json: true, tier: "fast", maxTokens: 50 };

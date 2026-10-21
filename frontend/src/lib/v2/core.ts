@@ -26,7 +26,7 @@ export interface Integrations {
     usage: { calls: number; errors: number; byProvider: Record<string, number> };
   };
   keys: { gemini: string; groq: string; openrouter: string; instantly: string };
-  instantly: { configured: boolean };
+  instantly: { configured: boolean; mailboxes?: { total: number; sending: number } };
   reacher: { configured: boolean; url: string; hasSecret: boolean };
 }
 
