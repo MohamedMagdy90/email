@@ -8,8 +8,10 @@ import { cleanEmail, isValidEmail } from "../../crawler/validate";
 import { normalizeCountry } from "../../country";
 import { detectLanguage, fetchPage, metaDescription, nameFromTitle, phoneFrom, pickLinks, titleOf } from "./web";
 import { researchJson, str, strList, type ResearchJson, type Row } from "./types";
+import { classifyIndustry, sizeFromText } from "../targeting/taxonomy";
 
 export const RESEARCH_TTL_DAYS = 90;
+const SITE_TEXT_MAX = 8000;
 
 const PEOPLE_PAGES = [
   /team|leadership|management|board|founder|our-people|executive|directors/,
@@ -56,13 +58,17 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
   const heuristicName = co.name || nameFromTitle(title, domain);
   const heuristicDesc = metaDescription(home.html) || home.text.split("\n").find((l) => l.length > 60 && l.length < 300) || null;
   const sources = pages.map((p) => p.url);
+  // Kept for the target check (keywords, size, industry): the visible text of the pages read.
+  const siteText = pages.map((p) => p.text).join("\n").slice(0, SITE_TEXT_MAX);
 
   if (!opts.ai) {
     const rj: ResearchJson = { hooks: [], people: [], emailsOnSite, sources };
+    const size = sizeFromText(null, siteText);
+    const industry = classifyIndustry({ name: heuristicName, description: heuristicDesc, text: siteText });
     await q(
       `UPDATE companies SET name = ?, description = COALESCE(description, ?), phone = ?, emails_json = ?, research_json = ?, language = ?,
-              research_status = 'partial', researched_at = ?, updated_at = ? WHERE id = ?`,
-      [heuristicName, heuristicDesc, phone, JSON.stringify(emailsOnSite), JSON.stringify(rj), language, now, now, co.id]
+              site_text = ?, size_band = ?, industry_id = ?, research_status = 'partial', researched_at = ?, updated_at = ? WHERE id = ?`,
+      [heuristicName, heuristicDesc, phone, JSON.stringify(emailsOnSite), JSON.stringify(rj), language, siteText, size.band, industry.id, now, now, co.id]
     );
     return { status: "partial", note: `Read ${pages.length} page(s) of ${domain} without AI: ${emailsOnSite.length} address(es) found, no people yet.` };
   }
@@ -97,14 +103,21 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
   const rj: ResearchJson = { hooks: strList(d.hooks, 4, 300), people, emailsOnSite, sources, summary: str(d.description, 500) || undefined };
   const linkedin = typeof d.linkedinUrl === "string" && /linkedin\.com\/company\//i.test(d.linkedinUrl) ? d.linkedinUrl.slice(0, 300) : co.linkedin_url || null;
   const country = normalizeCountry(str(d.country, 60)) || str(d.country, 60) || co.country || null;
+  const name = str(d.name, 120) || heuristicName;
+  const description = str(d.description, 500) || heuristicDesc;
+  const aiIndustry = str(d.industry, 80) || co.industry || null;
+  const sizeHint = str(d.sizeHint, 80) || null;
+  const size = sizeFromText(sizeHint, siteText);
+  const industry = classifyIndustry({ aiIndustry, name, description, text: siteText });
   await q(
     `UPDATE companies SET name = ?, description = ?, industry = ?, size_hint = ?, city = ?, country = ?, phone = ?, linkedin_url = ?,
-            emails_json = ?, people_json = ?, research_json = ?, language = ?, research_status = 'ok', researched_at = ?, updated_at = ? WHERE id = ?`,
+            emails_json = ?, people_json = ?, research_json = ?, language = ?, site_text = ?, size_band = ?, industry_id = ?,
+            research_status = 'ok', researched_at = ?, updated_at = ? WHERE id = ?`,
     [
-      str(d.name, 120) || heuristicName,
-      str(d.description, 500) || heuristicDesc,
-      str(d.industry, 80) || co.industry || null,
-      str(d.sizeHint, 80) || null,
+      name,
+      description,
+      aiIndustry,
+      sizeHint,
       str(d.city, 80) || co.city || null,
       country,
       phone,
@@ -113,6 +126,9 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
       JSON.stringify(people),
       JSON.stringify(rj),
       ["en", "ar", "mixed"].includes(d.language) ? d.language : language,
+      siteText,
+      size.band,
+      industry.id,
       now,
       now,
       co.id,

@@ -5,6 +5,7 @@ import { llm } from "../llm";
 import type { SendingPolicy } from "../agent-settings";
 import { suppressionReason } from "./suppression";
 import { offerText, type Offer, type ResearchJson, type Row } from "./types";
+import { describeTargeting, type EffectiveTargeting } from "../targeting/market";
 
 export interface VerifyOutcome {
   verdict: "ok" | "skip" | "hold";
@@ -38,7 +39,12 @@ export async function verifyProspect(p: Row, policy: SendingPolicy): Promise<Ver
 }
 
 /** AI errors propagate so the pass can stop AI work. */
-export async function scoreProspect(p: Row, company: Row, research: ResearchJson, seg: Row | null, offer: Offer | null): Promise<{ score: number; reason: string }> {
+export async function scoreProspect(p: Row, company: Row, research: ResearchJson, seg: Row | null, offer: Offer | null, eff?: EffectiveTargeting | null): Promise<{ score: number; reason: string }> {
+  const target = eff
+    ? `Target: ${seg ? `${seg.name}${seg.description ? ` — ${seg.description}` : ""}. ` : ""}${describeTargeting(eff)}`
+    : seg
+      ? `Target segment: ${seg.name} — ${seg.description || ""} Industries: ${seg.industries_json || "[]"}. Countries: ${seg.countries_json || "[]"}. Size: ${seg.company_size || "any"}.`
+      : "";
   const r = await llm<any>({
     tier: "fast",
     json: true,
@@ -48,7 +54,7 @@ export async function scoreProspect(p: Row, company: Row, research: ResearchJson
     prompt: [
       "Offer:",
       offerText(offer) || "(cloud ERP for SMEs in the Gulf)",
-      seg ? `Target segment: ${seg.name} — ${seg.description || ""} Industries: ${seg.industries_json || "[]"}. Countries: ${seg.countries_json || "[]"}. Size: ${seg.company_size || "any"}.` : "",
+      target,
       `Company: ${company.name || company.domain} (${company.domain}). ${company.description || ""} Industry: ${company.industry || "unknown"}. Size: ${company.size_hint || "unknown"}. Location: ${[company.city, company.country].filter(Boolean).join(", ") || "unknown"}.`,
       research.hooks.length ? `Facts: ${research.hooks.join("; ")}` : "",
       `Contact: ${p.full_name || "role address"}${p.title ? `, ${p.title}` : ""}.`,

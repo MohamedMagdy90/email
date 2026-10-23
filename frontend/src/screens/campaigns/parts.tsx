@@ -4,6 +4,25 @@ import { Badge, Field, Textarea, cn } from "../../lib/ui";
 import { STAGE_LABEL, type CampaignReadiness, type CampaignStatus, type Funnel, type ProspectStage } from "../../lib/v2/campaigns";
 
 export const goTab = (t: string) => window.dispatchEvent(new CustomEvent("dna-tab", { detail: t }));
+/** Open one campaign in the Campaigns tab (from Leads, Dashboard, Targeting…). */
+export const openCampaign = (id: string) => {
+  try {
+    localStorage.setItem("dnaCampaignOpen", id);
+  } catch {
+    /* private mode */
+  }
+  window.dispatchEvent(new CustomEvent("dna-open-campaign", { detail: id }));
+  goTab("campaigns");
+};
+/** Open one thread in the Inbox tab. */
+export const openThread = (id: string) => {
+  try {
+    localStorage.setItem("dnaInboxOpen", id);
+  } catch {
+    /* private mode */
+  }
+  goTab("inbox");
+};
 export const QUIET = "bg-hov text-ink ring-1 ring-inset ring-line-strong";
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 export const errMsg = (e: unknown) => String((e as any)?.message || e || "Something went wrong");

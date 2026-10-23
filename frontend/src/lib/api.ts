@@ -1,4 +1,6 @@
 const BASE = (import.meta as any).env?.VITE_API_URL || "";
+/** For raw fetches (CSV downloads) that can't go through req(). */
+export const API_BASE: string = BASE;
 
 /* ------------------------------- Auth ------------------------------- */
 const TOKEN_KEY = "dna_auth_token";

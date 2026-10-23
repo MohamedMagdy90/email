@@ -47,18 +47,44 @@ export async function ownDomains(): Promise<Set<string>> {
   return set;
 }
 
+/** The global do-not-contact entry for a domain (or a parent domain), if any. */
+async function excludedDomain(d: string): Promise<{ value: string; reason: string | null } | null> {
+  const parts = d.split(".");
+  const candidates: string[] = [];
+  for (let i = 0; i < parts.length - 1; i++) candidates.push(parts.slice(i).join("."));
+  try {
+    const r = (await q(`SELECT value, reason FROM exclusions WHERE kind = 'domain' AND value IN (${candidates.map(() => "?").join(",")}) LIMIT 1`, candidates))[0];
+    return r ? { value: String(r.value), reason: r.reason ? String(r.reason) : null } : null;
+  } catch {
+    return null; // table not migrated yet
+  }
+}
+
 /** Why a company domain may not be contacted at all, or null. */
 export async function domainBlockReason(domain: string, settings: CampaignSettings): Promise<string | null> {
   const d = domain.toLowerCase();
   if ((await ownDomains()).has(d)) return "That's one of our own domains";
   if (settings.excludeDomains.some((x) => d === x || d.endsWith(`.${x}`))) return "On this campaign's do-not-contact list";
+  const ex = await excludedDomain(d);
+  if (ex) return `On the do-not-contact list${ex.reason ? ` (${ex.reason})` : ""}`;
   return null;
 }
 
 /** Why this address must not be emailed by this campaign, or null when it's fine. */
-export async function suppressionReason(email: string, campaignId: string, prospectId?: string): Promise<string | null> {
+export async function suppressionReason(email: string, campaignId: string, prospectId?: string, companyId?: string | null): Promise<string | null> {
   const e = String(email || "").trim().toLowerCase();
   if (!e) return "No address";
+
+  // 0. The global do-not-contact list (the address, or its domain).
+  try {
+    const ex = (await q(`SELECT reason FROM exclusions WHERE kind = 'email' AND value = ? LIMIT 1`, [e]))[0];
+    if (ex) return `On the do-not-contact list${ex.reason ? ` (${ex.reason})` : ""}`;
+  } catch {
+    /* table not migrated yet */
+  }
+  const dom = e.split("@")[1] || "";
+  const exDom = dom ? await excludedDomain(dom) : null;
+  if (exDom) return `${exDom.value} is on the do-not-contact list${exDom.reason ? ` (${exDom.reason})` : ""}`;
 
   // 1. The old Resend console: people who unsubscribed or bounced there.
   try {
@@ -88,6 +114,22 @@ export async function suppressionReason(email: string, campaignId: string, prosp
     if (r.campaign_id === campaignId) continue;
     const when = String(r.sent_at || r.queued_at || r.updated_at || "");
     if (CONTACTED_STAGES.includes(r.stage) && when >= cutoff) return `Already contacted by "${r.campaign_name || "another campaign"}" in the last ${CONTACT_WINDOW_DAYS} days`;
+  }
+
+  // 2b. One conversation per company: another campaign is already talking to this company.
+  // (A prospect id names the company; an import passes the company id directly.)
+  if (prospectId || companyId) {
+    const coId = prospectId ? (await q(`SELECT company_id FROM prospects WHERE id = ?`, [prospectId]))[0]?.company_id : companyId;
+    if (coId) {
+      const other = (
+        await q(
+          `SELECT p.stage, p.sent_at, p.queued_at, p.updated_at, c.name AS campaign_name FROM prospects p LEFT JOIN campaigns c ON c.id = p.campaign_id
+            WHERE p.company_id = ? AND p.campaign_id <> ? AND p.id <> ?`,
+          [coId, campaignId, prospectId || ""]
+        )
+      ).find((r) => CONTACTED_STAGES.includes(r.stage) && String(r.sent_at || r.queued_at || r.updated_at || "") >= cutoff);
+      if (other) return `"${other.campaign_name || "Another campaign"}" is already in touch with this company (one conversation per company)`;
+    }
   }
 
   // 3. The inbox: a reply classified as unsubscribe / complaint / legal.

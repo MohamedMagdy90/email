@@ -1,5 +1,6 @@
 import {
   createContext,
+  forwardRef,
   useContext,
   useEffect,
   useState,
@@ -229,9 +230,9 @@ export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={cn(fieldBase, props.className)} />;
 }
 
-export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea {...props} className={cn(fieldBase, "resize-y leading-relaxed", props.className)} />;
-}
+export const Textarea = forwardRef<HTMLTextAreaElement, React.TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea(props, ref) {
+  return <textarea ref={ref} {...props} className={cn(fieldBase, "resize-y leading-relaxed", props.className)} />;
+});
 
 export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return <select {...props} className={cn(fieldBase, "cursor-pointer pr-8", props.className)} />;

@@ -4,18 +4,25 @@ import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
 import Setup from "./screens/Setup";
 import Inbox from "./screens/Inbox";
+import Leads from "./screens/Leads";
 import Campaigns from "./screens/Campaigns";
+import Targeting from "./screens/Targeting";
+import Sequences from "./screens/Sequences";
 import Mailboxes from "./screens/Mailboxes";
 import Agent from "./screens/Agent";
 import AccountDialog from "./screens/Account";
 import { req } from "./lib/api";
 
-type Tab = "inbox" | "campaigns" | "mailboxes" | "agent";
+type Tab = "inbox" | "leads" | "campaigns" | "targeting" | "sequences" | "mailboxes" | "agent";
 
-const TABS: { id: Tab; label: string }[] = [
+// Groups: work (inbox, leads) | set up (campaigns, targeting) | infrastructure (mailboxes, agent).
+const TABS: { id: Tab; label: string; sepBefore?: boolean }[] = [
   { id: "inbox", label: "Inbox" },
-  { id: "campaigns", label: "Campaigns" },
-  { id: "mailboxes", label: "Mailboxes" },
+  { id: "leads", label: "Leads" },
+  { id: "campaigns", label: "Campaigns", sepBefore: true },
+  { id: "targeting", label: "Targeting" },
+  { id: "sequences", label: "Sequences" },
+  { id: "mailboxes", label: "Mailboxes", sepBefore: true },
   { id: "agent", label: "Agent" },
 ];
 
@@ -90,8 +97,9 @@ export default function App() {
     return () => window.removeEventListener(TAB_EVENT, h);
   }, []);
 
-  // Inbox badge: unread + needs-a-human counts, polled like the leads console.
+  // Badges: Inbox = unread + needs a human; Leads = emails waiting for review. Polled like the leads console.
   const [inboxCount, setInboxCount] = useState<{ unread: number; needsHuman: number }>({ unread: 0, needsHuman: 0 });
+  const [reviewCount, setReviewCount] = useState(0);
   useEffect(() => {
     if (!authed) return;
     let alive = true;
@@ -99,6 +107,9 @@ export default function App() {
       if (document.hidden) return;
       req<{ unread: number; needsHuman: number }>("/api/v2/inbox/counts")
         .then((r) => alive && setInboxCount({ unread: Number(r.unread) || 0, needsHuman: Number(r.needsHuman) || 0 }))
+        .catch(() => {});
+      req<{ review: number }>("/api/v2/leads/counts")
+        .then((r) => alive && setReviewCount(Number(r.review) || 0))
         .catch(() => {});
     };
     poll();
@@ -175,18 +186,21 @@ export default function App() {
 
         <nav className="tabs" aria-label="Sections">
           {TABS.map((t) => {
-            const badge = t.id === "inbox" ? inboxCount.unread + inboxCount.needsHuman : 0;
+            const badge = t.id === "inbox" ? inboxCount.unread + inboxCount.needsHuman : t.id === "leads" ? reviewCount : 0;
             return (
-              <button
-                key={t.id}
-                type="button"
-                className={tab === t.id ? "tab on" : "tab"}
-                onClick={() => setTab(t.id)}
-                aria-current={tab === t.id ? "page" : undefined}
-              >
-                {t.label}
-                {badge > 0 && <span className="badge">{badge > 99 ? "99+" : badge}</span>}
-              </button>
+              <span key={t.id} className="contents">
+                {t.sepBefore && <span className="tabsep" aria-hidden />}
+                <button
+                  type="button"
+                  className={tab === t.id ? "tab on" : "tab"}
+                  onClick={() => setTab(t.id)}
+                  aria-current={tab === t.id ? "page" : undefined}
+                  title={t.id === "leads" && badge ? `${badge} email${badge === 1 ? "" : "s"} waiting for review` : undefined}
+                >
+                  {t.label}
+                  {badge > 0 && <span className="badge">{badge > 99 ? "99+" : badge}</span>}
+                </button>
+              </span>
             );
           })}
         </nav>
@@ -194,7 +208,10 @@ export default function App() {
         <HeadSlot.Provider value={headEl}>
           <main>
             {tab === "inbox" && <Inbox />}
+            {tab === "leads" && <Leads />}
             {tab === "campaigns" && <Campaigns />}
+            {tab === "targeting" && <Targeting />}
+            {tab === "sequences" && <Sequences />}
             {tab === "mailboxes" && <Mailboxes />}
             {tab === "agent" && <Agent />}
           </main>

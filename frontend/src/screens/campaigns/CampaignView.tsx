@@ -1,13 +1,16 @@
 // One campaign: status and actions, funnel, what's waiting, and the tabs.
 import { useCallback, useEffect, useState } from "react";
-import { Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Textarea, cn, toast } from "../../lib/ui";
+import { Button, Card, Field, Input, PageHeader, Select, Spinner, cn, toast } from "../../lib/ui";
 import { ago, v2, type AgentEvent } from "../../lib/v2/core";
-import { campaignsApi, type CampaignDetail, type CampaignSettings, type Offer, type RunResult, type SegmentInput, type StageGroup } from "../../lib/v2/campaigns";
-import { OfferForm, OfferSource, SegmentCard, SegmentEditor, SettingsForm } from "./forms";
-import { LeadPanel, LeadsTab, ReviewTab } from "./Leads";
-import { Empty, StatusChip, errMsg, plural, reached, replies } from "./parts";
+import { campaignsApi, type CampaignDetail, type CampaignSettings, type Offer, type RunResult, type StageGroup } from "../../lib/v2/campaigns";
+import { OfferForm, OfferSource, SettingsForm } from "./forms";
+import { LeadsTab, ReviewTab } from "./Leads";
+import LeadDrawer from "../leads/LeadDrawer";
+import { Empty, StatusChip, errMsg, reached, replies } from "./parts";
+import TargetingPanel from "../targeting/TargetingPanel";
+import SequenceEditor from "../sequences/Editor";
 
-type Tab = "review" | "leads" | "segments" | "offer" | "settings" | "activity";
+type Tab = "review" | "leads" | "sequence" | "targeting" | "offer" | "settings" | "activity";
 
 export default function CampaignView({ id, onBack, onResumeSetup }: { id: string; onBack: () => void; onResumeSetup: (id: string) => void }) {
   const [c, setC] = useState<CampaignDetail | null>(null);
@@ -82,7 +85,8 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
   const tabs: { id: Tab; label: string; badge?: number }[] = [
     { id: "review", label: "Review", badge: c.reviewCount },
     { id: "leads", label: "Leads" },
-    { id: "segments", label: "Segments" },
+    { id: "sequence", label: "Sequence" },
+    { id: "targeting", label: "Targeting" },
     { id: "offer", label: "Offer" },
     { id: "settings", label: "Settings" },
     { id: "activity", label: "Activity" },
@@ -218,162 +222,14 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
 
       {tab === "review" && <ReviewTab c={c} version={version} onChanged={load} onOpenLead={setLead} />}
       {tab === "leads" && <LeadsTab c={c} version={version} group={group} setGroup={setGroup} onOpenLead={setLead} />}
-      {tab === "segments" && <SegmentsTab c={c} reload={refresh} />}
+      {tab === "sequence" && <SequenceEditor campaignId={c.id} onSaved={() => setVersion((v) => v + 1)} />}
+      {tab === "targeting" && <TargetingPanel c={c} reload={refresh} onCampaign={setC} initial={c.segmentList.length ? "segments" : "market"} />}
       {tab === "offer" && <OfferTab c={c} onSaved={setC} />}
       {tab === "settings" && <SettingsTab c={c} onSaved={setC} onArchived={onBack} />}
       {tab === "activity" && <ActivityTab id={c.id} version={version} />}
 
-      {lead && <LeadPanel c={c} pid={lead} onClose={() => setLead(null)} onChanged={refresh} />}
+      {lead && <LeadDrawer pid={lead} onClose={() => setLead(null)} onChanged={refresh} />}
     </div>
-  );
-}
-
-/* ------------------------------- segments ------------------------------ */
-
-function SegmentsTab({ c, reload }: { c: CampaignDetail; reload: () => Promise<void> }) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const [adding, setAdding] = useState<SegmentInput | null>(null);
-  const [paste, setPaste] = useState(false);
-  const act = async (key: string, fn: () => Promise<unknown>, msg?: string) => {
-    setBusy(key);
-    try {
-      await fn();
-      if (msg) toast(msg, "success");
-      await reload();
-    } catch (e) {
-      toast(errMsg(e), "error");
-    } finally {
-      setBusy(null);
-    }
-  };
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-[13px] text-muted">The agent walks each enabled segment's searches in turn and adds the companies it finds.</p>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={() => setPaste(true)}>
-            Add companies
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => setAdding({ name: "", countries: ["Saudi Arabia"], titles: [], queries: [] })}>
-            Add by hand
-          </Button>
-          <Button
-            size="sm"
-            loading={busy === "suggest"}
-            onClick={() =>
-              act("suggest", async () => {
-                const r = await campaignsApi.proposeSegments(c.id, 3);
-                if (r.warning) toast(r.warning, "info");
-              })
-            }
-          >
-            Suggest more
-          </Button>
-        </div>
-      </div>
-      {adding && (
-        <Card className="p-4 sm:p-5">
-          <SegmentEditor value={adding} onChange={setAdding} />
-          <div className="mt-4 flex justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => setAdding(null)}>
-              Cancel
-            </Button>
-            <Button size="sm" loading={busy === "add"} onClick={() => act("add", async () => (await campaignsApi.addSegment(c.id, adding), setAdding(null)), "Segment added.")}>
-              Add segment
-            </Button>
-          </div>
-        </Card>
-      )}
-      {!c.segmentList.length ? (
-        <Empty title="No segments" body="Without a segment the agent doesn't know who to look for. Ask for suggestions or add one by hand." />
-      ) : (
-        <div className="grid gap-3 lg:grid-cols-2">
-          {c.segmentList.map((s) => (
-            <SegmentCard
-              key={s.id}
-              seg={s}
-              stats
-              onToggle={(enabled) => act(`t-${s.id}`, () => campaignsApi.updateSegment(c.id, s.id, { enabled }))}
-              onSave={async (v) => {
-                await campaignsApi.updateSegment(c.id, s.id, v);
-                toast("Segment saved.", "success");
-                await reload();
-              }}
-              onDelete={() => act(`d-${s.id}`, () => campaignsApi.deleteSegment(c.id, s.id), "Segment deleted.")}
-            />
-          ))}
-        </div>
-      )}
-      {paste && <AddCompanies c={c} onClose={() => setPaste(false)} onDone={reload} />}
-    </div>
-  );
-}
-
-function AddCompanies({ c, onClose, onDone }: { c: CampaignDetail; onClose: () => void; onDone: () => Promise<void> }) {
-  const [text, setText] = useState("");
-  const [seg, setSeg] = useState(c.segmentList.find((s) => s.enabled)?.id || "");
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ added: number; skipped: { domain: string; reason: string }[] } | null>(null);
-  return (
-    <Modal open onClose={onClose} title="Add companies by hand">
-      {result ? (
-        <div className="space-y-3">
-          <p className="text-[13.5px]">
-            Added <b>{plural(result.added, "company", "companies")}</b>. They go through the same research, checks and review as the rest.
-          </p>
-          {result.skipped.length > 0 && (
-            <ul className="max-h-[240px] space-y-1 overflow-y-auto rounded-lg border border-line-soft bg-sunk px-3 py-2 text-[12.5px]">
-              {result.skipped.map((s) => (
-                <li key={s.domain}>
-                  <b>{s.domain}</b> <span className="text-muted">— {s.reason}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-          <div className="flex justify-end">
-            <Button onClick={onClose}>Done</Button>
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          <Field label="Websites or domains" hint="One per line. Directories, social pages and do-not-contact domains are dropped.">
-            <Textarea rows={7} value={text} onChange={(e) => setText(e.target.value)} placeholder={"alpha-trading.com\nhttps://www.beta-foods.sa"} />
-          </Field>
-          <Field label="Segment">
-            <Select value={seg} onChange={(e) => setSeg(e.target.value)}>
-              <option value="">No segment</option>
-              {c.segmentList.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button
-              loading={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  const r = await campaignsApi.addCompanies(c.id, { segmentId: seg || undefined, domains: text.split(/\n+/).map((s) => s.trim()).filter(Boolean) });
-                  setResult(r);
-                  await onDone();
-                } catch (e) {
-                  toast(errMsg(e), "error");
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              Add
-            </Button>
-          </div>
-        </div>
-      )}
-    </Modal>
   );
 }
 

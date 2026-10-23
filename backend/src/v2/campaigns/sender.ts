@@ -7,6 +7,11 @@ import { logEvent, parseJson, todayUtc } from "../events";
 import * as inst from "../instantly";
 import { getAgentSettings } from "../agent-settings";
 import { suppressionReason } from "./suppression";
+import { marketOf } from "../targeting/market";
+import { sequenceFor } from "../sequences/store";
+import { syncCampaignDaily } from "../dashboard/daily";
+import { applyLearning } from "../targeting/learning";
+import { stepsFromSettings, type SequenceStep } from "../sequences/model";
 import type { CampaignSettings, CampaignStatsT, ProspectEmails, Row } from "./types";
 
 export async function sendableMailboxes(): Promise<{ email: string; dailyLimit: number }[]> {
@@ -35,11 +40,17 @@ function scheduleFor(settings: CampaignSettings, country: string | null): inst.C
   };
 }
 
-export function instantlyPayload(c: Row, settings: CampaignSettings, country: string | null, mailboxes: { email: string; dailyLimit: number }[]): inst.CreateCampaignInput {
-  const steps: inst.CreateCampaignInput["sequences"][0]["steps"] = [{ type: "email", delay: 0, variants: [{ subject: "{{subject_1}}", body: "{{body_1}}" }] }];
-  for (let i = 0; i < settings.followUps; i++) {
-    steps.push({ type: "email", delay: settings.followUpDelays[i] || 3, delay_unit: "days", variants: [{ subject: "", body: `{{body_${i + 2}}}` }] });
-  }
+/** The Instantly sequence for our steps: each step's copy travels in the lead's custom variables. */
+export function instantlySteps(seq: SequenceStep[]): inst.CreateCampaignInput["sequences"][0]["steps"] {
+  return seq.map((s, i) =>
+    i === 0
+      ? { type: "email", delay: 0, variants: [{ subject: "{{subject_1}}", body: "{{body_1}}" }] }
+      : { type: "email", delay: s.delayDays || 3, delay_unit: "days", variants: [{ subject: s.newThread ? `{{subject_${i + 1}}}` : "", body: `{{body_${i + 1}}}` }] }
+  ) as inst.CreateCampaignInput["sequences"][0]["steps"];
+}
+
+export function instantlyPayload(c: Row, settings: CampaignSettings, country: string | null, mailboxes: { email: string; dailyLimit: number }[], seq?: SequenceStep[]): inst.CreateCampaignInput {
+  const steps = instantlySteps(seq?.length ? seq : stepsFromSettings(settings.followUps, settings.followUpDelays));
   return {
     name: `${c.name} · DNA`,
     campaign_schedule: { schedules: [scheduleFor(settings, country)] },
@@ -60,7 +71,23 @@ export function instantlyPayload(c: Row, settings: CampaignSettings, country: st
   };
 }
 
-async function campaignCountry(campaignId: string): Promise<string | null> {
+/**
+ * The country whose schedule the Instantly campaign uses (one schedule per
+ * campaign): where most of the leads that are going out are, else the first
+ * country of the target market.
+ */
+export async function campaignCountry(campaignId: string): Promise<string | null> {
+  const top = (
+    await q(
+      `SELECT co.country AS country, CAST(count(*) AS INTEGER) AS n FROM prospects p JOIN companies co ON co.id = p.company_id
+        WHERE p.campaign_id = ? AND p.stage IN ('written','approved','queued','sent') AND co.country IS NOT NULL
+        GROUP BY co.country ORDER BY n DESC LIMIT 1`,
+      [campaignId]
+    )
+  )[0];
+  if (top?.country) return String(top.country);
+  const c = (await q(`SELECT kind, targeting_json FROM campaigns WHERE id = ?`, [campaignId]))[0];
+  if (c) return marketOf(c).countries[0] || null;
   const seg = (await q(`SELECT countries_json FROM segments WHERE campaign_id = ? AND enabled = 1 ORDER BY created_at LIMIT 1`, [campaignId]))[0];
   return parseJson<string[]>(seg?.countries_json, [])[0] || null;
 }
@@ -76,7 +103,8 @@ export async function ensureInstantlyCampaign(c: Row, settings: CampaignSettings
     }
     return String(c.instantly_campaign_id);
   }
-  const created = await inst.createCampaign(instantlyPayload(c, settings, await campaignCountry(c.id), mailboxes));
+  const seq = await sequenceFor(String(c.id));
+  const created = await inst.createCampaign(instantlyPayload(c, settings, await campaignCountry(c.id), mailboxes, seq.steps));
   await q(`UPDATE campaigns SET instantly_campaign_id = ?, instantly_status = ?, updated_at = ? WHERE id = ?`, [created.id, created.status ?? 0, nowIso(), c.id]);
   await saveMailboxSet(c.id, emails);
   await logEvent("send", `Created the Instantly campaign "${c.name} · DNA" with ${emails.length} sending mailbox(es).`, { campaignId: c.id });
@@ -121,11 +149,14 @@ export async function pushApproved(c: Row, settings: CampaignSettings): Promise<
   }
 
   const policy = (await getAgentSettings()).sending;
+  const seq = (await sequenceFor(String(c.id))).steps;
   const todayCatchAll = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND queued_at >= ? AND catch_all = 1`, [c.id, `${todayUtc()}T00:00:00.000Z`]))[0]?.n) || 0;
   const todayAll = await queuedToday(c.id);
   const rows = await q(
-    `SELECT p.*, co.name AS co_name, co.domain AS co_domain FROM prospects p LEFT JOIN companies co ON co.id = p.company_id
-      WHERE p.campaign_id = ? AND p.stage = 'approved' ORDER BY p.approved_at, p.created_at LIMIT ?`,
+    // Quota split: leads from Scaling segments go out first, then Working, then Testing.
+    `SELECT p.*, co.name AS co_name, co.domain AS co_domain FROM prospects p LEFT JOIN companies co ON co.id = p.company_id LEFT JOIN segments sg ON sg.id = p.segment_id
+      WHERE p.campaign_id = ? AND p.stage = 'approved'
+      ORDER BY CASE sg.status WHEN 'scaling' THEN 0 WHEN 'working' THEN 1 ELSE 2 END, p.approved_at, p.created_at LIMIT ?`,
     [c.id, limit * 2]
   );
   const batch: { p: Row; lead: inst.NewLead }[] = [];
@@ -145,8 +176,21 @@ export async function pushApproved(c: Row, settings: CampaignSettings): Promise<
     }
     const emails = parseJson<ProspectEmails | null>(p.email_json, null);
     if (!emails?.steps?.length) continue;
+    // Copy written for an older, shorter sequence would leave Instantly an empty step: rewrite it first.
+    if (emails.steps.length < seq.length) {
+      await q(`UPDATE prospects SET stage = 'verified', email_json = NULL, written_at = NULL, approved_at = NULL, stage_reason = ?, stage_changed_at = ?, updated_at = ? WHERE id = ?`, [
+        `Written for an older version of the sequence (${emails.steps.length} of ${seq.length} steps); rewriting it`,
+        now,
+        now,
+        p.id,
+      ]);
+      continue;
+    }
     const vars: Record<string, string> = { subject_1: emails.steps[0].subject, body_1: html(emails.steps[0].body) };
-    for (let i = 1; i < emails.steps.length && i <= settings.followUps; i++) vars[`body_${i + 1}`] = html(emails.steps[i].body);
+    for (let i = 1; i < seq.length; i++) {
+      vars[`body_${i + 1}`] = html(emails.steps[i].body);
+      if (seq[i].newThread) vars[`subject_${i + 1}`] = emails.steps[i].subject || "";
+    }
     batch.push({
       p,
       lead: {
@@ -210,6 +254,37 @@ export async function setInstantlyRunning(c: Row, running: boolean): Promise<voi
   }
 }
 
+/**
+ * The lead's progress from Instantly's lead object. Instantly names the last
+ * step by an opaque id, so the step NUMBER is worked out from the lead's own
+ * delays: how many steps fit between the first send and the last execution
+ * (Instantly skips weekends, so the real gap is only ever longer).
+ * `email_replied_step` is zero-based.
+ */
+export function leadProgress(p: Row, l: any): { lastStep: number; lastStepAt: string | null; repliedStep: number | null } | null {
+  const lastAt = String(l?.last_step_timestamp_executed || l?.status_summary?.lastStep?.timestamp_executed || l?.timestamp_last_contact || "") || null;
+  const first = String(p.sent_at || l?.timestamp_last_contact || "") || null;
+  const emails = parseJson<ProspectEmails | null>(p.email_json, null);
+  const total = Math.max(1, emails?.steps?.length || 1);
+  const rawReply = l?.email_replied_step;
+  const repliedStep = rawReply === null || rawReply === undefined || rawReply === "" || !Number.isFinite(Number(rawReply)) ? (p.replied_step ?? null) : Math.min(total, Math.max(1, Number(rawReply) + 1));
+  if (!lastAt && repliedStep == null) return null;
+  let lastStep = Number(p.last_step) || (lastAt ? 1 : 0);
+  if (lastAt && first) {
+    const elapsed = (Date.parse(lastAt) - Date.parse(first)) / 86400000;
+    let cum = 0;
+    let k = 1;
+    for (let i = 1; i < total; i++) {
+      cum += Number(emails?.steps?.[i]?.delayDays) || 3;
+      if (cum <= elapsed + 0.5) k = i + 1;
+      else break;
+    }
+    lastStep = Math.max(lastStep, k);
+  }
+  if (repliedStep && repliedStep > lastStep) lastStep = repliedStep;
+  return { lastStep: Math.min(total, lastStep), lastStepAt: lastAt || p.last_step_at || null, repliedStep };
+}
+
 /** Lead status -> sent / bounced / unsubscribed, campaign analytics -> stats. */
 export async function syncCampaign(c: Row): Promise<void> {
   if (!c.instantly_campaign_id || !(await inst.instantlyConfigured())) return;
@@ -220,8 +295,11 @@ export async function syncCampaign(c: Row): Promise<void> {
     for (const l of r.items || []) {
       const email = String(l.email || "").toLowerCase();
       if (!email) continue;
-      const p = (await q(`SELECT id, stage, segment_id FROM prospects WHERE campaign_id = ? AND lower(email) = ?`, [c.id, email]))[0];
+      const p = (await q(`SELECT id, stage, segment_id, sent_at, email_json, last_step, last_step_at, replied_step FROM prospects WHERE campaign_id = ? AND lower(email) = ?`, [c.id, email]))[0];
       if (!p) continue;
+      // Where the lead is in its sequence (Phase 7): last step executed + the step it replied to.
+      const progress = leadProgress(p, l);
+      if (progress) await q(`UPDATE prospects SET last_step = ?, last_step_at = ?, replied_step = ? WHERE id = ?`, [progress.lastStep, progress.lastStepAt, progress.repliedStep, p.id]);
       if (Number(l.status) === -1 && ["queued", "sent"].includes(p.stage)) {
         await q(`UPDATE prospects SET stage = 'bounced', stage_reason = 'Bounced in Instantly', stage_changed_at = ?, updated_at = ? WHERE id = ?`, [now, now, p.id]);
       } else if (Number(l.status) === -2 && ["queued", "sent"].includes(p.stage)) {
@@ -253,6 +331,8 @@ export async function syncCampaign(c: Row): Promise<void> {
   };
   if (a?.campaign_status !== undefined) await q(`UPDATE campaigns SET instantly_status = ? WHERE id = ?`, [Number(a.campaign_status), c.id]);
   await q(`UPDATE campaigns SET stats_json = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(stats), now, c.id]);
+  // Daily numbers for the Dashboard's trend (Phase 8). Never blocks the sync.
+  await syncCampaignDaily(c).catch((e) => logEvent("send", `Couldn't read Instantly's daily numbers: ${String(e?.message || e).slice(0, 160)}`, { level: "warn", campaignId: c.id }));
   // Segment replies / positives from our own prospect stages (the Inbox writes them).
   await q(
     `UPDATE segments SET
@@ -261,4 +341,6 @@ export async function syncCampaign(c: Row): Promise<void> {
      WHERE campaign_id = ?`,
     [c.id]
   );
+  // The learning loop reads those numbers: Testing / Working / Scaling / Paused (Phase 9).
+  await applyLearning(String(c.id)).catch((e) => console.error(`[learning] ${String(e?.message || e)}`));
 }

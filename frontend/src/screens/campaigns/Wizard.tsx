@@ -1,11 +1,15 @@
-// New campaign: basics -> offer -> ideal customers -> rules -> launch.
+// New campaign: basics -> offer -> market -> segments -> sequence -> rules -> launch.
 import { useEffect, useState } from "react";
 import { Badge, Button, Card, Field, Input, PageHeader, Spinner, cn, toast } from "../../lib/ui";
-import { campaignsApi, DEFAULT_CAMPAIGN_SETTINGS, type CampaignDetail, type CampaignKind, type CampaignSettings, type Offer, type SegmentInput } from "../../lib/v2/campaigns";
-import { OfferForm, OfferSource, SegmentCard, SegmentEditor, SettingsForm, emptyOffer } from "./forms";
-import { Empty, QUIET, errMsg, goTab } from "./parts";
+import { campaignsApi, DEFAULT_CAMPAIGN_SETTINGS, type CampaignDetail, type CampaignKind, type CampaignSettings, type Offer } from "../../lib/v2/campaigns";
+import { MarketEditor, useTaxonomy } from "../targeting/TargetingPanel";
+import { SegmentsSection } from "../targeting/Segments";
+import SequenceEditor from "../sequences/Editor";
+import { OfferForm, OfferSource, SettingsForm, emptyOffer } from "./forms";
+import { QUIET, errMsg, goTab } from "./parts";
 
-const STEPS = ["Basics", "Offer", "Ideal customers", "Rules", "Launch"];
+const STEPS = ["Basics", "Offer", "Market", "Segments", "Sequence", "Rules", "Launch"];
+const S = { basics: 0, offer: 1, market: 2, segments: 3, sequence: 4, rules: 5, launch: 6 } as const;
 
 export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: string; onCancel: () => void; onOpen: (id: string) => void }) {
   const [step, setStep] = useState(0);
@@ -18,7 +22,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
   const [settings, setSettings] = useState<CampaignSettings>(DEFAULT_CAMPAIGN_SETTINGS);
   const [busy, setBusy] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
-  const [adding, setAdding] = useState<SegmentInput | null>(null);
+  const tax = useTaxonomy();
 
   const adopt = (d: CampaignDetail) => {
     setC(d);
@@ -35,7 +39,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
       .get(resumeId)
       .then((r) => {
         adopt(r.campaign);
-        setStep(!r.campaign.offer ? 1 : !r.campaign.segmentList.length ? 2 : 3);
+        setStep(!r.campaign.offer ? S.offer : !r.campaign.segmentList.length ? S.market : S.launch);
       })
       .catch((e) => toast(errMsg(e), "error"))
       .finally(() => setLoading(false));
@@ -84,7 +88,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
       setStep(2);
       saved = true;
     });
-    if (saved && c && !c.segmentList.length) await suggest();
+    if (saved) window.scrollTo({ top: 0 });
   };
 
   const reload = async (): Promise<void> => {
@@ -104,7 +108,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
     run("rules", async () => {
       if (!c) return;
       adopt((await campaignsApi.update(c.id, { settings })).campaign);
-      setStep(4);
+      setStep(S.launch);
     });
 
   const start = () =>
@@ -155,7 +159,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
       {header}
       <ol className="mb-6 flex gap-1.5 overflow-x-auto pb-1">
         {STEPS.map((label, i) => {
-          const reachable = i === 0 || (!!c && (i <= 2 || (i === 3 && !!c.offer) || (i === 4 && !!c.offer && enabledSegs > 0)));
+          const reachable = i === 0 || (!!c && (i <= S.offer || (i < S.launch && !!c.offer) || (i === S.launch && !!c.offer && enabledSegs > 0)));
           return (
             <li key={label} className="shrink-0">
               <button
@@ -239,78 +243,90 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
       )}
 
       {step === 2 && c && (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
-              <div className="text-[15px] font-[650] tracking-[-0.01em]">Who to look for</div>
-              <p className="text-[13px] text-muted">Each segment is a slice of the market with its own searches and the people to contact. Turn off the ones you don't want.</p>
+              <div className="text-[15px] font-[650] tracking-[-0.01em]">Target market</div>
+              <p className="max-w-[720px] text-[13px] text-muted">
+                The outer limits: where, what size, which industries never, and who to email. Every segment stays inside these, and every company found is checked against them before anyone is contacted.
+              </p>
             </div>
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => setAdding({ name: "", countries: ["Saudi Arabia"], titles: [], queries: [] })}>
-                Add by hand
-              </Button>
-              <Button size="sm" loading={busy === "suggest"} onClick={suggest}>
-                Suggest segments
-              </Button>
-            </div>
+            <Button variant="ghost" size="sm" onClick={() => setStep(1)}>
+              Back to the offer
+            </Button>
           </div>
-          {adding && (
-            <Card className="p-4 sm:p-5">
-              <SegmentEditor value={adding} onChange={setAdding} />
-              <div className="mt-4 flex justify-end gap-2">
-                <Button variant="ghost" size="sm" onClick={() => setAdding(null)}>
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  loading={busy === "add"}
-                  onClick={() =>
-                    run("add", async () => {
-                      await campaignsApi.addSegment(c.id, adding);
-                      setAdding(null);
-                      await reload();
-                    })
-                  }
-                >
-                  Add segment
-                </Button>
-              </div>
-            </Card>
+          {tax ? (
+            <MarketEditor
+              c={c}
+              tax={tax}
+              inline
+              saveLabel="Save and continue"
+              onSaved={async () => {
+                const fresh = (await campaignsApi.get(c.id)).campaign;
+                adopt(fresh);
+                setStep(3);
+                window.scrollTo({ top: 0 });
+                if (!fresh.segmentList.length) await suggest();
+              }}
+            />
+          ) : (
+            <div className="flex items-center gap-2 py-10 text-muted">
+              <Spinner /> Loading…
+            </div>
           )}
+        </div>
+      )}
+
+      {step === 3 && c && (
+        <div className="space-y-4">
+          <div>
+            <div className="text-[15px] font-[650] tracking-[-0.01em]">Segments</div>
+            <p className="max-w-[720px] text-[13px] text-muted">Slices of the market, each with an industry and its own searches. Use "Find sample companies" to see what a segment finds before you start.</p>
+          </div>
           {busy === "suggest" && !c.segmentList.length ? (
             <div className="flex items-center gap-2 py-10 text-muted">
               <Spinner /> Working out who buys this…
             </div>
-          ) : !c.segmentList.length ? (
-            <Empty title="No segments yet" body="Ask for suggestions based on the offer, or add one by hand." />
-          ) : (
-            <div className="grid gap-3 lg:grid-cols-2">
-              {c.segmentList.map((s) => (
-                <SegmentCard
-                  key={s.id}
-                  seg={s}
-                  onToggle={(enabled) => run("toggle", async () => (await campaignsApi.updateSegment(c.id, s.id, { enabled }), await reload()))}
-                  onSave={async (v) => {
-                    await campaignsApi.updateSegment(c.id, s.id, v);
-                    await reload();
-                  }}
-                  onDelete={() => run("delete", async () => (await campaignsApi.deleteSegment(c.id, s.id), await reload()))}
-                />
-              ))}
-            </div>
-          )}
+          ) : tax ? (
+            <SegmentsSection c={c} tax={tax} market={c.market} reload={reload} />
+          ) : null}
           <div className="flex justify-between gap-2 border-t border-line-soft pt-4">
-            <Button variant="ghost" onClick={() => setStep(1)}>
+            <Button variant="ghost" onClick={() => setStep(2)}>
               Back
             </Button>
-            <Button onClick={() => setStep(3)} disabled={!enabledSegs}>
+            <Button onClick={() => setStep(S.sequence)} disabled={!enabledSegs}>
               Continue
             </Button>
           </div>
         </div>
       )}
 
-      {step === 3 && c && (
+      {step === S.sequence && c && (
+        <div>
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <div className="text-[15px] font-[650] tracking-[-0.01em]">Sequence</div>
+              <p className="max-w-[720px] text-[13px] text-muted">
+                The steps every lead gets. It starts from a proven {c.kind === "partner" ? "partner" : "customer"} sequence; change what each email must do, or write a step yourself, and preview it on the sample prospect.
+              </p>
+            </div>
+            <Button variant="ghost" size="sm" onClick={() => setStep(S.segments)}>
+              Back to the segments
+            </Button>
+          </div>
+          <SequenceEditor
+            campaignId={c.id}
+            inline
+            saveLabel="Save and continue"
+            onSaved={() => {
+              setStep(S.rules);
+              window.scrollTo({ top: 0 });
+            }}
+          />
+        </div>
+      )}
+
+      {step === S.rules && c && (
         <Card className="space-y-5 p-5 sm:p-6">
           <div>
             <div className="text-[15px] font-[650] tracking-[-0.01em]">Rules</div>
@@ -318,7 +334,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
           </div>
           <SettingsForm value={settings} onChange={setSettings} />
           <div className="flex justify-between gap-2 border-t border-line-soft pt-4">
-            <Button variant="ghost" onClick={() => setStep(2)}>
+            <Button variant="ghost" onClick={() => setStep(S.sequence)}>
               Back
             </Button>
             <Button loading={busy === "rules"} onClick={saveSettings}>
@@ -328,7 +344,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
         </Card>
       )}
 
-      {step === 4 && c && (
+      {step === S.launch && c && (
         <Card className="space-y-5 p-5 sm:p-6">
           <div>
             <div className="text-[15px] font-[650] tracking-[-0.01em]">Ready to start</div>
@@ -338,7 +354,8 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
             {(
               [
                 [true, "Offer", c.offer ? c.offer.oneLiner || c.offer.product : "Missing", null],
-                [enabledSegs > 0, "Segments", `${enabledSegs} enabled`, null],
+                [true, "Target market", `${c.market.countries.join(", ")} · ${c.market.titles.slice(0, 3).join(", ")}${c.market.titles.length > 3 ? "…" : ""}`, null],
+                [enabledSegs > 0, "Segments", `${enabledSegs} enabled · ${c.segmentList.filter((s) => s.enabled).reduce((n, s) => n + s.searchesTotal, 0)} searches planned`, null],
                 [c.readiness.ai, "AI key", c.readiness.ai ? "Research, scoring and writing are on" : "Needed to research properly and write the emails", "agent"],
                 [c.readiness.aiSearch, "Gemini search", c.readiness.aiSearch ? "Finds companies and decision makers" : "Optional, but the free search is slow and finds fewer people", "agent"],
                 [c.readiness.reacher, "Email verifier", c.readiness.reacher ? "Guessed addresses are checked before sending" : "Without it, guessed addresses wait (published ones still go)", "agent"],
@@ -362,7 +379,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
             ))}
           </ul>
           <div className="flex flex-wrap justify-between gap-2 border-t border-line-soft pt-4">
-            <Button variant="ghost" onClick={() => setStep(3)}>
+            <Button variant="ghost" onClick={() => setStep(S.rules)}>
               Back
             </Button>
             <div className="flex flex-wrap gap-2">

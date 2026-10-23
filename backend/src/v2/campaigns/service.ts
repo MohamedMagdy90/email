@@ -14,8 +14,23 @@ import { addCompany, discoverForSegment } from "./discover";
 import { researchCompany, researchIsFresh } from "./research";
 import { findContact } from "./contact";
 import { scoreProspect, verifyProspect } from "./qualify";
-import { writeEmails, WriterRejected } from "./writer";
-import { instantlyPayload, pushApproved, queuedToday, sendableMailboxes, setInstantlyRunning, syncCampaign } from "./sender";
+import { writableWithoutAi, writeEmails, WriterRejected } from "./writer";
+import { campaignCountry, instantlyPayload, pushApproved, queuedToday, sendableMailboxes, setInstantlyRunning, syncCampaign } from "./sender";
+import { ensureSequenceTables, sequenceFor } from "../sequences/store";
+import { discoveryOrder, getRules } from "../targeting/learning";
+import {
+  defaultMarket,
+  effectiveTargeting,
+  generateQueries,
+  marketOf,
+  normCountries,
+  segmentTargeting,
+  sizeLabel,
+  type EffectiveTargeting,
+  type TargetMarket,
+} from "../targeting/market";
+import { checkCompany, personAllowed, type SkipRule } from "../targeting/check";
+import { INDUSTRY_BY_ID } from "../targeting/taxonomy";
 import {
   CampaignError,
   CONTACTED_STAGES,
@@ -131,7 +146,11 @@ function blockersFor(c: Row, settings: CampaignSettings, offer: Offer | null, se
   const enabled = segs.filter((s) => Number(s.enabled) === 1);
   if (!offer) out.push("Add the offer first: learn it from the website (Offer tab) or fill it in.");
   if (!enabled.length) out.push("Add at least one ideal-customer segment so the agent knows who to look for.");
-  else if (enabled.every((s) => Number(s.exhausted) === 1)) out.push("Every segment has run all of its searches. Add search queries or suggest more segments to find new companies.");
+  else {
+    const empty = enabled.filter((s) => !parseJson<string[]>(s.queries_json, []).length);
+    if (empty.length) out.push(`${empty.map((s) => `"${s.name}"`).join(", ")} ${empty.length === 1 ? "has" : "have"} no searches yet: pick an industry in Targeting, or add searches by hand.`);
+    else if (enabled.every((s) => Number(s.exhausted) === 1)) out.push("Every segment has run all of its searches. Add cities or industries in Targeting, or suggest more segments, to find new companies.");
+  }
   if (c.status === "paused") out.push("Paused: nothing is researched, written or sent until you resume.");
   if (!r.ai) out.push("No AI key: companies get a basic read only, and nothing is scored or written. Connect Gemini, Groq or OpenRouter in the Agent tab.");
   else if (!r.aiSearch) out.push("No Gemini key: companies are found with the free web search (slow and often rate-limited) and decision makers come only from company websites.");
@@ -162,11 +181,13 @@ export async function campaignDetail(id: string) {
     queueLimit: Math.min(settings.dailyNewLeads, r.mailboxes.dailyCapacity),
   };
   const working = !!c.working_at && Date.now() - Date.parse(String(c.working_at)) < LOCK_STALE_MS;
+  const market = marketOf(c);
   return {
     ...summary(c, funnel, segs.filter((s) => Number(s.enabled) === 1).length),
     offer,
     settings,
-    segmentList: segs.map(segmentView),
+    market,
+    segmentList: segs.map((s) => segmentView(s, market)),
     readiness: r,
     blockers: blockersFor(c, settings, offer, segs, funnel, r, agent.sending.allowUnverifiedGuesses),
     today,
@@ -183,8 +204,19 @@ export async function createCampaign(body: any) {
   const website = str(body?.website, 300);
   const id = uid();
   const now = nowIso();
-  await q(`INSERT INTO campaigns (id, name, kind, status, website, settings_json, created_at, updated_at) VALUES (?,?,?,'draft',?,?,?,?)`, [id, name, kind, website || null, JSON.stringify(DEFAULT_SETTINGS), now, now]);
+  await ensureSequenceTables(); // (runs the one-time migration before this campaign exists)
+  await q(`INSERT INTO campaigns (id, name, kind, status, website, settings_json, targeting_json, created_at, updated_at) VALUES (?,?,?,'draft',?,?,?,?,?)`, [
+    id,
+    name,
+    kind,
+    website || null,
+    JSON.stringify(DEFAULT_SETTINGS),
+    JSON.stringify(defaultMarket(kind)),
+    now,
+    now,
+  ]);
   await logEvent("campaign", `Created the campaign "${name}".`, { campaignId: id });
+  await sequenceFor(id); // starts from the starter sequence for its kind
   return campaignDetail(id);
 }
 
@@ -233,8 +265,8 @@ export async function updateCampaign(id: string, body: any) {
   if (settingsChanged && c.instantly_campaign_id && (await instantlyConfigured())) {
     try {
       const fresh = await row(id);
-      const country = parseJson<string[]>((await q(`SELECT countries_json FROM segments WHERE campaign_id = ? AND enabled = 1 ORDER BY created_at LIMIT 1`, [id]))[0]?.countries_json, [])[0] || null;
-      const p = instantlyPayload(fresh, settingsChanged, country, await sendableMailboxes());
+      const country = await campaignCountry(id);
+      const p = instantlyPayload(fresh, settingsChanged, country, await sendableMailboxes(), (await sequenceFor(id)).steps);
       await patchCampaign(String(c.instantly_campaign_id), { campaign_schedule: p.campaign_schedule, sequences: p.sequences });
     } catch (e: any) {
       await logEvent("send", `Couldn't update the Instantly campaign's schedule: ${String(e?.message || e).slice(0, 200)}`, { level: "warn", campaignId: id });
@@ -248,6 +280,12 @@ export async function removeCampaign(id: string) {
   if (c.status === "draft" && !c.instantly_campaign_id) {
     await q(`DELETE FROM prospects WHERE campaign_id = ?`, [id]);
     await q(`DELETE FROM segments WHERE campaign_id = ?`, [id]);
+    try {
+      await q(`DELETE FROM sequence_versions WHERE sequence_id IN (SELECT id FROM sequences WHERE campaign_id = ?)`, [id]);
+      await q(`DELETE FROM sequences WHERE campaign_id = ?`, [id]);
+    } catch {
+      /* sequences not migrated */
+    }
     await q(`DELETE FROM campaigns WHERE id = ?`, [id]);
     return { ok: true as const, deleted: true };
   }
@@ -267,65 +305,141 @@ export async function learnCampaignOffer(id: string, website?: string) {
 
 /* ------------------------------ segments ------------------------------ */
 
-async function insertSegment(campaignId: string, s: SegmentInput) {
+const kindOf = (c: Row): CampaignKind => (c.kind === "partner" ? "partner" : "customer");
+
+/** Industry labels for display: the picked industries + any custom ones. */
+function industryLabels(ids: string[], custom: string[] = []): string[] {
+  const out = ids.map((i) => INDUSTRY_BY_ID.get(i)?.label || i);
+  for (const c of custom) if (!out.some((x) => x.toLowerCase() === c.toLowerCase())) out.push(c);
+  return out;
+}
+
+/** Queries for a segment row whose searches are automatic (from the market + its fields). */
+export function autoQueries(c: Row, market: TargetMarket, segRow: Row): string[] {
+  return generateQueries(effectiveTargeting(market, kindOf(c), segRow));
+}
+
+async function insertSegment(c: Row, s: SegmentInput) {
+  const market = marketOf(c);
   const id = uid();
   const now = nowIso();
+  const industryIds = s.industryIds || [];
+  const custom = (s.industries || []).filter((l) => !industryIds.some((i) => INDUSTRY_BY_ID.get(i)?.label.toLowerCase() === l.toLowerCase()));
+  // Automatic searches unless the segment came with hand-written ones and no industry.
+  const queriesAuto = s.queriesAuto ?? (industryIds.length > 0 || !(s.queries || []).length);
+  const sizeBands = s.sizeBands ?? null;
+  const row: Row = {
+    id,
+    campaign_id: c.id,
+    name: s.name || "Untitled segment",
+    description: s.description || "",
+    industries_json: JSON.stringify(industryLabels(industryIds, custom)),
+    countries_json: JSON.stringify(normCountries(s.countries || []).filter((x) => market.countries.includes(x))),
+    company_size: s.companySize || (sizeBands || s.minBranches ? sizeLabel(sizeBands || market.sizeBands, s.minBranches ?? null) : ""),
+    titles_json: JSON.stringify(s.titles || []),
+    fit_score: s.fitScore ?? null,
+    why: s.why || "",
+    enabled: s.enabled === false ? 0 : 1,
+    industry_ids_json: JSON.stringify(industryIds),
+    cities_json: JSON.stringify(s.cities || {}),
+    size_json: sizeBands || s.minBranches ? JSON.stringify({ bands: sizeBands || market.sizeBands, minBranches: s.minBranches ?? null }) : null,
+    titles_override: (s.titlesOverride ?? (s.titles || []).length > 0) ? 1 : 0,
+    signals_json: JSON.stringify(s.signals || { must: [], mustNot: [] }),
+    queries_auto: queriesAuto ? 1 : 0,
+  };
+  row.queries_json = JSON.stringify(queriesAuto ? autoQueries(c, market, row) : s.queries || []);
   await q(
-    `INSERT INTO segments (id, campaign_id, name, description, industries_json, countries_json, company_size, titles_json, queries_json, fit_score, why, status, enabled, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?, ?)`,
-    [id, campaignId, s.name || "Untitled segment", s.description || "", JSON.stringify(s.industries || []), JSON.stringify(s.countries || []), s.companySize || "", JSON.stringify(s.titles || []), JSON.stringify(s.queries || []), s.fitScore ?? null, s.why || "", s.enabled === false ? 0 : 1, now, now]
+    `INSERT INTO segments (id, campaign_id, name, description, industries_json, countries_json, company_size, titles_json, queries_json, fit_score, why, status, enabled,
+                           industry_ids_json, cities_json, size_json, titles_override, signals_json, queries_auto, searched_json, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?,?,?,?,?,?, '[]', ?, ?)`,
+    [
+      id,
+      c.id,
+      row.name,
+      row.description,
+      row.industries_json,
+      row.countries_json,
+      row.company_size,
+      row.titles_json,
+      row.queries_json,
+      row.fit_score,
+      row.why,
+      row.enabled,
+      row.industry_ids_json,
+      row.cities_json,
+      row.size_json,
+      row.titles_override,
+      row.signals_json,
+      row.queries_auto,
+      now,
+      now,
+    ]
   );
-  return segmentView((await q(`SELECT * FROM segments WHERE id = ?`, [id]))[0]);
+  return segmentView((await q(`SELECT * FROM segments WHERE id = ?`, [id]))[0], market);
 }
 
 export async function proposeCampaignSegments(id: string, count: number) {
   const c = await row(id);
   const existing = (await q(`SELECT name FROM segments WHERE campaign_id = ?`, [id])).map((r) => String(r.name));
-  const r = await proposeSegments({ kind: c.kind === "partner" ? "partner" : "customer", offer: offerOf(c), count, existing });
+  const r = await proposeSegments({ kind: kindOf(c), offer: offerOf(c), count, existing, market: marketOf(c) });
   const segments = [];
-  for (const s of r.segments) segments.push(await insertSegment(id, s));
+  for (const s of r.segments) segments.push(await insertSegment(c, s));
   if (segments.length) await logEvent("campaign", `Added ${segments.length} suggested segment(s): ${segments.map((s) => s.name).join("; ")}.`, { campaignId: id });
   return { segments, warning: r.warning };
 }
 
 export async function addSegment(id: string, body: any) {
-  await row(id);
+  const c = await row(id);
   const s = sanitizeSegmentInput(body);
   if (!s.name) throw new CampaignError("Give the segment a name");
-  return { segment: await insertSegment(id, s) };
+  return { segment: await insertSegment(c, s) };
 }
 
 export async function updateSegment(id: string, sid: string, body: any) {
   const cur = (await q(`SELECT * FROM segments WHERE id = ? AND campaign_id = ?`, [sid, id]))[0];
   if (!cur) throw new CampaignError("Segment not found", 404);
+  const c = await row(id);
+  const market = marketOf(c);
   const s = sanitizeSegmentInput(body);
-  const map: [keyof SegmentInput, string, (v: any) => any][] = [
-    ["name", "name", (v) => v || cur.name],
-    ["description", "description", (v) => v],
-    ["industries", "industries_json", (v) => JSON.stringify(v)],
-    ["countries", "countries_json", (v) => JSON.stringify(v)],
-    ["companySize", "company_size", (v) => v],
-    ["titles", "titles_json", (v) => JSON.stringify(v)],
-    ["queries", "queries_json", (v) => JSON.stringify(v)],
-    ["fitScore", "fit_score", (v) => v],
-    ["why", "why", (v) => v],
-    ["enabled", "enabled", (v) => (v ? 1 : 0)],
-  ];
-  const sets: string[] = [];
-  const vals: any[] = [];
-  for (const [k, col, fn] of map) {
-    if (s[k] === undefined) continue;
-    sets.push(`${col} = ?`);
-    vals.push(fn(s[k]));
+  const next: Row = { ...cur };
+  if (s.name !== undefined) next.name = s.name || cur.name;
+  if (s.description !== undefined) next.description = s.description;
+  if (s.fitScore !== undefined) next.fit_score = s.fitScore;
+  if (s.why !== undefined) next.why = s.why;
+  if (s.enabled !== undefined) next.enabled = s.enabled ? 1 : 0;
+  if (s.titles !== undefined) next.titles_json = JSON.stringify(s.titles);
+  if (s.titlesOverride !== undefined) next.titles_override = s.titlesOverride ? 1 : 0;
+  else if (s.titles !== undefined) next.titles_override = s.titles.length ? 1 : 0;
+  if (s.countries !== undefined) next.countries_json = JSON.stringify(normCountries(s.countries).filter((x) => market.countries.includes(x)));
+  if (s.cities !== undefined) next.cities_json = JSON.stringify(s.cities);
+  if (s.signals !== undefined) next.signals_json = JSON.stringify(s.signals);
+  if (s.industryIds !== undefined || s.industries !== undefined) {
+    const ids = s.industryIds ?? segmentTargeting(cur).industryIds;
+    const labelsIn = s.industries ?? parseJson<string[]>(cur.industries_json, []);
+    const custom = labelsIn.filter((l) => !ids.some((i) => INDUSTRY_BY_ID.get(i)?.label.toLowerCase() === l.toLowerCase()) && ![...INDUSTRY_BY_ID.values()].some((x) => x.label.toLowerCase() === l.toLowerCase()));
+    next.industry_ids_json = JSON.stringify(ids);
+    next.industries_json = JSON.stringify(industryLabels(ids, custom));
   }
-  // New searches or countries restart the walk.
-  if ((s.queries && JSON.stringify(s.queries) !== cur.queries_json) || (s.countries && JSON.stringify(s.countries) !== cur.countries_json)) sets.push("cursor = 0", "exhausted = 0");
-  if (sets.length) {
-    sets.push("updated_at = ?");
-    vals.push(nowIso(), sid);
-    await q(`UPDATE segments SET ${sets.join(", ")} WHERE id = ?`, vals);
+  if (s.sizeBands !== undefined || s.minBranches !== undefined) {
+    const prev = segmentTargeting(cur);
+    const sb = s.sizeBands !== undefined ? s.sizeBands : prev.sizeBands;
+    const mb = s.minBranches !== undefined ? s.minBranches : prev.minBranches;
+    next.size_json = (sb && sb.length) || mb ? JSON.stringify({ bands: sb && sb.length ? sb : market.sizeBands, minBranches: mb ?? null }) : null;
+    next.company_size = (sb && sb.length) || mb ? sizeLabel(sb && sb.length ? sb : market.sizeBands, mb ?? null) : "";
+  } else if (s.companySize !== undefined) next.company_size = s.companySize;
+  // Searches: hand-written ones switch automatic off; otherwise automatic ones follow the fields.
+  if (s.queriesAuto !== undefined) next.queries_auto = s.queriesAuto ? 1 : 0;
+  else if (s.queries !== undefined) next.queries_auto = 0;
+  if (Number(next.queries_auto) === 1) next.queries_json = JSON.stringify(autoQueries(c, market, next));
+  else if (s.queries !== undefined) next.queries_json = JSON.stringify(s.queries);
+  if (next.queries_json !== cur.queries_json || next.countries_json !== cur.countries_json) next.exhausted = 0;
+
+  const cols = ["name", "description", "fit_score", "why", "enabled", "titles_json", "titles_override", "countries_json", "cities_json", "signals_json", "industry_ids_json", "industries_json", "size_json", "company_size", "queries_auto", "queries_json", "exhausted"];
+  const changed = cols.filter((k) => next[k] !== cur[k]);
+  if (changed.length) {
+    await q(`UPDATE segments SET ${changed.map((k) => `${k} = ?`).join(", ")}, updated_at = ? WHERE id = ?`, [...changed.map((k) => next[k]), nowIso(), sid]);
   }
-  return { segment: segmentView((await q(`SELECT * FROM segments WHERE id = ?`, [sid]))[0]) };
+  return { segment: segmentView((await q(`SELECT * FROM segments WHERE id = ?`, [sid]))[0], market) };
 }
 
 export async function deleteSegment(id: string, sid: string) {
@@ -431,8 +545,8 @@ async function setStage(p: Row, stage: string, reason: string, extra: Record<str
   );
 }
 
-async function skipProspect(p: Row, reason: string) {
-  await setStage(p, "skipped", reason, { skipped_from: p.stage, next_action_at: null });
+async function skipProspect(p: Row, reason: string, rule: SkipRule | null = null, from?: string) {
+  await setStage(p, "skipped", reason, { skipped_from: from || p.stage, next_action_at: null, skip_rule: rule });
   await logEvent("campaign", `Skipped ${p.email || p.co_domain || "a lead"}: ${reason}`, { campaignId: p.campaign_id, refType: "prospect", refId: p.id });
 }
 
@@ -473,7 +587,7 @@ export async function skipProspects(id: string, body: any) {
   for (const pid of ids) {
     const p = (await q(`SELECT * FROM prospects WHERE id = ? AND campaign_id = ?`, [pid, id]))[0];
     if (!p || p.stage === "skipped" || (CONTACTED_STAGES as string[]).includes(p.stage) || ["unsubscribed", "bounced"].includes(p.stage)) continue;
-    await setStage(p, "skipped", reason ? `Skipped by hand: ${reason}` : "Skipped by hand", { skipped_from: p.stage, next_action_at: null });
+    await setStage(p, "skipped", reason ? `Skipped by hand: ${reason}` : "Skipped by hand", { skipped_from: p.stage, next_action_at: null, skip_rule: null });
     skipped++;
   }
   return { skipped };
@@ -487,7 +601,7 @@ export async function restoreProspects(id: string, body: any) {
     const p = (await q(`SELECT * FROM prospects WHERE id = ? AND campaign_id = ?`, [pid, id]))[0];
     if (!p || !["skipped", "failed"].includes(p.stage)) continue;
     const back = (STAGES as string[]).includes(p.skipped_from) && !["skipped", "failed"].includes(p.skipped_from) ? p.skipped_from : "found";
-    await setStage(p, back, "Put back by hand", { skipped_from: null, attempts: 0, last_error: null, next_action_at: null });
+    await setStage(p, back, "Put back by hand", { skipped_from: null, skip_rule: null, attempts: 0, last_error: null, next_action_at: null });
     restored++;
   }
   return { restored };
@@ -502,11 +616,19 @@ export async function updateProspect(id: string, pid: string, body: any) {
     if (!EDITABLE_COPY.includes(p.stage)) throw new CampaignError("This email has already gone to Instantly and can't be edited here.");
     const c = await row(id);
     const settings = settingsOf(c);
+    const seq = await sequenceFor(id);
     const prev = parseJson<ProspectEmails | null>(p.email_json, null);
-    const steps = body.steps.slice(0, 3).map((s: any, i: number) => ({ subject: i === 0 ? str(s?.subject, 120) : "", body: String(s?.body || "").replace(/\r/g, "").trim().slice(0, 4000), delayDays: i === 0 ? 0 : settings.followUpDelays[i - 1] || 3 }));
+    // Steps not sent in the edit keep their previous copy.
+    const given = seq.steps.map((_, i) => body.steps[i] ?? prev?.steps?.[i]).filter(Boolean);
+    const steps = given.map((s: any, i: number) => ({
+      subject: i === 0 || seq.steps[i]?.newThread ? str(s?.subject, 120) : "",
+      body: String(s?.body || "").replace(/\r/g, "").trim().slice(0, 4000),
+      delayDays: i === 0 ? 0 : seq.steps[i]?.delayDays || 3,
+    }));
     if (!steps.length || !steps[0].subject || steps.some((s: any) => !s.body)) throw new CampaignError("Every email needs a body, and the first one needs a subject.");
-    const emails: ProspectEmails = { steps, language: prev?.language || "en", source: "edited", writtenAt: prev?.writtenAt || now, warnings: [] };
-    await q(`UPDATE prospects SET email_json = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(emails), now, pid]);
+    if (steps.length < seq.steps.length) throw new CampaignError(`The sequence has ${seq.steps.length} steps; write all ${seq.steps.length} emails.`);
+    const emails: ProspectEmails = { steps, language: prev?.language || "en", source: "edited", writtenAt: prev?.writtenAt || now, warnings: [], sequenceVersion: seq.version };
+    await q(`UPDATE prospects SET email_json = ?, sequence_id = ?, sequence_version = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(emails), seq.id, seq.version, now, pid]);
     if (p.stage === "verified") await setStage(p, settings.reviewFirst ? "written" : "approved", "Written by hand", settings.reviewFirst ? { written_at: now } : { written_at: now, approved_at: now });
   }
   if (body?.fullName !== undefined || body?.title !== undefined) {
@@ -535,10 +657,24 @@ export async function rewriteProspect(id: string, pid: string, instruction?: str
   const settings = settingsOf(c);
   const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0] || { domain: p.co_domain };
   const seg = p.segment_id ? (await q(`SELECT * FROM segments WHERE id = ?`, [p.segment_id]))[0] : null;
+  const seq = await sequenceFor(id);
   try {
-    const emails = await writeEmails({ prospect: p, company: co, research: researchJson(co.research_json), segment: seg, offer: offerOf(c), settings, agent: await getAgentSettings(), instruction: str(instruction, 400) || undefined, previous: parseJson(p.email_json, null) });
+    const emails = await writeEmails({
+      prospect: p,
+      company: co,
+      research: researchJson(co.research_json),
+      segment: seg,
+      offer: offerOf(c),
+      settings,
+      agent: await getAgentSettings(),
+      steps: seq.steps,
+      sequenceLanguage: seq.language,
+      sequenceVersion: seq.version,
+      instruction: str(instruction, 400) || undefined,
+      previous: parseJson(p.email_json, null),
+    });
     const now = nowIso();
-    await q(`UPDATE prospects SET email_json = ?, written_at = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(emails), now, now, pid]);
+    await q(`UPDATE prospects SET email_json = ?, sequence_id = ?, sequence_version = ?, written_at = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(emails), seq.id, seq.version, now, now, pid]);
     if (p.stage !== "written" && settings.reviewFirst) await setStage(p, "written", "Rewritten, waiting for review", { approved_at: null });
     else if (p.stage === "verified") await setStage(p, "approved", "Written and approved (review is off)", { approved_at: now });
   } catch (e: any) {
@@ -566,6 +702,167 @@ export async function addCompanies(id: string, body: any) {
   }
   if (added) await logEvent("campaign", `Added ${added} compan${added === 1 ? "y" : "ies"} by hand.`, { campaignId: id });
   return { added, skipped };
+}
+
+/* ------------------------- writes from the Leads tab ------------------------- */
+// The Leads tab works across campaigns, but every change to a lead goes
+// through here so the stage rules live in one place.
+
+/** Stages a lead can be in before anything reached Instantly. */
+const PRE_INSTANTLY = ["found", "researched", "contact_found", "verified", "written", "approved", "skipped", "failed"];
+
+async function ownRows(id: string, ids: string[]): Promise<Row[]> {
+  const list = ids.map(String).slice(0, 5000);
+  if (!list.length) return [];
+  const out: Row[] = [];
+  for (let i = 0; i < list.length; i += 400) {
+    const part = list.slice(i, i + 400);
+    out.push(...(await q(`SELECT * FROM prospects WHERE campaign_id = ? AND id IN (${part.map(() => "?").join(",")})`, [id, ...part])));
+  }
+  return out;
+}
+
+const RESET_COPY = { fit_score: null, fit_reason: null, email_json: null, written_at: null, approved_at: null, skip_rule: null, skipped_from: null, target_penalty: 0, target_notes: null, attempts: 0, last_error: null, next_action_at: null };
+
+/** Research the company again (fresh read), then run the lead through the pipeline from the start. */
+export async function reresearchProspects(id: string, ids: string[]) {
+  await row(id);
+  let done = 0;
+  let skipped = 0;
+  const companies = new Set<string>();
+  for (const p of await ownRows(id, ids)) {
+    if (!PRE_INSTANTLY.includes(p.stage) || p.instantly_lead_id) {
+      skipped++;
+      continue;
+    }
+    if (p.company_id) companies.add(String(p.company_id));
+    await setStage(p, "found", "Research again, asked by hand", RESET_COPY);
+    done++;
+  }
+  for (const co of companies) await q(`UPDATE companies SET researched_at = NULL, updated_at = ? WHERE id = ?`, [nowIso(), co]);
+  if (done) await logEvent("campaign", `Sent ${done} lead${done === 1 ? "" : "s"} back to research.`, { campaignId: id });
+  return { done, skipped };
+}
+
+/** Check the address again (the cached verdict is dropped). Written copy is kept. */
+export async function reverifyProspects(id: string, ids: string[]) {
+  await row(id);
+  let done = 0;
+  let skipped = 0;
+  for (const p of await ownRows(id, ids)) {
+    if (!p.email || !PRE_INSTANTLY.includes(p.stage) || p.instantly_lead_id) {
+      skipped++;
+      continue;
+    }
+    await q(`DELETE FROM email_verifications WHERE email = ?`, [String(p.email).toLowerCase()]);
+    await setStage(p, "contact_found", "Checking the address again, asked by hand", { verify_json: null, email_status: null, catch_all: 0, skip_rule: null, skipped_from: null, attempts: 0, last_error: null, next_action_at: null });
+    done++;
+  }
+  if (done) await logEvent("verify", `Re-checking ${done} address${done === 1 ? "" : "es"}.`, { campaignId: id });
+  return { done, skipped };
+}
+
+/** Move leads to another campaign. Only before they reached Instantly; they restart there. */
+export async function moveProspects(id: string, ids: string[], toId: string, segmentId?: string | null) {
+  const from = await row(id);
+  const to = await row(toId);
+  if (to.status === "archived") throw new CampaignError("That campaign is archived.");
+  if (toId === id) return { done: 0, skipped: ids.length, reasons: ["Already in that campaign"] };
+  const seg = segmentId ? (await q(`SELECT id FROM segments WHERE id = ? AND campaign_id = ?`, [segmentId, toId]))[0] : null;
+  let done = 0;
+  let skipped = 0;
+  const reasons = new Set<string>();
+  for (const p of await ownRows(id, ids)) {
+    if (!PRE_INSTANTLY.includes(p.stage) || p.instantly_lead_id) {
+      skipped++;
+      reasons.add("Already in Instantly");
+      continue;
+    }
+    if (p.company_id && (await q(`SELECT id FROM prospects WHERE campaign_id = ? AND company_id = ? LIMIT 1`, [toId, p.company_id]))[0]) {
+      skipped++;
+      reasons.add("The company is already in that campaign");
+      continue;
+    }
+    const now = nowIso();
+    await q(
+      `UPDATE prospects SET campaign_id = ?, segment_id = ?, stage = 'found', stage_reason = ?, fit_score = NULL, fit_reason = NULL, email_json = NULL, written_at = NULL, approved_at = NULL,
+              skip_rule = NULL, skipped_from = NULL, target_penalty = 0, target_notes = NULL, attempts = 0, last_error = NULL, next_action_at = NULL, sequence_id = NULL, sequence_version = NULL,
+              stage_changed_at = ?, updated_at = ? WHERE id = ?`,
+      [toId, seg ? seg.id : null, `Moved from "${from.name}"`, now, now, p.id]
+    );
+    await logEvent("campaign", `Moved ${p.email || "a lead"} to "${to.name}".`, { campaignId: id, refType: "prospect", refId: p.id });
+    done++;
+  }
+  if (done) await logEvent("campaign", `${done} lead${done === 1 ? "" : "s"} moved in from "${from.name}".`, { campaignId: toId });
+  return { done, skipped, reasons: [...reasons] };
+}
+
+/** The human override of the Inbox's read: replied / interested / meeting / won / lost. */
+export const OUTCOME_OVERRIDES: Record<string, { interest: string | null; instantly: number | null; label: string }> = {
+  replied: { interest: null, instantly: null, label: "Replied" },
+  interested: { interest: "interested", instantly: 1, label: "Interested" },
+  meeting: { interest: "meeting", instantly: 2, label: "Meeting" },
+  won: { interest: "won", instantly: 4, label: "Won" },
+  lost: { interest: "not_interested", instantly: -3, label: "Lost" },
+};
+const OVERRIDABLE_FROM = ["queued", "sent", "replied", "interested", "meeting", "won", "lost"];
+
+export async function setStageByHand(pid: string, stage: string, note?: string) {
+  const p = (await q(`SELECT p.*, c.instantly_campaign_id AS c_instantly FROM prospects p LEFT JOIN campaigns c ON c.id = p.campaign_id WHERE p.id = ?`, [pid]))[0];
+  if (!p) throw new CampaignError("Lead not found", 404);
+  const o = OUTCOME_OVERRIDES[stage];
+  if (!o) throw new CampaignError("A lead can be moved to Replied, Interested, Meeting, Won or Lost.");
+  if (!OVERRIDABLE_FROM.includes(p.stage)) throw new CampaignError("Only leads that were emailed can be moved on the pipeline.");
+  if (p.stage === stage) return { ok: true as const, instantly: "unchanged" as const };
+  const reason = `Moved to ${o.label} by hand${note ? `: ${str(note, 300)}` : ""}`;
+  await setStage(p, stage, reason, { interest: o.interest ?? p.interest ?? null, replied_at: p.replied_at || nowIso() });
+  let instantly: "updated" | "skipped" | "failed" = "skipped";
+  if (o.instantly !== null && p.email && p.c_instantly && (await instantlyConfigured())) {
+    try {
+      const { updateInterest } = await import("../instantly");
+      await updateInterest(String(p.email), o.instantly, String(p.c_instantly));
+      instantly = "updated";
+    } catch (e: any) {
+      instantly = "failed";
+      await logEvent("campaign", `Couldn't update the lead's status in Instantly: ${String(e?.message || e).slice(0, 160)}`, { level: "warn", campaignId: p.campaign_id, refType: "prospect", refId: pid });
+    }
+  }
+  await logEvent("campaign", `${p.email || "A lead"} moved from ${p.stage} to ${o.label} by hand${note ? ` (${str(note, 120)})` : ""}.`, { campaignId: p.campaign_id, refType: "prospect", refId: pid });
+  // Segment reply / positive counters follow the stages.
+  if (p.segment_id) {
+    await q(
+      `UPDATE segments SET
+         replies = (SELECT CAST(count(*) AS INTEGER) FROM prospects x WHERE x.segment_id = segments.id AND x.stage IN ('replied','interested','meeting','won','lost','unsubscribed')),
+         positive = (SELECT CAST(count(*) AS INTEGER) FROM prospects x WHERE x.segment_id = segments.id AND x.stage IN ('interested','meeting','won'))
+       WHERE id = ?`,
+      [p.segment_id]
+    );
+  }
+  return { ok: true as const, instantly };
+}
+
+export async function setProspectNotes(pid: string, notes: string) {
+  const p = (await q(`SELECT id FROM prospects WHERE id = ?`, [pid]))[0];
+  if (!p) throw new CampaignError("Lead not found", 404);
+  await q(`UPDATE prospects SET notes = ?, updated_at = ? WHERE id = ?`, [String(notes || "").slice(0, 4000) || null, nowIso(), pid]);
+  return { ok: true as const };
+}
+
+/** Skip every not-yet-contacted lead at these domains / addresses (after they joined the do-not-contact list). */
+export async function skipForExclusion(values: { kind: "domain" | "email"; value: string }[], reason: string) {
+  let skipped = 0;
+  for (const v of values) {
+    const rows =
+      v.kind === "email"
+        ? await q(`SELECT * FROM prospects WHERE lower(email) = ?`, [v.value])
+        : await q(`SELECT p.* FROM prospects p JOIN companies co ON co.id = p.company_id WHERE co.domain = ? OR co.domain LIKE ?`, [v.value, `%.${v.value}`]);
+    for (const p of rows) {
+      if (!["found", "researched", "contact_found", "verified", "written", "approved"].includes(p.stage)) continue;
+      await setStage(p, "skipped", reason, { skipped_from: p.stage, next_action_at: null, skip_rule: null });
+      skipped++;
+    }
+  }
+  return skipped;
 }
 
 /* ---------------------------- pipeline pass ---------------------------- */
@@ -622,13 +919,33 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     const allSegs = await q(`SELECT * FROM segments WHERE campaign_id = ?`, [id]);
     for (const s of allSegs) segById.set(String(s.id), s);
 
+    // Targeting: the market narrowed by each segment (cached per pass).
+    const market = marketOf(c);
+    const kind = kindOf(c);
+    const effCache = new Map<string, EffectiveTargeting>();
+    const effFor = (segmentId: unknown): EffectiveTargeting => {
+      const key = segmentId ? String(segmentId) : "";
+      let e = effCache.get(key);
+      if (!e) {
+        e = effectiveTargeting(market, kind, key ? segById.get(key) || null : null);
+        effCache.set(key, e);
+      }
+      return e;
+    };
+    const roleOk = (eff: EffectiveTargeting) => (eff.roleAddresses === "inherit" ? agent.sending.allowRoleAddresses : eff.roleAddresses === "allow");
+
     // 1. Discover while the pre-write backlog is small.
     const backlog = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage IN ('found','researched','contact_found','verified') AND (next_action_at IS NULL OR next_action_at <= ?)`, [id, nowIso()]))[0]?.n) || 0;
     if (backlog < settings.dailyNewLeads * 3) {
       let searches = 0;
-      for (const seg of segRows.filter((s) => Number(s.exhausted) !== 1)) {
+      // Quota split (learning loop): the segment furthest below its share of today's finds goes first.
+      const foundToday = new Map<string, number>(
+        (await q(`SELECT segment_id, CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND created_at >= ? AND segment_id IS NOT NULL GROUP BY segment_id`, [id, `${todayUtc()}T00:00:00.000Z`])).map((r) => [String(r.segment_id), Number(r.n) || 0])
+      );
+      const ordered = discoveryOrder(segRows.filter((s) => Number(s.exhausted) !== 1), foundToday, await getRules());
+      for (const seg of ordered) {
         if (res.discovered >= 10 || searches >= 2 || !timeLeft()) break;
-        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch: ai.canSearch, aiOk });
+        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch: ai.canSearch, aiOk, eff: effFor(seg.id) });
         res.discovered += r.added;
         searches += r.searches;
         res.notes.push(...r.notes);
@@ -641,6 +958,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     const researchedToday = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects p JOIN companies co ON co.id = p.company_id WHERE p.campaign_id = ? AND co.researched_at >= ?`, [id, `${todayUtc()}T00:00:00.000Z`]))[0]?.n) || 0;
     const researchBudget = Math.max(0, Math.min(4, settings.researchPerDay - researchedToday));
     if (!researchBudget) res.notes.push(`Today's research limit (${settings.researchPerDay}) is reached.`);
+    let offTarget = 0;
     for (const p of await due(id, "found", researchBudget)) {
       if (!timeLeft()) break;
       try {
@@ -649,41 +967,67 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
           await skipProspect(p, "The company record is missing");
           continue;
         }
+        let note: string;
         if (researchIsFresh(co, aiOk)) {
-          await setStage(p, "researched", `Research reused from ${String(co.researched_at).slice(0, 10)}`, { attempts: 0, last_error: null });
-          res.researched++;
+          note = `Research reused from ${String(co.researched_at).slice(0, 10)}.`;
+        } else {
+          let out;
+          try {
+            out = await researchCompany(co, { ai: aiOk });
+          } catch (e) {
+            if (!isAiStop(e)) throw e;
+            stopAi(e);
+            out = await researchCompany(co, { ai: false });
+          }
+          note = out.note;
+          await logEvent("research", out.note, { campaignId: id, refType: "prospect", refId: p.id });
+        }
+        res.researched++;
+        // Target check on the facts, before any person search, score or email.
+        const fresh = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0] || co;
+        const t = checkCompany(fresh, effFor(p.segment_id));
+        if (!t.ok) {
+          await skipProspect(p, t.reason, t.rule, "researched");
+          offTarget++;
           continue;
         }
-        let out;
-        try {
-          out = await researchCompany(co, { ai: aiOk });
-        } catch (e) {
-          if (!isAiStop(e)) throw e;
-          stopAi(e);
-          out = await researchCompany(co, { ai: false });
-        }
-        await setStage(p, "researched", out.note, { attempts: 0, last_error: null });
-        await logEvent("research", out.note, { campaignId: id, refType: "prospect", refId: p.id });
-        res.researched++;
+        await setStage(p, "researched", t.notes.length ? `${note} ${t.notes.join("; ")}.` : note, {
+          attempts: 0,
+          last_error: null,
+          target_penalty: t.penalty,
+          target_notes: t.notes.join("; ") || null,
+        });
       } catch (e) {
         await failStep(p, e);
       }
     }
+    if (offTarget) res.notes.push(`${offTarget} researched compan${offTarget === 1 ? "y was" : "ies were"} outside the target and skipped (see Leads, Skipped).`);
 
     // 3. Decision maker + candidate address.
     for (const p of await due(id, "researched", 4)) {
       if (!timeLeft()) break;
       try {
+        // Imported people keep the person and address from the file; only the title rules apply.
+        if (p.email && p.email_source === "import") {
+          const allowed = personAllowed(p.title, effFor(p.segment_id));
+          if (!allowed.ok) await skipProspect(p, `Imported person passed over: ${allowed.reason}`);
+          else {
+            await setStage(p, "contact_found", "Imported from a file; checking the address", { attempts: 0, last_error: null, next_action_at: null });
+            res.contacted++;
+          }
+          continue;
+        }
         const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
-        const seg = p.segment_id ? segById.get(String(p.segment_id)) : null;
-        const titles = parseJson<string[]>(seg?.titles_json, []);
+        const eff = effFor(p.segment_id);
+        const titles = eff.titles;
+        const allowPerson = (title: string) => personAllowed(title, eff);
         let r;
         try {
-          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: ai.canSearch, aiOk, allowRole: agent.sending.allowRoleAddresses });
+          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: ai.canSearch, aiOk, allowRole: roleOk(eff), allowPerson });
         } catch (e) {
           if (!isAiStop(e)) throw e;
           stopAi(e);
-          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: false, aiOk: false, allowRole: agent.sending.allowRoleAddresses });
+          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: false, aiOk: false, allowRole: roleOk(eff), allowPerson });
         }
         if (r.ok && r.email) {
           await setStage(p, "contact_found", r.reason, {
@@ -715,7 +1059,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     for (const p of await due(id, "contact_found", 8)) {
       if (!timeLeft()) break;
       try {
-        const v = await verifyProspect(p, agent.sending);
+        const v = await verifyProspect(p, { ...agent.sending, allowRoleAddresses: roleOk(effFor(p.segment_id)) });
         if (v.verdict === "ok") {
           await setStage(p, "verified", v.reason, { verify_json: JSON.stringify(v.result), email_status: v.result.status, catch_all: v.catchAll ? 1 : 0, attempts: 0, last_error: null, next_action_at: null });
           res.verified++;
@@ -733,13 +1077,17 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
 
     // 5. Score (AI).
     if (aiOk) {
-      const threshold = settings.minFitScore ?? agent.sending.minFitScore;
       for (const p of await due(id, "verified", 6, "AND p.fit_score IS NULL")) {
         if (!timeLeft() || !aiOk) break;
         try {
           const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
           const seg = p.segment_id ? segById.get(String(p.segment_id)) || null : null;
-          const s = await scoreProspect(p, co, researchJson(co.research_json), seg, offer);
+          const eff = effFor(p.segment_id);
+          const threshold = eff.minFitScore ?? settings.minFitScore ?? agent.sending.minFitScore;
+          const raw = await scoreProspect(p, co, researchJson(co.research_json), seg, offer, eff);
+          // "Prefer" targeting rules (size, keywords) lower the score instead of skipping.
+          const penalty = Number(p.target_penalty) || 0;
+          const s = penalty ? { score: Math.max(0, raw.score - penalty), reason: `${raw.reason} (${raw.score} − ${penalty}: ${p.target_notes || "outside the preferred target"})` } : raw;
           await q(`UPDATE prospects SET fit_score = ?, fit_reason = ?, updated_at = ? WHERE id = ?`, [s.score, s.reason, nowIso(), p.id]);
           res.scored++;
           if (s.score < threshold) await skipProspect({ ...p, stage: "verified" }, `Fit ${s.score} is below ${threshold}: ${s.reason}`);
@@ -750,7 +1098,8 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
       }
     }
 
-    // 6. Write (AI). Leads that already have copy (edited by hand) skip the writer.
+    // 6. Write (AI, following the campaign's sequence). Leads that already have copy (edited by hand) skip the writer.
+    const seq = await sequenceFor(id);
     const ready = await due(id, "verified", 3, "AND p.fit_score IS NOT NULL");
     for (const p of ready) {
       if (!timeLeft()) break;
@@ -760,12 +1109,13 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
         res.written++;
         continue;
       }
-      if (!aiOk) break;
+      if (!aiOk && !writableWithoutAi(seq.steps)) break;
       try {
         const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
         const seg = p.segment_id ? segById.get(String(p.segment_id)) || null : null;
-        const emails = await writeEmails({ prospect: p, company: co, research: researchJson(co.research_json), segment: seg, offer, settings, agent });
-        const extra = settings.reviewFirst ? { email_json: JSON.stringify(emails), written_at: now, attempts: 0, last_error: null } : { email_json: JSON.stringify(emails), written_at: now, approved_at: now, attempts: 0, last_error: null };
+        const emails = await writeEmails({ prospect: p, company: co, research: researchJson(co.research_json), segment: seg, offer, settings, agent, steps: seq.steps, sequenceLanguage: seq.language, sequenceVersion: seq.version });
+        const base = { email_json: JSON.stringify(emails), sequence_id: seq.id, sequence_version: seq.version, written_at: now, attempts: 0, last_error: null };
+        const extra = settings.reviewFirst ? base : { ...base, approved_at: now };
         await setStage(p, settings.reviewFirst ? "written" : "approved", settings.reviewFirst ? "Written, waiting for your review" : "Written and approved (review is off)", extra);
         await logEvent("write", `Wrote ${emails.steps.length} email(s) for ${p.full_name || p.email} at ${co.name || co.domain}${emails.warnings.length ? ` (${emails.warnings.join(" ")})` : ""}.`, { campaignId: id, refType: "prospect", refId: p.id });
         res.written++;

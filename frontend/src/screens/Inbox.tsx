@@ -53,7 +53,16 @@ export default function Inbox() {
   const [filter, setFilter] = useState<InboxFilter>("active");
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<string | null>(null);
+  // Another tab can ask for a thread ("Open in Inbox" on a lead): a one-shot key.
+  const [selected, setSelected] = useState<string | null>(() => {
+    try {
+      const t = localStorage.getItem("dnaInboxOpen");
+      if (t) localStorage.removeItem("dnaInboxOpen");
+      return t;
+    } catch {
+      return null;
+    }
+  });
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);

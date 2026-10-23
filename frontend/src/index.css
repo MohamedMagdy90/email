@@ -422,3 +422,32 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
   .ib input, .ib select, .ib textarea { font-size: 16px; }
   .ib-cmp { border-radius: 0 0 12px 12px; }
 }
+
+/* ==========================================================================
+   Leads — pipeline board (ported from the DNA leads console .kb/.kc/.kd)
+   and the side drawers.
+   ========================================================================== */
+.kb { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(232px, 1fr); gap: 12px; overflow-x: auto; padding-bottom: 12px; }
+.kc {
+  background: var(--surf2); border: 1px solid var(--line1); border-radius: 13px; display: flex; flex-direction: column;
+  max-height: calc(100vh - 250px); min-height: 300px; transition: border-color 0.12s, background 0.12s;
+}
+.kc h3 {
+  display: flex; justify-content: space-between; align-items: center; padding: 12px 13px 10px; font-size: 0.78rem;
+  font-weight: 700; border-bottom: 1px solid var(--line1);
+}
+.kc h3 > span:last-child { font-size: 0.7rem; color: var(--mut); font-weight: 600; font-variant-numeric: tabular-nums; }
+.kc .cards { overflow-y: auto; padding: 9px; flex: 1; }
+.kc.over { border-color: var(--ac); background: var(--dropb); }
+.kd { background: var(--surf); border: 1px solid var(--line2); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: border-color 0.12s, transform 0.12s; }
+.kd:hover { border-color: var(--line3); }
+.kd[draggable="true"] { cursor: grab; }
+.kd.drag { opacity: 0.4; transform: scale(0.98); }
+.kd b { display: block; font-size: 0.84rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kd .meta { font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kd .tg { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; align-items: center; }
+.kd .tg .mut { margin-left: auto; font-size: 0.68rem; }
+@media (max-width: 860px) { .kc { max-height: none; } }
+
+.drawer-in { animation: drawer-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
+@keyframes drawer-in { from { transform: translateX(28px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }

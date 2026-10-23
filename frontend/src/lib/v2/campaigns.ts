@@ -4,6 +4,7 @@
 // .same/campaigns-spec.md. Change a shape here first, then on both sides.
 import { req } from "../api";
 import { del, j, put, type AgentEvent, type VerifyResult } from "./core";
+import type { TargetMarket } from "./targeting";
 
 /* ------------------------------- enums -------------------------------- */
 
@@ -120,10 +121,39 @@ export interface Segment {
   replies: number;
   positive: number;
   createdAt: string;
+  // Structured targeting (Phase 5, plan §8.4.2) — narrows the campaign's market.
+  industryIds: string[]; // taxonomy ids (lib/v2/targeting.ts)
+  cities: Record<string, string[]>; // country -> cities; {} = the market's
+  sizeBands: string[] | null; // null = the market's size
+  minBranches: number | null;
+  titlesOverride: boolean; // false = the market's ranked titles
+  signals: { must: string[]; mustNot: string[] };
+  queriesAuto: boolean; // searches generated from the fields (false = written by hand)
+  searchesDone: number;
+  searchesTotal: number;
 }
 
 export type SegmentInput = Partial<
-  Pick<Segment, "name" | "description" | "industries" | "countries" | "companySize" | "titles" | "queries" | "fitScore" | "why" | "enabled">
+  Pick<
+    Segment,
+    | "name"
+    | "description"
+    | "industries"
+    | "countries"
+    | "companySize"
+    | "titles"
+    | "queries"
+    | "fitScore"
+    | "why"
+    | "enabled"
+    | "industryIds"
+    | "cities"
+    | "sizeBands"
+    | "minBranches"
+    | "titlesOverride"
+    | "signals"
+    | "queriesAuto"
+  >
 >;
 
 /* ------------------------------ campaigns ----------------------------- */
@@ -172,6 +202,8 @@ export interface CampaignToday {
 export interface CampaignDetail extends CampaignSummary {
   offer: Offer | null;
   settings: CampaignSettings;
+  /** The target market (Phase 5). Edit it through targetingApi.saveMarket. */
+  market: TargetMarket;
   segmentList: Segment[];
   readiness: CampaignReadiness;
   /** Plain-English reasons a stage is waiting, e.g. "Waiting for an AI key to write the emails." */
@@ -200,11 +232,15 @@ export interface ProspectRow {
   linkedinUrl: string | null;
   email: string | null;
   emailStatus: VerifyResult["status"] | null;
-  emailSource: "published" | "pattern" | "role" | "manual" | null;
+  emailSource: "published" | "pattern" | "role" | "manual" | "import" | null;
   fitScore: number | null;
   fitReason: string | null;
   stage: ProspectStage;
   stageReason: string | null;
+  /** Which targeting rule skipped it (country, city, industry, size, keyword, language). */
+  skipRule: string | null;
+  /** "Prefer" rules it missed, which lowered its fit score. */
+  targetNotes: string | null;
   subject: string | null; // first email subject once written
   mailboxEmail: string | null;
   interest: string | null;
@@ -213,6 +249,14 @@ export interface ProspectRow {
   repliedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  campaignName: string | null;
+  /** How the agent found it: gemini / search / manual / import. */
+  leadSource: "gemini" | "search" | "manual" | "import" | null;
+  /** Steps Instantly has sent (1 = the first email), when it executed the last one, and the step replied to. */
+  lastStep: number | null;
+  lastStepAt: string | null;
+  repliedStep: number | null;
+  totalSteps: number;
 }
 
 export interface EmailStep {

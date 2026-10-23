@@ -47,6 +47,8 @@ const FREE = new Set(
     " "
   )
 );
+/** gmail.com, outlook.com … — a personal address says nothing about the company. */
+export const isFreeMailDomain = (domain: string) => FREE.has(String(domain || "").toLowerCase());
 
 export async function getReacherConfig(): Promise<{ url: string; secret: string } | null> {
   const url = ((await getSetting("reacher_url")) || process.env.REACHER_URL || "").trim().replace(/\/+$/, "");

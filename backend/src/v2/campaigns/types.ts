@@ -1,6 +1,7 @@
 // Campaigns (v2 workstream C) — types, defaults, sanitizers and row -> view
 // mappers. Mirrors frontend/src/lib/v2/campaigns.ts (the binding contract).
 import { parseJson } from "../events";
+import { planFor, planKey, sanitizeSegmentTargeting, segmentTargeting, type SegmentTargeting, type TargetMarket } from "../targeting/market";
 
 export type Row = Record<string, any>;
 export type CampaignKind = "customer" | "partner";
@@ -216,9 +217,19 @@ export interface Segment {
   replies: number;
   positive: number;
   createdAt: string;
+  // Structured targeting (§8.4.2)
+  industryIds: string[];
+  cities: Record<string, string[]>;
+  sizeBands: string[] | null;
+  minBranches: number | null;
+  titlesOverride: boolean;
+  signals: { must: string[]; mustNot: string[] };
+  queriesAuto: boolean;
+  searchesDone: number;
+  searchesTotal: number;
 }
 
-export interface SegmentInput {
+export interface SegmentInput extends Partial<Omit<SegmentTargeting, "countries">> {
   name?: string;
   description?: string;
   industries?: string[];
@@ -233,7 +244,7 @@ export interface SegmentInput {
 
 export function sanitizeSegmentInput(raw: any): SegmentInput {
   const s = raw && typeof raw === "object" ? raw : {};
-  const out: SegmentInput = {};
+  const out: SegmentInput = { ...sanitizeSegmentTargeting(s) };
   if (s.name !== undefined) out.name = str(s.name, 140);
   if (s.description !== undefined) out.description = str(s.description, 600);
   if (s.industries !== undefined) out.industries = strList(s.industries, 10, 80);
@@ -247,9 +258,23 @@ export function sanitizeSegmentInput(raw: any): SegmentInput {
   return out;
 }
 
-export function segmentView(r: Row): Segment {
+export function segmentView(r: Row, market?: TargetMarket | null): Segment {
   const enabled = Number(r.enabled) === 1;
+  const st = segmentTargeting(r);
+  const queries = parseJson<string[]>(r.queries_json, []);
+  const countries = st.countries.length ? st.countries : market?.countries || [];
+  const plan = planFor(queries, countries);
+  const searched = new Set(parseJson<string[]>(r.searched_json, []));
   return {
+    industryIds: st.industryIds,
+    cities: st.cities,
+    sizeBands: st.sizeBands,
+    minBranches: st.minBranches,
+    titlesOverride: st.titlesOverride,
+    signals: st.signals,
+    queriesAuto: st.queriesAuto,
+    searchesDone: plan.filter((p) => searched.has(planKey(p))).length,
+    searchesTotal: plan.length,
     id: String(r.id),
     campaignId: String(r.campaign_id),
     name: String(r.name || ""),
@@ -286,21 +311,26 @@ export interface ProspectEmails {
   source: "ai" | "edited";
   writtenAt: string;
   warnings: string[];
+  /** The sequence version it was written with (Phase 7). */
+  sequenceVersion?: number;
 }
 
 /** SELECT used by every prospect list/detail: prospect + company + segment name. */
 export const PROSPECT_SELECT = `
-  SELECT p.*, s.name AS segment_name,
+  SELECT p.*, s.name AS segment_name, cp.name AS campaign_name, cp.status AS campaign_status,
          co.name AS co_name, co.domain AS co_domain, co.website AS co_website, co.country AS co_country,
          co.city AS co_city, co.industry AS co_industry, co.description AS co_description,
          co.size_hint AS co_size_hint, co.phone AS co_phone, co.linkedin_url AS co_linkedin_url,
          co.research_json AS co_research_json, co.researched_at AS co_researched_at,
-         co.research_status AS co_research_status, co.language AS co_language
+         co.research_status AS co_research_status, co.language AS co_language,
+         co.industry_id AS co_industry_id, co.source AS co_source
     FROM prospects p
     LEFT JOIN segments s ON s.id = p.segment_id
+    LEFT JOIN campaigns cp ON cp.id = p.campaign_id
     LEFT JOIN companies co ON co.id = p.company_id`;
 
-const EMAIL_SOURCES = ["published", "pattern", "role", "manual"];
+const EMAIL_SOURCES = ["published", "pattern", "role", "manual", "import"];
+const LEAD_SOURCES = ["gemini", "search", "manual", "import"];
 const VERIFY_STATUSES = ["valid", "invalid", "risky", "catch_all", "unknown"];
 
 export function prospectRowView(r: Row) {
@@ -327,6 +357,8 @@ export function prospectRowView(r: Row) {
     fitReason: r.fit_reason ? String(r.fit_reason) : null,
     stage: (STAGES.includes(r.stage) ? r.stage : "found") as ProspectStage,
     stageReason: r.stage_reason ? String(r.stage_reason) : null,
+    skipRule: r.skip_rule ? String(r.skip_rule) : null,
+    targetNotes: r.target_notes ? String(r.target_notes) : null,
     subject: emails?.steps?.[0]?.subject || null,
     mailboxEmail: r.mailbox_email ? String(r.mailbox_email) : null,
     interest: r.interest ? String(r.interest) : null,
@@ -335,6 +367,12 @@ export function prospectRowView(r: Row) {
     repliedAt: r.replied_at || null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
+    campaignName: r.campaign_name ? String(r.campaign_name) : null,
+    leadSource: (LEAD_SOURCES.includes(r.lead_source) ? r.lead_source : LEAD_SOURCES.includes(r.co_source) ? r.co_source : null) as "gemini" | "search" | "manual" | "import" | null,
+    lastStep: r.last_step == null ? null : Number(r.last_step),
+    lastStepAt: r.last_step_at || null,
+    repliedStep: r.replied_step == null ? null : Number(r.replied_step),
+    totalSteps: emails?.steps?.length || 0,
   };
 }
 

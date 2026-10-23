@@ -142,6 +142,176 @@ export function resolveLeadCountry(opts: {
   );
 }
 
+/* ------------------------------ cities ------------------------------ */
+// Cities the targeting screen offers, per canonical country, with the Arabic
+// spelling used in generated searches. Aliases catch common transliterations.
+
+export interface City {
+  name: string;
+  ar: string;
+  aliases?: string[];
+}
+
+export const GULF_COUNTRIES = ["Saudi Arabia", "United Arab Emirates", "Qatar", "Kuwait", "Bahrain", "Oman"];
+
+/** Arabic country names for generated searches ("سلطنة عمان", never bare "عمان" — that's also Amman). */
+export const COUNTRY_AR: Record<string, string> = {
+  "Saudi Arabia": "السعودية",
+  "United Arab Emirates": "الإمارات",
+  Qatar: "قطر",
+  Kuwait: "الكويت",
+  Bahrain: "البحرين",
+  Oman: "سلطنة عمان",
+  Egypt: "مصر",
+  Jordan: "الأردن",
+  Iraq: "العراق",
+  Lebanon: "لبنان",
+};
+
+export const CITIES: Record<string, City[]> = {
+  "Saudi Arabia": [
+    { name: "Riyadh", ar: "الرياض", aliases: ["ar riyadh", "al riyadh"] },
+    { name: "Jeddah", ar: "جدة", aliases: ["jiddah", "jedda"] },
+    { name: "Dammam", ar: "الدمام", aliases: ["ad dammam"] },
+    { name: "Khobar", ar: "الخبر", aliases: ["al khobar", "al-khobar"] },
+    { name: "Dhahran", ar: "الظهران" },
+    { name: "Jubail", ar: "الجبيل", aliases: ["al jubail"] },
+    { name: "Makkah", ar: "مكة", aliases: ["mecca", "makkah al mukarramah"] },
+    { name: "Madinah", ar: "المدينة المنورة", aliases: ["medina", "al madinah"] },
+    { name: "Taif", ar: "الطائف" },
+    { name: "Al Ahsa", ar: "الأحساء", aliases: ["al hasa", "hofuf", "al hofuf"] },
+    { name: "Buraidah", ar: "بريدة", aliases: ["qassim", "al qassim", "buraydah"] },
+    { name: "Tabuk", ar: "تبوك" },
+    { name: "Abha", ar: "أبها" },
+    { name: "Khamis Mushait", ar: "خميس مشيط" },
+    { name: "Hail", ar: "حائل", aliases: ["ha'il"] },
+    { name: "Yanbu", ar: "ينبع" },
+    { name: "Jazan", ar: "جازان", aliases: ["jizan"] },
+    { name: "Najran", ar: "نجران" },
+  ],
+  "United Arab Emirates": [
+    { name: "Dubai", ar: "دبي" },
+    { name: "Abu Dhabi", ar: "أبوظبي", aliases: ["abudhabi"] },
+    { name: "Sharjah", ar: "الشارقة" },
+    { name: "Ajman", ar: "عجمان" },
+    { name: "Ras Al Khaimah", ar: "رأس الخيمة", aliases: ["rak", "ras al-khaimah"] },
+    { name: "Fujairah", ar: "الفجيرة" },
+    { name: "Umm Al Quwain", ar: "أم القيوين" },
+    { name: "Al Ain", ar: "العين" },
+  ],
+  Qatar: [
+    { name: "Doha", ar: "الدوحة" },
+    { name: "Al Rayyan", ar: "الريان", aliases: ["rayyan"] },
+    { name: "Al Wakrah", ar: "الوكرة", aliases: ["wakrah"] },
+    { name: "Lusail", ar: "لوسيل" },
+    { name: "Al Khor", ar: "الخور" },
+    { name: "Mesaieed", ar: "مسيعيد", aliases: ["mesaieed industrial city"] },
+  ],
+  Kuwait: [
+    { name: "Kuwait City", ar: "مدينة الكويت" },
+    { name: "Hawalli", ar: "حولي" },
+    { name: "Salmiya", ar: "السالمية", aliases: ["salmiyah"] },
+    { name: "Farwaniya", ar: "الفروانية", aliases: ["farwaniyah"] },
+    { name: "Shuwaikh", ar: "الشويخ", aliases: ["shuwaikh industrial"] },
+    { name: "Ahmadi", ar: "الأحمدي" },
+    { name: "Jahra", ar: "الجهراء" },
+  ],
+  Bahrain: [
+    { name: "Manama", ar: "المنامة" },
+    { name: "Muharraq", ar: "المحرق" },
+    { name: "Riffa", ar: "الرفاع" },
+    { name: "Sitra", ar: "سترة" },
+    { name: "Isa Town", ar: "مدينة عيسى" },
+    { name: "Hamad Town", ar: "مدينة حمد" },
+  ],
+  Oman: [
+    { name: "Muscat", ar: "مسقط" },
+    { name: "Sohar", ar: "صحار" },
+    { name: "Salalah", ar: "صلالة" },
+    { name: "Nizwa", ar: "نزوى" },
+    { name: "Duqm", ar: "الدقم" },
+  ],
+  Egypt: [
+    { name: "Cairo", ar: "القاهرة" },
+    { name: "Giza", ar: "الجيزة" },
+    { name: "Alexandria", ar: "الإسكندرية" },
+    { name: "New Cairo", ar: "القاهرة الجديدة" },
+    { name: "6th of October", ar: "السادس من أكتوبر", aliases: ["6th october", "october city"] },
+    { name: "10th of Ramadan", ar: "العاشر من رمضان", aliases: ["10th ramadan"] },
+    { name: "Port Said", ar: "بورسعيد" },
+    { name: "Mansoura", ar: "المنصورة" },
+  ],
+  Jordan: [
+    { name: "Amman", ar: "عمّان" },
+    { name: "Zarqa", ar: "الزرقاء" },
+    { name: "Irbid", ar: "إربد" },
+    { name: "Aqaba", ar: "العقبة" },
+  ],
+  Iraq: [
+    { name: "Baghdad", ar: "بغداد" },
+    { name: "Erbil", ar: "أربيل" },
+    { name: "Basra", ar: "البصرة" },
+  ],
+  Lebanon: [{ name: "Beirut", ar: "بيروت" }],
+};
+
+/** Drop Arabic diacritics and tatweel so "عمّان" and "عمان" compare equal. */
+function plainAr(s: string): string {
+  return s.replace(/[\u064B-\u065F\u0670\u0640]/g, "");
+}
+
+function escapeRe(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const CITY_INDEX: { needle: string; latin: boolean; country: string; city: string }[] = (() => {
+  const out: { needle: string; latin: boolean; country: string; city: string }[] = [];
+  for (const [country, list] of Object.entries(CITIES)) {
+    for (const c of list) {
+      for (const n of [c.name, ...(c.aliases || [])]) out.push({ needle: n.toLowerCase(), latin: true, country, city: c.name });
+      out.push({ needle: plainAr(c.ar), latin: false, country, city: c.name });
+    }
+  }
+  return out.sort((a, b) => b.needle.length - a.needle.length); // "new cairo" before "cairo"
+})();
+
+function hasNeedle(hay: string, needle: string, latin: boolean): boolean {
+  if (!latin) return hay.includes(needle);
+  return new RegExp(`(^|[^a-z0-9])${escapeRe(needle)}($|[^a-z0-9])`).test(hay);
+}
+
+/** A country named in free text (English or Arabic), or null. */
+export function countryInText(text: string): string | null {
+  const lower = String(text || "").toLowerCase();
+  const ar = plainAr(String(text || ""));
+  for (const [name, arName] of Object.entries(COUNTRY_AR)) {
+    if (ar.includes(plainAr(arName))) return name;
+  }
+  for (const [needle, iso] of NAME_TO_ISO) {
+    if (needle.length < 3) continue; // "qa", "ae"… are too short to search text for
+    if (hasNeedle(lower, needle, true)) return COUNTRY_NAME[iso];
+  }
+  return null;
+}
+
+/** The first known city named in free text, with its country. */
+export function cityInText(text: string): { city: string; country: string } | null {
+  const lower = String(text || "").toLowerCase();
+  const ar = plainAr(String(text || ""));
+  for (const e of CITY_INDEX) {
+    if (hasNeedle(e.latin ? lower : ar, e.needle, e.latin)) return { city: e.city, country: e.country };
+  }
+  return null;
+}
+
+/** Canonical city name for what research or a search result says ("Al Khobar" -> "Khobar"). */
+export function normalizeCity(input?: string | null, country?: string | null): string | null {
+  const hit = cityInText(String(input || ""));
+  if (!hit) return null;
+  if (country && normalizeCountry(country) && normalizeCountry(country) !== hit.country) return null;
+  return hit.city;
+}
+
 function hostOfUrl(url?: string | null): string | null {
   const u = String(url || "").trim();
   if (!u) return null;

@@ -25,9 +25,12 @@ export function titleRank(title: string, priorities: string[]): number {
   return 999;
 }
 
-export function pickPerson(people: ResearchJson["people"], titles: string[]) {
+export type PersonFilter = (title: string) => { ok: boolean; reason?: string };
+
+export function pickPerson(people: ResearchJson["people"], titles: string[], allow?: PersonFilter) {
   const ranked = people
     .filter((p) => p.name && p.name.split(/\s+/).length >= 2)
+    .filter((p) => !allow || allow(p.title).ok)
     .map((p) => ({ p, rank: titleRank(p.title, titles) }))
     .filter((x) => x.rank < 999)
     .sort((a, b) => a.rank - b.rank);
@@ -72,14 +75,21 @@ export interface ContactResult {
 }
 
 /** AI errors from the search step propagate (the pass stops AI work). */
-export async function findContact(company: Row, research: ResearchJson, titles: string[], opts: { canSearch: boolean; aiOk: boolean; allowRole: boolean }): Promise<ContactResult> {
+export async function findContact(
+  company: Row,
+  research: ResearchJson,
+  titles: string[],
+  opts: { canSearch: boolean; aiOk: boolean; allowRole: boolean; allowPerson?: PersonFilter }
+): Promise<ContactResult> {
   const domain = String(company.domain);
-  let person = pickPerson(research.people, titles);
+  let person = pickPerson(research.people, titles, opts.allowPerson);
   let linkedin: string | null = person?.linkedin || null;
   let viaSearch = false;
   if (!person && opts.canSearch && opts.aiOk) {
     const found = await personFromSearch(company, titles);
-    if (found) {
+    if (found && opts.allowPerson && !opts.allowPerson(found.title).ok) {
+      // Search named someone the targeting rules out (e.g. HR, or below manager level).
+    } else if (found) {
       person = { name: found.name, title: found.title, email: null, linkedin: found.linkedin };
       linkedin = found.linkedin;
       viaSearch = true;

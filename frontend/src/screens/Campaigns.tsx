@@ -32,6 +32,15 @@ export default function Campaigns() {
     }
     window.scrollTo({ top: 0 });
   };
+  // Other tabs open a campaign directly (openCampaign in parts.tsx).
+  useEffect(() => {
+    const h = (e: Event) => {
+      const id = String((e as CustomEvent).detail || "");
+      if (id) setViewState({ kind: "campaign", id });
+    };
+    window.addEventListener("dna-open-campaign", h);
+    return () => window.removeEventListener("dna-open-campaign", h);
+  }, []);
 
   if (view.kind === "wizard") return <Wizard resumeId={view.id} onCancel={() => setView({ kind: "list" })} onOpen={(id) => setView({ kind: "campaign", id })} />;
   if (view.kind === "campaign") return <CampaignView key={view.id} id={view.id} onBack={() => setView({ kind: "list" })} onResumeSetup={(id) => setView({ kind: "wizard", id })} />;

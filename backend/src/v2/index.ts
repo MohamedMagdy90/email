@@ -10,7 +10,7 @@ import type { Hono } from "hono";
 import { ensureV2Schema } from "./schema";
 import * as core from "./core-routes";
 
-const FEATURE_MODULES = ["./mailboxes/module", "./inbox/module", "./campaigns/module"] as const;
+const FEATURE_MODULES = ["./mailboxes/module", "./inbox/module", "./campaigns/module", "./targeting/module", "./leads/module", "./sequences/module", "./dashboard/module"] as const;
 
 type FeatureModule = { register?: (app: Hono) => void | Promise<void>; start?: () => void };
 const loaded: { name: string; mod: FeatureModule }[] = [];

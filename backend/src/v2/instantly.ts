@@ -302,6 +302,38 @@ export async function campaignAnalytics(id: string): Promise<any | null> {
   const r = await instantlyCall<any>("GET", "/api/v2/campaigns/analytics", { query: { id } });
   return Array.isArray(r) ? r[0] || null : r;
 }
+/** One row per day: date, sent, contacted, new_leads_contacted, replies, unique_replies, replies_automatic, opportunities … (max 31 days). */
+export interface DailyCampaignStat {
+  date: string;
+  sent?: number;
+  contacted?: number;
+  new_leads_contacted?: number;
+  replies?: number;
+  unique_replies?: number;
+  replies_automatic?: number;
+  unique_replies_automatic?: number;
+  opportunities?: number;
+  unique_opportunities?: number;
+}
+export async function campaignDailyAnalytics(id: string, startDate: string, endDate: string): Promise<DailyCampaignStat[]> {
+  const r = await instantlyCall<any>("GET", "/api/v2/campaigns/analytics/daily", { query: { campaign_id: id, start_date: startDate, end_date: endDate } });
+  return Array.isArray(r) ? r : [];
+}
+/** One row per step (and variant). `step` is ZERO-based, as a string (Instantly: "0" = the first email). */
+export interface StepAnalytics {
+  step: string | null;
+  variant: string | null;
+  sent?: number;
+  replies?: number;
+  unique_replies?: number;
+  replies_automatic?: number;
+  opportunities?: number;
+  meetings_booked?: number;
+}
+export async function campaignStepAnalytics(id: string): Promise<StepAnalytics[]> {
+  const r = await instantlyCall<any>("GET", "/api/v2/campaigns/analytics/steps", { query: { campaign_id: id, include_opportunities_count: "true" } });
+  return Array.isArray(r) ? r : [];
+}
 
 /* -------------------------------- leads ------------------------------- */
 
@@ -384,10 +416,14 @@ export function timezoneForCountry(country?: string | null): string {
   return "Asia/Baghdad";
 }
 
-/** Gulf work week (Sun–Thu) vs. Mon–Fri elsewhere. 0 = Sunday. */
+/**
+ * Sun–Thu where the weekend is Fri–Sat (Saudi, Qatar, Kuwait, Bahrain, Oman,
+ * Iraq, Yemen, Jordan, Egypt); Mon–Fri elsewhere — including the UAE, which
+ * moved to a Sat–Sun weekend in 2022. 0 = Sunday.
+ */
 export function workDaysForCountry(country?: string | null): Record<string, boolean> {
   const c = String(country || "").toLowerCase();
-  const gulf = /(saudi|ksa|qatar|kuwait|bahrain|emirates|uae|oman|iraq|yemen|jordan|egypt)/.test(c);
+  const gulf = /(saudi|ksa|qatar|kuwait|bahrain|oman|iraq|yemen|jordan|egypt)/.test(c) && !/(emirates|uae)/.test(c);
   return gulf
     ? { "0": true, "1": true, "2": true, "3": true, "4": true, "5": false, "6": false }
     : { "0": false, "1": true, "2": true, "3": true, "4": true, "5": true, "6": false };

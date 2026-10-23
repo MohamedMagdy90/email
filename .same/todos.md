@@ -110,7 +110,10 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
         queue, segments, offer, settings, activity), not-connected states, dark/light, 390px
   - [x] C3 Integrate: both tsc, vite build, 47/47 test, live smoke on the dev server, version
         (screenshot tool can't log in — USER to eyeball the Campaigns tab)
-  - [ ] C4 Push (2026-10-21) + Netlify republish only once Railway serves the new backend
+  - [ ] C4 PUSHED 075c581 (2026-10-21). Railway did NOT deploy it (no deployment record, no commit status;
+        /api/open still 200 = old build). Netlify NOT republished on purpose — wait for Railway.
+        Probe: curl https://email-production-3c14.up.railway.app/api/open?s=x -> 401 means new backend.
+        Netlify republish only once Railway serves the new backend
         (Railway has not auto-deployed since e06d231 — new screens against the old API = 404s)
 - [x] D Agent tab (2026-10-21, built directly, NOT pushed)
   - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
@@ -133,6 +136,56 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
     `.same/corrupt-db-backup-11/`, `-12/`; reinstall; ONE `bun run dev` (log /tmp/dev.log).
   - (Resolved by B: `/api/v2/inbox/counts` now exists.)
 - [ ] Integrate: static imports, typecheck, end-to-end mock run, design review, version
+
+## v2 workspace tabs (planned 2026-10-21) — spec in `.same/outreach-v2-plan.md` §8, decisions 8-13 in §7
+Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026-10-21), then Netlify.
+- [x] Phase 5 Targeting setup — market per campaign (countries, cities, size, excluded industries, must/must-not,
+      language, ranked titles, never-titles, role addresses, min fit), structured segment builder, `taxonomy.ts`
+      + `CITIES`, generated EN/AR searches, TARGET-CHECK step (today country/industry/size are never checked),
+      `skip_rule`, re-check dry run, sample preview, global `exclusions`, migration of existing segments
+      (2026-10-23: wizard wiring finished — Market + Segments steps; tg-test 72/72, cp-test 47/47, both tsc)
+- Env 2026-10-23: snapshot restore again -> DB parked in `.same/corrupt-db-backup-18/`, .git re-cloned
+  (`gh repo clone --no-checkout` + `git reset`), 3x bun install, ONE dev server (`nohup bun run dev > /tmp/dev.log`).
+  The platform supervisor survives `kill`; `kill -9` the pids of `bun run dev` + concurrently.
+
+### Build order for 6-9 (2026-10-23)
+- [x] 6a backend `v2/leads/` (list people/companies + facets, detail + thread, bulk via campaign service,
+      stage override -> Instantly interest, saved views, CSV import job + export, counts) + `ld-test.ts` 45/45
+      New campaign-service writes: reresearch / reverify / move / setStageByHand / notes / skipForExclusion.
+      Columns: prospects.lead_source, notes, sequence_id/version, variant, last_step(_at), replied_step;
+      campaigns.sequence_id; segments.suggested_* / status_reason. Imported people keep their person through
+      research (`email_source = 'import'`). `suppressionReason(email, cid, pid?, companyId?)` for imports.
+- [x] 6b `lib/v2/leads.ts` + shared campaign filter (`screens/shared/CampaignFilter.tsx`, key `dnaCampaignFilter`)
+      + `screens/Leads.tsx` (People/Companies/Pipeline, built-in + saved views, facet filters, skipped breakdown,
+      column picker, bulk bar, import dialog, export) + `leads/{LeadDrawer,CompanyDrawer,Pipeline,ImportDialog}`.
+      Campaign view uses LeadDrawer (old LeadPanel removed). `openCampaign` / `openThread` helpers.
+- Env 2026-10-23 (2nd restore mid-session): node_modules + .git + /tmp wiped again, DB -> corrupt-db-backup-19.
+  Use `./node_modules/.bin/tsc` in frontend (bunx pulls TS 6, which rejects `baseUrl`).
+- [x] 7a backend `v2/sequences/` {model, store, service, module} (sequences + sequence_versions, 5 starters,
+      migration from followUps, writer/sender refactor, preview on real lead or sample, rewrite-unsent, step stats,
+      lead progress from Instantly) + `sq-test.ts` 39/39. Instantly `step` / `email_replied_step` = ZERO-based.
+      Guard: a longer sequence is refused while leads are mid-sequence in Instantly (they'd get an empty email);
+      copy written for a shorter version is sent back to the writer at push. Template-only sequences need no AI.
+      `instantly.ts`: campaignDailyAnalytics + campaignStepAnalytics. Manual copy edit keeps unsent steps.
+- [x] 7b `lib/v2/sequences.ts` + `screens/Sequences.tsx` (overview | editor) + `sequences/Editor.tsx` (timeline,
+      angles, AI/template, variable chips, delays, thread + booking-link rules, preview panel, library, stats,
+      versions, save bar). Campaign view "Sequence" tab; wizard Sequence step (7 steps); follow-up fields removed
+      from Rules. `Textarea` now forwards refs.
+- [ ] 8a backend `v2/dashboard/` (`campaign_daily` sync, aggregate, pause-all / resume-all) + `db-test.ts`
+- [ ] 8b `screens/Dashboard.tsx` (needs-you, KPI tiles + sparklines, funnel, trend, tables, capacity, activity)
+- [ ] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
+- [ ] 9b Targeting: Results section + segment detail (search log) + steer box; "All campaigns" board
+- [ ] Shell: 8 tabs (Dashboard first), Leads badge, shared campaign filter; all tests, both tsc, vite build, version
+- [ ] Phase 6 Leads — cross-campaign People / Companies / Pipeline, filters + facets, saved views, bulk,
+      CSV import (5k cap) / export, stage override -> Instantly interest, richer lead panel
+- [ ] Phase 7 Sequences — `sequences` table + versions, writer/sender refactor, migration from followUps,
+      editor + preview on real leads, starter library, per-step stats (Instantly analytics/steps)
+- [ ] Phase 8 Dashboard — needs-you, KPI tiles + deltas, funnel, trend (`campaign_daily` from analytics/daily),
+      campaigns + segments tables, capacity, pause-all
+- [ ] Phase 9 Targeting results — segments board, search log (`segment_searches`), learning loop + quota split,
+      steer by chat
+- [ ] Shell: Dashboard first, 8 tabs, shared campaign filter; Campaigns embeds the shared components
+- [ ] USER: answer decisions 8-16 (plan §7)
 ## Old Resend console removed (2026-10-21, pushed to main; Netlify NOT republished)
 - [x] Frontend: tabs Overview / Discovery / Contacts / Templates / Send / History / Settings deleted with
       their screens + `lib/csv.ts` + `lib/starters.ts`; `lib/api.ts` = auth + `req` only. Shell = 4 v2 tabs.
