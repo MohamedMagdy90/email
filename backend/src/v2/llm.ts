@@ -56,17 +56,35 @@ export class LlmBudgetExceeded extends Error {
 
 /* ------------------------------- config ------------------------------- */
 
+// Google closed the 2.5 models to new API keys (404 "no longer available to
+// new users") and points at 3.5 Flash-Lite / 3.8 Flash. OpenRouter keeps
+// retiring individual ":free" slugs, so use its free router, which always
+// lands on whichever free model is live.
 const DEFAULT_MODELS = {
-  gemini: "gemini-2.5-flash",
-  geminiFast: "gemini-2.5-flash-lite",
+  gemini: "gemini-3.8-flash",
+  geminiFast: "gemini-3.5-flash-lite",
   groq: "openai/gpt-oss-120b",
-  openrouter: "meta-llama/llama-3.3-70b-instruct:free",
+  openrouter: "openrouter/free",
 };
+
+// Model names that providers have withdrawn. A setting that still holds one
+// (saved from the Models form back when it was the default) is ignored, so the
+// current default applies instead of a guaranteed 404.
+const RETIRED_MODELS = new Set([
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
+  "meta-llama/llama-3.3-70b-instruct:free",
+]);
+async function modelSetting(key: string, fallback: string): Promise<string> {
+  const v = ((await getSetting(key)) || "").trim();
+  return v && !RETIRED_MODELS.has(v) ? v : fallback;
+}
 
 // Minimum gap between calls to the same model, under the free-tier RPM caps.
 const MIN_GAP_MS: Record<string, number> = {
-  gemini: 6500, // ~9 RPM (2.5 Flash free = 10 RPM)
-  geminiFast: 4500, // ~13 RPM (Flash-Lite free = 15 RPM)
+  gemini: 6500, // ~9 RPM (Flash free tier)
+  geminiFast: 4500, // ~13 RPM (Flash-Lite free tier)
   groq: 2200, // ~27 RPM (free = 30 RPM)
   openrouter: 3500, // ~17 RPM (free = 20 RPM)
 };
@@ -86,10 +104,10 @@ export async function getLlmConfig(): Promise<LlmConfig> {
       openrouter: await s("ai_openrouter_key", "OPENROUTER_API_KEY"),
     },
     models: {
-      gemini: (await getSetting("ai_gemini_model")) || DEFAULT_MODELS.gemini,
-      geminiFast: (await getSetting("ai_gemini_fast_model")) || DEFAULT_MODELS.geminiFast,
-      groq: (await getSetting("ai_groq_model")) || DEFAULT_MODELS.groq,
-      openrouter: (await getSetting("ai_openrouter_model")) || DEFAULT_MODELS.openrouter,
+      gemini: await modelSetting("ai_gemini_model", DEFAULT_MODELS.gemini),
+      geminiFast: await modelSetting("ai_gemini_fast_model", DEFAULT_MODELS.geminiFast),
+      groq: await modelSetting("ai_groq_model", DEFAULT_MODELS.groq),
+      openrouter: await modelSetting("ai_openrouter_model", DEFAULT_MODELS.openrouter),
     },
     dailyBudget: Math.max(10, Number(await getSetting("ai_daily_budget")) || 600),
   };
@@ -220,8 +238,14 @@ async function callGemini(
     },
   };
   if (req.system) body.systemInstruction = { parts: [{ text: req.system }] };
-  // Thinking eats into maxOutputTokens on 2.5 models; keep it small and bounded.
+  // Thinking tokens come out of maxOutputTokens, so keep it bounded or the
+  // answer gets cut off (empty response / half a JSON object).
+  //  - 2.5 models take a token budget.
+  //  - 3.x / 4 take a level. Flash-Lite allows "minimal" (≈ no thinking);
+  //    Flash and Argon reject "minimal" with an error, so they use "low".
+  const lite = /flash-lite/.test(model);
   if (/2\.5-flash(?!-lite)/.test(model)) body.generationConfig.thinkingConfig = { thinkingBudget: fast ? 0 : 512 };
+  else if (/^gemini-(3|4)/.test(model)) body.generationConfig.thinkingConfig = { thinkingLevel: lite ? "minimal" : "low" };
   if (req.search) body.tools = [{ google_search: {} }];
   // Structured output can't be combined with tools; with search we parse text.
   else if (req.json) body.generationConfig.responseMimeType = "application/json";
@@ -270,6 +294,13 @@ async function callOpenAICompat(
     max_tokens: req.maxTokens ?? (req.tier === "fast" ? 1024 : 4096),
   };
   if (req.json) body.response_format = { type: "json_object" };
+  // Reasoning models (gpt-oss on Groq) spend output tokens thinking before
+  // they answer; with a small max_tokens the JSON is cut off and Groq rejects
+  // it ("Failed to validate JSON"). Keep the reasoning short and out of the reply.
+  if (/gpt-oss/.test(model)) {
+    body.reasoning_effort = "low";
+    if (base.includes("groq.com")) body.reasoning_format = "hidden";
+  }
   let res: Response;
   try {
     res = await fetch(`${base}/chat/completions`, {
@@ -418,7 +449,9 @@ export async function testProvider(
   const key = (keyOverride || "").trim() || cfg.keys[provider];
   if (!key) return { ok: false, error: "No key saved" };
   const t0 = Date.now();
-  const req: LlmRequest = { prompt: 'Reply with the JSON {"ok":true}', json: true, tier: "fast", maxTokens: 50 };
+  // Room for a reasoning model's short think + the answer; 50 tokens was not
+  // enough for gpt-oss and failed a perfectly good Groq key.
+  const req: LlmRequest = { prompt: 'Reply with the JSON {"ok":true}', json: true, tier: "fast", maxTokens: 512 };
   try {
     const model = provider === "gemini" ? cfg.models.geminiFast : cfg.models[provider];
     const r =
