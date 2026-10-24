@@ -163,7 +163,7 @@ export interface CampaignReadiness {
   aiSearch: boolean; // Gemini key (Google Search grounding)
   instantly: boolean;
   mailboxes: { total: number; sending: number; dailyCapacity: number };
-  reacher: boolean; // SMTP verification available
+  verifier: boolean; // No2Bounce connected: guessed addresses can be checked
   budgetRemaining: number; // AI calls left today
 }
 

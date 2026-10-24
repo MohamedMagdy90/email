@@ -5,7 +5,7 @@ import { q, nowIso } from "../../db";
 import { logEvent, parseJson, todayUtc, uid, type AgentEvent } from "../events";
 import { aiStatus, budgetRemaining, LlmBudgetExceeded, LlmUnavailable } from "../llm";
 import { getAgentSettings } from "../agent-settings";
-import { getReacherConfig, splitName } from "../verify";
+import { verifierConfigured, splitName } from "../verify";
 import { instantlyConfigured, patchCampaign } from "../instantly";
 import { cleanEmail, isValidEmail } from "../../crawler/validate";
 import { learnOffer } from "./offer";
@@ -110,7 +110,7 @@ export async function readiness() {
     aiSearch: ai.canSearch,
     instantly: await instantlyConfigured(),
     mailboxes: { total, sending: sendable.length, dailyCapacity: sendable.reduce((n, m) => n + m.dailyLimit, 0) },
-    reacher: !!(await getReacherConfig()),
+    verifier: await verifierConfigured(),
     budgetRemaining: await budgetRemaining(),
   };
 }
@@ -155,7 +155,7 @@ function blockersFor(c: Row, settings: CampaignSettings, offer: Offer | null, se
   if (!r.ai) out.push("No AI key: companies get a basic read only, and nothing is scored or written. Connect Gemini, Groq or OpenRouter in the Agent tab.");
   else if (!r.aiSearch) out.push("No Gemini key: companies are found with the free web search (slow and often rate-limited) and decision makers come only from company websites.");
   if (r.ai && r.budgetRemaining <= 0) out.push("Today's AI budget is used up; the agent carries on tomorrow.");
-  if (!r.reacher && !allowGuesses) out.push("Guessed addresses wait for the email verifier. Connect Reacher in the Agent tab, or allow unverified guesses in the agent's sending rules.");
+  if (!r.verifier && !allowGuesses) out.push("Guessed addresses wait for the email verifier. Connect No2Bounce in the Agent tab, or allow unverified guesses in the agent's sending rules.");
   if (settings.reviewFirst && funnel.written > 0) out.push(`${funnel.written} email${funnel.written === 1 ? "" : "s"} waiting for your review.`);
   if (funnel.approved > 0 && !r.instantly) out.push("Approved emails are waiting: connect Instantly in the Agent tab to start sending.");
   else if (funnel.approved > 0 && r.mailboxes.sending === 0) out.push("Approved emails are waiting for a sending mailbox: mailboxes are still warming up (Mailboxes tab).");

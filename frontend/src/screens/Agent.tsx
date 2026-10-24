@@ -272,7 +272,7 @@ function SectionTiles({ section, onChange, intg, draft }: { section: Section; on
             [
               ["Instantly", inst],
               ["AI", ai],
-              ["Verifier", intg.reacher.configured],
+              ["Verifier", intg.no2bounce.configured],
             ] as const
           ).map(([name, on]) => (
             <span key={name} className="inline-flex items-center gap-1.5">
@@ -350,7 +350,7 @@ function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: 
     <div className="grid items-start gap-4 lg:grid-cols-2">
       <div className="space-y-4">
         <InstantlyCard intg={intg} onChange={onChange} />
-        <ReacherCard intg={intg} onChange={onChange} />
+        <VerifierCard intg={intg} onChange={onChange} />
       </div>
       <AiCard intg={intg} onChange={onChange} />
     </div>
@@ -359,7 +359,7 @@ function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: 
 
 function describeOk(target: IntegrationTarget, t: TestResult): string {
   if (target === "instantly") return `Instantly answered · ${t.accounts ?? 0} mailbox${t.accounts === 1 ? "" : "es"} on the account`;
-  if (target === "reacher") return `Reacher answered · test check came back "${t.sample || "unknown"}"`;
+  if (target === "no2bounce") return "No2Bounce accepted the token · no credit was used for this test";
   return `Answered in ${t.ms != null ? `${(t.ms / 1000).toFixed(1)} s` : "—"}${t.model ? ` · ${t.model}` : ""}`;
 }
 
@@ -565,10 +565,13 @@ function KeyRow({
   removeWarning,
   onChange,
   afterSave,
+  service,
 }: {
   target: IntegrationTarget;
   field: keyof IntegrationsPatch;
   name: string;
+  /** Service name for the toasts when `name` is a generic label ("API token"). */
+  service?: string;
   role: ReactNode;
   badge?: ReactNode;
   masked: string;
@@ -612,7 +615,7 @@ function KeyRow({
       setValue("");
       setEditing(false);
       setResult(detail ? { ok: true, text: detail } : null);
-      toast(`${name === "API key" ? "Instantly" : name} ${configured ? "key replaced" : "connected"}.`, "success");
+      toast(`${service ?? (name === "API key" ? "Instantly" : name)} ${configured ? "key replaced" : "connected"}.`, "success");
       afterSave?.();
     } catch (e: any) {
       setResult({ ok: false, text: e.message });
@@ -644,7 +647,7 @@ function KeyRow({
       onChange(await v2.saveIntegrations({ [field]: "" } as IntegrationsPatch));
       setResult(null);
       setConfirmRemove(false);
-      toast(`${name === "API key" ? "Instantly" : name} disconnected.`, "info");
+      toast(`${service ?? (name === "API key" ? "Instantly" : name)} disconnected.`, "info");
     } catch (e: any) {
       toast(e.message, "error");
     } finally {
@@ -705,7 +708,11 @@ function KeyRow({
         >
           <Input
             type="password"
-            autoComplete="off"
+            name={`${target}-key`}
+            autoComplete="new-password"
+            data-1p-ignore
+            data-lpignore="true"
+            data-bwignore
             spellCheck={false}
             placeholder={placeholder}
             aria-label={placeholder}
@@ -752,167 +759,52 @@ function ResultLine({ ok, text, onForce }: { ok: boolean; text: string; onForce?
           Save it anyway
         </button>
       )}
-    </div>
+        </div>
   );
 }
 
-function ReacherCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
-  const r = intg.reacher;
-  const [editing, setEditing] = useState(false);
-  const [url, setUrl] = useState(r.url);
-  const [secret, setSecret] = useState("");
-  const [busy, setBusy] = useState<"" | "save" | "test" | "remove">("");
-  const [result, setResult] = useState<{ ok: boolean; text: string; canForce?: boolean } | null>(null);
-  const [confirmRemove, setConfirmRemove] = useState(false);
-  useEffect(() => {
-    if (!confirmRemove) return;
-    const t = setTimeout(() => setConfirmRemove(false), 4000);
-    return () => clearTimeout(t);
-  }, [confirmRemove]);
-
-  async function save(force = false) {
-    const u = url.trim();
-    if (!/^https?:\/\/\S+$/i.test(u)) {
-      setResult({ ok: false, text: "Enter the full address, starting with https://" });
-      return;
-    }
-    setBusy("save");
-    setResult(null);
-    try {
-      let detail = "";
-      if (!force) {
-        const t = await agentApi.test("reacher", { url: u, secret: secret.trim() || undefined });
-        if (!t.ok) {
-          setResult({ ok: false, text: t.error || "Reacher didn't answer.", canForce: true });
-          return;
-        }
-        detail = describeOk("reacher", t);
-      }
-      const patch: IntegrationsPatch = { reacherUrl: u };
-      if (secret.trim()) patch.reacherSecret = secret.trim();
-      onChange(await v2.saveIntegrations(patch));
-      setEditing(false);
-      setSecret("");
-      setResult(detail ? { ok: true, text: detail } : null);
-      toast("Verifier connected.", "success");
-    } catch (e: any) {
-      setResult({ ok: false, text: e.message });
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function test() {
-    setBusy("test");
-    setResult(null);
-    try {
-      const t = await agentApi.test("reacher");
-      setResult(t.ok ? { ok: true, text: describeOk("reacher", t) } : { ok: false, text: t.error || "The test failed." });
-    } catch (e: any) {
-      setResult({ ok: false, text: e.message });
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function remove() {
-    if (!confirmRemove) return setConfirmRemove(true);
-    setBusy("remove");
-    try {
-      onChange(await v2.saveIntegrations({ reacherUrl: "", reacherSecret: "" }));
-      setUrl("");
-      setResult(null);
-      setConfirmRemove(false);
-      toast("Verifier disconnected. The built-in checks still run.", "info");
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setBusy("");
-    }
-  }
-
-  const showForm = !r.configured || editing;
+/** Email verification: a No2Bounce API token (hosted, 1 credit per check). */
+function VerifierCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
+  const on = intg.no2bounce.configured;
   return (
     <Card className="p-5 sm:p-6">
-      <Label>Email verification · optional</Label>
+      <Label>Email verification</Label>
       <div className="mt-1.5 flex flex-wrap items-center gap-2">
-        <h2 className="text-[1.05rem] font-[650] tracking-[-0.01em]">Reacher</h2>
-        <Badge className={r.configured ? "bg-okb text-good" : "bg-ink/[0.06] text-muted"}>{r.configured ? "Connected" : "Built-in checks only"}</Badge>
+        <h2 className="text-[1.05rem] font-[650] tracking-[-0.01em]">No2Bounce</h2>
+        <Badge className={on ? "bg-okb text-good" : "bg-ink/[0.06] text-muted"}>{on ? "Checking addresses" : "Built-in checks only"}</Badge>
       </div>
       <p className="mt-1 text-[13px] leading-relaxed text-muted">
-        Asks the recipient's mail server whether an address exists before anything is sent. Without it, addresses get the built-in checks
-        (format, MX, disposable, role), and guessed addresses that can't be confirmed are held back.
+        Asks the recipient's mail server whether an address exists before anything is sent, and spots domains that accept every address. The free
+        built-in checks (format, mail domain, throwaway domains) run first, so credits are only spent on addresses that pass them. Each check uses 1
+        credit and is remembered for 30 days.
       </p>
-
-      {r.configured && !editing && (
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4">
-          <div className="min-w-0 text-[12px] text-muted">
-            <code className="break-all rounded-md border border-line-soft bg-sunk px-2 py-0.5 font-mono text-[11.5px] text-ink-soft">{r.url}</code>
-            <span className="ml-2">{r.hasSecret ? "secret saved" : "no secret"}</span>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            <Button size="sm" variant="outline" onClick={test} loading={busy === "test"}>
-              Test
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                setUrl(r.url);
-                setEditing(true);
-                setResult(null);
-              }}
-            >
-              Edit
-            </Button>
-            <Button size="sm" variant={confirmRemove ? "danger" : "ghost"} onClick={remove} loading={busy === "remove"}>
-              {confirmRemove ? "Confirm remove" : "Remove"}
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {showForm && (
-        <form
-          className="mt-4 space-y-2.5 border-t border-line-soft pt-4"
-          onSubmit={(e) => {
-            e.preventDefault();
-            save();
-          }}
-        >
-          <div className="grid gap-2.5 sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
-            <Input
-              placeholder="https://reacher.your-server.com"
-              aria-label="Reacher server address"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              spellCheck={false}
-              className="font-mono"
-            />
-            <Input
-              type="password"
-              autoComplete="off"
-              placeholder={r.hasSecret ? "Secret (blank keeps the saved one)" : "Secret header (if set)"}
-              aria-label="Reacher secret"
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-              className="font-mono"
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button type="submit" size="sm" variant={url.trim() ? "solid" : "outline"} loading={busy === "save"} disabled={!url.trim()}>
-              Test & save
-            </Button>
-            {editing && (
-              <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)}>
-                Cancel
-              </Button>
-            )}
-            <span className="text-[12px] text-muted">Self-hosted, free. Needs a server where outbound port 25 is open.</span>
-          </div>
-        </form>
-      )}
-      {result && <ResultLine ok={result.ok} text={result.text} onForce={result.canForce && url.trim() ? () => save(true) : undefined} />}
+      <div className="mt-4 border-t border-line-soft pt-4">
+        <KeyRow
+          target="no2bounce"
+          field="no2bounceKey"
+          name="API token"
+          service="No2Bounce"
+          role={
+            on
+              ? "Guessed addresses are checked before they are sent to."
+              : "Without it, guessed addresses wait (or go out unchecked if you allow that in the sending rules); published ones still go."
+          }
+          masked={intg.keys.no2bounce}
+          configured={on}
+          placeholder="Paste the No2Bounce API token"
+          getKey={
+            <>
+              In{" "}
+              <a href="https://app.no2bounce.com/api" target="_blank" rel="noreferrer" className="font-medium text-accent hover:underline">
+                app.no2bounce.com/api
+              </a>
+              : Create API, then copy its token. Leave the IP allow-list empty: the backend has no fixed IP address.
+            </>
+          }
+          removeWarning="Without a verifier, guessed addresses stop being sent until it is reconnected."
+          onChange={onChange}
+        />
+      </div>
     </Card>
   );
 }

@@ -366,7 +366,11 @@ function Setup({
         >
           <Input
             type="password"
-            autoComplete="off"
+            name="instantly-key"
+            autoComplete="new-password"
+            data-1p-ignore
+            data-lpignore="true"
+            data-bwignore
             placeholder="Instantly API key"
             value={key}
             onChange={(e) => setKey(e.target.value)}

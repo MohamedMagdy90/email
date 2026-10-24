@@ -88,6 +88,6 @@ export const agentApi = {
   voice: (settings: AgentSettings, sample: SampleKind, generate = false) =>
     req<VoicePreview>("/api/v2/agent/voice/preview", j({ settings, sample, generate })),
   /** Test values BEFORE saving them (no values = test what's saved). */
-  test: (target: IntegrationTarget, values: { key?: string; url?: string; secret?: string } = {}) =>
+  test: (target: IntegrationTarget, values: { key?: string } = {}) =>
     req<TestResult>("/api/v2/integrations/test", j({ target, ...values })),
 };

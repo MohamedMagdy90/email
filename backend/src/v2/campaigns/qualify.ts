@@ -1,6 +1,6 @@
 // Steps 6-7 — verify the address against the sending policy and the
 // suppression rules, then score the fit with AI.
-import { getReacherConfig, verifyEmail, type VerifyResult } from "../verify";
+import { verifierConfigured, verifyEmail, type VerifyResult } from "../verify";
 import { llm } from "../llm";
 import type { SendingPolicy } from "../agent-settings";
 import { suppressionReason } from "./suppression";
@@ -26,8 +26,13 @@ export async function verifyProspect(p: Row, policy: SendingPolicy): Promise<Ver
   if (v.status === "unknown") {
     const published = (p.email_source === "published" || p.email_source === "role" || p.email_source === "manual") && v.checks.mx;
     if (!published && !policy.allowUnverifiedGuesses) {
-      if (!(await getReacherConfig())) {
-        return { ...base, verdict: "hold", reason: `${email} is a guess from the name pattern and can't be checked until the email verifier is connected (Agent tab), or unverified guesses are allowed` };
+      if (!(await verifierConfigured())) {
+        return { ...base, verdict: "hold", reason: `${email} is a guess from the name pattern and can't be checked until the email verifier (No2Bounce) is connected in the Agent tab, or unverified guesses are allowed` };
+      }
+      // Connected, but it gave no answer this time (credits, token, timeout):
+      // wait and ask again rather than dropping the person.
+      if (v.source === "builtin") {
+        return { ...base, verdict: "hold", reason: `${email} couldn't be checked right now (${v.reasons[v.reasons.length - 1] || "verifier unavailable"}); it is tried again on a later pass` };
       }
       return { ...base, verdict: "skip", reason: `The mail server wouldn't confirm ${email}, and unverified guesses are switched off` };
     }

@@ -117,7 +117,7 @@ export function ReadinessStrip({ r }: { r: CampaignReadiness }) {
   const items: { ok: boolean; warn?: boolean; label: string; sub: string; tab: string }[] = [
     { ok: r.ai, label: "AI key", sub: r.ai ? `${r.budgetRemaining.toLocaleString()} calls left today` : "Needed to research, score and write", tab: "agent" },
     { ok: r.aiSearch, warn: !r.aiSearch, label: "Gemini search", sub: r.aiSearch ? "Finds companies and people" : "Free search is slow without it", tab: "agent" },
-    { ok: r.reacher, warn: !r.reacher, label: "Email verifier", sub: r.reacher ? "Guessed addresses are checked" : "Guesses wait until connected", tab: "agent" },
+    { ok: r.verifier, warn: !r.verifier, label: "Email verifier", sub: r.verifier ? "No2Bounce checks guessed addresses" : "Guesses wait until No2Bounce is connected", tab: "agent" },
     { ok: r.instantly, label: "Instantly", sub: r.instantly ? "Connected" : "Needed to send", tab: "agent" },
     {
       ok: r.mailboxes.sending > 0,

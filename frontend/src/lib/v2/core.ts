@@ -10,7 +10,7 @@ export const del: RequestInit = { method: "DELETE" };
 export interface V2Status {
   ai: { configured: boolean; canSearch: boolean; usage: { calls: number; errors: number; byProvider: Record<string, number> }; budget: number };
   instantly: { configured: boolean };
-  reacher: { configured: boolean; url: string; hasSecret: boolean };
+  no2bounce: { configured: boolean };
 }
 
 export interface Integrations {
@@ -25,20 +25,19 @@ export interface Integrations {
     budget: number;
     usage: { calls: number; errors: number; byProvider: Record<string, number> };
   };
-  keys: { gemini: string; groq: string; openrouter: string; instantly: string };
+  keys: { gemini: string; groq: string; openrouter: string; instantly: string; no2bounce: string };
   instantly: { configured: boolean; mailboxes?: { total: number; sending: number } };
-  reacher: { configured: boolean; url: string; hasSecret: boolean };
+  no2bounce: { configured: boolean };
 }
 
-export type IntegrationTarget = "gemini" | "groq" | "openrouter" | "instantly" | "reacher";
+export type IntegrationTarget = "gemini" | "groq" | "openrouter" | "instantly" | "no2bounce";
 
 export interface IntegrationsPatch {
   geminiKey?: string;
   groqKey?: string;
   openrouterKey?: string;
   instantlyKey?: string;
-  reacherUrl?: string;
-  reacherSecret?: string;
+  no2bounceKey?: string;
   geminiModel?: string;
   geminiFastModel?: string;
   groqModel?: string;

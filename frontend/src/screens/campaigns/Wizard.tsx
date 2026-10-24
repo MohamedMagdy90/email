@@ -358,7 +358,7 @@ export default function Wizard({ resumeId, onCancel, onOpen }: { resumeId?: stri
                 [enabledSegs > 0, "Segments", `${enabledSegs} enabled · ${c.segmentList.filter((s) => s.enabled).reduce((n, s) => n + s.searchesTotal, 0)} searches planned`, null],
                 [c.readiness.ai, "AI key", c.readiness.ai ? "Research, scoring and writing are on" : "Needed to research properly and write the emails", "agent"],
                 [c.readiness.aiSearch, "Gemini search", c.readiness.aiSearch ? "Finds companies and decision makers" : "Optional, but the free search is slow and finds fewer people", "agent"],
-                [c.readiness.reacher, "Email verifier", c.readiness.reacher ? "Guessed addresses are checked before sending" : "Without it, guessed addresses wait (published ones still go)", "agent"],
+                [c.readiness.verifier, "Email verifier", c.readiness.verifier ? "No2Bounce checks guessed addresses before sending" : "Without No2Bounce, guessed addresses wait (published ones still go)", "agent"],
                 [c.readiness.instantly, "Instantly", c.readiness.instantly ? "Connected" : "Needed before anything is sent", "agent"],
                 [c.readiness.mailboxes.sending > 0, "Sending mailboxes", c.readiness.mailboxes.sending ? `${c.readiness.mailboxes.sending} ready · ${c.readiness.mailboxes.dailyCapacity} emails a day` : "None ready yet. Approved emails wait until one is.", "mailboxes"],
               ] as [boolean, string, string, string | null][]

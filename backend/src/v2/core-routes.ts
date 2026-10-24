@@ -1,11 +1,11 @@
-// Core v2 routes: integrations (AI keys, Instantly, Reacher), agent settings,
+// Core v2 routes: integrations (AI keys, Instantly, No2Bounce), agent settings,
 // the activity feed and a one-off verifier. All under /api/v2 (token-gated by
 // the global /api/* middleware in index.ts).
 import type { Hono } from "hono";
 import { getSetting, setSetting, q } from "../db";
 import { aiStatus, testProvider, llm, LlmBudgetExceeded, type LlmProvider } from "./llm";
 import { getInstantlyKey, testConnection } from "./instantly";
-import { getReacherConfig, testReacher, verifyEmail } from "./verify";
+import { getNo2BounceKey, testNo2Bounce, verifyEmail } from "./verify";
 import {
   getAgentSettings,
   saveAgentSettings,
@@ -26,7 +26,7 @@ function mask(v: string): string {
 async function integrationsView() {
   const ai = await aiStatus();
   const instantlyKey = await getInstantlyKey();
-  const reacher = await getReacherConfig();
+  const no2bounceKey = await getNo2BounceKey();
   let mailboxes = { total: 0, sending: 0 };
   try {
     const r = await q(
@@ -45,9 +45,10 @@ async function integrationsView() {
       groq: mask(((await getSetting("ai_groq_key")) || process.env.GROQ_API_KEY || "").trim()),
       openrouter: mask(((await getSetting("ai_openrouter_key")) || process.env.OPENROUTER_API_KEY || "").trim()),
       instantly: mask(instantlyKey),
+      no2bounce: mask(no2bounceKey),
     },
     instantly: { configured: !!instantlyKey, mailboxes },
-    reacher: { configured: !!reacher, url: reacher?.url || "", hasSecret: !!reacher?.secret },
+    no2bounce: { configured: !!no2bounceKey },
   };
 }
 
@@ -57,8 +58,7 @@ const FIELD_TO_SETTING: Record<string, string> = {
   groqKey: "ai_groq_key",
   openrouterKey: "ai_openrouter_key",
   instantlyKey: "instantly_api_key",
-  reacherUrl: "reacher_url",
-  reacherSecret: "reacher_secret",
+  no2bounceKey: "no2bounce_api_key",
   geminiModel: "ai_gemini_model",
   geminiFastModel: "ai_gemini_fast_model",
   groqModel: "ai_groq_model",
@@ -72,7 +72,7 @@ export function register(app: Hono) {
     return c.json({
       ai: { configured: view.ai.configured, canSearch: view.ai.canSearch, usage: view.ai.usage, budget: view.ai.budget },
       instantly: view.instantly,
-      reacher: view.reacher,
+      no2bounce: view.no2bounce,
     });
   });
 
@@ -83,26 +83,19 @@ export function register(app: Hono) {
     for (const [field, key] of Object.entries(FIELD_TO_SETTING)) {
       if (!(field in b)) continue;
       let v = String(b[field] ?? "").trim();
-      if (field === "reacherUrl") v = v.replace(/\/+$/, "");
       if (field === "aiDailyBudget" && v && !(Number(v) > 0)) return c.json({ error: "Daily budget must be a positive number" }, 400);
       await setSetting(key, v);
     }
     return c.json(await integrationsView());
   });
 
-  // `key` / `url` / `secret` test a candidate BEFORE it is saved, so a typo
-  // never replaces a working key. Without them the saved values are tested.
+  // `key` tests a candidate BEFORE it is saved, so a typo never replaces a
+  // working key. Without it the saved value is tested.
   app.post("/api/v2/integrations/test", async (c) => {
-    const { target, key, url, secret } = await c.req.json().catch(() => ({}));
+    const { target, key } = await c.req.json().catch(() => ({}));
     const candidate = typeof key === "string" && key.trim() ? key.trim() : undefined;
     if (target === "instantly") return c.json(await testConnection(candidate));
-    if (target === "reacher") {
-      if (typeof url === "string" && url.trim()) {
-        const saved = await getReacherConfig();
-        return c.json(await testReacher({ url, secret: typeof secret === "string" && secret.trim() ? secret : saved?.secret }));
-      }
-      return c.json(await testReacher());
-    }
+    if (target === "no2bounce") return c.json(await testNo2Bounce(candidate));
     if (["gemini", "groq", "openrouter"].includes(target)) return c.json(await testProvider(target as LlmProvider, candidate));
     return c.json({ ok: false, error: "Unknown target" }, 400);
   });
