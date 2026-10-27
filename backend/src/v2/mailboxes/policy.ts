@@ -33,6 +33,21 @@ export interface MailboxPolicy {
   autoStart: boolean;
   /** Turn warmup back on whenever Instantly reports it off. Warmup runs for life. */
   keepWarmupOn: boolean;
+  /* ---- own engine (Google / Microsoft mailboxes we connect ourselves) ---- */
+  /** The domain must be at least this old (registration date) before sending. */
+  minDomainAgeDays: number;
+  /** The mailbox must exist this many days before sending (0 for bought pre-warmed ones). */
+  minMailboxDays: number;
+  /** Inbox tests needed in the last 3 days before the rate counts. */
+  minPlacementTests: number;
+  /** Share of inbox tests (business seeds count double) that must land in the inbox. */
+  minPlacementRate: number;
+  /** A sending mailbox pauses when inbox tests are under this two days running. */
+  pausePlacementRate: number;
+  /** A sending mailbox pauses when unsubscribes + complaints pass this share of its sends. */
+  maxComplaintRate: number;
+  /** Sends since the ramp started before the complaint rate counts. */
+  minSendsForComplaints: number;
 }
 
 export const DEFAULT_POLICY: MailboxPolicy = {
@@ -45,11 +60,19 @@ export const DEFAULT_POLICY: MailboxPolicy = {
   // One bounce in 20 sends is noise, not a signal. 50 is about the first four
   // days of a ramp, and needs at least two bounces to cross 3%.
   minSendsForBounce: 50,
-  rampStart: 10,
-  rampStep: 3,
+  // Slow start for fresh domains (decided 2026-10-24): 5 a day, +2 a day, up to 30.
+  rampStart: 5,
+  rampStep: 2,
   targetLimit: 30,
   autoStart: true,
   keepWarmupOn: true,
+  minDomainAgeDays: 14,
+  minMailboxDays: 7,
+  minPlacementTests: 12,
+  minPlacementRate: 75,
+  pausePlacementRate: 50,
+  maxComplaintRate: 1,
+  minSendsForComplaints: 100,
 };
 
 const LIMITS: Record<Exclude<keyof MailboxPolicy, "autoStart" | "keepWarmupOn">, [number, number]> = {
@@ -63,6 +86,13 @@ const LIMITS: Record<Exclude<keyof MailboxPolicy, "autoStart" | "keepWarmupOn">,
   rampStart: [1, 200],
   rampStep: [1, 100],
   targetLimit: [1, 200],
+  minDomainAgeDays: [0, 90],
+  minMailboxDays: [0, 60],
+  minPlacementTests: [1, 200],
+  minPlacementRate: [30, 100],
+  pausePlacementRate: [0, 100],
+  maxComplaintRate: [0.1, 20],
+  minSendsForComplaints: [10, 2000],
 };
 
 /** Merge a stored/posted policy onto the defaults and clamp every number. */
@@ -75,12 +105,25 @@ export function normalizePolicy(raw: unknown): MailboxPolicy {
   }
   if (typeof src.autoStart === "boolean") out.autoStart = src.autoStart;
   if (typeof src.keepWarmupOn === "boolean") out.keepWarmupOn = src.keepWarmupOn;
-  for (const k of ["minWarmDays", "minWarmDaysPreWarmed", "minWarmupSample", "minSendsForBounce", "rampStart", "rampStep", "targetLimit"] as const) {
+  for (const k of [
+    "minWarmDays",
+    "minWarmDaysPreWarmed",
+    "minWarmupSample",
+    "minSendsForBounce",
+    "rampStart",
+    "rampStep",
+    "targetLimit",
+    "minDomainAgeDays",
+    "minMailboxDays",
+    "minPlacementTests",
+    "minSendsForComplaints",
+  ] as const) {
     out[k] = Math.round(out[k]);
   }
   // The pause line must sit below the pass line, or a mailbox could pass the
   // gate and be paused on the same day.
   if (out.pauseInboxRate >= out.minInboxRate) out.pauseInboxRate = Math.max(0, out.minInboxRate - 1);
+  if (out.pausePlacementRate >= out.minPlacementRate) out.pausePlacementRate = Math.max(0, out.minPlacementRate - 1);
   if (out.rampStart > out.targetLimit) out.rampStart = out.targetLimit;
   return out;
 }
@@ -121,6 +164,39 @@ export interface MailboxRow {
   target_custom?: number | null;
   /** Set when the mailbox disappeared from Instantly. */
   missing_since?: string | null;
+  /* own engine */
+  /** 'instantly' (synced from Instantly) | 'google' | 'microsoft' (connected here). */
+  provider?: string | null;
+  auth_status?: string | null;
+  auth_error?: string | null;
+  warmup_mode?: string | null;
+  experiment_group?: string | null;
+  domain_registered_at?: string | null;
+  sender_name?: string | null;
+  connected_at?: string | null;
+}
+
+export const isOwn = (row: Pick<MailboxRow, "provider">) => row.provider === "google" || row.provider === "microsoft";
+
+/** Inbox-test results for one mailbox (engine/placement.ts builds it). */
+export interface PlacementSummary {
+  tests3d: number;
+  pass3d: number;
+  /** Weighted: business seeds (Workspace, Microsoft 365) count double. */
+  rate3d: number | null;
+  /** Last results from Microsoft 365 seeds, newest first. */
+  m365Last: string[];
+  /** Last 7 days, oldest first. */
+  byDay: { day: string; tests: number; pass: number; spam: number; missing: number; rate: number | null }[];
+  lastAt: string | null;
+}
+
+/** What the gate needs beyond the row and the health days, for own mailboxes. */
+export interface OwnExtra {
+  placement?: PlacementSummary | null;
+  seeds?: number;
+  /** Sends and unsubscribes/complaints since the current ramp started. */
+  complaints?: { sent: number; complaints: number } | null;
 }
 
 /** A `mailbox_health` row (one mailbox, one UTC day). */
@@ -147,7 +223,7 @@ export interface Dns {
   checkedAt: string;
 }
 
-export type CheckKey = "connection" | "warmup" | "dns" | "age" | "inbox";
+export type CheckKey = "connection" | "warmup" | "dns" | "age" | "inbox" | "domain_age" | "placement";
 export type CheckState = "pass" | "fail" | "pending";
 export interface Check {
   key: CheckKey;
@@ -243,12 +319,21 @@ export function metrics(row: MailboxRow, health: HealthRow[], policy: MailboxPol
     }
   }
   const volume = inbox + spam;
-  const warmStart = row.warmup_started_at || firstWarm;
-  const needed = row.pre_warmed ? policy.minWarmDaysPreWarmed : policy.minWarmDays;
+  // Own mailboxes: "days" = how long the mailbox has existed here; the earliest
+  // ready day also waits for the domain to be old enough.
+  const own = isOwn(row);
+  const warmStart = own ? row.connected_at || row.created_at : row.warmup_started_at || firstWarm;
+  const needed = own ? (row.pre_warmed ? 0 : policy.minMailboxDays) : row.pre_warmed ? policy.minWarmDaysPreWarmed : policy.minWarmDays;
+  let eta = warmStart ? addDays(warmStart, needed) : null;
+  if (own) {
+    const domainFrom = row.domain_registered_at || row.connected_at || row.created_at;
+    const domainEta = domainFrom ? addDays(domainFrom, policy.minDomainAgeDays) : null;
+    if (domainEta && (!eta || domainEta > eta)) eta = domainEta;
+  }
   return {
     warmDays: warmStart ? Math.max(0, dayDiff(warmStart, today)) : null,
     warmDaysNeeded: needed,
-    readyEta: warmStart ? addDays(warmStart, needed) : null,
+    readyEta: eta,
     inboxRate7: volume > 0 ? round1((inbox / volume) * 100) : null,
     warmupVolume7: volume,
     sent7,
@@ -294,7 +379,120 @@ function dnsOnlyIndeterminate(dns: Dns): boolean {
   return miss.length > 0 && miss.every((m) => unsure.has(m));
 }
 
-export function readinessChecks(row: MailboxRow, m: Metrics, policy: MailboxPolicy): Check[] {
+function dnsCheck(row: MailboxRow, ownHint: boolean): Check {
+  const dns = parseDns(row.dns_json);
+  if (!dns) return { key: "dns", label: "DNS records", state: "pending", detail: "Not checked yet. Checked within a few minutes." };
+  if (dns.allPass) return { key: "dns", label: "DNS records", state: "pass", detail: "MX, SPF, DKIM and DMARC all found." };
+  if (dnsOnlyIndeterminate(dns)) {
+    return { key: "dns", label: "DNS records", state: "pending", detail: `Couldn't look up ${missingDns(dns).join(", ")} (DNS timeout). Checked again shortly.` };
+  }
+  return {
+    key: "dns",
+    label: "DNS records",
+    state: "fail",
+    detail: ownHint
+      ? `Missing ${missingDns(dns).join(", ")}. Open "DNS setup" on this domain for the exact records to add.`
+      : `Missing ${missingDns(dns).join(", ")}. Add the record at the domain's DNS provider (the mailbox vendor usually does this for you).`,
+  };
+}
+
+const PASS_RESULTS = new Set(["inbox", "other_tab", "other"]);
+
+/** The gate for mailboxes connected to our own engine (plan §10). */
+function ownChecks(row: MailboxRow, m: Metrics, policy: MailboxPolicy, extra: OwnExtra = {}, today?: string): Check[] {
+  const checks: Check[] = [];
+  const t = today || new Date().toISOString().slice(0, 10);
+
+  // 1. We can send and read with its sign-in.
+  checks.push(
+    row.auth_status === "failed"
+      ? { key: "connection", label: "Signed in", state: "fail", detail: row.auth_error ? `Sign in again: ${row.auth_error}` : "The sign-in stopped working. Sign in again." }
+      : { key: "connection", label: "Signed in", state: "pass", detail: `Connected to ${row.provider === "microsoft" ? "Microsoft 365" : "Google Workspace"}.` }
+  );
+
+  // 2. DNS.
+  checks.push(dnsCheck(row, true));
+
+  // 3. Domain age.
+  const regFrom = row.domain_registered_at || null;
+  const from = regFrom || row.connected_at || row.created_at;
+  const domainDays = from ? Math.max(0, dayDiff(from, t)) : 0;
+  const needD = policy.minDomainAgeDays;
+  checks.push(
+    domainDays >= needD
+      ? { key: "domain_age", label: `Domain ${needD}+ days old`, state: "pass", detail: regFrom ? `Registered ${plural(domainDays, "day")} ago.` : `Added ${plural(domainDays, "day")} ago (the registry didn't give a registration date).` }
+      : {
+          key: "domain_age",
+          label: `Domain ${needD}+ days old`,
+          state: "pending",
+          detail: `${regFrom ? "Registered" : "Added"} ${plural(domainDays, "day")} ago. Old enough on ${fmtDay(addDays(from as string, needD))}.`,
+        }
+  );
+
+  // 4. Mailbox age.
+  const needM = m.warmDaysNeeded;
+  const ageM = m.warmDays ?? 0;
+  checks.push(
+    ageM >= needM
+      ? { key: "age", label: needM ? `Mailbox ${needM}+ days old` : "Mailbox age", state: "pass", detail: row.pre_warmed ? "Bought pre-warmed: no waiting." : `Connected ${plural(ageM, "day")} ago.` }
+      : { key: "age", label: `Mailbox ${needM}+ days old`, state: "pending", detail: `Day ${ageM} of ${needM}. Ready around ${fmtDay(addDays(row.connected_at || row.created_at, needM))}.` }
+  );
+
+  // 5. Inbox tests.
+  const p = extra.placement || null;
+  const label = `${policy.minPlacementRate}% in the inbox`;
+  // A mailbox sends each test inbox ONE test a day, and the 3-day window includes TODAY,
+  // whose tests may still be in flight. So the most that is reliably there is two full
+  // days: seeds x 2. With the recommended pair (Workspace + Microsoft 365) that is 4;
+  // requiring the full minPlacementTests (12, sized for more test inboxes) would hold
+  // every mailbox at "not enough tests" forever. The bar scales down to what is possible.
+  const needTests = Math.max(1, Math.min(policy.minPlacementTests, (extra.seeds || 0) * 2));
+  if (!extra.seeds) {
+    checks.push({ key: "placement", label, state: "pending", detail: "No test inbox connected yet. Add one under Agent → Connections → Test inboxes." });
+  } else if (!p || p.tests3d < needTests || p.rate3d == null) {
+    const capped = needTests < policy.minPlacementTests ? ` (${extra.seeds} test inbox${extra.seeds === 1 ? "" : "es"} x 2 full days)` : "";
+    checks.push({ key: "placement", label, state: "pending", detail: `Not enough inbox tests yet: ${p?.tests3d || 0} of ${needTests} in the last 3 days${capped}.` });
+  } else {
+    const m365Pass = p.m365Last.filter((r) => PASS_RESULTS.has(r)).length;
+    const m365Bad = p.m365Last.length >= 3 && m365Pass < 2;
+    if (p.rate3d < policy.minPlacementRate) {
+      checks.push({ key: "placement", label, state: "fail", detail: `Only ${p.rate3d}% of ${p.tests3d} inbox tests landed in the inbox in the last 3 days (needs ${policy.minPlacementRate}%).` });
+    } else if (m365Bad) {
+      checks.push({ key: "placement", label, state: "fail", detail: `${p.rate3d}% in the inbox overall, but the Microsoft 365 test inbox got it in the inbox only ${m365Pass} of the last 3 times (needs 2).` });
+    } else {
+      checks.push({ key: "placement", label, state: "pass", detail: `${p.rate3d}% of ${p.tests3d} inbox tests landed in the inbox in the last 3 days.` });
+    }
+  }
+  return checks;
+}
+
+function ownPauseTrigger(row: MailboxRow, m: Metrics, policy: MailboxPolicy, extra: OwnExtra = {}): string | null {
+  if (row.auth_status === "failed") return `Sign-in stopped working${row.auth_error ? ` (${row.auth_error})` : ""}. Sign in again on the Mailboxes tab.`;
+  const dns = parseDns(row.dns_json);
+  if (dns && !dns.allPass && !dnsOnlyIndeterminate(dns)) return `DNS check failed: ${missingDns(dns).join(", ")} missing.`;
+  const p = extra.placement;
+  if (p) {
+    const last2 = p.byDay.filter((d) => d.tests >= 2 && d.rate != null).slice(-2);
+    if (last2.length === 2 && last2.every((d) => (d.rate as number) < policy.pausePlacementRate)) {
+      return `Inbox tests under ${policy.pausePlacementRate}% two days running (${last2.map((d) => `${d.rate}%`).join(", ")}).`;
+    }
+    if (p.m365Last.length >= 3 && p.m365Last.every((r) => r === "spam" || r === "missing")) {
+      return "The last 3 tests to the Microsoft 365 test inbox went to junk or never arrived.";
+    }
+  }
+  if (m.bounceRate7 != null && m.bounceSent >= policy.minSendsForBounce && m.bounceRate7 > policy.maxBounceRate) {
+    return `Bounce rate ${m.bounceRate7}%: ${m.bounceBounced} of ${m.bounceSent} emails bounced since ${fmtDay(m.bounceFrom)} (limit ${policy.maxBounceRate}%).`;
+  }
+  const c = extra.complaints;
+  if (c && c.sent >= policy.minSendsForComplaints) {
+    const rate = round1((c.complaints / c.sent) * 100);
+    if (rate > policy.maxComplaintRate) return `${c.complaints} unsubscribes or complaints from ${c.sent} emails since the ramp started (${rate}%, limit ${policy.maxComplaintRate}%).`;
+  }
+  return null;
+}
+
+export function readinessChecks(row: MailboxRow, m: Metrics, policy: MailboxPolicy, extra?: OwnExtra, today?: string): Check[] {
+  if (isOwn(row)) return ownChecks(row, m, policy, extra, today);
   const checks: Check[] = [];
 
   // 1. The account itself is healthy in Instantly.
@@ -385,7 +583,8 @@ export function readinessChecks(row: MailboxRow, m: Metrics, policy: MailboxPoli
 /* ----------------------------- auto-pause ----------------------------- */
 
 /** Why a SENDING mailbox must stop now, or null if it may keep sending. */
-export function pauseTrigger(row: MailboxRow, m: Metrics, policy: MailboxPolicy): string | null {
+export function pauseTrigger(row: MailboxRow, m: Metrics, policy: MailboxPolicy, extra?: OwnExtra): string | null {
+  if (isOwn(row)) return ownPauseTrigger(row, m, policy, extra);
   const st = row.instantly_status;
   if (st === 2) return "Paused in Instantly.";
   if (st != null && st < 0) return CONNECTION_FAIL[String(st)] || `Instantly status ${st}.`;
@@ -455,9 +654,9 @@ function waitingOn(checks: Check[]): string {
  * The next state of one mailbox. `held` = the user (or the policy) wants a
  * mailbox that passes every check to wait for a manual start.
  */
-export function decide(row: MailboxRow, health: HealthRow[], policy: MailboxPolicy, today: string): Decision {
+export function decide(row: MailboxRow, health: HealthRow[], policy: MailboxPolicy, today: string, extra?: OwnExtra): Decision {
   const m = metrics(row, health, policy, today);
-  const checks = readinessChecks(row, m, policy);
+  const checks = readinessChecks(row, m, policy, extra, today);
   const who = row.email;
   const base = { checks, metrics: m };
 
@@ -466,7 +665,7 @@ export function decide(row: MailboxRow, health: HealthRow[], policy: MailboxPoli
   }
 
   if (row.stage === "ramping" || row.stage === "active") {
-    const trigger = pauseTrigger(row, m, policy);
+    const trigger = pauseTrigger(row, m, policy, extra);
     if (trigger) {
       return {
         ...base,

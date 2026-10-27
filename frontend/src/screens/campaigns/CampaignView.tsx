@@ -9,8 +9,9 @@ import LeadDrawer from "../leads/LeadDrawer";
 import { Empty, StatusChip, errMsg, reached, replies } from "./parts";
 import TargetingPanel from "../targeting/TargetingPanel";
 import SequenceEditor from "../sequences/Editor";
+import { EngineSwitch, SendingToday } from "../engine/SendingToday";
 
-type Tab = "review" | "leads" | "sequence" | "targeting" | "offer" | "settings" | "activity";
+type Tab = "review" | "leads" | "sending" | "sequence" | "targeting" | "offer" | "settings" | "activity";
 
 export default function CampaignView({ id, onBack, onResumeSetup }: { id: string; onBack: () => void; onResumeSetup: (id: string) => void }) {
   const [c, setC] = useState<CampaignDetail | null>(null);
@@ -85,6 +86,7 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
   const tabs: { id: Tab; label: string; badge?: number }[] = [
     { id: "review", label: "Review", badge: c.reviewCount },
     { id: "leads", label: "Leads" },
+    ...(c.engine === "own" ? [{ id: "sending" as Tab, label: "Sending today" }] : []),
     { id: "sequence", label: "Sequence" },
     { id: "targeting", label: "Targeting" },
     { id: "offer", label: "Offer" },
@@ -101,6 +103,7 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
           <span className="inline-flex flex-wrap items-center gap-2">
             <StatusChip status={c.status} working={c.working} />
             <span>{c.kind === "partner" ? "Partners" : "Customers"}</span>
+            <span className="text-muted">· {c.engine === "own" ? "your own mailboxes" : "via Instantly"}</span>
             {c.website && <span className="text-muted">· {c.website.replace(/^https?:\/\//, "")}</span>}
           </span>
         }
@@ -222,6 +225,7 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
 
       {tab === "review" && <ReviewTab c={c} version={version} onChanged={load} onOpenLead={setLead} />}
       {tab === "leads" && <LeadsTab c={c} version={version} group={group} setGroup={setGroup} onOpenLead={setLead} />}
+      {tab === "sending" && <SendingToday campaignId={c.id} version={version} />}
       {tab === "sequence" && <SequenceEditor campaignId={c.id} onSaved={() => setVersion((v) => v + 1)} />}
       {tab === "targeting" && <TargetingPanel c={c} reload={refresh} onCampaign={setC} initial={c.segmentList.length ? "segments" : "market"} />}
       {tab === "offer" && <OfferTab c={c} onSaved={setC} />}
@@ -311,6 +315,7 @@ function SettingsTab({ c, onSaved, onArchived }: { c: CampaignDetail; onSaved: (
   const dirty = JSON.stringify(settings) !== JSON.stringify(c.settings) || name !== c.name || kind !== c.kind;
   return (
     <div className="space-y-4">
+      <EngineSwitch c={c} onSaved={onSaved} />
       <Card className="space-y-5 p-5 sm:p-6">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Campaign name">

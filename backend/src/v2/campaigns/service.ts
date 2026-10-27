@@ -96,24 +96,51 @@ async function funnels(campaignId?: string): Promise<Map<string, Funnel>> {
   return map;
 }
 
-export async function readiness() {
+async function ownEngineCapacity() {
+  try {
+    const { ownCapacity } = await import("../engine/bridge");
+    return await ownCapacity();
+  } catch {
+    return { mailboxes: 0, sending: 0, dailyCapacity: 0 };
+  }
+}
+
+/**
+ * What the campaign engine can use. `mailboxes` follows the engine:
+ * Instantly mailboxes for Instantly campaigns, our own for own-engine ones
+ * (both together for the campaign list).
+ */
+export async function readiness(engine: "instantly" | "own" | "all" = "all") {
   const ai = await aiStatus();
   const sendable = await sendableMailboxes();
   let total = 0;
   try {
-    total = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM mailboxes WHERE missing_since IS NULL`))[0]?.n) || 0;
+    total = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM mailboxes WHERE missing_since IS NULL AND COALESCE(provider,'instantly') = 'instantly'`))[0]?.n) || 0;
   } catch {
     total = 0;
   }
+  const own = await ownEngineCapacity();
+  const inst = { total, sending: sendable.length, dailyCapacity: sendable.reduce((n, m) => n + m.dailyLimit, 0) };
+  const ownMb = { total: own.mailboxes, sending: own.sending, dailyCapacity: own.dailyCapacity };
+  const mailboxes =
+    engine === "own"
+      ? ownMb
+      : engine === "instantly"
+        ? inst
+        : { total: inst.total + ownMb.total, sending: inst.sending + ownMb.sending, dailyCapacity: inst.dailyCapacity + ownMb.dailyCapacity };
   return {
     ai: ai.configured,
     aiSearch: ai.canSearch,
     instantly: await instantlyConfigured(),
-    mailboxes: { total, sending: sendable.length, dailyCapacity: sendable.reduce((n, m) => n + m.dailyLimit, 0) },
+    engine,
+    mailboxes,
+    ownMailboxes: ownMb,
     verifier: await verifierConfigured(),
     budgetRemaining: await budgetRemaining(),
   };
 }
+
+const engineOf = (c: Row): "instantly" | "own" => (c.engine === "own" ? "own" : "instantly");
 type Readiness = Awaited<ReturnType<typeof readiness>>;
 
 function summary(c: Row, funnel: Funnel, segments: number) {
@@ -126,6 +153,7 @@ function summary(c: Row, funnel: Funnel, segments: number) {
     segments,
     funnel,
     instantly: { id: c.instantly_campaign_id || null, status: c.instantly_status == null ? null : Number(c.instantly_status) },
+    engine: engineOf(c),
     stats: statsOf(c),
     lastError: c.last_error || null,
     createdAt: String(c.created_at),
@@ -157,6 +185,12 @@ function blockersFor(c: Row, settings: CampaignSettings, offer: Offer | null, se
   if (r.ai && r.budgetRemaining <= 0) out.push("Today's AI budget is used up; the agent carries on tomorrow.");
   if (!r.verifier && !allowGuesses) out.push("Guessed addresses wait for the email verifier. Connect No2Bounce in the Agent tab, or allow unverified guesses in the agent's sending rules.");
   if (settings.reviewFirst && funnel.written > 0) out.push(`${funnel.written} email${funnel.written === 1 ? "" : "s"} waiting for your review.`);
+  if (engineOf(c) === "own") {
+    if (funnel.approved > 0 && r.mailboxes.total === 0) out.push("Approved emails are waiting: connect a sending mailbox on the Mailboxes tab.");
+    else if (funnel.approved > 0 && r.mailboxes.sending === 0) out.push("Approved emails are waiting for a sending mailbox: your mailboxes are still going through the readiness checks (Mailboxes tab).");
+    else if (funnel.approved > 0 && c.status !== "active") out.push("Approved emails go into your send queue once the campaign is started.");
+    return out;
+  }
   if (funnel.approved > 0 && !r.instantly) out.push("Approved emails are waiting: connect Instantly in the Agent tab to start sending.");
   else if (funnel.approved > 0 && r.mailboxes.sending === 0) out.push("Approved emails are waiting for a sending mailbox: mailboxes are still warming up (Mailboxes tab).");
   else if (funnel.approved > 0 && c.status !== "active") out.push("Approved emails go to Instantly once the campaign is started.");
@@ -169,7 +203,7 @@ export async function campaignDetail(id: string) {
   const offer = offerOf(c);
   const segs = await q(`SELECT * FROM segments WHERE campaign_id = ? ORDER BY created_at`, [id]);
   const funnel = (await funnels(id)).get(id) || emptyFunnel();
-  const r = await readiness();
+  const r = await readiness(engineOf(c));
   const agent = await getAgentSettings();
   const day = `${todayUtc()}T00:00:00.000Z`;
   const cnt = async (sql: string, params: any[]) => Number((await q(sql, params))[0]?.n) || 0;
@@ -205,13 +239,19 @@ export async function createCampaign(body: any) {
   const id = uid();
   const now = nowIso();
   await ensureSequenceTables(); // (runs the one-time migration before this campaign exists)
-  await q(`INSERT INTO campaigns (id, name, kind, status, website, settings_json, targeting_json, created_at, updated_at) VALUES (?,?,?,'draft',?,?,?,?,?)`, [
+  // New campaigns send through our own mailboxes once any are connected. Until then the
+  // existing Instantly path stays the default, so nothing changes for anyone mid-build
+  // (plan §1: campaigns move over one at a time). An explicit choice always wins.
+  const ownExists = (await ownEngineCapacity()).mailboxes > 0;
+  const engine = body?.engine === "own" || body?.engine === "instantly" ? body.engine : ownExists ? "own" : "instantly";
+  await q(`INSERT INTO campaigns (id, name, kind, status, website, settings_json, targeting_json, engine, created_at, updated_at) VALUES (?,?,?,'draft',?,?,?,?,?,?)`, [
     id,
     name,
     kind,
     website || null,
     JSON.stringify(DEFAULT_SETTINGS),
     JSON.stringify(defaultMarket(kind)),
+    engine,
     now,
     now,
   ]);
@@ -239,6 +279,22 @@ export async function updateCampaign(id: string, body: any) {
   if (body?.website !== undefined) {
     sets.push("website = ?");
     vals.push(str(body.website, 300) || null);
+  }
+  if (body?.engine !== undefined) {
+    // Switching engines only changes where NEW leads go: leads already in
+    // Instantly finish there, leads already in our queue finish here.
+    const next = body.engine === "own" ? "own" : "instantly";
+    if (next !== engineOf(c)) {
+      sets.push("engine = ?");
+      vals.push(next);
+      await logEvent(
+        "campaign",
+        next === "own"
+          ? `"${c.name}" now sends new leads from your own mailboxes. Leads already in Instantly finish their sequence there.`
+          : `"${c.name}" now sends new leads through Instantly. Leads already in your send queue finish their sequence from your mailboxes.`,
+        { campaignId: id }
+      );
+    }
   }
   if (body?.offer !== undefined) {
     const prev = offerOf(c);
@@ -290,6 +346,12 @@ export async function removeCampaign(id: string) {
     return { ok: true as const, deleted: true };
   }
   await setInstantlyRunning(c, false);
+  try {
+    const { cancelForCampaign } = await import("../engine/queue");
+    await cancelForCampaign(id, "The campaign was archived");
+  } catch {
+    /* engine not mounted */
+  }
   await q(`UPDATE campaigns SET status = 'archived', updated_at = ? WHERE id = ?`, [nowIso(), id]);
   await logEvent("campaign", `Archived the campaign "${c.name}".`, { campaignId: id });
   return { ok: true as const, deleted: false };
@@ -1135,12 +1197,17 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     // 7. Push + sync (active campaigns only; drafts never send).
     if (c.status === "active") {
       const fresh = await row(id);
-      const pushed = await pushApproved(fresh, settings);
+      const own = engineOf(fresh) === "own";
+      const pushed = own ? await (await import("../engine/bridge")).queueApprovedOwn(fresh, settings) : await pushApproved(fresh, settings);
       res.queued = pushed.queued;
       res.notes.push(...pushed.notes);
+      // Leads sent through Instantly before a switch still finish there, so keep syncing it.
       if (fresh.instantly_campaign_id && Date.now() - (lastSync.get(id) || 0) > SYNC_EVERY_MS) {
         lastSync.set(id, Date.now());
         await syncCampaign(await row(id)).catch((e) => res.notes.push(`Couldn't sync with Instantly: ${String(e?.message || e).slice(0, 160)}`));
+      }
+      if (own || Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM outbox WHERE campaign_id = ? LIMIT 1`, [id]).catch(() => [{ n: 0 }]))[0]?.n) > 0) {
+        await (await import("../engine/bridge")).syncOwnCampaign(await row(id)).catch((e) => res.notes.push(`Couldn't update the campaign's numbers: ${String(e?.message || e).slice(0, 160)}`));
       }
     } else if (opts.manual && c.status === "draft") {
       res.notes.push("This campaign is a draft: nothing is sent until you start it.");

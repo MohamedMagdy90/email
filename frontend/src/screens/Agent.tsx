@@ -22,6 +22,7 @@ import {
   type VoicePreview,
 } from "../lib/v2/agent";
 import { mailboxesApi } from "../lib/v2/mailboxes";
+import { OwnMailboxesCard, TestInboxesCard, useEngineStatus } from "./engine/Connections";
 
 /* -------------------------------- vocabulary -------------------------------- */
 
@@ -346,13 +347,18 @@ function SectionTiles({ section, onChange, intg, draft }: { section: Section; on
 /* ------------------------------- connections ------------------------------- */
 
 function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
+  const engine = useEngineStatus();
   return (
     <div className="grid items-start gap-4 lg:grid-cols-2">
       <div className="space-y-4">
+        <OwnMailboxesCard {...engine} />
+        <TestInboxesCard {...engine} />
         <InstantlyCard intg={intg} onChange={onChange} />
+      </div>
+      <div className="space-y-4">
+        <AiCard intg={intg} onChange={onChange} />
         <VerifierCard intg={intg} onChange={onChange} />
       </div>
-      <AiCard intg={intg} onChange={onChange} />
     </div>
   );
 }
@@ -368,7 +374,7 @@ function InstantlyCard({ intg, onChange }: { intg: Integrations; onChange: (i: I
   const mb = intg.instantly.mailboxes;
   return (
     <Card className="p-5 sm:p-6">
-      <Label>Sending engine</Label>
+      <Label>Warmup (optional)</Label>
       <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-[1.05rem] font-[650] tracking-[-0.01em]">Instantly</h2>
         {on && (
@@ -378,8 +384,8 @@ function InstantlyCard({ intg, onChange }: { intg: Integrations; onChange: (i: I
         )}
       </div>
       <p className="mt-1 text-[13px] leading-relaxed text-muted">
-        Sends every campaign email through your warmed mailboxes, and collects replies in its Unibox so the agent can answer them. API
-        access needs the Growth plan or above.
+        Only needed for the warmup test (mailboxes in the "warmup on" group), and for campaigns still set to send through Instantly. Campaigns on
+        your own mailboxes never touch it. API access needs the Growth plan or above.
       </p>
       <div className="mt-4 border-t border-line-soft pt-4">
         <KeyRow

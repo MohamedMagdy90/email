@@ -1,3 +1,46 @@
+# Own sending engine (STARTED 2026-10-24) — plan in `.same/own-engine-plan.md`
+Decisions: all accepted — both Google + Microsoft, warmup test with Instantly, ramp 5 -> +2 -> 30.
+Env 2026-10-24: snapshot restore again -> DB parked in `.same/corrupt-db-backup-20/`, .git re-cloned, deps reinstalled.
+Code lives in `backend/src/v2/engine/` (+ `v2/schedule.ts`). Built against documented Gmail API / Graph
+behaviour and fake servers; the Phase 0 items below need REAL accounts to confirm.
+- [ ] USER: buy 2 domains, 2 Workspace + 2 Microsoft 365 mailboxes, seeds; create the OAuth apps
+- [ ] 0 Spike: Google + Microsoft OAuth send/read, MIME List-Unsubscribe, threading, Arabic, Railway Hobby
+### Backend (all phases built; verified 2026-10-25)
+- [x] 1 Connections + mailboxes (OAuth, encrypted tokens, provider layer, DNS assistant)
+- [x] 2 Inbox tests (seeds, placement_tests, grid)
+- [x] 3 Gate / ramp / auto-pause on inbox tests; warmup optional; Instantly warmup-only
+- [x] 4 Send queue (outbox, windows, gaps, threading, stop on reply, unsubscribe, engine switch)
+- [x] 5 Reply + bounce reader -> existing Inbox
+- [x] 6 Stats from own data (campaign stats + campaign_daily via bridge.syncOwnCampaign)
+- [x] 7 Warmup on/off comparison (experiment.ts, 21 days, 10-point rule)
+- [x] engine-test.ts 106/106 (was crashing at check 15). Fixed 2025-10-25:
+      test bugs: crypto check ran before boot; duplicate placement rows; clock rewound with gaps set;
+      fake mail stamped with the wall clock; two over-broad assertions.
+      REAL bug A: `queueApprovedOwn` / `syncOwnDaily` used the wall clock, the queue its own clock ->
+      bridge now uses `queueNowIso()` (exported from queue.ts) everywhere.
+      REAL bug B: `createCampaign` defaulted to engine "own" whenever Instantly wasn't connected, even
+      with ZERO own mailboxes -> cp-test 36/47, sq-test 30/39. Now "own" only once own mailboxes exist.
+- [x] All suites: cp 47 · sq 39 · engine 106 · db 48 · ld 45 · tg 72 · n2b 34 = 391/391; both tsc clean
+### Frontend (built; verified 2026-10-27)
+- [x] F1 `lib/v2/engine.ts` typed client + mailboxes types (engine, placement, provider, checks)
+- [x] F2 Agent -> Connections: Mail accounts (Google / Microsoft app setup + status), Test inboxes,
+      Instantly card becomes "Warmup (optional)", APP_SECRET warning (`screens/engine/Connections.tsx`)
+- [x] F3 Mailboxes: Add mailbox (sign in), own-mailbox detail, DNS assistant per domain, inbox-test
+      grid, warmup experiment panel (`screens/engine/{AddMailbox,DnsSetup,InboxTests,shared}.tsx`)
+- [x] F4 Campaigns: engine switch per campaign, "Sending today" tab (`screens/engine/SendingToday.tsx`)
+- [x] F5 both tsc clean (TS 5.9.3), vite build OK, suites engine 109 · cp 47 · sq 39 · db 48 · ld 45 ·
+      tg 72 · n2b 34 = 394/394; live HTTP smoke: every /api/v2/engine GET 200 logged in, 401 without,
+      also via the vite proxy. Screens reviewed from `.same/shots-tmp/` (preview tool can't log in).
+- [ ] Commit + push (backend live on Railway) — WAITING FOR USER OK. Do NOT commit
+      frontend/{package.json,bun.lock,tsconfig.json,vite.config.ts} (Same preview edits),
+      frontend/dev-dist/, frontend/output/, .same/shots-tmp/.
+- [ ] USER republishes Netlify (`cd frontend && bun run build`, upload dist/)
+- Env 2026-10-27: snapshot restore again -> DB parked in `.same/corrupt-db-backup-23/`, deps reinstalled,
+  ONE dev server (`nohup bun run dev > /tmp/dev.log 2>&1 &`).
+  GIT REMOTE IS `MohamedMagdy90/email` (NOT `bandoorahamra/dna-outreach`, which is a stale Aug copy).
+  Restore: `gh repo clone MohamedMagdy90/email /tmp/email-git -- --no-checkout` -> move .git -> `git reset -q`.
+  Backend has no local tsc: run `../frontend/node_modules/.bin/tsc --noEmit -p .` from backend/.
+
 # Outreach v2 (2026-10-20) — full plan in `.same/outreach-v2-plan.md`
 
 ## Phase 0 — DNA console UI port (DONE)
@@ -110,11 +153,16 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
         queue, segments, offer, settings, activity), not-connected states, dark/light, 390px
   - [x] C3 Integrate: both tsc, vite build, 47/47 test, live smoke on the dev server, version
         (screenshot tool can't log in — USER to eyeball the Campaigns tab)
-  - [ ] C4 PUSHED 075c581 (2026-10-21). Railway did NOT deploy it (no deployment record, no commit status;
-        /api/open still 200 = old build). Netlify NOT republished on purpose — wait for Railway.
-        Probe: curl https://email-production-3c14.up.railway.app/api/open?s=x -> 401 means new backend.
-        Netlify republish only once Railway serves the new backend
-        (Railway has not auto-deployed since e06d231 — new screens against the old API = 404s)
+  - [x] C4 Backend LIVE (2026-10-23): pushed f2b0706 (phases 5-9 on top of 075c581) to main; Railway
+        deployed it in ~2.5 min (deployment success 23:38:04Z), /api/open now 401 = new backend.
+        (075c581 itself never deployed; a stray deployment of 848e4f7 appeared 4s later and went inactive.)
+        Verified first: both tsc, vite build, SQLite suites 251/251, Postgres (PGlite) smoke 44/44
+        (`.same-test/pg-smoke.ts`, needs an API on :3999 with DATABASE_URL -> PGlite).
+        Backup branch: backup/workspace-tabs (same commit, safe to delete).
+        NOT committed on purpose: frontend/{package.json,bun.lock,tsconfig.json,vite.config.ts} — the Same
+        preview injected same-runtime / react-grab into them. Never commit those edits.
+  - [ ] USER: republish the Netlify frontend from main (`cd frontend && bun run build`, upload dist/).
+        dist/_redirects proxies /api/* to Railway. Until then the live frontend talks to the new API.
 - [x] D Agent tab (2026-10-21, built directly, NOT pushed)
   - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
     `decideReply(settings, {category, confidence, autoRepliesInThread})` -> send|draft|handoff|silent + reason
@@ -171,9 +219,9 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
       angles, AI/template, variable chips, delays, thread + booking-link rules, preview panel, library, stats,
       versions, save bar). Campaign view "Sequence" tab; wizard Sequence step (7 steps); follow-up fields removed
       from Rules. `Textarea` now forwards refs.
-- [ ] 8a backend `v2/dashboard/` (`campaign_daily` sync, aggregate, pause-all / resume-all) + `db-test.ts`
+- [x] 8a backend `v2/dashboard/` (`campaign_daily` sync, aggregate, pause-all / resume-all) + `db-test.ts` 48/48
 - [ ] 8b `screens/Dashboard.tsx` (needs-you, KPI tiles + sparklines, funnel, trend, tables, capacity, activity)
-- [ ] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
+- [x] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
 - [ ] 9b Targeting: Results section + segment detail (search log) + steer box; "All campaigns" board
 - [ ] Shell: 8 tabs (Dashboard first), Leads badge, shared campaign filter; all tests, both tsc, vite build, version
 - [ ] Phase 6 Leads — cross-campaign People / Companies / Pipeline, filters + facets, saved views, bulk,
@@ -495,3 +543,43 @@ Resend flagged: (1) link URLs != sending domain (all wrapped through
 - [ ] USER: change `mailto:inquiry@dna.systems` in templates (still flagged — a mailto can't be redirected)
 - Note: Railway Hobby = 2 custom domains per service
 - Local: data.sqlite was already corrupt on workspace restore -> moved to `.same/corrupt-db-backup-8/`; fresh DB created
+
+## AI provider keys failing on Test & connect (2026-10-24, local only — NOT pushed)
+- [x] Gemini 404: Google closed gemini-2.5-flash / -flash-lite to new keys. Defaults now
+      gemini-3.8-flash (writing/search) + gemini-3.5-flash-lite (classify/test). Gemini 3 uses
+      thinkingLevel: Flash-Lite "minimal", Flash "low" (3.8 Flash ERRORS on "minimal").
+- [x] OpenRouter 404: llama-3.3-70b-instruct:free went paid. Default now `openrouter/free` (router).
+- [x] Groq 400 "Failed to validate JSON": key test gave gpt-oss only 50 tokens, reasoning ate them.
+      Test now 512 tokens; gpt-oss calls send reasoning_effort=low (+ reasoning_format=hidden on Groq).
+- [x] RETIRED_MODELS in llm.ts: a saved override holding a withdrawn model name is ignored.
+- [x] tsc clean; cp/db/ld/sq/tg suites 47+48+45+39+72 = 251/251.
+- [ ] Google Search grounding is NOT on the Gemini free tier for 3.x models (pricing page:
+      "Not available" free; paid = 5,000 searches/mo free then $14/1k). Campaign discovery needs
+      billing enabled on the AI Studio project. Verify with a real key.
+- [x] PUSHED 4217ac8 to main (fast-forward from f2b0706, llm.ts only — frontend Same-preview edits
+      left out on purpose). Railway deployment 7295543026 success 2026-10-24T07:18:35Z (~65s).
+      Health 200 direct + via Netlify proxy. No stray deployment this time.
+- [ ] USER: Test & connect each key on the LIVE app too (production keys live in Railway Postgres,
+      separate from the local dev DB).
+- Local dev DB was corrupted by the workspace snapshot (bytes >= 0x80 replaced by U+FFFD; same
+  damage in every older *.corrupt copy). Moved to backend/.backup/*.corrupt-2026-10-24T07-00-38Z,
+  fresh DB created. Run ONE `bun run dev` only — 3 API processes were sharing one WAL file.
+
+## Autofill into key fields (2026-10-24) — pushed with 150fd16
+- [x] Browser filled the app login (dnaadmin) into Reacher URL + secret (text+password = login form).
+      Reacher URL type=url autoComplete=url; secrets/keys autoComplete=new-password + data-1p-ignore,
+      data-lpignore, data-bwignore (Agent.tsx Reacher + KeyRow, Mailboxes.tsx Instantly). tsc + build OK.
+- [ ] Ships with the next Netlify republish (frontend is not auto-deployed).
+
+## Reacher -> No2Bounce (2026-10-24) — PUSHED 150fd16, Railway deployment 7296055484 success 08:12:35Z
+- [x] verify.ts: No2Bounce client (POST /v2/n2b_validate_email -> trackingId -> poll GET; header apitoken).
+      scoreStatus Valid/Invalid/Catch-All/Disposable/Unknown mapped to valid/invalid/catch_all/invalid/unknown.
+      Built-in checks first (no credit). Errors/timeouts NOT cached; pending trackingIds reused (no double charge).
+      Old builtin 'no verifier' cache rows re-checked once a token exists. Setting no2bounce_api_key / env NO2BOUNCE_API_KEY.
+- [x] testNo2Bounce: /v2/n2b_validate_token (200 = ok); live API answers a bad token with 500 there, so it falls back
+      to a fake-trackingId lookup ('invalid or expired' = bad token). No credit used.
+- [x] Finder stops probing on verifier error (keeps best guess); qualify holds (12 h retry) instead of skipping.
+- [x] readiness.reacher -> readiness.verifier (backend + Wizard/parts). Agent: VerifierCard (KeyRow, target no2bounce).
+- [x] .same-test/n2b-test.ts 34/34 (needs N2B_POLL_SCALE=0.002); cp/db/ld/sq/tg 251/251; both tsc clean; vite build OK.
+- [ ] USER: save the No2Bounce token on the LIVE app (needs the Netlify republish first), Test & connect.
+- Note: old reacher_url / reacher_secret settings rows are left in the DB, unread.

@@ -9,8 +9,9 @@
 import { q, getSetting, setSetting } from "../../db";
 import { uid, todayUtc, logEvent, parseJson } from "../events";
 import * as inst from "../instantly";
-import { normalizePolicy, decide, rampParams, addDays, type MailboxPolicy, type MailboxRow, type HealthRow, type Dns } from "./policy";
+import { normalizePolicy, decide, rampParams, addDays, isOwn, type MailboxPolicy, type MailboxRow, type HealthRow, type Dns, type OwnExtra } from "./policy";
 import { buildView, viewMailbox, type PoolView } from "./view";
+import { placementSummaries } from "../engine/placement";
 
 const POLICY_KEY = "mailbox_policy";
 const LAST_SYNC_KEY = "mailbox_last_sync";
@@ -117,14 +118,53 @@ async function loadHealth(sinceDay: string, mailboxId?: string): Promise<Map<str
   return out;
 }
 
-/** Mailboxes allowed to send campaign mail right now, with today's limit. */
+/** Instantly mailboxes allowed to send campaign mail right now, with today's limit. Own-engine mailboxes are never added to Instantly campaigns. */
 export async function getSendableMailboxes(): Promise<{ email: string; dailyLimit: number }[]> {
   const rows = await q(
     `SELECT email, daily_limit FROM mailboxes
      WHERE stage IN ('ramping', 'active') AND missing_since IS NULL AND instantly_status = 1 AND daily_limit > 0
+       AND COALESCE(provider, 'instantly') = 'instantly'
      ORDER BY email`
   );
   return rows.map((r) => ({ email: String(r.email), dailyLimit: Number(r.daily_limit) || 0 }));
+}
+
+/** Inbox tests, test-inbox count and complaints for own mailboxes (the gate's extra inputs). */
+async function loadExtras(rows: MailboxRow[], t: string): Promise<Map<string, OwnExtra>> {
+  const out = new Map<string, OwnExtra>();
+  const own = rows.filter(isOwn);
+  if (!own.length) return out;
+  let seeds = 0;
+  let placement = new Map<string, any>();
+  try {
+    seeds = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM seed_inboxes WHERE enabled = 1 AND status = 'ok'`))[0]?.n) || 0;
+    placement = await placementSummaries(t);
+  } catch {
+    /* engine tables not created yet */
+  }
+  for (const r of own) {
+    let complaints: OwnExtra["complaints"] = null;
+    if (r.ramp_started_at) {
+      try {
+        const from = `${r.ramp_started_at.slice(0, 10)}T00:00:00.000Z`;
+        const sent = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM outbox WHERE mailbox_id = ? AND kind = 'campaign' AND sent_at >= ?`, [r.id, from]))[0]?.n) || 0;
+        const bad = Number(
+          (
+            await q(
+              `SELECT CAST(count(DISTINCT o.prospect_id) AS INTEGER) AS n FROM outbox o JOIN prospects p ON p.id = o.prospect_id
+                WHERE o.mailbox_id = ? AND o.kind = 'campaign' AND o.sent_at >= ? AND (p.stage = 'unsubscribed' OR p.interest IN ('unsubscribe','complaint','legal'))`,
+              [r.id, from]
+            )
+          )[0]?.n
+        ) || 0;
+        complaints = { sent, complaints: bad };
+      } catch {
+        complaints = null;
+      }
+    }
+    out.set(r.id, { placement: placement.get(r.id) || null, seeds, complaints });
+  }
+  return out;
 }
 
 export interface LastSync {
@@ -135,13 +175,28 @@ export interface LastSync {
   ms: number;
 }
 
-export async function listView(): Promise<PoolView & { example: false; connected: boolean; syncing: boolean; lastSync: LastSync | null; policy: MailboxPolicy }> {
+export async function listView(): Promise<
+  PoolView & { example: false; connected: boolean; instantly: boolean; engine: { apps: number; seeds: number }; syncing: boolean; lastSync: LastSync | null; policy: MailboxPolicy }
+> {
   const policy = await getPolicy();
   const t = today();
-  const view = buildView(await loadRows(), await loadHealth(addDays(t, -29)), policy, t);
+  const rows = await loadRows();
+  const view = buildView(rows, await loadHealth(addDays(t, -29)), policy, t, await loadExtras(rows, t));
+  const instantly = await inst.instantlyConfigured();
+  let engine = { apps: 0, seeds: 0 };
+  try {
+    engine = {
+      apps: Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM mail_connections`))[0]?.n) || 0,
+      seeds: Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM seed_inboxes WHERE enabled = 1`))[0]?.n) || 0,
+    };
+  } catch {
+    /* engine tables not created yet */
+  }
   return {
     example: false,
-    connected: await inst.instantlyConfigured(),
+    connected: instantly || engine.apps > 0 || rows.some(isOwn),
+    instantly,
+    engine,
     syncing: isSyncing(),
     lastSync: parseJson<LastSync | null>(await getSetting(LAST_SYNC_KEY), null),
     policy,
@@ -159,7 +214,8 @@ export async function mailboxDetail(id: string) {
     "SELECT * FROM agent_events WHERE ref_type = 'mailbox' AND ref_id = ? ORDER BY created_at DESC LIMIT 40",
     [id]
   );
-  return { mailbox: viewMailbox(row, health, policy, t), health, events };
+  const extra = (await loadExtras([row], t)).get(id);
+  return { mailbox: viewMailbox(row, health, policy, t, extra), health, events };
 }
 
 /* ------------------------------ evaluate ------------------------------ */
@@ -170,19 +226,27 @@ export async function mailboxDetail(id: string) {
  * paused ones, warmup back on where it was switched off.
  * `live` = the account list from this sync (lets us see Instantly's own limit).
  */
-export async function evaluateAll(opts: { push: boolean; onlyId?: string; live?: Map<string, inst.InstantlyAccount> }): Promise<{ errors: string[] }> {
+export async function evaluateAll(opts: {
+  push: boolean;
+  onlyId?: string;
+  live?: Map<string, inst.InstantlyAccount>;
+  /** 'own' = only mailboxes connected to our engine; 'instantly' = only Instantly ones. */
+  scope?: "all" | "own" | "instantly";
+}): Promise<{ errors: string[] }> {
   const policy = await getPolicy();
   const t = today();
   const now = nowIso();
-  const rows = (await loadRows()).filter((r) => !opts.onlyId || r.id === opts.onlyId);
+  const scope = opts.scope || "all";
+  const rows = (await loadRows()).filter((r) => (!opts.onlyId || r.id === opts.onlyId) && (scope === "all" || (scope === "own") === isOwn(r)));
   const health = await loadHealth(addDays(t, -29), opts.onlyId);
+  const extras = await loadExtras(rows, t);
   const errors: string[] = [];
   const connected = opts.push && (await inst.instantlyConfigured());
   const warmupOff: MailboxRow[] = [];
 
   for (const row of rows) {
     if (row.missing_since) continue;
-    const d = decide(row, health.get(row.id) || [], policy, t);
+    const d = decide(row, health.get(row.id) || [], policy, t, extras.get(row.id));
     const { target } = rampParams(row, policy);
     const stageChanged = d.stage !== row.stage;
     await q(
@@ -205,6 +269,13 @@ export async function evaluateAll(opts: { push: boolean; onlyId?: string; live?:
     );
     if (d.event) await logEvent("mailbox", d.event.message, { level: d.event.level, refType: "mailbox", refId: row.id });
     if (!connected) continue;
+
+    // Own mailboxes send through our queue: Instantly only runs their warmup
+    // (when they are in the warmup test), so limits and pauses stay with us.
+    if (isOwn(row)) {
+      if (row.warmup_mode === "instantly" && row.warmup_status === 0 && row.instantly_status != null) warmupOff.push(row);
+      continue;
+    }
 
     const live = opts.live?.get(row.email.toLowerCase());
     try {
@@ -302,6 +373,19 @@ async function runSync(opts: { forceDns?: boolean }): Promise<{ synced: number; 
       a.timestamp_warmup_start || null,
     ];
     const row = byEmail.get(email);
+    if (row && isOwn(row)) {
+      // Connected to our own engine; in Instantly only for warmup. Take the warmup facts, nothing else.
+      idByEmail.set(email, row.id);
+      await q(`UPDATE mailboxes SET instantly_status = ?, warmup_status = ?, warmup_score = ?, warmup_started_at = ?, last_synced_at = ? WHERE id = ?`, [
+        a.status ?? null,
+        a.warmup_status ?? null,
+        a.stat_warmup_score ?? null,
+        a.timestamp_warmup_start || null,
+        now,
+        row.id,
+      ]);
+      continue;
+    }
     if (!row) {
       const id = uid();
       idByEmail.set(email, id);
@@ -333,6 +417,11 @@ async function runSync(opts: { forceDns?: boolean }): Promise<{ synced: number; 
 
   /* 2. mailboxes that left Instantly */
   for (const r of existing) {
+    if (isOwn(r)) {
+      // Left Instantly (or never there): its warmup there is off, the mailbox itself is fine.
+      if (!live.has(r.email.toLowerCase()) && r.instantly_status != null) await q("UPDATE mailboxes SET instantly_status = NULL, warmup_status = NULL WHERE id = ?", [r.id]);
+      continue;
+    }
     if (live.has(r.email.toLowerCase()) || r.missing_since) continue;
     await q("UPDATE mailboxes SET missing_since = ?, stage = 'paused', stage_reason = ?, stage_changed_at = ?, daily_limit = 0, updated_at = ? WHERE id = ?", [
       now,
@@ -377,8 +466,9 @@ async function runSync(opts: { forceDns?: boolean }): Promise<{ synced: number; 
     }
   }
 
-  /* 4. daily campaign numbers -> mailbox_health (campaign columns) */
-  for (const part of chunks(emails, 200)) {
+  /* 4. daily campaign numbers -> mailbox_health (campaign columns). Own mailboxes count their own sends. */
+  const ownEmails = new Set(existing.filter(isOwn).map((r) => r.email.toLowerCase()));
+  for (const part of chunks(emails.filter((e) => !ownEmails.has(e)), 200)) {
     try {
       const stats = await inst.dailyAccountAnalytics(part, addDays(t, -29), t);
       for (const s of stats) {
@@ -401,7 +491,7 @@ async function runSync(opts: { forceDns?: boolean }): Promise<{ synced: number; 
   const fresh = await loadRows();
   const byDomain = new Map<string, MailboxRow[]>();
   for (const r of fresh) {
-    if (r.missing_since || !r.domain) continue;
+    if (r.missing_since || !r.domain || isOwn(r)) continue; // own domains are checked by the engine (with the exact records)
     byDomain.set(r.domain, [...(byDomain.get(r.domain) || []), r]);
   }
   const due: { domain: string; email: string; prev: Dns | null }[] = [];
@@ -474,7 +564,7 @@ export async function pauseMailbox(id: string, reason?: string) {
   const now = nowIso();
   const why = (reason || "").trim().slice(0, 300) || "Paused by you.";
   await q("UPDATE mailboxes SET stage = 'paused', stage_reason = ?, stage_changed_at = ?, updated_at = ? WHERE id = ?", [why, now, now, id]);
-  const warning = row.stage === "ramping" || row.stage === "active" ? await tellInstantly(() => inst.pauseAccount(row.email)) : null;
+  const warning = !isOwn(row) && (row.stage === "ramping" || row.stage === "active") ? await tellInstantly(() => inst.pauseAccount(row.email)) : null;
   await logEvent("mailbox", `Paused ${row.email} by hand.${reason ? ` Reason: ${why}` : ""}`, { refType: "mailbox", refId: id });
   return { warning };
 }
@@ -482,14 +572,14 @@ export async function pauseMailbox(id: string, reason?: string) {
 export async function resumeMailbox(id: string) {
   const row = await mustRow(id);
   if (row.stage !== "paused") throw new MailboxError("Only a paused mailbox can be resumed.");
-  if (row.missing_since) throw new MailboxError("This mailbox is no longer in Instantly. Add it back there first.");
+  if (row.missing_since && !isOwn(row)) throw new MailboxError("This mailbox is no longer in Instantly. Add it back there first.");
   const now = nowIso();
   await q(
     "UPDATE mailboxes SET stage = 'warming', stage_reason = ?, stage_changed_at = ?, ramp_started_at = NULL, daily_limit = 0, updated_at = ? WHERE id = ?",
     ["Back through the checks after a pause.", now, now, id]
   );
-  const warning = row.instantly_status === 2 ? await tellInstantly(() => inst.resumeAccount(row.email)) : null;
-  if (!warning && row.instantly_status === 2 && (await inst.instantlyConfigured())) await q("UPDATE mailboxes SET instantly_status = 1 WHERE id = ?", [id]);
+  const warning = !isOwn(row) && row.instantly_status === 2 ? await tellInstantly(() => inst.resumeAccount(row.email)) : null;
+  if (!isOwn(row) && !warning && row.instantly_status === 2 && (await inst.instantlyConfigured())) await q("UPDATE mailboxes SET instantly_status = 1 WHERE id = ?", [id]);
   await logEvent("mailbox", `Resumed ${row.email}. It goes through the readiness checks again, and the ramp restarts from day 1.`, {
     refType: "mailbox",
     refId: id,
@@ -505,7 +595,7 @@ export async function startMailbox(id: string) {
   const policy = await getPolicy();
   const t = today();
   const health = (await loadHealth(addDays(t, -29), id)).get(id) || [];
-  const d = decide({ ...row, manual_hold: 0, stage: "warming" }, health, { ...policy, autoStart: true }, t);
+  const d = decide({ ...row, manual_hold: 0, stage: "warming" }, health, { ...policy, autoStart: true }, t, (await loadExtras([row], t)).get(id));
   if (d.stage !== "ramping" && d.stage !== "active") throw new MailboxError(`Not ready yet: ${d.reason}`);
   // daily_limit stays 0 here: the evaluation below sets it and, because it
   // changed, pushes it to Instantly.
@@ -525,6 +615,10 @@ export interface MailboxPatch {
   manualHold?: boolean;
   targetLimit?: number | null;
   notes?: string;
+  /* own engine */
+  senderName?: string;
+  /** null = not in the warmup test. Joining a group sets its warmup mode. */
+  experimentGroup?: "warmup_on" | "warmup_off" | null;
 }
 
 export async function updateMailbox(id: string, p: MailboxPatch) {
@@ -565,17 +659,49 @@ export async function updateMailbox(id: string, p: MailboxPatch) {
     sets.push("notes = ?");
     vals.push(String(p.notes).slice(0, 1000));
   }
+  let warmupTo: boolean | null = null;
+  if (p.senderName !== undefined && isOwn(row)) {
+    const n = String(p.senderName).replace(/[\r\n"<>]/g, " ").trim().slice(0, 80);
+    sets.push("sender_name = ?");
+    vals.push(n || null);
+    if (n !== (row.sender_name || "")) said.push(`sender name "${n}"`);
+  }
+  if (p.experimentGroup !== undefined && isOwn(row)) {
+    const g = p.experimentGroup === "warmup_on" || p.experimentGroup === "warmup_off" ? p.experimentGroup : null;
+    sets.push("experiment_group = ?");
+    vals.push(g);
+    if (g) {
+      sets.push("warmup_mode = ?");
+      vals.push(g === "warmup_on" ? "instantly" : "off");
+      warmupTo = g === "warmup_on";
+    }
+    if (g !== (row.experiment_group || null)) said.push(g ? `warmup test group: ${g === "warmup_on" ? "warmup on" : "warmup off"}` : "left the warmup test");
+  }
   if (!sets.length) return;
   sets.push("updated_at = ?");
   vals.push(nowIso(), id);
   await q(`UPDATE mailboxes SET ${sets.join(", ")} WHERE id = ?`, vals);
   if (said.length) await logEvent("mailbox", `Updated ${row.email}: ${said.join(", ")}.`, { refType: "mailbox", refId: id });
+  let warmupNote: string | null = null;
+  if (warmupTo !== null && row.instantly_status != null && (await inst.instantlyConfigured())) {
+    warmupNote = await tellInstantly(() => (warmupTo ? inst.enableWarmup([row.email]) : inst.disableWarmup([row.email])));
+    if (!warmupNote) await q("UPDATE mailboxes SET warmup_status = ? WHERE id = ?", [warmupTo ? 1 : 0, id]);
+  } else if (warmupTo === true) {
+    warmupNote = "Add this mailbox to Instantly (warmup only, no campaigns) so its warmup can run. It's matched by address on the next sync.";
+  }
   const ev = await evaluateAll({ push: true, onlyId: id });
-  return { warning: ev.errors[0] || null };
+  return { warning: warmupNote || ev.errors[0] || null };
 }
 
 export async function setWarmup(id: string, on: boolean) {
   const row = await mustRow(id);
+  if (isOwn(row)) {
+    await q("UPDATE mailboxes SET warmup_mode = ?, updated_at = ? WHERE id = ?", [on ? "instantly" : "off", nowIso(), id]);
+    if (row.instantly_status == null || !(await inst.instantlyConfigured())) {
+      await logEvent("mailbox", `${row.email}: warmup ${on ? "requested (it runs once the mailbox is also in Instantly)" : "off"}.`, { refType: "mailbox", refId: id });
+      return;
+    }
+  }
   if (!(await inst.instantlyConfigured())) throw new MailboxError("Connect Instantly first.");
   try {
     await (on ? inst.enableWarmup([row.email]) : inst.disableWarmup([row.email]));
@@ -594,6 +720,11 @@ export async function setWarmup(id: string, on: boolean) {
 /** Drop a mailbox that is no longer in Instantly, with its history. */
 export async function forgetMailbox(id: string) {
   const row = await mustRow(id);
+  if (isOwn(row)) {
+    const { removeOwnMailbox } = await import("../engine/accounts");
+    await removeOwnMailbox(id);
+    return;
+  }
   if (!row.missing_since) throw new MailboxError("Only mailboxes that were removed from Instantly can be dropped here.");
   await q("DELETE FROM mailbox_health WHERE mailbox_id = ?", [id]);
   await q("DELETE FROM mailboxes WHERE id = ?", [id]);

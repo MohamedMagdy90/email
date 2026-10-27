@@ -4,6 +4,7 @@ import {
   addDays,
   dayDiff,
   fullRampDay,
+  isOwn,
   metrics,
   parseDns,
   rampParams,
@@ -14,6 +15,8 @@ import {
   type MailboxPolicy,
   type MailboxRow,
   type Metrics,
+  type OwnExtra,
+  type PlacementSummary,
   type Stage,
 } from "./policy";
 
@@ -52,6 +55,16 @@ export interface MailboxView {
   sentToday: number;
   notes: string;
   lastSyncedAt: string | null;
+  /** 'own' = connected here (Google / Microsoft sign-in); 'instantly' = synced from Instantly. */
+  engine: "own" | "instantly";
+  providerKind: "google" | "microsoft" | "instantly";
+  authStatus: "ok" | "failed" | null;
+  authError: string | null;
+  warmupMode: "off" | "instantly";
+  experimentGroup: "warmup_on" | "warmup_off" | null;
+  senderName: string;
+  domainRegisteredAt: string | null;
+  placement: PlacementSummary | null;
 }
 
 export interface DomainView {
@@ -59,6 +72,9 @@ export interface DomainView {
   vendors: string[];
   count: number;
   dns: Dns | null;
+  engine: "own" | "instantly";
+  providerKind: "google" | "microsoft" | "instantly";
+  registeredAt: string | null;
 }
 
 export interface Summary {
@@ -72,6 +88,10 @@ export interface Summary {
   warmupVolume7: number;
   nextReady: { email: string; day: string } | null;
   attention: number;
+  /** Own mailboxes only: weighted inbox-test rate over the last 3 days, pool-wide. */
+  placementRate3d: number | null;
+  placementTests3d: number;
+  own: number;
 }
 
 export interface PoolView {
@@ -82,8 +102,9 @@ export interface PoolView {
 
 const asStage = (s: string): Stage => (STAGES.includes(s as Stage) ? (s as Stage) : "warming");
 
-export function viewMailbox(row: MailboxRow, health: HealthRow[], policy: MailboxPolicy, today: string): MailboxView {
+export function viewMailbox(row: MailboxRow, health: HealthRow[], policy: MailboxPolicy, today: string, extra?: OwnExtra): MailboxView {
   const m = metrics(row, health, policy, today);
+  const own = isOwn(row);
   const stage = asStage(row.stage);
   const { target, start, step } = rampParams(row, policy);
   const byDay = new Map(health.map((h) => [h.day, h]));
@@ -100,11 +121,11 @@ export function viewMailbox(row: MailboxRow, health: HealthRow[], policy: Mailbo
     domain: row.domain || row.email.split("@")[1] || "",
     vendor: row.vendor || "other",
     name: [row.first_name, row.last_name].filter(Boolean).join(" "),
-    provider: PROVIDERS[String(row.provider_code)] || "Other",
+    provider: own ? (row.provider === "microsoft" ? "Microsoft 365" : "Google Workspace") : PROVIDERS[String(row.provider_code)] || "Other",
     stage,
     reason: row.stage_reason || "",
     stageChangedAt: row.stage_changed_at,
-    sendable: sending && !row.missing_since && row.instantly_status === 1,
+    sendable: own ? sending && !row.missing_since && row.auth_status !== "failed" && Number(row.daily_limit) > 0 : sending && !row.missing_since && row.instantly_status === 1,
     dailyLimit: Number(row.daily_limit) || 0,
     targetLimit: target,
     targetCustom: row.target_custom === 1,
@@ -118,24 +139,38 @@ export function viewMailbox(row: MailboxRow, health: HealthRow[], policy: Mailbo
     warmupStatus: row.warmup_status,
     warmupScore: row.warmup_score,
     missing: !!row.missing_since,
-    checks: readinessChecks(row, m, policy),
+    checks: readinessChecks(row, m, policy, extra, today),
     metrics: m,
     spark,
     sentToday: Number(byDay.get(today)?.campaign_sent) || 0,
     notes: row.notes || "",
     lastSyncedAt: row.last_synced_at,
+    engine: own ? "own" : "instantly",
+    providerKind: own ? (row.provider === "microsoft" ? "microsoft" : "google") : "instantly",
+    authStatus: own ? (row.auth_status === "failed" ? "failed" : "ok") : null,
+    authError: row.auth_error || null,
+    warmupMode: row.warmup_mode === "instantly" ? "instantly" : "off",
+    experimentGroup: row.experiment_group === "warmup_on" || row.experiment_group === "warmup_off" ? row.experiment_group : null,
+    senderName: row.sender_name || [row.first_name, row.last_name].filter(Boolean).join(" "),
+    domainRegisteredAt: row.domain_registered_at || null,
+    placement: own ? extra?.placement || null : null,
   };
 }
 
-export function buildView(rows: MailboxRow[], health: Map<string, HealthRow[]>, policy: MailboxPolicy, today: string): PoolView {
-  const mailboxes = rows.map((r) => viewMailbox(r, health.get(r.id) || [], policy, today));
+export function buildView(rows: MailboxRow[], health: Map<string, HealthRow[]>, policy: MailboxPolicy, today: string, extras?: Map<string, OwnExtra>): PoolView {
+  const mailboxes = rows.map((r) => viewMailbox(r, health.get(r.id) || [], policy, today, extras?.get(r.id)));
   mailboxes.sort((a, b) => a.domain.localeCompare(b.domain) || a.email.localeCompare(b.email));
 
   const domainMap = new Map<string, DomainView>();
   for (const mb of mailboxes) {
-    const d = domainMap.get(mb.domain) || { domain: mb.domain, vendors: [], count: 0, dns: null };
+    const d = domainMap.get(mb.domain) || { domain: mb.domain, vendors: [], count: 0, dns: null, engine: mb.engine, providerKind: mb.providerKind, registeredAt: mb.domainRegisteredAt };
     d.count++;
-    if (!d.vendors.includes(mb.vendor)) d.vendors.push(mb.vendor);
+    if (mb.engine === "own") {
+      d.engine = "own";
+      d.providerKind = mb.providerKind;
+      d.registeredAt = d.registeredAt || mb.domainRegisteredAt;
+    }
+    if (mb.engine === "instantly" && !d.vendors.includes(mb.vendor)) d.vendors.push(mb.vendor);
     const row = rows.find((r) => r.id === mb.id);
     const dns = row ? parseDns(row.dns_json) : null;
     if (dns && (!d.dns || dns.checkedAt > d.dns.checkedAt)) d.dns = dns;
@@ -174,6 +209,22 @@ export function buildView(rows: MailboxRow[], health: Map<string, HealthRow[]>, 
       warmupVolume7: volume,
       nextReady: next ? { email: next.email, day: next.metrics.readyEta as string } : null,
       attention: live.filter((m) => m.stage === "paused" || (m.stage === "warming" && m.checks.some((c) => c.state === "fail"))).length,
+      ...poolPlacement(live),
+      own: live.filter((m) => m.engine === "own").length,
     },
   };
+}
+
+function poolPlacement(list: MailboxView[]): { placementRate3d: number | null; placementTests3d: number } {
+  let tests = 0;
+  let weighted = 0;
+  let rateSum = 0;
+  for (const m of list) {
+    const p = m.placement;
+    if (!p || p.rate3d == null || !p.tests3d) continue;
+    tests += p.tests3d;
+    weighted += p.tests3d;
+    rateSum += p.rate3d * p.tests3d;
+  }
+  return { placementRate3d: weighted ? Math.round((rateSum / weighted) * 10) / 10 : null, placementTests3d: tests };
 }

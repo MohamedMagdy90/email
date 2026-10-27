@@ -157,12 +157,17 @@ export type SegmentInput = Partial<
 >;
 
 /* ------------------------------ campaigns ----------------------------- */
-
+/** 'own' = our Google / Microsoft mailboxes (own send queue); 'instantly' = an Instantly campaign. */
+export type CampaignEngine = "own" | "instantly";
 export interface CampaignReadiness {
   ai: boolean; // any AI key
   aiSearch: boolean; // Gemini key (Google Search grounding)
   instantly: boolean;
+  /** Which engine `mailboxes` describes: the campaign's own, or both (campaign list). */
+  engine?: CampaignEngine | "all";
   mailboxes: { total: number; sending: number; dailyCapacity: number };
+  /** Our own Google / Microsoft mailboxes, whatever the campaign's engine. */
+  ownMailboxes?: { total: number; sending: number; dailyCapacity: number };
   verifier: boolean; // No2Bounce connected: guessed addresses can be checked
   budgetRemaining: number; // AI calls left today
 }
@@ -185,6 +190,8 @@ export interface CampaignSummary {
   segments: number; // enabled segments
   funnel: Funnel;
   instantly: { id: string | null; status: number | null };
+  /** Where NEW leads are sent from. Leads already sent finish where they started. */
+  engine: CampaignEngine;
   stats: CampaignStats | null;
   lastError: string | null;
   createdAt: string;
@@ -310,9 +317,9 @@ const B = "/api/v2/campaigns";
 
 export const campaignsApi = {
   list: () => req<{ campaigns: CampaignSummary[]; readiness: CampaignReadiness }>(B),
-  create: (body: { name: string; kind: CampaignKind; website?: string }) => req<{ campaign: CampaignDetail }>(B, j(body)),
+  create: (body: { name: string; kind: CampaignKind; website?: string; engine?: CampaignEngine }) => req<{ campaign: CampaignDetail }>(B, j(body)),
   get: (id: string) => req<{ campaign: CampaignDetail }>(`${B}/${id}`),
-  update: (id: string, body: { name?: string; kind?: CampaignKind; website?: string; offer?: Offer; settings?: Partial<CampaignSettings> }) =>
+  update: (id: string, body: { name?: string; kind?: CampaignKind; website?: string; offer?: Offer; settings?: Partial<CampaignSettings>; engine?: CampaignEngine }) =>
     req<{ campaign: CampaignDetail }>(`${B}/${id}`, put(body)),
   /** Drafts are deleted; anything else is archived (and paused in Instantly). */
   remove: (id: string) => req<{ ok: true; deleted: boolean }>(`${B}/${id}`, del),

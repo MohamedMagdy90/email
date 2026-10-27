@@ -400,31 +400,5 @@ export async function unreadCount(): Promise<number> {
 
 /* ------------------------------- helpers ------------------------------ */
 
-/** Map a country to one of Instantly's allowed schedule timezones. */
-export function timezoneForCountry(country?: string | null): string {
-  const c = String(country || "").toLowerCase();
-  if (/(emirates|uae|dubai|abu dhabi|oman)/.test(c)) return "Asia/Dubai";
-  if (/(saudi|ksa|qatar|kuwait|bahrain|iraq)/.test(c)) return "Asia/Baghdad";
-  if (/yemen/.test(c)) return "Asia/Aden";
-  if (/jordan/.test(c)) return "Asia/Amman";
-  if (/egypt/.test(c)) return "Africa/Cairo";
-  if (/lebanon/.test(c)) return "Asia/Beirut";
-  if (/pakistan/.test(c)) return "Asia/Karachi";
-  if (/india/.test(c)) return "Asia/Kolkata";
-  // Only values from Instantly's 102-entry enum are allowed (no Asia/Riyadh,
-  // no Europe/London). Default: UTC+3, which covers KSA/Qatar/Kuwait/Bahrain.
-  return "Asia/Baghdad";
-}
-
-/**
- * Sun–Thu where the weekend is Fri–Sat (Saudi, Qatar, Kuwait, Bahrain, Oman,
- * Iraq, Yemen, Jordan, Egypt); Mon–Fri elsewhere — including the UAE, which
- * moved to a Sat–Sun weekend in 2022. 0 = Sunday.
- */
-export function workDaysForCountry(country?: string | null): Record<string, boolean> {
-  const c = String(country || "").toLowerCase();
-  const gulf = /(saudi|ksa|qatar|kuwait|bahrain|oman|iraq|yemen|jordan|egypt)/.test(c) && !/(emirates|uae)/.test(c);
-  return gulf
-    ? { "0": true, "1": true, "2": true, "3": true, "4": true, "5": false, "6": false }
-    : { "0": false, "1": true, "2": true, "3": true, "4": true, "5": true, "6": false };
-}
+// Time zones and work days live in ../schedule (both engines use them).
+export { timezoneForCountry, workDaysForCountry } from "./schedule";

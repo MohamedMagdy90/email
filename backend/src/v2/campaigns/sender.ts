@@ -320,9 +320,12 @@ export async function syncCampaign(c: Row): Promise<void> {
     for (const v of vals) if (v !== undefined && v !== null && Number.isFinite(Number(v))) return Number(v);
     return null;
   };
-  const stats: CampaignStatsT & { mailboxes?: string } = {
+  // A campaign can have sent through both engines (switched part-way): add our own sends.
+  const instantlySent = num(a?.emails_sent_count, a?.contacted_count, prev.instantlySent, prev.sent) ?? 0;
+  const stats: CampaignStatsT & { mailboxes?: string; instantlySent?: number } = {
     ...prev,
-    sent: num(a?.emails_sent_count, a?.contacted_count, prev.sent) ?? 0,
+    instantlySent,
+    sent: instantlySent + (Number(prev.ownSent) || 0),
     opened: null, // open tracking is off on purpose
     replies: num(a?.reply_count_unique, a?.reply_count, prev.replies) ?? 0,
     positive,

@@ -1,9 +1,16 @@
-// Mailboxes — the sending pool in Instantly: warmup health, the readiness gate,
-// the daily ramp and auto-pause. Works before Instantly is connected (setup
-// steps + an example pool run through the real rules).
+// Mailboxes — the sending pool: our own Google / Microsoft mailboxes (inbox
+// tests, DNS assistant, sign-in) and any still synced from Instantly (warmup
+// health). Both share the readiness gate, the daily ramp and auto-pause.
+// Works before anything is connected (setup steps + an example pool run
+// through the real rules).
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner, Textarea, cn, toast } from "../lib/ui";
 import { ago, v2, type AgentEvent } from "../lib/v2/core";
+import { engineApi, signInWithProvider } from "../lib/v2/engine";
+import { AddMailboxModal, openConnections } from "./engine/AddMailbox";
+import { DnsModal } from "./engine/DnsSetup";
+import { ExperimentPanel, InboxTestGrid, MailboxTests } from "./engine/InboxTests";
+import { PlacementBars, ProviderMark, announceStoredOAuth, placementTone } from "./engine/shared";
 import {
   VENDOR_LABEL,
   fmtDay,
@@ -11,6 +18,7 @@ import {
   rampSteps,
   type Check,
   type Dns,
+  type DomainInfo,
   type HealthDay,
   type Mailbox,
   type MailboxDetail,
@@ -58,11 +66,19 @@ const DEFAULT_POLICY: MailboxPolicy = {
   pauseInboxRate: 90,
   maxBounceRate: 3,
   minSendsForBounce: 50,
-  rampStart: 10,
-  rampStep: 3,
+  // Slow start for fresh domains (decided 2026-10-24): 5 a day, +2 a day, up to 30.
+  rampStart: 5,
+  rampStep: 2,
   targetLimit: 30,
   autoStart: true,
   keepWarmupOn: true,
+  minDomainAgeDays: 14,
+  minMailboxDays: 7,
+  minPlacementTests: 12,
+  minPlacementRate: 75,
+  pausePlacementRate: 50,
+  maxComplaintRate: 1,
+  minSendsForComplaints: 100,
 };
 
 const Label = ({ children, className }: { children: ReactNode; className?: string }) => (
@@ -91,6 +107,9 @@ export default function Mailboxes() {
   const [filter, setFilter] = useState<Stage | "all">("all");
   const [openId, setOpenId] = useState<string | null>(null);
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [dnsDomain, setDnsDomain] = useState<string | null>(null);
+  const [version, setVersion] = useState(0); // bumps the inbox-test grid + warmup test
   const [events, setEvents] = useState<AgentEvent[]>([]);
 
   const load = useCallback(
@@ -102,6 +121,7 @@ export default function Mailboxes() {
         setLoadError("");
         if (mode === "example") setEvents(d.events || []);
         else if (d.connected) setEvents((await v2.events({ kind: "mailbox", limit: 40 })).events);
+        setVersion((v) => v + 1);
       } catch (e: any) {
         setLoadError(e.message || "Couldn't load mailboxes.");
       } finally {
@@ -113,6 +133,11 @@ export default function Mailboxes() {
 
   useEffect(() => {
     load();
+  }, [load]);
+
+  // A sign-in that finished as a full-page redirect (popup blocked) lands back here.
+  useEffect(() => {
+    announceStoredOAuth(() => load(true));
   }, [load]);
 
   // Pick up the background sync (every 30 min) without a reload.
@@ -143,21 +168,26 @@ export default function Mailboxes() {
   const header = (
     <PageHeader
       title="Mailboxes"
-      subtitle="Your sending mailboxes in Instantly: warmup health, readiness checks and the daily ramp. Nothing sends until a mailbox has earned it."
+      subtitle="Your sending mailboxes: inbox tests, readiness checks and the daily ramp. Nothing sends until a mailbox has earned it."
       actions={
         data && (
           <>
             {example ? (
               <Badge className="bg-wnb text-warn">Example data</Badge>
-            ) : data.connected ? (
+            ) : data.instantly ? (
               <SyncPill data={data} syncing={syncing} />
             ) : null}
             <Button variant="outline" size="sm" onClick={() => setRulesOpen(true)}>
               Rules
             </Button>
-            {!example && data.connected && (
-              <Button size="sm" onClick={syncNow} loading={syncing}>
-                Sync now
+            {!example && data.instantly && (
+              <Button variant="outline" size="sm" onClick={syncNow} loading={syncing}>
+                Sync Instantly
+              </Button>
+            )}
+            {!example && (
+              <Button size="sm" onClick={() => setAddOpen(true)}>
+                Add mailbox
               </Button>
             )}
           </>
@@ -202,7 +232,7 @@ export default function Mailboxes() {
       {header}
 
       {showSetup ? (
-        <Setup policy={policy} onPreview={() => setMode("example")} onRules={() => setRulesOpen(true)} onConnected={(v) => setData(v)} />
+        <Setup policy={policy} onPreview={() => setMode("example")} onRules={() => setRulesOpen(true)} onConnected={(v) => setData(v)} onAdd={() => setAddOpen(true)} />
       ) : (
         <>
           {example && (
@@ -224,7 +254,7 @@ export default function Mailboxes() {
           )}
 
           {data.mailboxes.length === 0 ? (
-            <EmptyPool onSync={syncNow} syncing={syncing} />
+            <EmptyPool onSync={syncNow} syncing={syncing} instantly={!!data.instantly} onAdd={() => setAddOpen(true)} />
           ) : (
             <>
               <SummaryTiles data={data} />
@@ -235,16 +265,29 @@ export default function Mailboxes() {
                     .map((d) => ({ d, list: visible.filter((m) => m.domain === d.domain) }))
                     .filter((g) => g.list.length > 0)
                     .map(({ d, list }) => (
-                      <DomainGroup key={d.domain} dns={d.dns} domain={d.domain} vendors={d.vendors} total={d.count} mailboxes={list} policy={policy} onOpen={setOpenId} />
+                      <DomainGroup
+                        key={d.domain}
+                        info={d}
+                        mailboxes={list}
+                        policy={policy}
+                        onOpen={setOpenId}
+                        onDns={example ? undefined : () => setDnsDomain(d.domain)}
+                      />
                     ))}
                   {visible.length === 0 && (
                     <div className="rounded-xl border border-dashed border-line px-5 py-12 text-center text-sm text-muted">
                       No {filter === "all" ? "" : STAGE_LABEL[filter as Stage].toLowerCase()} mailboxes right now.
                     </div>
                   )}
+                  {!example && data.summary.own > 0 && (
+                    <>
+                      <InboxTestGrid mailboxes={data.mailboxes} policy={policy} version={version} />
+                      <ExperimentPanel version={version} />
+                    </>
+                  )}
                 </div>
                 <div className="space-y-4">
-                  <RulesGlance policy={policy} onEdit={() => setRulesOpen(true)} />
+                  <RulesGlance policy={policy} own={data.mailboxes.some((m) => m.engine === "own")} instantly={data.mailboxes.some((m) => m.engine !== "own")} onEdit={() => setRulesOpen(true)} />
                   <ActivityFeed events={events} onOpen={(id) => data.mailboxes.some((m) => m.id === id) && setOpenId(id)} />
                 </div>
               </div>
@@ -263,6 +306,8 @@ export default function Mailboxes() {
           onChanged={() => load(true)}
         />
       )}
+      <AddMailboxModal open={addOpen} onClose={() => setAddOpen(false)} onAdded={() => load(true)} />
+      {dnsDomain && <DnsModal open domain={dnsDomain} onClose={() => setDnsDomain(null)} onChecked={() => load(true)} />}
       <RulesModal
         open={rulesOpen}
         policy={policy}
@@ -292,16 +337,79 @@ function SyncPill({ data, syncing }: { data: PoolResponse; syncing: boolean }) {
 
 /* ---------------------------------- setup ---------------------------------- */
 
+function OwnSetup({ onAdd }: { onAdd: () => void }) {
+  const steps: { title: string; body: ReactNode }[] = [
+    {
+      title: "Buy 2 spare domains and 4 mailboxes",
+      body: (
+        <>
+          One domain on a new Google Workspace account, one on a new Microsoft 365 account, two mailboxes each (about $6–8 a month per mailbox).
+          Never <span className="font-medium text-ink">dna.systems</span>.
+        </>
+      ),
+    },
+    { title: "Make one sign-in app per provider", body: "About five minutes each, in Agent → Connections. The exact steps and the redirect URI are there." },
+    { title: "Add the mailboxes and two test inboxes", body: "Sign each mailbox in. Inbox tests start straight away, so a mailbox has a track record by the time its domain is old enough." },
+  ];
+  return (
+    <Card className="mb-4 overflow-hidden">
+      <div className="grid gap-0 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="p-5 sm:p-6">
+          <div className="flex flex-wrap items-center gap-2">
+            <Label>Your own mailboxes</Label>
+            <Badge className="bg-okb text-good">Recommended</Badge>
+          </div>
+          <h2 className="mt-1.5 text-[1.05rem] font-[650] tracking-[-0.01em]">Send from Google and Microsoft mailboxes you own</h2>
+          <ol className="mt-4 grid gap-4 md:grid-cols-3">
+            {steps.map((s, i) => (
+              <li key={s.title} className="min-w-0">
+                <span className="grid h-[27px] w-[27px] place-items-center rounded-full border border-line-strong bg-sunk text-[12px] font-bold tabular-nums text-ink-soft">{i + 1}</span>
+                <div className="mt-2 text-[13.5px] font-semibold">{s.title}</div>
+                <p className="mt-1 text-[12.5px] leading-relaxed text-muted">{s.body}</p>
+              </li>
+            ))}
+          </ol>
+          <div className="mt-5 flex flex-wrap gap-2">
+            <Button size="sm" onClick={openConnections}>
+              Set up sign-in apps
+            </Button>
+            <Button variant="outline" size="sm" onClick={onAdd}>
+              Add a mailbox
+            </Button>
+          </div>
+        </div>
+        <div className="border-t border-line-soft bg-surf2 p-5 sm:p-6 lg:border-l lg:border-t-0">
+          <Label>Why own mailboxes</Label>
+          <ul className="mt-3 space-y-2.5 text-[12.5px] leading-relaxed text-muted">
+            {[
+              "Readiness is measured with real inbox tests, not a warmup score.",
+              "Replies and bounces are read from the mailbox itself, straight into the Inbox.",
+              "No sending platform in between: about $30–50 a month in total.",
+            ].map((t) => (
+              <li key={t} className="flex gap-2">
+                <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-good" />
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function Setup({
   policy,
   onPreview,
   onRules,
   onConnected,
+  onAdd,
 }: {
   policy: MailboxPolicy;
   onPreview: () => void;
   onRules: () => void;
   onConnected: (v: PoolResponse) => void;
+  onAdd: () => void;
 }) {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
@@ -386,10 +494,12 @@ function Setup({
   ];
 
   return (
+    <>
+    <OwnSetup onAdd={onAdd} />
     <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)]">
       <Card className="p-5 sm:p-6">
-        <Label>Get the pool running</Label>
-        <h2 className="mt-1.5 text-[1.05rem] font-[650] tracking-[-0.01em]">Three steps, then this tab takes over</h2>
+        <Label>Or: mailboxes in Instantly</Label>
+        <h2 className="mt-1.5 text-[1.05rem] font-[650] tracking-[-0.01em]">Already have warmed mailboxes in Instantly?</h2>
         <ol className="mt-5">
           {steps.map((s, i) => (
             <li key={s.n} className="relative flex gap-4 pb-6 last:pb-0">
@@ -421,24 +531,25 @@ function Setup({
         </div>
       </Card>
     </div>
+    </>
   );
 }
 
 function Lifecycle({ policy: p }: { policy: MailboxPolicy }) {
   const steps = rampSteps(p.rampStart, p.rampStep, p.targetLimit);
   const rows: { stage: Stage; title: string; body: ReactNode }[] = [
-    { stage: "warming", title: "Warming", body: "Instantly's warmup network sends and answers mail for it. Checked every 30 minutes." },
+    { stage: "warming", title: "Getting ready", body: "Sends one test a day to each test inbox while its domain ages. Checked every 10 minutes." },
     {
       stage: "ready",
       title: "Passes the gate",
       body: (
         <ul className="mt-1.5 space-y-1">
           {[
-            "Connected in Instantly, no errors",
-            "Warmup on",
+            "Signed in, can send and read",
             "MX, SPF, DKIM and DMARC found",
-            `${p.minWarmDays} days warming (${p.minWarmDaysPreWarmed} if pre-warmed)`,
-            `${p.minInboxRate}%+ of warmup mail in the inbox, last 7 days`,
+            `Domain ${p.minDomainAgeDays}+ days old, mailbox ${p.minMailboxDays}+ days (0 if bought pre-warmed)`,
+            `${p.minPlacementTests}+ inbox tests in 3 days, ${p.minPlacementRate}%+ in the inbox`,
+            "Instantly mailboxes: warmup on and its inbox rate instead",
           ].map((t) => (
             <li key={t} className="flex items-start gap-2">
               <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-good" />
@@ -466,7 +577,7 @@ function Lifecycle({ policy: p }: { policy: MailboxPolicy }) {
     {
       stage: "paused",
       title: "Pauses itself",
-      body: `If the inbox rate drops below ${p.pauseInboxRate}%, bounces pass ${p.maxBounceRate}%, or Instantly reports an error. Resuming sends it back through the gate.`,
+      body: `If inbox tests stay under ${p.pausePlacementRate}% two days running, bounces pass ${p.maxBounceRate}%, unsubscribes and complaints pass ${p.maxComplaintRate}%, or the sign-in stops working. Resuming sends it back through the gate.`,
     },
   ];
   return (
@@ -485,17 +596,24 @@ function Lifecycle({ policy: p }: { policy: MailboxPolicy }) {
   );
 }
 
-function EmptyPool({ onSync, syncing }: { onSync: () => void; syncing: boolean }) {
+function EmptyPool({ onSync, syncing, instantly, onAdd }: { onSync: () => void; syncing: boolean; instantly: boolean; onAdd: () => void }) {
   return (
     <div className="rounded-xl border border-dashed border-line px-6 py-14 text-center">
-      <h3 className="text-[15px] font-[650]">No mailboxes in Instantly yet</h3>
-      <p className="mx-auto mt-2 max-w-[520px] text-[13px] leading-relaxed text-muted">
-        Export the mailboxes from Zapmail and Mailforge into Instantly. They appear here on the next sync, which runs every 30
-        minutes on its own.
+      <h3 className="text-[15px] font-[650]">No mailboxes yet</h3>
+      <p className="mx-auto mt-2 max-w-[540px] text-[13px] leading-relaxed text-muted">
+        Sign in your Google Workspace or Microsoft 365 mailboxes. Each one starts on inbox tests and the readiness checks straight away.
+        {instantly && " Mailboxes in Instantly appear here on the next sync, every 30 minutes."}
       </p>
-      <Button className="mt-5" size="sm" onClick={onSync} loading={syncing}>
-        Sync now
-      </Button>
+      <div className="mt-5 flex flex-wrap justify-center gap-2">
+        <Button size="sm" onClick={onAdd}>
+          Add mailbox
+        </Button>
+        {instantly && (
+          <Button variant="outline" size="sm" onClick={onSync} loading={syncing}>
+            Sync Instantly
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -522,12 +640,19 @@ function SummaryTiles({ data }: { data: PoolResponse }) {
       ),
       sub: `${s.byStage.ramping} ramping · ${s.byStage.active} at full limit`,
     },
-    {
-      label: "Warmup inbox rate",
-      value: s.inboxRate7 == null ? "—" : `${s.inboxRate7}%`,
-      sub: s.warmupVolume7 ? `last 7 days · ${s.warmupVolume7.toLocaleString()} warmup emails` : "no warmup data yet",
-      tone: rateTone(s.inboxRate7, p),
-    },
+    s.own > 0
+      ? {
+          label: "Inbox tests",
+          value: s.placementRate3d == null ? "—" : `${s.placementRate3d}%`,
+          sub: s.placementTests3d ? `in the inbox · ${s.placementTests3d} tests, last 3 days` : "first results within 2 hours",
+          tone: placementTone(s.placementRate3d, p.minPlacementRate, p.pausePlacementRate),
+        }
+      : {
+          label: "Warmup inbox rate",
+          value: s.inboxRate7 == null ? "—" : `${s.inboxRate7}%`,
+          sub: s.warmupVolume7 ? `last 7 days · ${s.warmupVolume7.toLocaleString()} warmup emails` : "no warmup data yet",
+          tone: rateTone(s.inboxRate7, p),
+        },
     s.attention > 0
       ? {
           label: "Needs attention",
@@ -622,46 +747,56 @@ function DnsChips({ dns }: { dns: Dns | null }) {
 }
 
 function DomainGroup({
-  domain,
-  vendors,
-  total,
-  dns,
+  info,
   mailboxes,
   policy,
   onOpen,
+  onDns,
 }: {
-  domain: string;
-  vendors: string[];
-  total: number;
-  dns: Dns | null;
+  info: DomainInfo;
   mailboxes: Mailbox[];
   policy: MailboxPolicy;
   onOpen: (id: string) => void;
+  onDns?: () => void;
 }) {
+  const { domain, vendors, count: total, dns } = info;
+  const own = info.engine === "own";
+  const ageDays = info.registeredAt ? Math.floor((Date.now() - Date.parse(info.registeredAt)) / 86_400_000) : null;
   return (
     <Card className="overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-line-soft px-4 py-3">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {own && info.providerKind !== "instantly" && <ProviderMark provider={info.providerKind} size={22} />}
           <span className="truncate text-[14px] font-[650] tracking-[-0.01em]">{domain}</span>
-          {vendors.map((v) => (
-            <Badge key={v} className="bg-ink/[0.06] text-ink-soft">
-              {VENDOR_LABEL[v] || v}
-            </Badge>
-          ))}
+          {own ? (
+            <Badge className="bg-ink/[0.06] text-ink-soft">{info.providerKind === "microsoft" ? "Microsoft 365" : "Google Workspace"}</Badge>
+          ) : (
+            vendors.map((v) => (
+              <Badge key={v} className="bg-ink/[0.06] text-ink-soft">
+                {VENDOR_LABEL[v] || v}
+              </Badge>
+            ))
+          )}
           <span className="text-[12px] text-muted">
             {total} mailbox{total === 1 ? "" : "es"}
+            {own && ageDays != null && ` · domain ${ageDays} day${ageDays === 1 ? "" : "s"} old`}
           </span>
         </div>
         <div className="flex items-center gap-2">
           <DnsChips dns={dns} />
           <span className="hidden text-[11.5px] text-muted sm:inline">{dns ? `checked ${ago(dns.checkedAt)}` : "DNS not checked"}</span>
+          {own && onDns && (
+            <Button variant={dns?.allPass ? "ghost" : "outline"} size="sm" onClick={onDns}>
+              DNS setup
+            </Button>
+          )}
         </div>
       </div>
       <div className="hidden grid-cols-[minmax(0,1.5fr)_minmax(0,1.6fr)_92px_116px_150px_14px] gap-4 border-b border-line-soft px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.09em] text-muted md:grid">
         <span>Mailbox</span>
         <span>Stage</span>
         <span>Checks</span>
-        <span>Inbox rate</span>
+        <span>{own ? "Inbox tests" : "Inbox rate"}</span>
         <span>Daily limit</span>
         <span />
       </div>
@@ -686,9 +821,13 @@ function MailboxRow({ m, policy, onOpen }: { m: Mailbox; policy: MailboxPolicy; 
     >
       <div className="flex min-w-0 items-start justify-between gap-3 md:block">
         <div className="min-w-0">
-          <div className="truncate text-[13.5px] font-semibold">{m.email}</div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-[13.5px] font-semibold">{m.email}</span>
+            {m.authStatus === "failed" && <Badge className="shrink-0 bg-dgb text-bad">Sign in again</Badge>}
+            {m.experimentGroup && <Badge className="shrink-0 bg-tlb text-accent">{m.experimentGroup === "warmup_on" ? "Warmup on" : "Warmup off"}</Badge>}
+          </div>
           <div className="mt-0.5 truncate text-[12px] text-muted">
-            {[m.name, m.provider, m.preWarmed ? "pre-warmed" : null].filter(Boolean).join(" · ")}
+            {[m.engine === "own" ? m.senderName || m.name : m.name, m.provider, m.preWarmed ? "pre-warmed" : null].filter(Boolean).join(" · ")}
           </div>
         </div>
         <span className="md:hidden">
@@ -707,12 +846,25 @@ function MailboxRow({ m, policy, onOpen }: { m: Mailbox; policy: MailboxPolicy; 
       </div>
       <div className="flex items-center gap-3 md:block">
         <span className="text-[11px] font-semibold uppercase tracking-[0.09em] text-muted md:hidden">Inbox</span>
-        <div className="flex items-center gap-2.5">
-          <span className={cn("w-[46px] text-[13px] font-semibold tabular-nums", rateTone(m.metrics.inboxRate7, policy))}>
-            {m.metrics.inboxRate7 == null ? "—" : `${m.metrics.inboxRate7}%`}
-          </span>
-          <Spark values={m.spark} policy={policy} />
-        </div>
+        {m.engine === "own" ? (
+          <div className="flex items-center gap-2.5" title={m.placement ? `${m.placement.pass3d} of ${m.placement.tests3d} inbox tests in the inbox, last 3 days` : "No inbox-test results yet"}>
+            <span className={cn("w-[46px] text-[13px] font-semibold tabular-nums", placementTone(m.placement?.rate3d, policy.minPlacementRate, policy.pausePlacementRate))}>
+              {m.placement?.rate3d == null ? "—" : `${m.placement.rate3d}%`}
+            </span>
+            {m.placement ? (
+              <PlacementBars days={m.placement.byDay} pass={policy.minPlacementRate} pause={policy.pausePlacementRate} />
+            ) : (
+              <span className="text-[11.5px] text-muted">no tests yet</span>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2.5">
+            <span className={cn("w-[46px] text-[13px] font-semibold tabular-nums", rateTone(m.metrics.inboxRate7, policy))}>
+              {m.metrics.inboxRate7 == null ? "—" : `${m.metrics.inboxRate7}%`}
+            </span>
+            <Spark values={m.spark} policy={policy} />
+          </div>
+        )}
       </div>
       <LimitMeter m={m} />
       <svg width="8" height="12" viewBox="0 0 8 12" className="hidden text-ink/30 md:block" aria-hidden>
@@ -761,7 +913,9 @@ function LimitMeter({ m }: { m: Mailbox }) {
   const pct = m.targetLimit ? Math.min(100, (m.dailyLimit / m.targetLimit) * 100) : 0;
   const sub = m.missing
     ? "not in Instantly"
-    : m.stage === "ramping"
+    : m.authStatus === "failed"
+      ? "sign-in stopped working"
+      : m.stage === "ramping"
       ? `day ${m.rampDay} · full on ${fmtDay(m.fullRampOn)}`
       : m.stage === "active"
         ? `${m.sentToday} sent today`
@@ -791,11 +945,27 @@ function LimitMeter({ m }: { m: Mailbox }) {
 
 /* ------------------------------ sidebar cards ------------------------------ */
 
-function RulesGlance({ policy: p, onEdit }: { policy: MailboxPolicy; onEdit: () => void }) {
+function RulesGlance({ policy: p, own, instantly, onEdit }: { policy: MailboxPolicy; own: boolean; instantly: boolean; onEdit: () => void }) {
+  const showOwn = own || !instantly;
   const rows: [string, string][] = [
-    ["Gate", `${p.minWarmDays} days (${p.minWarmDaysPreWarmed} pre-warmed) · ${p.minInboxRate}% inbox · DNS`],
+    ...(showOwn
+      ? ([
+          ["Gate", `DNS · domain ${p.minDomainAgeDays}d · mailbox ${p.minMailboxDays}d · ${p.minPlacementRate}% of ${p.minPlacementTests}+ inbox tests`],
+        ] as [string, string][])
+      : []),
+    ...(instantly ? ([[showOwn ? "Instantly" : "Gate", `${p.minWarmDays} days warming (${p.minWarmDaysPreWarmed} pre-warmed) · ${p.minInboxRate}% warmup inbox · DNS`]] as [string, string][]) : []),
     ["Ramp", `${p.rampStart} → +${p.rampStep} a day → ${p.targetLimit}${p.autoStart ? "" : " · manual start"}`],
-    ["Pause", `inbox < ${p.pauseInboxRate}% · bounces > ${p.maxBounceRate}%`],
+    [
+      "Pause",
+      [
+        showOwn ? `inbox tests < ${p.pausePlacementRate}% two days` : null,
+        instantly ? `warmup inbox < ${p.pauseInboxRate}%` : null,
+        `bounces > ${p.maxBounceRate}%`,
+        showOwn ? `complaints > ${p.maxComplaintRate}%` : null,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    ],
   ];
   return (
     <Card className="p-4">
@@ -807,7 +977,7 @@ function RulesGlance({ policy: p, onEdit }: { policy: MailboxPolicy; onEdit: () 
       </div>
       <dl className="mt-3 space-y-2">
         {rows.map(([k, v]) => (
-          <div key={k} className="grid grid-cols-[52px_minmax(0,1fr)] gap-2 text-[12.5px] leading-snug">
+          <div key={k} className="grid grid-cols-[64px_minmax(0,1fr)] gap-2 text-[12.5px] leading-snug">
             <dt className="text-muted">{k}</dt>
             <dd className="text-ink-soft">{v}</dd>
           </div>
@@ -873,7 +1043,7 @@ function RampStairs({ steps, doneThrough, className }: { steps: number[]; doneTh
   );
 }
 
-function HealthChart({ health, target }: { health: HealthDay[]; target: number }) {
+function HealthChart({ health, target, own = false }: { health: HealthDay[]; target: number; own?: boolean }) {
   // Fill the last 30 days, oldest first.
   const end = health.length ? health[health.length - 1].day : new Date().toISOString().slice(0, 10);
   const byDay = new Map(health.map((h) => [h.day, h]));
@@ -887,11 +1057,18 @@ function HealthChart({ health, target }: { health: HealthDay[]; target: number }
   const maxSent = Math.max(target, 10, ...days.map((d) => d.h?.campaign_sent || 0));
   const W = 10;
   const anySends = days.some((d) => (d.h?.campaign_sent || 0) > 0);
+  const anyWarmup = days.some((d) => (d.h?.warmup_inbox || 0) + (d.h?.warmup_spam || 0) > 0);
+  const showWarmup = !own || anyWarmup;
   return (
     <div>
       <div className="mb-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11.5px] text-muted">
-        <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-accent" />Warmup in inbox</span>
-        <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-bad" />Warmup in spam</span>
+        {showWarmup && (
+          <>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-accent" />Warmup in inbox</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-bad" />Warmup in spam</span>
+          </>
+        )}
+        {!showWarmup && <span>No warmup on this mailbox: readiness comes from the inbox tests above.</span>}
         <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-inf" />Campaign sends</span>
         <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-sm bg-warn" />Bounced</span>
       </div>
@@ -987,7 +1164,55 @@ function DetailModal({
     }
   }
 
+  async function signInAgain(mb: Mailbox) {
+    if (example) return toast("This is example data. Actions are off in the preview.");
+    setBusy("signin");
+    try {
+      const conn = (await engineApi.status()).connections.find((c) => c.provider === mb.providerKind);
+      if (!conn) throw new Error("The sign-in app for this provider was removed. Add it again in Agent → Connections.");
+      const r = await signInWithProvider({ connectionId: conn.id, purpose: "mailbox", mailboxId: mb.id, loginHint: mb.email });
+      if (r) toast(r.message, r.ok ? "success" : "error");
+      setDetail(await mailboxesApi.detail(mb.id));
+      onChanged();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function testSignIn(mb: Mailbox) {
+    if (example) return toast("This is example data. Actions are off in the preview.");
+    setBusy("test");
+    try {
+      const r = await engineApi.testMailbox(mb.id);
+      toast(r.ok ? `Signed in as ${r.email || mb.email}. Sending and reading work.` : `Sign-in failed: ${r.error}`, r.ok ? "success" : "error");
+      setDetail(await mailboxesApi.detail(mb.id));
+      onChanged();
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeOwn(mb: Mailbox) {
+    if (example) return toast("This is example data. Actions are off in the preview.");
+    if (!window.confirm(`Remove ${mb.email}? Its scheduled emails are cancelled and its leads' follow-ups stop. You can sign it in again later.`)) return;
+    setBusy("remove");
+    try {
+      const r = await engineApi.removeMailbox(mb.id);
+      toast(r.cancelled ? `Removed. ${r.cancelled} scheduled email${r.cancelled === 1 ? "" : "s"} cancelled.` : "Removed.", "success");
+      onChanged();
+      onClose();
+    } catch (e: any) {
+      toast(e.message, "error");
+      setBusy(null);
+    }
+  }
+
   const m = detail?.mailbox;
+  const own = m?.engine === "own";
   return (
     <Modal open onClose={onClose} title={m?.email || "Mailbox"} wide>
       {!m ? (
@@ -1002,9 +1227,29 @@ function DetailModal({
         <div className="space-y-5">
           <div className="-mt-1 flex flex-wrap items-center gap-2 text-[12.5px] text-muted">
             <StagePill stage={m.missing ? "paused" : m.stage} />
-            <span>{[m.name, m.provider, VENDOR_LABEL[m.vendor] || m.vendor, m.preWarmed ? "pre-warmed" : null].filter(Boolean).join(" · ")}</span>
+            <span>
+              {(own
+                ? [m.senderName ? `From "${m.senderName}"` : null, m.provider, m.preWarmed ? "pre-warmed" : null]
+                : [m.name, m.provider, VENDOR_LABEL[m.vendor] || m.vendor, m.preWarmed ? "pre-warmed" : null]
+              )
+                .filter(Boolean)
+                .join(" · ")}
+            </span>
+            {m.experimentGroup && <Badge className="bg-tlb text-accent">{m.experimentGroup === "warmup_on" ? "Warmup test: on" : "Warmup test: off"}</Badge>}
             {example && <Badge className="bg-wnb text-warn">Example</Badge>}
           </div>
+
+          {own && m.authStatus === "failed" && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dgl bg-dgb px-4 py-3">
+              <p className="max-w-[560px] text-[13px] leading-relaxed text-bad">
+                <span className="font-semibold">The sign-in stopped working.</span> {m.authError || "The password changed, or access was removed."} Nothing
+                sends or gets read until it is signed in again.
+              </p>
+              <Button size="sm" loading={busy === "signin"} onClick={() => signInAgain(m)}>
+                Sign in again
+              </Button>
+            </div>
+          )}
 
           <div className={cn("flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3", m.stage === "paused" || m.missing ? "border-dgl bg-dgb" : "border-line-soft bg-surf2")}>
             <p className={cn("max-w-[560px] text-[13px] leading-relaxed", m.stage === "paused" || m.missing ? "text-bad" : "text-ink-soft")}>{m.reason}</p>
@@ -1040,14 +1285,23 @@ function DetailModal({
             <RampPanel m={m} />
           </div>
 
+          {own && <MailboxTests m={m} policy={policy} example={example} />}
+
           <div>
             <Label className="mb-2.5">Last 30 days</Label>
-            <HealthChart health={detail.health} target={m.targetLimit} />
+            <HealthChart health={detail.health} target={m.targetLimit} own={own} />
           </div>
 
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             {[
-              ["Inbox rate", m.metrics.inboxRate7 == null ? "—" : `${m.metrics.inboxRate7}%`, `${m.metrics.warmupVolume7} warmup emails, 7 days`, rateTone(m.metrics.inboxRate7, policy)],
+              own
+                ? [
+                    "Inbox tests",
+                    m.placement?.rate3d == null ? "—" : `${m.placement.rate3d}%`,
+                    m.placement ? `${m.placement.tests3d} tests, 3 days` : "no results yet",
+                    placementTone(m.placement?.rate3d, policy.minPlacementRate, policy.pausePlacementRate),
+                  ]
+                : ["Inbox rate", m.metrics.inboxRate7 == null ? "—" : `${m.metrics.inboxRate7}%`, `${m.metrics.warmupVolume7} warmup emails, 7 days`, rateTone(m.metrics.inboxRate7, policy)],
               ["Sent", m.metrics.sent7.toLocaleString(), "campaign emails, 7 days", ""],
               [
                 "Bounce rate",
@@ -1080,7 +1334,23 @@ function DetailModal({
                 Pause
               </Button>
             )}
-            {!m.missing &&
+            {own && (
+              <>
+                <Button variant="outline" size="sm" loading={busy === "test"} onClick={() => testSignIn(m)}>
+                  Test sign-in
+                </Button>
+                {m.authStatus !== "failed" && (
+                  <Button variant="ghost" size="sm" loading={busy === "signin"} onClick={() => signInAgain(m)}>
+                    Sign in again
+                  </Button>
+                )}
+                <Button variant="ghost" size="sm" loading={busy === "remove"} onClick={() => removeOwn(m)} className="text-bad sm:ml-auto">
+                  Remove mailbox
+                </Button>
+              </>
+            )}
+            {!own &&
+              !m.missing &&
               (m.warmupStatus === 1 ? (
                 <Button
                   variant="ghost"
@@ -1208,8 +1478,17 @@ function MailboxSettings({
   example: boolean;
   onSaved: (d: MailboxDetail) => void;
 }) {
+  const own = m.engine === "own";
   const initial = useMemo(
-    () => ({ vendor: m.vendor, preWarmed: m.preWarmed, manualHold: m.manualHold, limit: m.targetCustom ? String(m.targetLimit) : "", notes: m.notes }),
+    () => ({
+      vendor: m.vendor,
+      preWarmed: m.preWarmed,
+      manualHold: m.manualHold,
+      limit: m.targetCustom ? String(m.targetLimit) : "",
+      notes: m.notes,
+      senderName: m.senderName || "",
+      group: (m.experimentGroup || "") as "" | "warmup_on" | "warmup_off",
+    }),
     [m]
   );
   const [f, setF] = useState(initial);
@@ -1225,7 +1504,7 @@ function MailboxSettings({
     setSaving(true);
     try {
       const r = await mailboxesApi.update(m.id, {
-        vendor: f.vendor,
+        ...(own ? { senderName: f.senderName.trim(), experimentGroup: f.group || null } : { vendor: f.vendor }),
         preWarmed: f.preWarmed,
         manualHold: f.manualHold,
         targetLimit: limit ? Number(limit) : null,
@@ -1244,24 +1523,50 @@ function MailboxSettings({
     <div className="rounded-xl border border-line-soft p-4">
       <Label className="mb-3">Settings</Label>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Vendor">
-          <Select value={f.vendor} onChange={(e) => setF({ ...f, vendor: e.target.value })} disabled={example}>
-            <option value="zapmail">Zapmail</option>
-            <option value="mailforge">Mailforge</option>
-            <option value="other">Other</option>
-          </Select>
-        </Field>
+        {own ? (
+          <Field label="Sender name" hint="The From name people see. A real person's name.">
+            <Input value={f.senderName} maxLength={80} onChange={(e) => setF({ ...f, senderName: e.target.value })} disabled={example} placeholder="Sara Ahmed" />
+          </Field>
+        ) : (
+          <Field label="Vendor">
+            <Select value={f.vendor} onChange={(e) => setF({ ...f, vendor: e.target.value })} disabled={example}>
+              <option value="zapmail">Zapmail</option>
+              <option value="mailforge">Mailforge</option>
+              <option value="other">Other</option>
+            </Select>
+          </Field>
+        )}
         <Field label="Full daily limit" hint={`Leave empty to follow the pool rule (${policy.targetLimit} a day).`}>
           <Input inputMode="numeric" placeholder={String(policy.targetLimit)} value={f.limit} onChange={(e) => setF({ ...f, limit: e.target.value.replace(/[^\d]/g, "") })} disabled={example} />
         </Field>
+        {own && (
+          <div className="sm:col-span-2">
+            <Field
+              label="Warmup test group"
+              hint={
+                f.group === "warmup_on"
+                  ? "Warmup runs in Instantly for this mailbox (needs the Instantly key). It is never added to an Instantly campaign."
+                  : f.group === "warmup_off"
+                    ? "No warmup: only the slow ramp. Compared against the 'warmup on' group for 21 days."
+                    : "Not in the warmup test. Warmup stays off."
+              }
+            >
+              <Select value={f.group} onChange={(e) => setF({ ...f, group: e.target.value as typeof f.group })} disabled={example}>
+                <option value="">Not in the test</option>
+                <option value="warmup_on">Warmup on (Instantly warmup)</option>
+                <option value="warmup_off">Warmup off (ramp only)</option>
+              </Select>
+            </Field>
+          </div>
+        )}
       </div>
       <div className="mt-3 space-y-2">
         <Toggle
           checked={f.preWarmed}
           onChange={(v) => setF({ ...f, preWarmed: v })}
           disabled={example}
-          label="Sold as pre-warmed"
-          hint={`Needs ${policy.minWarmDaysPreWarmed} days of warmup here instead of ${policy.minWarmDays}.`}
+          label={own ? "Bought pre-warmed" : "Sold as pre-warmed"}
+          hint={own ? `Skips the ${policy.minMailboxDays}-day mailbox-age wait. The domain age and inbox tests still apply.` : `Needs ${policy.minWarmDaysPreWarmed} days of warmup here instead of ${policy.minWarmDays}.`}
         />
         <Toggle
           checked={f.manualHold}
@@ -1376,11 +1681,24 @@ function RulesModal({
   return (
     <Modal open={open} onClose={onClose} title="Mailbox rules" wide>
       <p className="-mt-1 mb-5 text-[13px] leading-relaxed text-muted">
-        These apply to every mailbox. Saving re-checks the whole pool straight away and sends any new daily limits to Instantly.
+        These apply to every mailbox. Saving re-checks the whole pool straight away (and sends any new daily limits to Instantly for mailboxes there).
       </p>
       <div className="space-y-5">
         <section>
-          <Label className="mb-3">Readiness gate</Label>
+          <Label className="mb-3">Readiness gate · your own mailboxes</Label>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {field("minDomainAgeDays", "Domain age", "days")}
+            {field("minMailboxDays", "Mailbox age", "days")}
+            {field("minPlacementTests", "Inbox tests needed", "/ 3 days")}
+            {field("minPlacementRate", "In the inbox", "%")}
+          </div>
+          <p className="mt-2 text-[12px] leading-relaxed text-muted">
+            Plus: signed in, and MX, SPF, DKIM and DMARC found. Business test inboxes count double. With fewer test inboxes the number needed drops to
+            two full days of results (2 test inboxes: 4).
+          </p>
+        </section>
+        <section>
+          <Label className="mb-3">Readiness gate · mailboxes in Instantly</Label>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             {field("minWarmDays", "Days warming", "days")}
             {field("minWarmDaysPreWarmed", "If pre-warmed", "days")}
@@ -1414,9 +1732,12 @@ function RulesModal({
         <section>
           <Label className="mb-3">Auto-pause</Label>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            {field("pauseInboxRate", "Inbox rate below", "%")}
+            {field("pausePlacementRate", "Inbox tests below (2 days)", "%")}
+            {field("maxComplaintRate", "Unsubscribes + complaints above", "%")}
+            {field("minSendsForComplaints", "Only after", "sends")}
             {field("maxBounceRate", "Bounce rate above", "%")}
             {field("minSendsForBounce", "Only after", "sends")}
+            {field("pauseInboxRate", "Instantly warmup inbox below", "%")}
           </div>
           <div className="mt-3">
             <Toggle

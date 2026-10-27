@@ -1,11 +1,11 @@
-// Mailboxes API (v2 workstream A). Mirrors backend/src/v2/mailboxes/{policy,view,service}.ts.
+// Mailboxes API (v2 workstream A + own engine). Mirrors backend/src/v2/mailboxes/{policy,view,service}.ts.
 import { req } from "../api";
 import { del, j, patch, put, type AgentEvent } from "./core";
 
 export type Stage = "warming" | "ready" | "ramping" | "active" | "paused";
 export const STAGES: Stage[] = ["warming", "ready", "ramping", "active", "paused"];
 
-export type CheckKey = "connection" | "warmup" | "dns" | "age" | "inbox";
+export type CheckKey = "connection" | "warmup" | "dns" | "age" | "inbox" | "domain_age" | "placement";
 export interface Check {
   key: CheckKey;
   label: string;
@@ -27,6 +27,22 @@ export interface Metrics {
   bounceBounced: number;
   bounceFrom: string;
 }
+
+/** Inbox-test results for one of our own mailboxes (backend engine/placement.ts). */
+export interface PlacementSummary {
+  tests3d: number;
+  pass3d: number;
+  /** Weighted: business test inboxes (Workspace, Microsoft 365) count double. */
+  rate3d: number | null;
+  /** Last results from Microsoft 365 test inboxes, newest first. */
+  m365Last: string[];
+  /** Last 7 days, oldest first. */
+  byDay: { day: string; tests: number; pass: number; spam: number; missing: number; rate: number | null }[];
+  lastAt: string | null;
+}
+
+export type Engine = "own" | "instantly";
+export type ProviderKind = "google" | "microsoft" | "instantly";
 
 export interface Mailbox {
   id: string;
@@ -58,6 +74,16 @@ export interface Mailbox {
   sentToday: number;
   notes: string;
   lastSyncedAt: string | null;
+  /** 'own' = signed in here with Google / Microsoft; 'instantly' = synced from Instantly. */
+  engine: Engine;
+  providerKind: ProviderKind;
+  authStatus: "ok" | "failed" | null;
+  authError: string | null;
+  warmupMode: "off" | "instantly";
+  experimentGroup: "warmup_on" | "warmup_off" | null;
+  senderName: string;
+  domainRegisteredAt: string | null;
+  placement: PlacementSummary | null;
 }
 
 export interface Dns {
@@ -75,6 +101,9 @@ export interface DomainInfo {
   vendors: string[];
   count: number;
   dns: Dns | null;
+  engine: Engine;
+  providerKind: ProviderKind;
+  registeredAt: string | null;
 }
 
 export interface Summary {
@@ -88,6 +117,10 @@ export interface Summary {
   warmupVolume7: number;
   nextReady: { email: string; day: string } | null;
   attention: number;
+  /** Own mailboxes only: weighted inbox-test rate over the last 3 days. */
+  placementRate3d: number | null;
+  placementTests3d: number;
+  own: number;
 }
 
 export interface MailboxPolicy {
@@ -103,6 +136,14 @@ export interface MailboxPolicy {
   targetLimit: number;
   autoStart: boolean;
   keepWarmupOn: boolean;
+  /* own engine (Google / Microsoft mailboxes signed in here) */
+  minDomainAgeDays: number;
+  minMailboxDays: number;
+  minPlacementTests: number;
+  minPlacementRate: number;
+  pausePlacementRate: number;
+  maxComplaintRate: number;
+  minSendsForComplaints: number;
 }
 
 export interface HealthDay {
@@ -134,7 +175,12 @@ export interface MailboxDetail {
 
 export interface PoolResponse {
   example: boolean;
+  /** Anything to show: Instantly connected, a sign-in app saved, or an own mailbox exists. */
   connected: boolean;
+  /** Instantly key saved (live mode only). */
+  instantly?: boolean;
+  /** Own engine: sign-in apps and test inboxes (live mode only). */
+  engine?: { apps: number; seeds: number };
   syncing: boolean;
   lastSync: LastSync | null;
   policy: MailboxPolicy;
@@ -152,6 +198,10 @@ export interface MailboxPatch {
   manualHold?: boolean;
   targetLimit?: number | null;
   notes?: string;
+  /** Own mailboxes: the From name. */
+  senderName?: string;
+  /** Own mailboxes: the warmup on/off test group (null = not in the test). */
+  experimentGroup?: "warmup_on" | "warmup_off" | null;
 }
 
 type ActionResult = { ok: true; warning: string | null; detail: MailboxDetail };

@@ -8,15 +8,27 @@
 // fails to load) never takes the rest of the API down.
 import type { Hono } from "hono";
 import { ensureV2Schema } from "./schema";
+import { ensureEngineSchema } from "./engine/schema";
 import * as core from "./core-routes";
 
-const FEATURE_MODULES = ["./mailboxes/module", "./inbox/module", "./campaigns/module", "./targeting/module", "./leads/module", "./sequences/module", "./dashboard/module"] as const;
+const FEATURE_MODULES = [
+  "./mailboxes/module",
+  "./inbox/module",
+  "./campaigns/module",
+  "./targeting/module",
+  "./leads/module",
+  "./sequences/module",
+  "./dashboard/module",
+  "./engine/module",
+] as const;
 
 type FeatureModule = { register?: (app: Hono) => void | Promise<void>; start?: () => void };
 const loaded: { name: string; mod: FeatureModule }[] = [];
 
 export async function mountV2(app: Hono) {
   await ensureV2Schema();
+  // Before any module reads mailboxes.provider / campaigns.engine.
+  await ensureEngineSchema();
   core.register(app);
   for (const path of FEATURE_MODULES) {
     try {

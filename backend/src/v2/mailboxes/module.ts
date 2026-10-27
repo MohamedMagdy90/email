@@ -85,6 +85,8 @@ export async function register(app: Hono) {
         manualHold: typeof b.manualHold === "boolean" ? b.manualHold : undefined,
         targetLimit: b.targetLimit === null ? null : b.targetLimit === undefined || b.targetLimit === "" ? undefined : Number(b.targetLimit),
         notes: typeof b.notes === "string" ? b.notes : undefined,
+        senderName: typeof b.senderName === "string" ? b.senderName : undefined,
+        experimentGroup: b.experimentGroup === undefined ? undefined : b.experimentGroup === "warmup_on" || b.experimentGroup === "warmup_off" ? b.experimentGroup : null,
       });
       return c.json({ ok: true, warning: r?.warning || null, detail: await mailboxDetail(c.req.param("id")) });
     } catch (e) {

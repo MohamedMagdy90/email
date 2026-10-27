@@ -183,7 +183,10 @@ async function recompute(threadId: string, opts: { keepClosed?: boolean } = {}) 
 
 /* -------------------------------- ingest -------------------------------- */
 
-type RawEmail = inst.InstantlyEmail & { from_address_json?: any; i_status?: number | null };
+// Own-engine mail comes in through the same door (engine/reader.ts): ids are
+// "gm:…" / "ms:…" / "outbox:…" and thread keys start with "own:".
+type RawEmail = inst.InstantlyEmail & { from_address_json?: any; i_status?: number | null; message_id_header?: string | null; sent_by?: string | null };
+const isOwnThread = (t: Row | null | undefined) => String(t?.instantly_thread_id || "").startsWith("own:");
 
 function directionOf(e: RawEmail, eaccount: string): "in" | "out" {
   if (e.ue_type === 2) return "in";
@@ -276,8 +279,8 @@ export async function storeEmail(e: RawEmail, opts: { pendingIfAfter: string; on
   const queued = dir === "in" && at >= opts.pendingIfAfter;
   await q(
     `INSERT INTO messages (id, instantly_id, thread_id, direction, eaccount, from_email, to_email, subject, body_text, body_html, preview,
-       sent_at, is_auto_reply, step, ai_status, ai_reason, sent_by, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       sent_at, is_auto_reply, step, ai_status, ai_reason, sent_by, message_id_header, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       uid(),
       e.id,
@@ -295,7 +298,8 @@ export async function storeEmail(e: RawEmail, opts: { pendingIfAfter: string; on
       e.step || null,
       dir === "in" ? (queued ? "pending" : "skipped") : null,
       dir === "in" && !queued ? "Earlier message, kept for context." : null,
-      dir === "out" ? (e.ue_type === 1 ? "campaign" : "instantly") : null,
+      dir === "out" ? e.sent_by || (e.ue_type === 1 ? "campaign" : "instantly") : null,
+      e.message_id_header || null,
       now,
     ]
   );
@@ -307,9 +311,9 @@ export async function storeEmail(e: RawEmail, opts: { pendingIfAfter: string; on
   if (dir === "out" && e.ue_type === 3) {
     // Someone answered in Instantly itself: nothing before it still needs us.
     await q(
-      `UPDATE messages SET ai_status = 'replied', ai_reason = 'Answered from Instantly.', reply_due_at = NULL
+      `UPDATE messages SET ai_status = 'replied', ai_reason = ?, reply_due_at = NULL
        WHERE thread_id = ? AND direction = 'in' AND ai_status IN ('needs_human','drafted','failed','scheduled') AND sent_at <= ?`,
-      [t!.id, at]
+      [e.sent_by === "you" ? "You answered from your mailbox." : "Answered from Instantly.", t!.id, at]
     );
   }
   await recompute(t!.id, { keepClosed: dir === "out" });
@@ -380,7 +384,9 @@ async function doSync(): Promise<LastSync> {
 
   // Give new threads their history (our first email, follow-ups) so the agent
   // knows what it is answering. Capped per sync; the rest go next time.
-  const todo = await q(`SELECT id FROM threads WHERE backfilled_at IS NULL ORDER BY created_at ASC LIMIT ${MAX_BACKFILL_PER_SYNC}`);
+  const todo = await q(
+    `SELECT id FROM threads WHERE backfilled_at IS NULL AND (instantly_thread_id IS NULL OR instantly_thread_id NOT LIKE 'own:%') ORDER BY created_at ASC LIMIT ${MAX_BACKFILL_PER_SYNC}`
+  );
   for (const r of todo) {
     try {
       await backfillThread(r.id, windowStart);
@@ -450,8 +456,18 @@ async function applyOutcome(t: Row, m: Row, cls: Classification) {
   } catch {
     /* lead engine not migrated */
   }
+  // Own engine: a real reply stops the rest of the sequence straight away
+  // (the queue checks again before every send, this just tidies the list).
+  if (email && o.replied) {
+    try {
+      const { cancelForProspect } = await import("../engine/queue");
+      for (const p of await q(`SELECT id FROM prospects WHERE LOWER(email) = ?`, [email])) await cancelForProspect(String(p.id), `Stopped: they replied (${cls.category.replace(/_/g, " ")})`);
+    } catch {
+      /* engine not mounted */
+    }
+  }
   if (!email || !(await inst.instantlyConfigured())) return;
-  if (typeof o.instantly === "number") {
+  if (typeof o.instantly === "number" && !isOwnThread(t)) {
     try {
       await inst.updateInterest(email, o.instantly, t.instantly_campaign_id || undefined);
     } catch (e) {
@@ -639,16 +655,43 @@ export async function processPending(limit = 4): Promise<number> {
 async function deliver(t: Row, replyTo: Row, body: string, by: "agent" | "approved" | "you"): Promise<void> {
   const text = String(body || "").trim();
   if (!text) throw new InboxError("The reply is empty.");
-  if (!(await inst.instantlyConfigured())) throw new InboxError("Connect Instantly first — replies go out through your mailboxes there.");
   if (!t.eaccount) throw new InboxError("This thread has no sending mailbox.");
-  if (!replyTo?.instantly_id) throw new InboxError("Can't reply to this message: it has no Instantly id.");
-  const subject = `Re: ${stripRe(replyTo.subject || t.subject || "")}`.trim();
-  const sent = await inst.replyToEmail({ eaccount: t.eaccount, reply_to_uuid: replyTo.instantly_id, subject, body: { text, html: textToHtml(text) } });
-  const at = sent?.timestamp_email || sent?.timestamp_created || nowIso();
+  const subject = `Re: ${stripRe(replyTo?.subject || t.subject || "")}`.trim();
+  let sentId: string | null = null;
+  let messageIdHeader: string | null = null;
+  let at: string;
+  if (isOwnThread(t)) {
+    // Our own engine: same mailbox, same thread (In-Reply-To + References).
+    const { sendThreadReply } = await import("../engine/queue");
+    const msgs = await threadMessages(t.id);
+    const refs = msgs.map((m) => m.message_id_header).filter(Boolean) as string[];
+    const target = replyTo?.message_id_header || refs[refs.length - 1] || null;
+    const r = await sendThreadReply({
+      mailboxEmail: String(t.eaccount),
+      to: String(t.lead_email),
+      toName: t.lead_name || null,
+      subject,
+      text,
+      inReplyTo: target,
+      references: refs,
+      prospectId: t.prospect_id || null,
+      campaignId: t.campaign_id || null,
+      inboxThreadId: t.id,
+    });
+    sentId = `outbox:${r.outboxId}`;
+    messageIdHeader = r.messageId;
+    at = r.at;
+  } else {
+    if (!(await inst.instantlyConfigured())) throw new InboxError("Connect Instantly first — replies go out through your mailboxes there.");
+    if (!replyTo?.instantly_id) throw new InboxError("Can't reply to this message: it has no Instantly id.");
+    const sent = await inst.replyToEmail({ eaccount: t.eaccount, reply_to_uuid: replyTo.instantly_id, subject, body: { text, html: textToHtml(text) } });
+    sentId = sent?.id || null;
+    at = sent?.timestamp_email || sent?.timestamp_created || nowIso();
+  }
   await q(
-    `INSERT INTO messages (id, instantly_id, thread_id, direction, eaccount, from_email, to_email, subject, body_text, body_html, preview, sent_at, is_auto_reply, sent_by, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [uid(), sent?.id || null, t.id, "out", t.eaccount, t.eaccount, t.lead_email, subject, text, textToHtml(text), oneLine(text, 240), at, 0, by, nowIso()]
+    `INSERT INTO messages (id, instantly_id, thread_id, direction, eaccount, from_email, to_email, subject, body_text, body_html, preview, sent_at, is_auto_reply, sent_by, message_id_header, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [uid(), sentId, t.id, "out", t.eaccount, t.eaccount, t.lead_email, subject, text, textToHtml(text), oneLine(text, 240), at, 0, by, messageIdHeader, nowIso()]
   );
   await q(
     `UPDATE messages SET ai_status = 'replied', reply_due_at = NULL,
@@ -665,6 +708,7 @@ async function deliver(t: Row, replyTo: Row, body: string, by: "agent" | "approv
 }
 
 function retryable(e: unknown) {
+  if ((e as any)?.name === "EngineError") return (e as any).code === "retry";
   return e instanceof inst.InstantlyError && (e.status === 0 || e.status === 429 || e.status >= 500);
 }
 
@@ -1079,7 +1123,9 @@ export function startInboxWorker() {
         await syncInbox().catch((e) => console.error(`[inbox] sync failed: ${errMsg(e)}`));
       }
       await processPending(4);
-      if (connected) await sendDue(5);
+      // Scheduled replies go out through Instantly or through our own mailboxes.
+      const own = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM mailboxes WHERE provider IN ('google','microsoft')`).catch(() => [{ n: 0 }]))[0]?.n) > 0;
+      if (connected || own) await sendDue(5);
     } catch (e) {
       console.error(`[inbox] tick failed: ${errMsg(e)}`);
     } finally {

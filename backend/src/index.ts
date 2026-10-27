@@ -45,6 +45,9 @@ const PUBLIC_API = new Set([
 app.use("/api/*", async (c, next) => {
   if (c.req.method === "OPTIONS") return next();
   if (PUBLIC_API.has(c.req.path)) return next();
+  // Own engine: the unsubscribe link in our emails, and the page Google /
+  // Microsoft redirect to after a mailbox signs in (protected by a one-time state).
+  if (c.req.path.startsWith("/api/u/") || c.req.path === "/api/v2/oauth/callback") return next();
   const header = c.req.header("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!(await verifyToken(token))) return c.json({ error: "Unauthorized" }, 401);
