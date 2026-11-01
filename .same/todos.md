@@ -1,3 +1,19 @@
+# DEPLOYMENT (verified 2026-11-01) — a push to main deploys EVERYTHING; there is NO manual publish
+Railway project `magnificent-rejoicing`, both services auto-deploy from `MohamedMagdy90/email` main on every push:
+- `email` = backend -> https://email-production-3c14.up.railway.app
+- `easygoing-kindness` = FRONTEND -> https://easygoing-kindness-production-94d8.up.railway.app (builds frontend/, its
+  bundle calls the backend URL directly; it served the 9b screens minutes after the 79e2479 push).
+TWO HOSTS => the browser never reaches /api on the frontend host (it serves index.html there). So:
+- Mailbox sign-in (FIXED 2026-11-01): redirect URI = the BACKEND's `/api/v2/oauth/callback` (`apiOrigin()` from
+  VITE_API_URL); full-page round trip (`returnTo`) -> backend callback -> 302 to the app `#dnaOauth=<json>` ->
+  `captureReturnedOAuth()` stores it, Mailboxes/Agent announce it. Same host (dev) keeps the popup.
+- Unsubscribe base: APP_URL / the address a callback came in on (`engine_callback_base`) / RAILWAY_PUBLIC_DOMAIN,
+  each checked with GET /api/health (JSON = us). The old `engine_public_base` (written at sign-in START) is ignored.
+Check a push: `gh api repos/MohamedMagdy90/email/commits/<sha>/statuses` (one status per service) and grep the
+live `assets/index-*.js` for a new string. Netlify is NOT part of the live setup (no Netlify status on any commit);
+every older "USER: republish Netlify" item below was wrong and is void. Keep leaving the 4 Same-preview frontend
+files out of commits: the frontend service builds from the repo.
+
 # Own sending engine (STARTED 2026-10-24) — plan in `.same/own-engine-plan.md`
 Decisions: all accepted — both Google + Microsoft, warmup test with Instantly, ramp 5 -> +2 -> 30.
 Env 2026-10-24: snapshot restore again -> DB parked in `.same/corrupt-db-backup-20/`, .git re-cloned, deps reinstalled.
@@ -38,9 +54,13 @@ behaviour and fake servers; the Phase 0 items below need REAL accounts to confir
       frontend/{package.json,bun.lock,tsconfig.json,vite.config.ts} (Same preview edits),
       frontend/dev-dist/, frontend/output/, .same/shots-tmp/.
       NOTE: unknown /api/* routes answer 401 (auth runs first), so a 401 does NOT prove a route exists.
+- [x] Two-host sign-in + unsubscribe base fix (2026-11-01): engine-test 121/121 (+12: two hosts, unsubscribe base);
+      real browser on the live layout (app :4173 built with VITE_API_URL, API :3997, Google consent faked): shows the
+      backend redirect URI, returns to the app, toast "…is connected.", mailbox saved, no page errors.
+- [ ] USER: in the Google / Microsoft sign-in apps register https://email-production-3c14.up.railway.app/api/v2/oauth/callback
 - [ ] USER: set APP_SECRET on Railway BEFORE connecting real mailboxes (else tokens are encrypted
       with a key kept in the same database).
-- [ ] USER republishes Netlify (`cd frontend && bun run build`, upload dist/)
+- [x] (void) Netlify republish: the frontend deploys on push (Railway service easygoing-kindness)
 - Env 2026-10-27: snapshot restore again -> DB parked in `.same/corrupt-db-backup-23/`, deps reinstalled,
   ONE dev server (`nohup bun run dev > /tmp/dev.log 2>&1 &`).
   GIT REMOTE IS `MohamedMagdy90/email` (NOT `bandoorahamra/dna-outreach`, which is a stale Aug copy).
@@ -167,7 +187,7 @@ Explee WORKFLOW only · auto-reply FULLY automatic + tone controls.
         Backup branch: backup/workspace-tabs (same commit, safe to delete).
         NOT committed on purpose: frontend/{package.json,bun.lock,tsconfig.json,vite.config.ts} — the Same
         preview injected same-runtime / react-grab into them. Never commit those edits.
-  - [ ] USER: republish the Netlify frontend from main (`cd frontend && bun run build`, upload dist/).
+  - [x] (void) Netlify republish: the frontend deploys on push (Railway service easygoing-kindness).
         dist/_redirects proxies /api/* to Railway. Until then the live frontend talks to the new API.
 - [x] D Agent tab (2026-10-21, built directly, NOT pushed)
   - Backend (additive): `agent-settings.ts` gains `REPLY_CATEGORIES` (12: 7 reply, 2 locked human, 3 silent),
@@ -239,7 +259,7 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
   - [x] PUSHED b1e8432 to main (fast-forward from a0a921e). Railway deployment 7470269415 success
         2026-11-01T07:53:53Z (~32s). Staged tree built + booted in isolation first (/tmp/stage: both tsc,
         vite build, 8 modules, dashboard 200 / 401). Production health 200 afterwards.
-  - [ ] USER: republish Netlify (`cd frontend && bun run build`, upload dist/) to get the Dashboard tab live
+  - [x] Dashboard tab is live (frontend service deploys on push; verified in the 79e2479 bundle)
 - Env 2026-11-01: container restarted mid-session -> DB parked in `.same/corrupt-db-backup-24/`, .git
   re-cloned (MohamedMagdy90/email), deps reinstalled, ONE dev server (setsid nohup ... & disown).
 - [x] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
@@ -267,7 +287,13 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
   - Chromium without root on this box (Ubuntu 24.04 ARM64): `bunx playwright@1.48.2 install chromium`, then
     `apt-get -o Dir::State::Lists=/tmp/apt/lists -o Dir::Cache=/tmp/apt/cache -o Debug::NoLocking=1 update|download <t64 libs>`,
     `dpkg-deb -x` into /tmp/libs, LD_LIBRARY_PATH=/tmp/libs/usr/lib/aarch64-linux-gnu. Wiped by every restart.
-  - [ ] push to main + republish Netlify (frontend only; the 9a backend is already live in b1e8432)
+  - [x] PUSHED 79e2479 to main (fast-forward from b1e8432, 14 files; the 4 Same-preview frontend files left out again).
+        Staged tree built + booted in isolation first (/tmp/stage: both tsc, vite build, 8 modules, targeting/rules/dashboard 200,
+        401 unauth; byte-identical to the commit). Railway deployment 7471855361 success 2026-11-01T10:39:43Z (~31s), health 200.
+        GOTCHA: a heredoc commit message lost the emoji line -> amended from a file written with the editor before pushing.
+  - [x] LIVE: the Railway frontend service (easygoing-kindness) deployed 79e2479 on the same push; its bundle has
+        "Steer by chat", "Numbers and search log", "Learning loop rules", "across campaigns", dna-open-segment, and the
+        Dashboard. No Netlify step (the zip I built was deleted).
 - [ ] Shell: 8 tabs (Dashboard first), Leads badge, shared campaign filter; all tests, both tsc, vite build, version
 - [ ] Phase 6 Leads — cross-campaign People / Companies / Pipeline, filters + facets, saved views, bulk,
       CSV import (5k cap) / export, stage override -> Instantly interest, richer lead panel
@@ -294,8 +320,7 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
 - [x] `ensureSchema()` only creates `settings`. Old tables (contacts, sends, templates, domains, email_assets,
       crawled_domains, discovery_sources, discovered_leads) are NOT dropped — data stays in Postgres.
 - [ ] Campaigns (C) must exclude old opt-outs: `contacts.status IN ('unsubscribed','bounced')`.
-- [ ] Deploy needs BOTH: push (Railway backend) AND republish the Netlify zip — the live frontend still has
-      the old tabs, which would 404 against the new backend.
+- [x] (void) "Deploy needs a Netlify republish": the frontend is a Railway service that deploys on push.
 - [ ] Optional later: drop the old tables in Postgres once nobody needs the data.
 ---
 
@@ -614,7 +639,7 @@ Resend flagged: (1) link URLs != sending domain (all wrapped through
 - [x] Browser filled the app login (dnaadmin) into Reacher URL + secret (text+password = login form).
       Reacher URL type=url autoComplete=url; secrets/keys autoComplete=new-password + data-1p-ignore,
       data-lpignore, data-bwignore (Agent.tsx Reacher + KeyRow, Mailboxes.tsx Instantly). tsc + build OK.
-- [ ] Ships with the next Netlify republish (frontend is not auto-deployed).
+- [x] Shipped with the next push (the frontend IS auto-deployed, as a Railway service).
 
 ## Reacher -> No2Bounce (2026-10-24) — PUSHED 150fd16, Railway deployment 7296055484 success 08:12:35Z
 - [x] verify.ts: No2Bounce client (POST /v2/n2b_validate_email -> trackingId -> poll GET; header apitoken).
@@ -626,5 +651,5 @@ Resend flagged: (1) link URLs != sending domain (all wrapped through
 - [x] Finder stops probing on verifier error (keeps best guess); qualify holds (12 h retry) instead of skipping.
 - [x] readiness.reacher -> readiness.verifier (backend + Wizard/parts). Agent: VerifierCard (KeyRow, target no2bounce).
 - [x] .same-test/n2b-test.ts 34/34 (needs N2B_POLL_SCALE=0.002); cp/db/ld/sq/tg 251/251; both tsc clean; vite build OK.
-- [ ] USER: save the No2Bounce token on the LIVE app (needs the Netlify republish first), Test & connect.
+- [ ] USER: save the No2Bounce token on the LIVE app, Test & connect.
 - Note: old reacher_url / reacher_secret settings rows are left in the DB, unread.

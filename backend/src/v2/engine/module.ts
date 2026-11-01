@@ -7,7 +7,7 @@
 import type { Context, Hono } from "hono";
 import { q } from "../../db";
 import { ensureEngineSchema } from "./schema";
-import { CALLBACK_PATH, callbackPage, finishOAuth, publicBase, startOAuth } from "./oauth";
+import { CALLBACK_PATH, callbackPage, finishOAuth, publicBase, returnUrl, startOAuth } from "./oauth";
 import {
   addImapSeed,
   deleteConnection,
@@ -76,6 +76,9 @@ export async function register(app: Hono) {
           .catch((e) => console.error(`[engine] after sign-in: ${String(e?.message || e)}`));
       }, 300);
     }
+    // Full-page sign-in (the app is on another host): straight back to it with the result.
+    const back = returnUrl(r);
+    if (back) return c.redirect(back, 302);
     return c.html(callbackPage(r));
   });
   app.get("/api/u/:token", async (c) => {
@@ -120,6 +123,7 @@ export async function register(app: Hono) {
           redirectBase: String(b.redirectBase || ""),
           loginHint: b.loginHint ? String(b.loginHint) : null,
           mailboxId: b.mailboxId ? String(b.mailboxId) : null,
+          returnTo: b.returnTo ? String(b.returnTo) : null,
         })
       );
     })

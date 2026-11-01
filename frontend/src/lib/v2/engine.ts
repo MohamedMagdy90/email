@@ -154,7 +154,8 @@ export const engineApi = {
       : req<{ connections: Connection[] }>(`${B}/connections`, j(body)),
   deleteConnection: (id: string) => req<{ connections: Connection[] }>(`${B}/connections/${enc(id)}`, del),
 
-  startOAuth: (body: { connectionId: string; purpose: "mailbox" | "seed"; redirectBase: string; loginHint?: string | null; mailboxId?: string | null }) =>
+  /** redirectBase = the backend's public address; returnTo = the app, for a full-page sign-in (API on another host). */
+  startOAuth: (body: { connectionId: string; purpose: "mailbox" | "seed"; redirectBase: string; loginHint?: string | null; mailboxId?: string | null; returnTo?: string | null }) =>
     req<{ url: string; redirectUri: string }>(`${B}/oauth/start`, j(body)),
 
   testMailbox: (id: string) => req<{ ok: boolean; error?: string; email?: string }>(`${B}/mailboxes/${enc(id)}/test`, j({})),
@@ -175,8 +176,25 @@ export const engineApi = {
   queueToday: (campaignId?: string) => req<{ items: QueueItem[] }>(`${B}/queue/today${campaignId ? `?campaignId=${enc(campaignId)}` : ""}`),
 };
 
-/** The redirect URI to register in the Google / Microsoft app. Same origin: /api is proxied to the backend. */
-export const callbackUrl = (path = "/api/v2/oauth/callback") => `${window.location.origin}${path}`;
+/**
+ * Where the browser reaches the backend. Live (Railway) the frontend and the
+ * backend are two services on two hosts and the build carries the backend's
+ * address in VITE_API_URL; in development (and behind a proxy) it is this page's.
+ */
+export function apiOrigin(): string {
+  const base = ((import.meta as any).env?.VITE_API_URL || "") as string;
+  try {
+    return base ? new URL(base).origin : window.location.origin;
+  } catch {
+    return window.location.origin;
+  }
+}
+
+/** The API on another host: a popup can't report back across hosts, so sign-in goes through a full page. */
+const apiOnAnotherHost = () => apiOrigin() !== window.location.origin;
+
+/** The redirect URI to register in the Google / Microsoft app: the BACKEND's callback (never the frontend host). */
+export const callbackUrl = (path = "/api/v2/oauth/callback") => `${apiOrigin()}${path}`;
 
 export const PROVIDER_LABEL: Record<Provider, string> = { google: "Google Workspace", microsoft: "Microsoft 365" };
 
@@ -200,6 +218,24 @@ export interface OAuthResult {
 
 const RESULT_KEY = "dnaOauthResult";
 
+/**
+ * A full-page sign-in comes back to the app as /#dnaOauth=<result>. Keep the
+ * result where the Mailboxes / Agent screens announce it on mount, and clean
+ * the address bar. Runs once when this module loads (before any screen mounts).
+ */
+function captureReturnedOAuth() {
+  try {
+    const m = window.location.hash.match(/^#dnaOauth=(.+)$/);
+    if (!m) return;
+    history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    const r = JSON.parse(decodeURIComponent(m[1]));
+    if (r && r.type === "dna-oauth" && typeof r.message === "string") localStorage.setItem(RESULT_KEY, JSON.stringify({ type: "dna-oauth", ok: !!r.ok, message: r.message.slice(0, 400), kind: r.kind ?? null, email: r.email ?? null }));
+  } catch {
+    /* malformed or private mode: nothing to announce */
+  }
+}
+captureReturnedOAuth();
+
 /** A result left behind by the callback page when it couldn't reach a popup opener (full-page redirect). */
 export function takeStoredOAuthResult(): OAuthResult | null {
   try {
@@ -214,7 +250,14 @@ export function takeStoredOAuthResult(): OAuthResult | null {
 }
 
 /**
- * Opens the provider's consent page in a popup and resolves when the callback
+ * Sign in with Google / Microsoft.
+ *
+ * API on another host (live): a full-page round trip. The browser goes to the
+ * provider, the provider to the backend's callback, the callback back to this
+ * app with the result in the fragment (captureReturnedOAuth). Resolves null;
+ * the page is navigating away.
+ *
+ * Same host (development, proxied): a popup that resolves when the callback
  * reports back. The callback page posts a message to its opener AND writes
  * localStorage, because Google's pages can cut the opener link (COOP); either
  * signal finishes the flow. A blocked popup falls back to a full-page redirect.
@@ -224,6 +267,11 @@ export async function signInWithProvider(opts: { connectionId: string; purpose: 
     localStorage.removeItem(RESULT_KEY);
   } catch {
     /* private mode */
+  }
+  if (apiOnAnotherHost()) {
+    const { url } = await engineApi.startOAuth({ ...opts, redirectBase: apiOrigin(), returnTo: `${window.location.origin}${window.location.pathname}` });
+    window.location.assign(url);
+    return null;
   }
   const { url } = await engineApi.startOAuth({ ...opts, redirectBase: window.location.origin });
   const w = 520;
