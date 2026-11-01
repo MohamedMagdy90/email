@@ -31,9 +31,15 @@ behaviour and fake servers; the Phase 0 items below need REAL accounts to confir
 - [x] F5 both tsc clean (TS 5.9.3), vite build OK, suites engine 109 · cp 47 · sq 39 · db 48 · ld 45 ·
       tg 72 · n2b 34 = 394/394; live HTTP smoke: every /api/v2/engine GET 200 logged in, 401 without,
       also via the vite proxy. Screens reviewed from `.same/shots-tmp/` (preview tool can't log in).
-- [ ] Commit + push (backend live on Railway) — WAITING FOR USER OK. Do NOT commit
+- [x] PUSHED a0a921e to main (fast-forward from 150fd16). Railway deployment 7354271427 success
+      2026-10-27T08:59:37Z (~1m40s). Verified live: health 200, public /api/v2/oauth/callback serves
+      the engine's page (old build had no such route). Staged tree was built + booted in isolation
+      first (/tmp/stage: both tsc, vite build, 8 modules mounted). Left out on purpose:
       frontend/{package.json,bun.lock,tsconfig.json,vite.config.ts} (Same preview edits),
       frontend/dev-dist/, frontend/output/, .same/shots-tmp/.
+      NOTE: unknown /api/* routes answer 401 (auth runs first), so a 401 does NOT prove a route exists.
+- [ ] USER: set APP_SECRET on Railway BEFORE connecting real mailboxes (else tokens are encrypted
+      with a key kept in the same database).
 - [ ] USER republishes Netlify (`cd frontend && bun run build`, upload dist/)
 - Env 2026-10-27: snapshot restore again -> DB parked in `.same/corrupt-db-backup-23/`, deps reinstalled,
   ONE dev server (`nohup bun run dev > /tmp/dev.log 2>&1 &`).
@@ -220,7 +226,19 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
       versions, save bar). Campaign view "Sequence" tab; wizard Sequence step (7 steps); follow-up fields removed
       from Rules. `Textarea` now forwards refs.
 - [x] 8a backend `v2/dashboard/` (`campaign_daily` sync, aggregate, pause-all / resume-all) + `db-test.ts` 48/48
-- [ ] 8b `screens/Dashboard.tsx` (needs-you, KPI tiles + sparklines, funnel, trend, tables, capacity, activity)
+- [x] 8b `screens/Dashboard.tsx` (needs-you, KPI tiles + sparklines, funnel, trend, tables, capacity, activity)
+  - [x] backend: dashboard engine-aware (capacity = readiness("all") + mailboxes listView summary;
+        approved split by engine; firstSendNote scoped to the engines of the campaigns in view; campaign
+        engine + per-engine queue limit; nextReady per engine; pause counts are global, not filtered)
+  - [x] `lib/v2/dashboard.ts` + `screens/Dashboard.tsx` + `db-*` CSS (index.css end)
+  - [x] Shell: Dashboard first, new visit lands on it (tab in sessionStorage); Leads preset view
+        (`openLeads()` in campaigns/parts.tsx -> localStorage `dnaLeadsPreset`, peeked + cleared in Leads)
+  - [x] db-test 58/58 (+10 engine-aware checks); all suites 404/404; both tsc; vite build; live HTTP smoke
+  - [ ] NOT DONE: screenshots of the populated dashboard. Chromium + /tmp/shot are wiped by every
+        container restart; a demo-seed script hung twice in the file tool. USER to eyeball it in the preview.
+  - [ ] Commit + push when the user asks (same exclusions as the engine commit)
+- Env 2026-11-01: container restarted mid-session -> DB parked in `.same/corrupt-db-backup-24/`, .git
+  re-cloned (MohamedMagdy90/email), deps reinstalled, ONE dev server (setsid nohup ... & disown).
 - [x] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
 - [ ] 9b Targeting: Results section + segment detail (search log) + steer box; "All campaigns" board
 - [ ] Shell: 8 tabs (Dashboard first), Leads badge, shared campaign filter; all tests, both tsc, vite build, version

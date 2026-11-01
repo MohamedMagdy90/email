@@ -14,6 +14,16 @@ export const openCampaign = (id: string) => {
   window.dispatchEvent(new CustomEvent("dna-open-campaign", { detail: id }));
   goTab("campaigns");
 };
+/** Open the Leads tab on one built-in view (review, hot…) or one stage. Uses the shared campaign filter as it is. */
+export const openLeads = (view: string) => {
+  try {
+    localStorage.setItem("dnaLeadsPreset", view);
+  } catch {
+    /* private mode */
+  }
+  window.dispatchEvent(new CustomEvent("dna-leads-preset", { detail: view }));
+  goTab("leads");
+};
 /** Open one thread in the Inbox tab. */
 export const openThread = (id: string) => {
   try {

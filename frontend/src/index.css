@@ -451,3 +451,151 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
 
 .drawer-in { animation: drawer-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
 @keyframes drawer-in { from { transform: translateX(28px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* ==========================================================================
+   Dashboard (db-). Built on the partner-console .hb tile. Tones come in
+   fg/bg pairs like every other status in the console.
+   ========================================================================== */
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line2); border-radius: 9px; background: var(--sunk); }
+.seg button {
+  border: 0; background: transparent; color: var(--mut); font-size: 0.74rem; font-weight: 650; line-height: 1;
+  padding: 6px 10px; border-radius: 6px; cursor: pointer; font-variant-numeric: tabular-nums; transition: color 0.12s, background 0.12s;
+}
+.seg button:hover { color: var(--txt); }
+.seg button.on { background: var(--surf); color: var(--txt); box-shadow: 0 0 0 1px var(--line3), 0 1px 2px var(--shadow); }
+
+.db-in { animation: db-in 0.38s cubic-bezier(0.2, 0.8, 0.2, 1) both; animation-delay: var(--d, 0ms); }
+@keyframes db-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .db-in { animation: none; } }
+
+.db-h { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.db-h h2 { font-size: 0.66rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mut); font-weight: 700; }
+.db-h .aside { font-size: 0.72rem; color: var(--mut2); font-variant-numeric: tabular-nums; }
+.db-card { background: var(--surf); border: 1px solid var(--line1); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+
+/* tone pairs */
+[data-tone="bad"] { --t: var(--dgf); --tb: var(--dgb); --tl: var(--dgl); }
+[data-tone="warn"] { --t: var(--wnf); --tb: var(--wnb); --tl: var(--wnl); }
+[data-tone="info"] { --t: var(--inf); --tb: var(--inb); --tl: var(--line3); }
+[data-tone="good"] { --t: var(--okf); --tb: var(--okb); --tl: var(--okl); }
+
+/* needs you */
+.db-need {
+  position: relative; display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  background: var(--surf); border: 1px solid var(--line1); border-radius: 13px; padding: 14px 16px 14px 18px; overflow: hidden;
+}
+.db-need::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--t); }
+.db-need .top { display: flex; align-items: center; gap: 10px; }
+.db-need .n {
+  min-width: 30px; height: 30px; padding: 0 8px; border-radius: 9px; display: grid; place-items: center;
+  background: var(--tb); color: var(--t); font-weight: 750; font-size: 0.86rem; font-variant-numeric: tabular-nums;
+}
+.db-need .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--t); box-shadow: 0 0 0 4px var(--tb); margin: 0 4px; flex: 0 0 9px; }
+.db-need b { font-size: 0.88rem; font-weight: 650; letter-spacing: -0.005em; line-height: 1.3; }
+.db-need p { font-size: 0.78rem; color: var(--mut); line-height: 1.45; flex: 1; }
+.db-need button.go {
+  align-self: flex-start; margin-top: 4px; border: 0; background: none; padding: 0; cursor: pointer;
+  color: var(--t); font-size: 0.78rem; font-weight: 700; display: inline-flex; align-items: center; gap: 5px;
+}
+.db-need button.go:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+/* KPI tiles */
+.db-kpi { display: flex; flex-direction: column; min-width: 0; padding: 15px 16px 12px; }
+.db-kpi .lbl { display: flex; align-items: center; gap: 6px; }
+.db-kpi .lbl i { font-style: normal; width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--line3); color: var(--mut2); font-size: 0.6rem; display: grid; place-items: center; cursor: help; }
+.db-kpi .v { font-size: 1.62rem; font-weight: 650; letter-spacing: -0.025em; line-height: 1.1; margin-top: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.db-kpi .v small { font-size: 0.9rem; color: var(--mut); font-weight: 600; margin-left: 1px; }
+.db-kpi .d { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 0.7rem; color: var(--mut2); white-space: nowrap; min-height: 20px; }
+.db-delta { display: inline-flex; align-items: center; gap: 3px; font-weight: 750; padding: 2px 6px; border-radius: 6px; font-variant-numeric: tabular-nums; }
+.db-delta.good { color: var(--okf); background: var(--okb); }
+.db-delta.bad { color: var(--dgf); background: var(--dgb); }
+.db-delta.flat { color: var(--mut); background: var(--hov); }
+.db-spark { display: block; width: 100%; height: 30px; margin-top: 10px; overflow: visible; }
+.db-spark .l { fill: none; stroke: var(--acb); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.db-spark .a { fill: color-mix(in oklab, var(--acb) 14%, transparent); }
+.db-spark .z { stroke: var(--line2); stroke-width: 1; stroke-dasharray: 2 3; vector-effect: non-scaling-stroke; }
+.db-kpi .edit { margin-left: auto; border: 0; background: none; color: var(--mut2); font-size: 0.68rem; cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px; }
+.db-kpi .edit:hover { color: var(--txt); }
+
+/* funnel */
+.db-fun { display: grid; gap: 3px; }
+.db-fr {
+  display: grid; grid-template-columns: 104px minmax(0, 1fr) 58px 52px; align-items: center; gap: 10px; width: calc(100% + 12px);
+  border: 0; background: none; color: inherit; text-align: left; padding: 5px 6px; margin: 0 -6px; border-radius: 8px; cursor: pointer; font: inherit;
+}
+.db-fr:hover { background: var(--hov); }
+.db-fr:hover .bar i { filter: brightness(1.15); }
+.db-fr .nm { font-size: 0.78rem; color: var(--txt2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.db-fr .bar { height: 10px; border-radius: 99px; background: var(--line0); overflow: hidden; }
+.db-fr .bar i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--netg), var(--acb)); transition: width 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.db-fr.out .bar i { background: linear-gradient(90deg, color-mix(in oklab, var(--okf) 40%, var(--surf)), var(--okf)); }
+.db-fr .ct { font-size: 0.82rem; font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; }
+.db-fr .cv { font-size: 0.7rem; color: var(--mut2); text-align: right; font-variant-numeric: tabular-nums; }
+.db-fr .cv.low { color: var(--wnf); font-weight: 700; }
+.db-sep { height: 1px; background: var(--line1); margin: 6px 0; }
+.db-exits { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.db-exits button {
+  border: 1px solid var(--line2); background: transparent; color: var(--mut); border-radius: 99px; padding: 3px 10px;
+  font-size: 0.72rem; cursor: pointer; display: inline-flex; gap: 6px; align-items: center;
+}
+.db-exits button:hover { color: var(--txt); border-color: var(--line3); background: var(--hov); }
+.db-exits button b { color: var(--txt2); font-variant-numeric: tabular-nums; }
+
+/* trend */
+.db-tr { position: relative; }
+.db-tr svg { display: block; width: 100%; overflow: visible; }
+.db-tr .gl { stroke: var(--line1); }
+.db-tr .ax { fill: var(--mut2); font-size: 10px; font-variant-numeric: tabular-nums; }
+.db-tr .bs { fill: color-mix(in oklab, var(--acb) 34%, transparent); }
+.db-tr .bs.on { fill: var(--acb); }
+.db-tr .hl { fill: var(--hov); }
+.db-tr .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.db-tip {
+  position: absolute; top: 4px; pointer-events: none; z-index: 2; min-width: 140px;
+  background: var(--surf); border: 1px solid var(--line3); border-radius: 10px; padding: 9px 11px; box-shadow: 0 12px 28px var(--shadow);
+  font-size: 0.74rem; line-height: 1.55;
+}
+.db-tip b { display: block; font-size: 0.72rem; color: var(--mut); font-weight: 650; margin-bottom: 3px; }
+.db-tip div { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
+.db-tip span { display: inline-flex; align-items: center; gap: 6px; color: var(--txt2); }
+.db-key { display: flex; flex-wrap: wrap; gap: 6px; }
+.db-key button {
+  border: 1px solid var(--line2); background: transparent; border-radius: 99px; padding: 4px 10px; font-size: 0.72rem; color: var(--txt2);
+  display: inline-flex; align-items: center; gap: 7px; cursor: pointer; transition: opacity 0.12s, background 0.12s;
+}
+.db-key button:hover { background: var(--hov); }
+.db-key button.off { opacity: 0.45; }
+.db-key button b { font-variant-numeric: tabular-nums; }
+.sw { width: 9px; height: 9px; border-radius: 3px; display: inline-block; flex: 0 0 9px; }
+
+/* tables */
+.db-tbl { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.db-tbl th {
+  text-align: left; font-size: 0.64rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--mut); font-weight: 700;
+  padding: 0 10px 9px; border-bottom: 1px solid var(--line1); white-space: nowrap;
+}
+.db-tbl td { padding: 10px; border-bottom: 1px solid var(--line0); vertical-align: middle; font-variant-numeric: tabular-nums; }
+.db-tbl tr:last-child td { border-bottom: 0; }
+.db-tbl tbody tr { cursor: pointer; transition: background 0.1s; }
+.db-tbl tbody tr:hover td { background: var(--hov); }
+.db-tbl th.r, .db-tbl td.r { text-align: right; }
+.db-tbl th:first-child, .db-tbl td:first-child { padding-left: 4px; }
+.db-tbl th:last-child, .db-tbl td:last-child { padding-right: 4px; }
+
+/* meters */
+.db-meter { height: 6px; border-radius: 99px; background: var(--line1); overflow: hidden; }
+.db-meter i { display: block; height: 100%; border-radius: 99px; background: var(--acb); transition: width 0.5s ease; }
+.db-meter.warn i { background: var(--wnf); }
+.db-kv { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 0.8rem; padding: 6px 0; border-bottom: 1px dashed var(--line1); }
+.db-kv:last-child { border-bottom: 0; }
+.db-kv > span:first-child { color: var(--mut); }
+.db-kv b { font-weight: 650; font-variant-numeric: tabular-nums; }
+
+/* skeleton */
+.db-sk { border-radius: 14px; background: linear-gradient(90deg, var(--surf) 0%, var(--hov) 50%, var(--surf) 100%); background-size: 200% 100%; animation: db-sk 1.3s ease-in-out infinite; border: 1px solid var(--line1); }
+@keyframes db-sk { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+@media (max-width: 860px) {
+  .db-fr { grid-template-columns: 86px minmax(0, 1fr) 46px 40px; gap: 8px; }
+  .db-kpi .v { font-size: 1.4rem; }
+}

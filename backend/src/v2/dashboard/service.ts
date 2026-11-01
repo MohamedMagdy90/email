@@ -7,8 +7,7 @@ import { listEvents, parseJson, todayUtc } from "../events";
 import { aiStatus, budgetRemaining, usageToday } from "../llm";
 import { instantlyConfigured } from "../instantly";
 import { emptyFunnel, STAGES, type Funnel, type Row } from "../campaigns/types";
-import { pauseCampaign, startCampaign } from "../campaigns/service";
-import { sendableMailboxes } from "../campaigns/sender";
+import { pauseCampaign, readiness, startCampaign } from "../campaigns/service";
 import { ensureDailyTable } from "./daily";
 import { evaluate, getRules, loopStatusOf, segmentStats } from "../targeting/learning";
 
@@ -105,12 +104,22 @@ async function build(range: number, campaign: string) {
   }
 
   /* ---------------------------- campaigns ---------------------------- */
-  const sendable = await sendableMailboxes();
-  const capacityToday = sendable.reduce((n, m) => n + m.dailyLimit, 0);
+  // Sending capacity follows the engine, exactly as the senders see it:
+  // Instantly mailboxes for Instantly campaigns, our own for own-engine ones.
+  const ready = await readiness("all");
+  const own = ready.ownMailboxes;
+  const inst = {
+    total: Math.max(0, ready.mailboxes.total - own.total),
+    sending: Math.max(0, ready.mailboxes.sending - own.sending),
+    dailyCapacity: Math.max(0, ready.mailboxes.dailyCapacity - own.dailyCapacity),
+  };
+  const engineOf = (c: Row): "own" | "instantly" => (c.engine === "own" ? "own" : "instantly");
+  const capacityToday = ready.mailboxes.dailyCapacity;
   const todayIso = `${todayUtc()}T00:00:00.000Z`;
   const campaignRows = [];
   for (const c of campaigns) {
     const cid = String(c.id);
+    const engine = engineOf(c);
     const settings = parseJson<any>(c.settings_json, {}) || {};
     const stats = parseJson<any>(c.stats_json, {}) || {};
     const contactedN = await one(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND sent_at IS NOT NULL`, [cid]);
@@ -122,14 +131,16 @@ async function build(range: number, campaign: string) {
       name: String(c.name),
       kind: c.kind === "partner" ? "partner" : "customer",
       status: String(c.status),
+      engine,
       sent: Number(stats.sent) || contactedN,
       contacted: contactedN,
       replyRate: rate(repliesN, contactedN),
       hot: hotN,
       bounceRate: rate(bouncedN, contactedN),
       review: await one(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage = 'written'`, [cid]),
+      approved: await one(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage = 'approved'`, [cid]),
       queuedToday: await one(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND queued_at >= ?`, [cid, todayIso]),
-      queueLimit: Math.min(Number(settings.dailyNewLeads) || 30, capacityToday),
+      queueLimit: Math.min(Number(settings.dailyNewLeads) || 30, (engine === "own" ? own : inst).dailyCapacity),
       lastError: c.last_error || null,
     });
   }
@@ -162,24 +173,39 @@ async function build(range: number, campaign: string) {
     .slice(0, 12);
 
   /* ------------------------ capacity + mailboxes ----------------------- */
-  let mb = { total: 0, sending: sendable.length, warming: 0, paused: 0, firstReadyAt: null as string | null };
+  // Stages and "next ready" come from the Mailboxes tab's own view (both
+  // engines, same gate), so the two screens can never disagree.
+  const mb = {
+    total: ready.mailboxes.total,
+    sending: ready.mailboxes.sending,
+    warming: 0,
+    ready: 0,
+    paused: 0,
+    failing: 0,
+    nextReady: null as { email: string; day: string } | null,
+    own: { total: own.total, sending: own.sending, dailyCapacity: own.dailyCapacity },
+    instantly: { total: inst.total, sending: inst.sending, dailyCapacity: inst.dailyCapacity },
+  };
+  // The next mailbox to become ready, per engine: same rule as the Mailboxes
+  // summary (warming, has a date, nothing failing).
+  const nextReadyBy: Record<"own" | "instantly", { email: string; day: string } | null> = { own: null, instantly: null };
   try {
-    const rows = await q(`SELECT stage, warmup_started_at, pre_warmed FROM mailboxes WHERE missing_since IS NULL`);
-    const policy = await import("../mailboxes/service").then((m) => m.getPolicy()).catch(() => null);
-    const warmDays = (pre: boolean) => (pre ? policy?.minWarmDaysPreWarmed ?? 7 : policy?.minWarmDays ?? 14);
-    let first: number | null = null;
-    for (const r of rows) {
-      if (r.stage === "warming" || r.stage === "ready") {
-        mb.warming++;
-        const started = Date.parse(String(r.warmup_started_at || ""));
-        if (Number.isFinite(started)) {
-          const ready = started + warmDays(Number(r.pre_warmed) === 1) * DAY_MS;
-          if (first === null || ready < first) first = ready;
-        }
-      }
-      if (r.stage === "paused") mb.paused++;
+    const { listView } = await import("../mailboxes/service");
+    const view = await listView();
+    const s = view.summary;
+    mb.total = s.total;
+    mb.warming = s.byStage.warming || 0;
+    mb.ready = s.byStage.ready || 0;
+    mb.paused = s.byStage.paused || 0;
+    mb.failing = Math.max(0, s.attention - mb.paused);
+    mb.nextReady = s.nextReady;
+    const t = todayUtc();
+    for (const m of view.mailboxes) {
+      const eta = m.metrics.readyEta;
+      if (m.missing || m.stage !== "warming" || !eta || eta < t || m.checks.some((c) => c.state === "fail")) continue;
+      const cur = nextReadyBy[m.engine];
+      if (!cur || eta < cur.day) nextReadyBy[m.engine] = { email: m.email, day: eta };
     }
-    mb = { ...mb, total: rows.length, firstReadyAt: first !== null ? iso(Math.max(first, now)) : null };
   } catch {
     /* mailboxes not migrated */
   }
@@ -189,10 +215,21 @@ async function build(range: number, campaign: string) {
   const remaining = await budgetRemaining();
   const instantly = await instantlyConfigured();
   const everSent = funnel.sent + funnel.replied + funnel.interested + funnel.meeting + funnel.won + funnel.lost + funnel.bounced + funnel.unsubscribed + funnel.queued > 0;
+  // Engine-scoped helpers: only the engines of the campaigns in view matter
+  // (no campaigns yet = either engine could be used).
+  type Engine = "own" | "instantly";
+  const scope: Engine[] = campaigns.length ? [...new Set(campaigns.map(engineOf))] : ["own", "instantly"];
+  const pools = { own, instantly: inst };
+  const sendingIn = (es: Engine[]) => es.reduce((n, e) => n + pools[e].sending, 0);
+  const mailboxesIn = (es: Engine[]) => es.reduce((n, e) => n + pools[e].total, 0);
+  const readyOn = (es: Engine[], fmt: "short" | "long") => {
+    const day = es.map((e) => nextReadyBy[e]?.day).filter((d): d is string => !!d).sort()[0];
+    return day ? new Date(`${day}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: fmt, timeZone: "UTC" }) : null;
+  };
 
   /* ----------------------------- needs you ---------------------------- */
   const needs: NeedsYou[] = [];
-  if (funnel.written > 0) needs.push({ id: "review", tone: "warn", count: funnel.written, title: `${funnel.written} email${funnel.written === 1 ? "" : "s"} to review`, body: "Written and waiting for your approval before they go to Instantly.", action: { label: "Review them", tab: "leads", leadsView: "review" } });
+  if (funnel.written > 0) needs.push({ id: "review", tone: "warn", count: funnel.written, title: `${funnel.written} email${funnel.written === 1 ? "" : "s"} to review`, body: "Written and waiting for your approval before they're sent.", action: { label: "Review them", tab: "leads", leadsView: "review" } });
   let humans = 0;
   try {
     const t = (await q(`SELECT CAST(SUM(CASE WHEN status = 'needs_human' THEN 1 ELSE 0 END) AS INTEGER) AS n FROM threads`))[0];
@@ -201,25 +238,56 @@ async function build(range: number, campaign: string) {
     humans = 0;
   }
   if (humans) needs.push({ id: "inbox", tone: "warn", count: humans, title: `${humans} repl${humans === 1 ? "y needs" : "ies need"} a human`, body: "The agent handed these over: pricing, a meeting request, or something it shouldn't answer alone.", action: { label: "Open the Inbox", tab: "inbox" } });
-  if (mb.paused) needs.push({ id: "mailboxes", tone: "bad", count: mb.paused, title: `${mb.paused} mailbox${mb.paused === 1 ? " is" : "es are"} paused`, body: "Pulled out of sending (bounces, inbox rate or an Instantly error). Check why before resuming.", action: { label: "Open Mailboxes", tab: "mailboxes" } });
+  if (mb.paused) needs.push({ id: "mailboxes", tone: "bad", count: mb.paused, title: `${mb.paused} mailbox${mb.paused === 1 ? " is" : "es are"} paused`, body: "Pulled out of sending (bounces, inbox tests, a sign-in or Instantly error). Check why before resuming.", action: { label: "Open Mailboxes", tab: "mailboxes" } });
+  if (mb.failing) needs.push({ id: "mailbox-checks", tone: "warn", count: mb.failing, title: `${mb.failing} mailbox${mb.failing === 1 ? " is" : "es are"} failing a check`, body: "A readiness check failed (DNS, sign-in or inbox tests), so it won't start sending until that's fixed.", action: { label: "Open Mailboxes", tab: "mailboxes" } });
   if (!ai.configured) needs.push({ id: "ai", tone: "bad", title: "No AI key", body: "Companies get a basic read only, and nothing is scored or written.", action: { label: "Connect one", tab: "agent" } });
   else if (remaining <= 0) needs.push({ id: "budget", tone: "warn", title: "Today's AI budget is used up", body: "Research, scoring and writing carry on tomorrow, or raise the budget.", action: { label: "Agent settings", tab: "agent" } });
-  if (funnel.approved > 0 && !instantly) needs.push({ id: "instantly", tone: "bad", count: funnel.approved, title: "Approved emails can't go out", body: "Connect Instantly to start sending.", action: { label: "Connect Instantly", tab: "agent" } });
-  else if (funnel.approved > 0 && !sendable.length) needs.push({ id: "capacity", tone: "info", count: funnel.approved, title: `${funnel.approved} approved email${funnel.approved === 1 ? "" : "s"} waiting for a mailbox`, body: mb.firstReadyAt ? `The first mailbox should be ready around ${new Date(mb.firstReadyAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}.` : "Mailboxes are still warming up.", action: { label: "Open Mailboxes", tab: "mailboxes" } });
+  // Approved emails wait on THEIR campaign's engine: an own-engine campaign
+  // never needs Instantly, an Instantly one never uses our own mailboxes.
+  const approvedBy = { own: 0, instantly: 0 };
+  for (const c of campaignRows) approvedBy[c.engine] += c.approved;
+  const waitingOn: Engine[] = [];
+  let waiting = 0;
+  if (approvedBy.instantly > 0 && !instantly) {
+    const n = approvedBy.instantly;
+    needs.push({ id: "instantly", tone: "bad", count: n, title: `${n} approved email${n === 1 ? " can't" : "s can't"} go out`, body: "Their campaigns send through Instantly, which isn't connected. Connect it, or switch those campaigns to your own mailboxes.", action: { label: "Connect Instantly", tab: "agent" } });
+  } else if (approvedBy.instantly > 0 && !inst.sending) {
+    waiting += approvedBy.instantly;
+    waitingOn.push("instantly");
+  }
+  if (approvedBy.own > 0 && !own.sending) {
+    waiting += approvedBy.own;
+    waitingOn.push("own");
+  }
+  if (waiting) {
+    const on = readyOn(waitingOn, "short");
+    const body = on ? `The first mailbox should be ready around ${on}.` : mailboxesIn(waitingOn) ? "Mailboxes are still warming up or finishing their checks." : waitingOn.includes("own") ? "No mailbox of your own yet. Sign one in from the Mailboxes tab." : "No Instantly mailbox is sending yet.";
+    needs.push({ id: "capacity", tone: "info", count: waiting, title: `${waiting} approved email${waiting === 1 ? "" : "s"} waiting for a mailbox`, body, action: { label: "Open Mailboxes", tab: "mailboxes" } });
+  }
   const suggestions = segments.filter((s) => s.suggested).length || (await one(`SELECT CAST(count(*) AS INTEGER) AS n FROM segments WHERE suggested_status IS NOT NULL ${ids.length ? `AND campaign_id IN (${ids.map(() => "?").join(",")})` : ""}`, ids));
   if (suggestions) needs.push({ id: "learning", tone: "good", count: suggestions, title: `${suggestions} segment change${suggestions === 1 ? "" : "s"} suggested`, body: "The learning loop has numbers to back a change (scale up or pause). Nothing changes until you apply it.", action: { label: "See them in Targeting", tab: "targeting" } });
   for (const c of campaignRows.filter((x) => x.lastError).slice(0, 2)) needs.push({ id: `err-${c.id}`, tone: "bad", title: `"${c.name}" hit a problem`, body: String(c.lastError).slice(0, 200), action: { label: "Open the campaign", tab: "campaigns", campaignId: c.id } });
 
   let firstSendNote: string | null = null;
   if (!everSent) {
+    const on = readyOn(scope, "long");
     if (!campaigns.length) firstSendNote = "Create a campaign: the agent starts finding and researching companies straight away.";
-    else if (!instantly) firstSendNote = "First emails go out once Instantly is connected and a mailbox has finished warming up.";
-    else if (!sendable.length) firstSendNote = mb.firstReadyAt ? `First emails go out when the first mailbox finishes warming up, around ${new Date(mb.firstReadyAt).toLocaleDateString("en-GB", { day: "numeric", month: "long" })}.` : "First emails go out when a mailbox finishes warming up.";
-    else if (!campaigns.some((c) => c.status === "active")) firstSendNote = "A mailbox is ready. Start a campaign and approved emails go out today.";
+    else if (scope.length === 1 && scope[0] === "instantly" && !instantly) firstSendNote = "First emails go out once Instantly is connected and a mailbox has finished warming up, or switch the campaign to your own mailboxes.";
+    else if (!sendingIn(scope)) {
+      if (on) firstSendNote = `First emails go out when the first mailbox is ready, around ${on}.`;
+      else if (mailboxesIn(scope)) firstSendNote = "First emails go out when a mailbox finishes warming up and passes its checks.";
+      else firstSendNote = scope.includes("own") ? "First emails go out once you sign in a mailbox of your own (Google Workspace or Microsoft 365) in the Mailboxes tab." : "First emails go out once an Instantly mailbox is sending.";
+    } else if (!campaigns.some((c) => c.status === "active")) firstSendNote = "A mailbox is ready. Start a campaign and approved emails go out today.";
     else firstSendNote = "Mailboxes are ready: approved emails go out at the next send slot.";
   }
 
+  // Pause / resume act on EVERY campaign, so their counts ignore the filter.
   const pausedAll = parseJson<string[]>(await getSetting("paused_all_ids"), []);
+  const statusRows = await q(`SELECT id, status FROM campaigns WHERE status IN ('active', 'paused')`);
+  const pause = {
+    active: statusRows.filter((c) => c.status === "active").length,
+    pausedByAll: statusRows.filter((c) => c.status === "paused" && pausedAll.includes(String(c.id))).length,
+  };
   return {
     range,
     campaign: campaign || null,
@@ -230,12 +298,13 @@ async function build(range: number, campaign: string) {
     trend,
     campaigns: campaignRows,
     segments,
-    capacity: { mailboxes: mb, dailyCapacity: capacityToday, usedToday },
+    // dailyCapacity / sending = what the campaigns in view can use; mailboxes = the whole pool.
+    capacity: { mailboxes: mb, engines: scope, sending: sendingIn(scope), dailyCapacity: scope.reduce((n, e) => n + pools[e].dailyCapacity, 0), poolCapacity: capacityToday, usedToday },
     ai: { configured: ai.configured, canSearch: ai.canSearch, callsToday: usage.calls, budgetLeft: remaining },
     events: await listEvents({ campaignId: campaign || undefined, limit: 15 }),
     firstSendNote,
     hasData: everSent,
-    pause: { active: campaigns.filter((c) => c.status === "active").length, pausedByAll: pausedAll.filter((id) => campaigns.some((c) => c.id === id && c.status === "paused")).length },
+    pause,
     monthlyCost: monthly,
   };
 }

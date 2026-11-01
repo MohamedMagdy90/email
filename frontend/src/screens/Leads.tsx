@@ -42,6 +42,23 @@ function load<T>(key: string, fallback: T): T {
     return fallback;
   }
 }
+/** A view handed over by another tab (openLeads). Peeked in state initialisers
+ * (StrictMode may run those twice), cleared once mounted. */
+const PRESET_KEY = "dnaLeadsPreset";
+function peekPreset(): string | null {
+  try {
+    return localStorage.getItem(PRESET_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+function clearPreset() {
+  try {
+    localStorage.removeItem(PRESET_KEY);
+  } catch {
+    /* private mode */
+  }
+}
 function store(key: string, v: unknown) {
   try {
     localStorage.setItem(key, JSON.stringify(v));
@@ -53,8 +70,12 @@ function store(key: string, v: unknown) {
 export default function Leads() {
   const [campaign, setCampaign] = useCampaignFilter();
   const campaigns = useCampaignList();
-  const [view, setViewState] = useState<LeadView>(() => load<LeadView>(VIEW_KEY, "people"));
-  const [filters, setFilters] = useState<LeadFilters>({ stage: "all" });
+  // A preset filters the list, so it can't land on the board (which ignores stages).
+  const [view, setViewState] = useState<LeadView>(() => {
+    const v = load<LeadView>(VIEW_KEY, "people");
+    return peekPreset() && v === "pipeline" ? "people" : v;
+  });
+  const [filters, setFilters] = useState<LeadFilters>(() => ({ stage: peekPreset() || "all" }));
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<{ key: string; dir?: "asc" | "desc" }>({ key: "updated" });
   const [offset, setOffset] = useState(0);
@@ -86,6 +107,21 @@ export default function Leads() {
     setColsState(c);
     store(COLS_KEY, c);
   };
+
+  // Presets: the one this tab opened with, and any sent while it's open.
+  useEffect(() => {
+    clearPreset();
+    const h = (e: Event) => {
+      const v = String((e as CustomEvent).detail || "");
+      if (!v) return;
+      clearPreset();
+      setFilters({ stage: v });
+      setSearch("");
+      setViewState((cur) => (cur === "pipeline" ? "people" : cur));
+    };
+    window.addEventListener("dna-leads-preset", h);
+    return () => window.removeEventListener("dna-leads-preset", h);
+  }, []);
 
   // Debounced search into the filters.
   useEffect(() => {

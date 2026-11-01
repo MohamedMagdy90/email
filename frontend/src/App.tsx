@@ -3,6 +3,7 @@ import { HeadSlot, Logo, Mark, Spinner, ThemeButton, Toaster } from "./lib/ui";
 import { api, clearToken } from "./lib/api";
 import Login from "./screens/Login";
 import Setup from "./screens/Setup";
+import Dashboard from "./screens/Dashboard";
 import Inbox from "./screens/Inbox";
 import Leads from "./screens/Leads";
 import Campaigns from "./screens/Campaigns";
@@ -13,10 +14,11 @@ import Agent from "./screens/Agent";
 import AccountDialog from "./screens/Account";
 import { req } from "./lib/api";
 
-type Tab = "inbox" | "leads" | "campaigns" | "targeting" | "sequences" | "mailboxes" | "agent";
+type Tab = "dashboard" | "inbox" | "leads" | "campaigns" | "targeting" | "sequences" | "mailboxes" | "agent";
 
-// Groups: work (inbox, leads) | set up (campaigns, targeting) | infrastructure (mailboxes, agent).
+// Groups: work (dashboard, inbox, leads) | set up (campaigns, targeting, sequences) | infrastructure (mailboxes, agent).
 const TABS: { id: Tab; label: string; sepBefore?: boolean }[] = [
+  { id: "dashboard", label: "Dashboard" },
   { id: "inbox", label: "Inbox" },
   { id: "leads", label: "Leads" },
   { id: "campaigns", label: "Campaigns", sepBefore: true },
@@ -29,6 +31,8 @@ const TABS: { id: Tab; label: string; sepBefore?: boolean }[] = [
 // Other screens can jump tabs: window.dispatchEvent(new CustomEvent("dna-tab", { detail: "agent" }))
 const TAB_EVENT = "dna-tab";
 
+// Per browser TAB session: a reload stays where you were, a new visit opens
+// on the Dashboard (plan §8.1).
 const TAB_KEY = "dnaOutreachTab";
 
 function initials(name: string) {
@@ -38,12 +42,12 @@ function initials(name: string) {
 
 function initialTab(): Tab {
   try {
-    const t = localStorage.getItem(TAB_KEY) as Tab | null;
+    const t = sessionStorage.getItem(TAB_KEY) as Tab | null;
     if (t && TABS.some((x) => x.id === t)) return t;
   } catch {
     /* private mode */
   }
-  return "inbox";
+  return "dashboard";
 }
 
 export default function App() {
@@ -57,7 +61,7 @@ export default function App() {
   function setTab(t: Tab) {
     setTabState(t);
     try {
-      localStorage.setItem(TAB_KEY, t);
+      sessionStorage.setItem(TAB_KEY, t);
     } catch {
       /* private mode */
     }
@@ -207,6 +211,7 @@ export default function App() {
 
         <HeadSlot.Provider value={headEl}>
           <main>
+            {tab === "dashboard" && <Dashboard />}
             {tab === "inbox" && <Inbox />}
             {tab === "leads" && <Leads />}
             {tab === "campaigns" && <Campaigns />}
