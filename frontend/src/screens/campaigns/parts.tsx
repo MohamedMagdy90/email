@@ -24,6 +24,18 @@ export const openLeads = (view: string) => {
   window.dispatchEvent(new CustomEvent("dna-leads-preset", { detail: view }));
   goTab("leads");
 };
+/** Open one segment's results (numbers + search log) in the Targeting tab, with the shared filter on its campaign. */
+export const openSegment = (campaignId: string, segmentId: string) => {
+  try {
+    localStorage.setItem("dnaCampaignFilter", campaignId);
+    localStorage.setItem("dnaTargetingSegment", segmentId);
+  } catch {
+    /* private mode */
+  }
+  window.dispatchEvent(new CustomEvent("dna-campaign-filter", { detail: campaignId }));
+  window.dispatchEvent(new CustomEvent("dna-open-segment", { detail: segmentId }));
+  goTab("targeting");
+};
 /** Open one thread in the Inbox tab. */
 export const openThread = (id: string) => {
   try {

@@ -71,7 +71,7 @@ export function CampaignFilter({ value, onChange, list, required, className }: {
   if (!list || !list.length) return null;
   const known = list.some((c) => c.id === value);
   return (
-    <Select value={known ? value : required ? list[0].id : ""} onChange={(e) => onChange(e.target.value)} aria-label="Campaign" className={cn("h-8 w-auto min-w-[190px] max-w-[280px] py-0 text-[12.5px]", className)}>
+    <Select value={known ? value : required ? list[0].id : ""} onChange={(e) => onChange(e.target.value)} aria-label="Campaign" className={cn("h-8 w-auto min-w-[190px] max-w-[280px] !py-0 text-[12.5px]", className)}>
       {!required && <option value="">All campaigns</option>}
       {list.map((c) => (
         <option key={c.id} value={c.id}>

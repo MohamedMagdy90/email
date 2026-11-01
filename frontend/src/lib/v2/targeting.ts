@@ -3,7 +3,7 @@
 // (+ campaigns.ts for segments). Change a shape here first, then on both sides.
 import { getToken, req } from "../api";
 import { del, j, put } from "./core";
-import type { Segment, SegmentInput } from "./campaigns";
+import type { Offer, ProspectRow, Segment, SegmentInput } from "./campaigns";
 
 export type SizeBand = "1-10" | "11-50" | "51-200" | "201-500" | "500+";
 export type SkipRule = "country" | "city" | "industry" | "size" | "keyword" | "language";
@@ -130,6 +130,128 @@ export interface ExclusionList {
   autoRecent: { value: string; reason: string; at: string }[];
 }
 
+/* ------------------------- results (Phase 9, §8.4.5) ------------------------- */
+
+/** The learning loop's view of a segment. Exhausted is a flag on the segment, not a status. */
+export type LoopStatus = "testing" | "working" | "scaling" | "paused";
+
+/** backend/src/v2/targeting/learning.ts SegmentRules — one set for every campaign. */
+export interface SegmentRules {
+  /** Testing until this many leads were emailed. */
+  testUntil: number;
+  /** Scaling at this positive-reply rate (%)… */
+  scalePositiveRate: number;
+  /** …or this reply rate (%). */
+  scaleReplyRate: number;
+  /** Paused with no hot lead after this many emailed. */
+  pauseAfter: number;
+  /** Paused when bounces go above this (%). */
+  pauseBounceRate: number;
+  /** suggest = changes wait for Apply; auto = the loop applies them. */
+  mode: "suggest" | "auto";
+  /** Share of each day's new leads by status; sums to 100. */
+  quota: { scaling: number; working: number; testing: number };
+}
+
+export interface SegmentStats {
+  found: number;
+  researched: number;
+  /** skipped by a targeting rule */
+  offTarget: number;
+  inTargetPct: number | null;
+  contacted: number;
+  replies: number;
+  positive: number;
+  bounced: number;
+  replyRate: number | null;
+  positiveRate: number | null;
+  bounceRate: number | null;
+  foundToday: number;
+}
+
+export interface LoopSuggestion {
+  status: LoopStatus;
+  /** the rule that fired, with the numbers behind it */
+  reason: string;
+  at?: string;
+}
+
+export interface ResultSegment extends Segment {
+  campaignName: string;
+  campaignKind: CampaignKind;
+  loopStatus: LoopStatus;
+  /** why it has its current status (set by hand, or by the loop) */
+  statusReason: string | null;
+  suggestion: LoopSuggestion | null;
+  /** what the rules say right now, in words */
+  verdict: string;
+  stats: SegmentStats & {
+    /** % of the campaign's daily new leads this segment gets (0 when off) */
+    quotaShare: number;
+    searchesLeft: number;
+  };
+}
+
+export interface OfferCard {
+  campaignId: string;
+  campaignName: string;
+  kind: CampaignKind;
+  website: string | null;
+  offer: Offer | null;
+}
+
+export interface TargetingResults {
+  rules: SegmentRules;
+  offers: OfferCard[];
+  segments: ResultSegment[];
+}
+
+export interface SearchLogEntry {
+  id: string;
+  query: string;
+  country: string | null;
+  via: "gemini" | "search";
+  ranAt: string;
+  results: number;
+  added: number;
+  /** rule = a SkipRule, or duplicate | excluded | junk */
+  rejected: { rule: string; label: string; count: number }[];
+  examples: { domain: string | null; reason: string }[];
+}
+
+export interface SegmentDetail {
+  segment: Segment & { loopStatus: LoopStatus; statusReason: string | null; suggestion: LoopSuggestion | null };
+  campaign: { id: string; name: string; kind: CampaignKind };
+  stats: SegmentStats;
+  verdict: string;
+  /** newest first, last 100 */
+  searches: SearchLogEntry[];
+  /** newest first, last 100 */
+  companies: ProspectRow[];
+}
+
+/* ---------------------------- steer by chat (§8.4.7) ---------------------------- */
+
+export type SteerOp = "add" | "remove" | "set";
+export type SteerChange =
+  | { id: string; kind: "market"; field: string; op: SteerOp; value: unknown; label: string }
+  | { id: string; kind: "segment"; segmentId: string; segmentName: string; field: string; op: SteerOp; value: unknown; label: string }
+  | { id: string; kind: "exclusion"; value: string[]; label: string }
+  | { id: string; kind: "new_segment"; value: { name: string; industryIds: string[]; why: string }; label: string };
+
+export interface SteerProposal {
+  summary: string;
+  /** already validated: unknown fields, industries and segments are dropped */
+  changes: SteerChange[];
+}
+
+export interface SteerApplied {
+  applied: number;
+  notes: string[];
+  /** dry run of the leads already found, against the new targeting */
+  recheck: RecheckResult;
+}
+
 const C = (id: string) => `/api/v2/campaigns/${id}`;
 const T = "/api/v2/targeting";
 
@@ -145,6 +267,19 @@ export const targetingApi = {
   regenerate: (id: string, sid: string) => req<{ segment: Segment }>(`${C(id)}/segments/${sid}/queries/regenerate`, j({})),
   /** 1-2 live searches, screened. Nothing saved, no searches used up. */
   preview: (id: string, sid: string) => req<SegmentPreview>(`${C(id)}/segments/${sid}/preview`, j({})),
+
+  /** Offers + every segment with numbers and loop status. No campaign = every campaign that isn't archived. */
+  results: (campaign?: string) => req<TargetingResults>(`${T}${campaign ? `?campaign=${encodeURIComponent(campaign)}` : ""}`),
+  rules: () => req<SegmentRules>(`${T}/rules`),
+  /** Merged onto the current rules and sanitized (quota re-balanced to 100). */
+  saveRules: (rules: Partial<SegmentRules>) => req<SegmentRules>(`${T}/rules`, put(rules)),
+  applySuggestions: (ids: string[], dismiss = false) => req<{ applied: number; dismissed: number }>(`${T}/suggestions/apply`, j({ ids, dismiss })),
+  segment: (sid: string) => req<SegmentDetail>(`${T}/segments/${sid}`),
+  /** Same campaign = "(copy)". Searches start from the beginning. */
+  duplicate: (sid: string, campaignId: string) => req<{ segment: Segment; campaignId: string }>(`${T}/segments/${sid}/duplicate`, j({ campaignId })),
+  setStatus: (sid: string, status: LoopStatus, reason?: string) => req<{ ok: true }>(`${T}/segments/${sid}/status`, j({ status, reason })),
+  steer: (campaignId: string, message: string) => req<SteerProposal>(`${T}/steer`, j({ campaignId, message })),
+  applySteer: (campaignId: string, changes: SteerChange[]) => req<SteerApplied>(`${T}/steer/apply`, j({ campaignId, changes })),
 
   exclusions: (params: { q?: string; limit?: number; offset?: number } = {}) => {
     const qs = new URLSearchParams();
@@ -173,6 +308,15 @@ export const SIZE_LABEL: Record<SizeBand, string> = {
   "51-200": "51-200",
   "201-500": "201-500",
   "500+": "500+",
+};
+
+export const LOOP_LABEL: Record<LoopStatus, string> = { scaling: "Scaling", working: "Working", testing: "Testing", paused: "Paused" };
+/** fg + bg, like every status chip in the console */
+export const LOOP_TONE: Record<LoopStatus, string> = {
+  scaling: "bg-okb text-good",
+  working: "bg-tlb text-accent",
+  testing: "bg-ink/[0.06] text-ink-soft",
+  paused: "bg-wnb text-warn",
 };
 
 export function sizeSummary(bands: SizeBand[], minBranches: number | null): string {

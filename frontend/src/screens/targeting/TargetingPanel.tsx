@@ -1,30 +1,24 @@
-// Targeting for ONE campaign: the market (with a save bar and a re-check of
-// the leads already found), the segments inside it, and who never to contact.
-// Used by the Targeting tab, the campaign view and the new-campaign wizard.
+// Targeting for ONE campaign: what's working (results board + learning loop),
+// the market (with a save bar and a re-check of the leads already found), the
+// segments inside it, and who never to contact, with steer-by-chat above the
+// results and the segments. Used by the Targeting tab and the campaign view;
+// the new-campaign wizard uses MarketEditor and SegmentsSection directly.
 import { useCallback, useEffect, useState } from "react";
 import { Button, Card, Spinner, cn, toast } from "../../lib/ui";
 import type { CampaignDetail } from "../../lib/v2/campaigns";
 import { targetingApi, type MarketView, type RecheckResult, type SkipRule, type Taxonomy, type TargetMarket } from "../../lib/v2/targeting";
 import { errMsg, plural } from "../campaigns/parts";
+import { useCampaignList } from "../shared/CampaignFilter";
 import MarketForm from "./MarketForm";
 import NeverContact from "./NeverContact";
+import Results from "./Results";
 import { SegmentsSection } from "./Segments";
+import SteerBox from "./Steer";
+import { useTaxonomy } from "./useTaxonomy";
 
-let taxPromise: Promise<Taxonomy> | null = null;
-export function useTaxonomy(): Taxonomy | null {
-  const [tax, setTax] = useState<Taxonomy | null>(null);
-  useEffect(() => {
-    if (!taxPromise) taxPromise = targetingApi.taxonomy().catch((e) => ((taxPromise = null), Promise.reject(e)));
-    let alive = true;
-    taxPromise.then((t) => alive && setTax(t)).catch((e) => toast(errMsg(e), "error"));
-    return () => {
-      alive = false;
-    };
-  }, []);
-  return tax;
-}
+export { useTaxonomy };
 
-export type TargetingSection = "market" | "segments" | "never";
+export type TargetingSection = "results" | "market" | "segments" | "never";
 
 function ruleSummary(skipped: Partial<Record<SkipRule, number>>, labels: Record<SkipRule, string>): string {
   return (Object.entries(skipped) as [SkipRule, number][])
@@ -228,21 +222,47 @@ export default function TargetingPanel({
   c,
   reload,
   onCampaign,
-  initial = "market",
+  initial,
+  focus,
+  edit,
 }: {
   c: CampaignDetail;
   reload: () => Promise<void>;
   onCampaign?: (c: CampaignDetail) => void;
+  /** default: Results once the campaign has segments, else Market */
   initial?: TargetingSection;
+  /** open this segment's numbers + search log (openSegment handoff) */
+  focus?: { sid: string; n: number } | null;
+  /** open this segment in the builder (Edit on the all-campaigns board) */
+  edit?: { sid: string; n: number } | null;
 }) {
   const tax = useTaxonomy();
-  const [section, setSection] = useState<TargetingSection>(initial);
+  const campaigns = useCampaignList();
+  const [section, setSection] = useState<TargetingSection>(edit ? "segments" : focus ? "results" : initial || (c.segmentList.length ? "results" : "market"));
+  // Edit from the results board opens the builder in Segments.
+  const [editSeg, setEditSeg] = useState<{ sid: string | "new"; n: number } | null>(edit || null);
+  // Bumped after a steer or an edit so the board re-reads its numbers.
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    if (focus) setSection("results");
+  }, [focus?.n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const reloadAll = async () => {
+    await reload();
+    setVersion((v) => v + 1);
+  };
   const enabled = c.segmentList.filter((s) => s.enabled).length;
   const tabs: { id: TargetingSection; label: string; sub: string }[] = [
+    { id: "results", label: "Results", sub: c.segmentList.length ? "what's working" : "no segments yet" },
     { id: "market", label: "Market", sub: `${c.market.countries.length} countr${c.market.countries.length === 1 ? "y" : "ies"}` },
     { id: "segments", label: "Segments", sub: c.segmentList.length ? `${enabled} on` : "none yet" },
     { id: "never", label: "Never contact", sub: "every campaign" },
   ];
+  const editFromBoard = (_cid: string, sid: string | "new") => {
+    setEditSeg({ sid, n: Date.now() });
+    setSection("segments");
+    window.scrollTo({ top: 0 });
+  };
 
   if (!tax) {
     return (
@@ -267,12 +287,14 @@ export default function TargetingPanel({
             )}
           >
             {t.label}
-            <span className="font-normal text-muted">{t.sub}</span>
+            <span className="hidden font-normal text-muted sm:inline">{t.sub}</span>
           </button>
         ))}
       </div>
-      {section === "market" && <MarketEditor c={c} tax={tax} onSaved={() => reload()} />}
-      {section === "segments" && <SegmentsSection c={c} tax={tax} market={c.market} reload={reload} />}
+      {(section === "results" || section === "segments") && <SteerBox c={c} onApplied={reloadAll} />}
+      {section === "results" && <Results campaignId={c.id} campaigns={campaigns} version={version} focus={focus} onEditSegment={editFromBoard} onAddSegments={() => editFromBoard(c.id, "new")} onChanged={() => reload()} />}
+      {section === "market" && <MarketEditor c={c} tax={tax} onSaved={() => reloadAll()} />}
+      {section === "segments" && <SegmentsSection key={editSeg?.n || 0} c={c} tax={tax} market={c.market} reload={reloadAll} initialEditing={editSeg?.sid ?? null} />}
       {section === "never" && <NeverContact c={c} onCampaignSaved={onCampaign} />}
     </div>
   );

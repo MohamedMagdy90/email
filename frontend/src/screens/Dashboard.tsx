@@ -8,7 +8,7 @@ import { ago } from "../lib/v2/core";
 import type { Funnel } from "../lib/v2/campaigns";
 import { dashboardApi, type DashCampaign, type DashSegment, type Dashboard as Data, type Kpi, type KpiKey, type LoopStatus, type NeedsYou, type Range, type TrendDay } from "../lib/v2/dashboard";
 import { CampaignFilter, refreshCampaignList, setCampaignFilter, useCampaignFilter, useCampaignList } from "./shared/CampaignFilter";
-import { Empty, StatusChip, errMsg, goTab, openCampaign, openLeads, plural } from "./campaigns/parts";
+import { Empty, StatusChip, errMsg, goTab, openCampaign, openLeads, openSegment, plural } from "./campaigns/parts";
 
 const RANGE_KEY = "dnaDashRange";
 const RANGES: Range[] = [7, 30, 90];
@@ -874,10 +874,7 @@ const LOOP_TONE: Record<LoopStatus, string> = {
 const LOOP_LABEL: Record<LoopStatus, string> = { scaling: "Scaling", working: "Working", testing: "Testing", paused: "Paused" };
 
 function SegmentsBoard({ rows, showCampaign }: { rows: DashSegment[]; showCampaign: boolean }) {
-  const open = (s: DashSegment) => {
-    setCampaignFilter(s.campaignId);
-    goTab("targeting");
-  };
+  const open = (s: DashSegment) => openSegment(s.campaignId, s.id);
   return (
     <>
       <Head title="Segments" aside={rows.length ? "most emailed first" : undefined}>

@@ -227,7 +227,7 @@ export default function CampaignView({ id, onBack, onResumeSetup }: { id: string
       {tab === "leads" && <LeadsTab c={c} version={version} group={group} setGroup={setGroup} onOpenLead={setLead} />}
       {tab === "sending" && <SendingToday campaignId={c.id} version={version} />}
       {tab === "sequence" && <SequenceEditor campaignId={c.id} onSaved={() => setVersion((v) => v + 1)} />}
-      {tab === "targeting" && <TargetingPanel c={c} reload={refresh} onCampaign={setC} initial={c.segmentList.length ? "segments" : "market"} />}
+      {tab === "targeting" && <TargetingPanel c={c} reload={refresh} onCampaign={setC} />}
       {tab === "offer" && <OfferTab c={c} onSaved={setC} />}
       {tab === "settings" && <SettingsTab c={c} onSaved={setC} onArchived={onBack} />}
       {tab === "activity" && <ActivityTab id={c.id} version={version} />}

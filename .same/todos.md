@@ -236,11 +236,38 @@ Prerequisite: Railway serving the current backend (`/api/open` still 200 on 2026
   - [x] db-test 58/58 (+10 engine-aware checks); all suites 404/404; both tsc; vite build; live HTTP smoke
   - [ ] NOT DONE: screenshots of the populated dashboard. Chromium + /tmp/shot are wiped by every
         container restart; a demo-seed script hung twice in the file tool. USER to eyeball it in the preview.
-  - [ ] Commit + push when the user asks (same exclusions as the engine commit)
+  - [x] PUSHED b1e8432 to main (fast-forward from a0a921e). Railway deployment 7470269415 success
+        2026-11-01T07:53:53Z (~32s). Staged tree built + booted in isolation first (/tmp/stage: both tsc,
+        vite build, 8 modules, dashboard 200 / 401). Production health 200 afterwards.
+  - [ ] USER: republish Netlify (`cd frontend && bun run build`, upload dist/) to get the Dashboard tab live
 - Env 2026-11-01: container restarted mid-session -> DB parked in `.same/corrupt-db-backup-24/`, .git
   re-cloned (MohamedMagdy90/email), deps reinstalled, ONE dev server (setsid nohup ... & disown).
 - [x] 9a backend: `segment_searches` log, learning loop + quota split, results API, duplicate, rules, steer by chat
-- [ ] 9b Targeting: Results section + segment detail (search log) + steer box; "All campaigns" board
+- [x] 9b Targeting: Results section + segment detail (search log) + steer box; "All campaigns" board (2026-11-01, NOT pushed)
+  - Env 2026-11-01 (2nd restore): DB -> `.same/corrupt-db-backup-25/`, .git re-cloned (b1e8432), deps x3, ONE dev server.
+  - [x] contract first: LoopStatus / SegmentRules / SegmentStats / ResultSegment / OfferCard / TargetingResults / SearchLogEntry /
+        SegmentDetail / SteerChange / SteerProposal / SteerApplied + 9 api calls + LOOP_LABEL / LOOP_TONE in `lib/v2/targeting.ts`
+  - [x] `targeting/Results.tsx` — loop strip, segments board FIRST (status filter chips, fit, found +today, in target, emailed, replies,
+        hot, daily share bar, searches left, per-row suggestion Apply / Dismiss, More: log / edit / status / copy), then offers
+        side by side (Edit in campaign / Learn again / Copy into another campaign). Phones: one card per segment (no table).
+  - [x] `targeting/LoopRules.tsx` — strip + rules dialog (suggest | auto, test-until, scale, pause, bounce, split must = 100)
+  - [x] `targeting/SegmentDrawer.tsx` — Overview (verdict, test progress, 6 numbers, definition) · Search log (totals, rejected by
+        rule, per-search examples on click, Arabic queries dir=auto) · Companies (-> LeadDrawer). Status / Copy / Edit.
+  - [x] `targeting/Steer.tsx` — examples per kind, propose -> tick -> apply -> re-check dry run -> "Re-check them"; disabled +
+        link to Agent when /status says no AI key
+  - [x] `targeting/useTaxonomy.ts` (moved out of TargetingPanel; re-exported, so Wizard's import still works)
+  - [x] TargetingPanel: Results · Market · Segments · Never contact (Results default once segments exist; CampaignView too),
+        steer box above Results + Segments, Edit on the board opens the builder (`SegmentsSection initialEditing`).
+        Targeting tab on the SHARED filter: All campaigns = board across campaigns + global never-contact.
+        `openSegment(cid, sid)` in parts.tsx; Dashboard segment rows use it (drawer opens on that segment).
+  - [x] FIX: shared CampaignFilter select text was clipped (py-0 lost to the field's py-2.5) -> `!py-0` (Dashboard/Leads/Targeting)
+  - [x] `.same-test/tg-results-test.ts` 48/48 (every contract field against the real routes; SEED_ONLY=1 seeds a demo DB);
+        db-test 58/58; both tsc; vite build; biome clean. Screens checked with headless Chromium (dark, light, 390 px, drawer,
+        search log, rules, steer) — 0 page errors, 0 px horizontal overflow on phones. Shots in `.same/shots-tmp/9b-*.png`.
+  - Chromium without root on this box (Ubuntu 24.04 ARM64): `bunx playwright@1.48.2 install chromium`, then
+    `apt-get -o Dir::State::Lists=/tmp/apt/lists -o Dir::Cache=/tmp/apt/cache -o Debug::NoLocking=1 update|download <t64 libs>`,
+    `dpkg-deb -x` into /tmp/libs, LD_LIBRARY_PATH=/tmp/libs/usr/lib/aarch64-linux-gnu. Wiped by every restart.
+  - [ ] push to main + republish Netlify (frontend only; the 9a backend is already live in b1e8432)
 - [ ] Shell: 8 tabs (Dashboard first), Leads badge, shared campaign filter; all tests, both tsc, vite build, version
 - [ ] Phase 6 Leads — cross-campaign People / Companies / Pipeline, filters + facets, saved views, bulk,
       CSV import (5k cap) / export, stage override -> Instantly interest, richer lead panel

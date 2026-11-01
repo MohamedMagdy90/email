@@ -500,8 +500,8 @@ export function SegmentTile({
 
 /* ------------------------------- section ------------------------------- */
 
-export function SegmentsSection({ c, tax, market, reload }: { c: CampaignDetail; tax: Taxonomy; market: TargetMarket; reload: () => Promise<void> }) {
-  const [editing, setEditing] = useState<string | "new" | null>(null);
+export function SegmentsSection({ c, tax, market, reload, initialEditing = null }: { c: CampaignDetail; tax: Taxonomy; market: TargetMarket; reload: () => Promise<void>; initialEditing?: string | "new" | null }) {
+  const [editing, setEditing] = useState<string | "new" | null>(initialEditing);
   const [busy, setBusy] = useState(false);
   const [paste, setPaste] = useState(false);
   const segs = c.segmentList;
