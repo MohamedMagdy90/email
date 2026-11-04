@@ -2,7 +2,7 @@
 // company research; if none fit, Gemini search may name one (we never fetch
 // linkedin.com ourselves). The address comes from findEmail() (published first,
 // then name patterns). Role addresses only when the sending policy allows them.
-import { llm } from "../llm";
+import { llm, LlmUnavailable } from "../llm";
 import { findEmail, splitName } from "../verify";
 import { isRole } from "../../crawler/validate";
 import type { ResearchJson, Row } from "./types";
@@ -72,21 +72,33 @@ export interface ContactResult {
   email?: string;
   emailSource?: "published" | "pattern" | "role";
   emailStatus?: string;
+  /** Gemini refused to search: the caller stops person searches for this pass (the AI stays on). */
+  searchFailed?: boolean;
 }
 
-/** AI errors from the search step propagate (the pass stops AI work). */
-export async function findContact(
-  company: Row,
-  research: ResearchJson,
-  titles: string[],
-  opts: { canSearch: boolean; aiOk: boolean; allowRole: boolean; allowPerson?: PersonFilter }
-): Promise<ContactResult> {
+type ContactOpts = { canSearch: boolean; aiOk: boolean; allowRole: boolean; allowPerson?: PersonFilter };
+
+/** Only the daily-budget error propagates; a refused search is reported as `searchFailed`. */
+export async function findContact(company: Row, research: ResearchJson, titles: string[], opts: ContactOpts): Promise<ContactResult> {
+  const state = { searchFailed: false };
+  const r = await findContactInner(company, research, titles, opts, state);
+  return state.searchFailed ? { ...r, searchFailed: true } : r;
+}
+
+async function findContactInner(company: Row, research: ResearchJson, titles: string[], opts: ContactOpts, state: { searchFailed: boolean }): Promise<ContactResult> {
   const domain = String(company.domain);
   let person = pickPerson(research.people, titles, opts.allowPerson);
   let linkedin: string | null = person?.linkedin || null;
   let viaSearch = false;
   if (!person && opts.canSearch && opts.aiOk) {
-    const found = await personFromSearch(company, titles);
+    let found: Awaited<ReturnType<typeof personFromSearch>> = null;
+    try {
+      found = await personFromSearch(company, titles);
+    } catch (e) {
+      // Gemini refused to search: carry on without it (the AI stays on for the rest).
+      if (!(e instanceof LlmUnavailable)) throw e;
+      state.searchFailed = true;
+    }
     if (found && opts.allowPerson && !opts.allowPerson(found.title).ok) {
       // Search named someone the targeting rules out (e.g. HR, or below manager level).
     } else if (found) {
@@ -123,8 +135,9 @@ export async function findContact(
     const role = domainEmails.find((e) => isRole(e));
     if (role) return { ok: true, reason: `No named decision maker, using ${role} (role addresses are allowed)`, email: role, emailSource: "role", emailStatus: "unknown" };
   }
-  if (!opts.canSearch || !opts.aiOk) {
-    return { ok: false, hold: true, reason: research.people.length ? "None of the people on the site has a decision-maker title. A Gemini key would let the agent look them up." : "No people named on the site. A Gemini key would let the agent look up the decision maker." };
+  if (!opts.canSearch || !opts.aiOk || state.searchFailed) {
+    const lookUp = "Web search (a Gemini key with billing on) would let the agent look";
+    return { ok: false, hold: true, reason: research.people.length ? `None of the people on the site has a decision-maker title. ${lookUp} them up.` : `No people named on the site. ${lookUp} up the decision maker.` };
   }
   return { ok: false, reason: "No decision maker found on the site or in search results" };
 }

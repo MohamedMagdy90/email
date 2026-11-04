@@ -147,17 +147,21 @@ export async function discoverForSegment(
   seg: Row,
   settings: CampaignSettings,
   opts: { max: number; maxSearches: number; canSearch: boolean; aiOk: boolean; eff?: EffectiveTargeting | null }
-): Promise<{ added: number; searches: number; notes: string[]; aiStopped: boolean }> {
+): Promise<{ added: number; searches: number; notes: string[]; aiStopped: boolean; searchUnavailable: boolean }> {
   const plan = segmentPlan(seg, opts.eff);
   const notes: string[] = [];
   const searched = parseJson<string[]>(seg.searched_json, []);
   const done = new Set(searched);
   let added = 0;
   let searches = 0;
+  /** Today's AI budget is spent: the caller stops every AI step. */
   let aiStopped = false;
+  /** Gemini refused to search (free tier, rate limit): only searching falls back, the AI stays on. */
+  let searchUnavailable = false;
+  let canSearch = opts.canSearch && opts.aiOk;
   if (!plan.length) {
     await q(`UPDATE segments SET exhausted = 1, updated_at = ? WHERE id = ?`, [nowIso(), seg.id]);
-    return { added, searches, notes: [`"${seg.name}" has no searches. Pick an industry in Targeting, or add searches by hand.`], aiStopped };
+    return { added, searches, notes: [`"${seg.name}" has no searches. Pick an industry in Targeting, or add searches by hand.`], aiStopped, searchUnavailable };
   }
   for (const step of plan) {
     if (added >= opts.max || searches >= opts.maxSearches) break;
@@ -166,19 +170,29 @@ export async function discoverForSegment(
     let found: CandidateCompany[] = [];
     let via: "gemini" | "search" = "search";
     try {
-      if (opts.canSearch && opts.aiOk) {
+      if (canSearch) {
         via = "gemini";
-        found = await searchWithGemini(step.query, step.country);
+        try {
+          found = await searchWithGemini(step.query, step.country);
+        } catch (e: any) {
+          if (!(e instanceof LlmBudgetExceeded || e instanceof LlmUnavailable)) throw e;
+          // Same step, free web search. A refused search must not cost the research its AI.
+          canSearch = false;
+          if (e instanceof LlmBudgetExceeded) aiStopped = true;
+          else searchUnavailable = true;
+          notes.push(
+            e instanceof LlmBudgetExceeded
+              ? "Today's AI budget is used up, so the free web search was used."
+              : `Gemini couldn't search the web (${String(e.message).replace(/^Gemini couldn't search the web: /, "").slice(0, 160)}), so the free web search was used. Research and writing still use the AI.`
+          );
+          via = "search";
+          found = await searchFree(step.query, step.country);
+        }
       } else {
         found = await searchFree(step.query, step.country);
       }
     } catch (e: any) {
-      if (e instanceof LlmBudgetExceeded || e instanceof LlmUnavailable) {
-        aiStopped = true;
-        notes.push(`Search with Gemini stopped: ${e instanceof LlmBudgetExceeded ? "today's AI budget is used up" : "no AI provider answered"}.`);
-      } else {
-        notes.push(`Search for "${step.query}" didn't run: ${String(e?.message || e).slice(0, 160)}`);
-      }
+      notes.push(`Search for "${step.query}" didn't run: ${String(e?.message || e).slice(0, 160)}`);
       break; // not marked as searched, retried next pass
     }
     searches++;
@@ -228,5 +242,5 @@ export async function discoverForSegment(
     seg.id,
   ]);
   if (exhausted) notes.push(`"${seg.name}" has run all of its searches. Add cities or industries in Targeting, or suggest more segments, to keep finding companies.`);
-  return { added, searches, notes, aiStopped };
+  return { added, searches, notes, aiStopped, searchUnavailable };
 }

@@ -13,10 +13,19 @@ export interface V2Status {
   no2bounce: { configured: boolean };
 }
 
+export interface SearchBlocked {
+  /** "key" = Google refused search on this key (free tier); "busy" = rate limit / outage. */
+  kind: "key" | "busy";
+  reason: string;
+  error: string;
+  until: string;
+  at: string;
+}
 export interface Integrations {
   ai: {
     configured: boolean;
     canSearch: boolean;
+    search?: { blocked: SearchBlocked | null };
     providers: {
       gemini: { configured: boolean; model: string; fastModel: string };
       groq: { configured: boolean; model: string };

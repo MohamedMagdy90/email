@@ -8,7 +8,7 @@
 // Every call is paced per model (free tiers are RPM-limited), counted in
 // llm_usage, and capped by a daily call budget. Failing providers fall through
 // to the next one. Callers never see provider details unless they want to.
-import { q, getSetting } from "../db";
+import { q, getSetting, setSetting } from "../db";
 import { sleep, todayUtc } from "./events";
 
 export type LlmProvider = "gemini" | "groq" | "openrouter";
@@ -42,9 +42,12 @@ export interface LlmResult<T = any> {
 }
 
 export class LlmUnavailable extends Error {
-  constructor(msg: string) {
+  /** HTTP statuses the providers answered with (0 = network error). */
+  statuses: number[];
+  constructor(msg: string, statuses: number[] = []) {
     super(msg);
     this.name = "LlmUnavailable";
+    this.statuses = statuses;
   }
 }
 export class LlmBudgetExceeded extends Error {
@@ -174,6 +177,76 @@ export async function budgetRemaining(): Promise<number> {
   const cfg = await getLlmConfig();
   const u = await usageToday();
   return Math.max(0, cfg.dailyBudget - u.calls);
+}
+
+/* --------------------------- web search state --------------------------- */
+// Grounding with Google Search is paid-tier only on Gemini 3 and newer (the
+// pricing page lists it as "Not available" on the free tier). A free key still
+// answers normal prompts, so the key test passes, but EVERY search is refused.
+// Remember the refusal per key and stop asking for a while: discovery uses the
+// free web search instead, and research, scoring and writing keep the AI.
+
+const SEARCH_BLOCK = "ai_search_block";
+const SEARCH_BLOCK_KEY_MS = 12 * 3600_000; // the key can't search (free tier, no access, bad model)
+const SEARCH_BLOCK_BUSY_MS = 15 * 60_000; // rate limit, overload, network
+
+export interface SearchBlock {
+  /** "key" = this key can't search; "busy" = a passing rate limit or outage. */
+  kind: "key" | "busy";
+  /** Plain-English reason for the UI and the activity log. */
+  reason: string;
+  /** What Google answered, shortened. */
+  error: string;
+  until: string;
+  at: string;
+  /** Last characters of the key it applies to (a new key starts unblocked). */
+  key: string;
+}
+
+const keyTag = (key: string) => key.trim().slice(-6);
+
+async function readSearchBlock(geminiKey: string): Promise<SearchBlock | null> {
+  if (!geminiKey) return null;
+  const raw = await getSetting(SEARCH_BLOCK);
+  if (!raw) return null;
+  try {
+    const b = JSON.parse(raw) as SearchBlock;
+    if (!b || b.key !== keyTag(geminiKey) || !(Date.parse(b.until) > Date.now())) return null;
+    return b;
+  } catch {
+    return null;
+  }
+}
+
+/** Was this a "the key can't search" answer, or a passing problem? */
+function searchFailureKind(errors: string[], statuses: number[]): "key" | "busy" {
+  const text = errors.join(" | ");
+  if (statuses.some((s) => s === 400 || s === 401 || s === 403 || s === 404)) return "key";
+  if (/limit:\s*0\b|free[ _-]?tier|not available|not supported|billing|permission|paid tier/i.test(text)) return "key";
+  return "busy";
+}
+
+async function blockSearch(geminiKey: string, errors: string[], statuses: number[]): Promise<SearchBlock> {
+  const kind = searchFailureKind(errors, statuses);
+  const error = (errors[errors.length - 1] || "no answer").slice(0, 240);
+  const now = Date.now();
+  const b: SearchBlock = {
+    kind,
+    reason:
+      kind === "key"
+        ? "Google refused web search on this Gemini key. On Gemini 3 models, Google Search only works once billing is on for the key's Google Cloud project (5,000 searches a month are free). Until then new companies come from the free web search; research, scoring and writing still use Gemini."
+        : "Gemini search is rate-limited or busy right now. New companies come from the free web search for the next 15 minutes; research, scoring and writing still use the AI.",
+    error,
+    until: new Date(now + (kind === "key" ? SEARCH_BLOCK_KEY_MS : SEARCH_BLOCK_BUSY_MS)).toISOString(),
+    at: new Date(now).toISOString(),
+    key: keyTag(geminiKey),
+  };
+  await setSetting(SEARCH_BLOCK, JSON.stringify(b)).catch(() => {});
+  return b;
+}
+
+async function clearSearchBlock(): Promise<void> {
+  if (await getSetting(SEARCH_BLOCK)) await setSetting(SEARCH_BLOCK, "").catch(() => {});
 }
 
 /* ------------------------------ JSON parse ----------------------------- */
@@ -376,8 +449,14 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
   if (used.calls >= cfg.dailyBudget) {
     throw new LlmBudgetExceeded(`Daily AI budget reached (${used.calls}/${cfg.dailyBudget} calls). Work resumes tomorrow (UTC).`);
   }
+  // A key Google refused search on: don't ask again until the block runs out.
+  if (req.search) {
+    const block = await readSearchBlock(cfg.keys.gemini);
+    if (block) throw new LlmUnavailable(`Web search is off for now: ${block.error}`);
+  }
 
   const errors: string[] = [];
+  const statuses: number[] = [];
   for (const route of routes) {
     for (let attempt = 0; attempt < 2; attempt++) {
       await pace(route.slot);
@@ -405,12 +484,15 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
             break;
           }
         }
+        if (req.search) await clearSearchBlock();
         return { text: r.text, data, provider: route.provider, model: route.model, sources: r.sources };
       } catch (e: any) {
         await recordUsage(route.provider, route.model, 0, 0, true);
         const msg = String(e?.message || e);
         errors.push(msg);
-        if (e instanceof ProviderError && e.status === 429 && attempt === 0) {
+        if (e instanceof ProviderError) statuses.push(e.status);
+        // "limit: 0" = not on this plan at all; waiting won't help.
+        if (e instanceof ProviderError && e.status === 429 && attempt === 0 && !/limit:\s*0\b/.test(msg)) {
           await sleep(8000);
           continue;
         }
@@ -419,16 +501,26 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
       }
     }
   }
-  throw new LlmUnavailable(`All AI providers failed${req.task ? ` (${req.task})` : ""}: ${errors.slice(-3).join(" | ")}`);
+  // Only a provider error blocks search (an unparseable answer is not a refusal).
+  if (req.search && cfg.keys.gemini && statuses.length) {
+    const b = await blockSearch(cfg.keys.gemini, errors, statuses);
+    throw new LlmUnavailable(`Gemini couldn't search the web: ${b.error}`, statuses);
+  }
+  throw new LlmUnavailable(`All AI providers failed${req.task ? ` (${req.task})` : ""}: ${errors.slice(-3).join(" | ")}`, statuses);
 }
 
 /** Is any provider configured? (`search` = can we ground in Google Search) */
 export async function aiStatus() {
   const cfg = await getLlmConfig();
   const usage = await usageToday();
+  const blocked = await readSearchBlock(cfg.keys.gemini);
   return {
     configured: !!(cfg.keys.gemini || cfg.keys.groq || cfg.keys.openrouter),
-    canSearch: !!cfg.keys.gemini,
+    /** A Gemini key exists and Google hasn't refused search on it lately. */
+    canSearch: !!cfg.keys.gemini && !blocked,
+    search: {
+      blocked: blocked ? { kind: blocked.kind, reason: blocked.reason, error: blocked.error, until: blocked.until, at: blocked.at } : null,
+    },
     providers: {
       gemini: { configured: !!cfg.keys.gemini, model: cfg.models.gemini, fastModel: cfg.models.geminiFast },
       groq: { configured: !!cfg.keys.groq, model: cfg.models.groq },
@@ -444,7 +536,7 @@ export async function testProvider(
   provider: LlmProvider,
   /** Test this key instead of the saved one (checked before saving). */
   keyOverride?: string
-): Promise<{ ok: boolean; model?: string; error?: string; ms?: number }> {
+): Promise<{ ok: boolean; model?: string; error?: string; ms?: number; search?: { ok: boolean; model: string; error?: string } }> {
   const cfg = await getLlmConfig();
   const key = (keyOverride || "").trim() || cfg.keys[provider];
   if (!key) return { ok: false, error: "No key saved" };
@@ -452,8 +544,9 @@ export async function testProvider(
   // Room for a reasoning model's short think + the answer; 50 tokens was not
   // enough for gpt-oss and failed a perfectly good Groq key.
   const req: LlmRequest = { prompt: 'Reply with the JSON {"ok":true}', json: true, tier: "fast", maxTokens: 512 };
+  let model = "";
   try {
-    const model = provider === "gemini" ? cfg.models.geminiFast : cfg.models[provider];
+    model = provider === "gemini" ? cfg.models.geminiFast : cfg.models[provider];
     const r =
       provider === "gemini"
         ? await callGemini(key, model, req)
@@ -461,8 +554,33 @@ export async function testProvider(
           ? await callOpenAICompat("https://api.groq.com/openai/v1", key, model, req)
           : await callOpenAICompat("https://openrouter.ai/api/v1", key, model, req);
     await recordUsage(provider, model, r.inTok, r.outTok);
-    return { ok: true, model, ms: Date.now() - t0 };
   } catch (e: any) {
     return { ok: false, error: String(e?.message || e) };
+  }
+  const ms = Date.now() - t0;
+  if (provider !== "gemini") return { ok: true, model, ms };
+  // A key can pass the plain prompt and still be refused web search (free
+  // tier), so check search on its own. Uses one search request.
+  return { ok: true, model, ms, search: await testGeminiSearch(key, cfg.models.gemini) };
+}
+
+async function testGeminiSearch(key: string, model: string): Promise<{ ok: boolean; model: string; error?: string }> {
+  const req: LlmRequest = {
+    prompt: 'Use Google Search: what is the official website of Saudi Aramco? Reply with the JSON {"website": string}',
+    search: true,
+    json: true,
+    tier: "fast",
+    maxTokens: 1024,
+  };
+  try {
+    const r = await callGemini(key, model, req);
+    await recordUsage("gemini", model, r.inTok, r.outTok);
+    await clearSearchBlock();
+    return { ok: true, model };
+  } catch (e: any) {
+    await recordUsage("gemini", model, 0, 0, true);
+    const status = e instanceof ProviderError ? e.status : 0;
+    const b = await blockSearch(key, [String(e?.message || e)], [status]);
+    return { ok: false, model, error: b.kind === "key" ? `Web search refused: ${b.error}` : `Web search didn't answer just now: ${b.error}` };
   }
 }

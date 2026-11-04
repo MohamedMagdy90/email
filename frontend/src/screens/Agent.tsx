@@ -366,7 +366,9 @@ function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: 
 function describeOk(target: IntegrationTarget, t: TestResult): string {
   if (target === "instantly") return `Instantly answered · ${t.accounts ?? 0} mailbox${t.accounts === 1 ? "" : "es"} on the account`;
   if (target === "no2bounce") return "No2Bounce accepted the token · no credit was used for this test";
-  return `Answered in ${t.ms != null ? `${(t.ms / 1000).toFixed(1)} s` : "—"}${t.model ? ` · ${t.model}` : ""}`;
+  const base = `Answered in ${t.ms != null ? `${(t.ms / 1000).toFixed(1)} s` : "—"}${t.model ? ` · ${t.model}` : ""}`;
+  if (target !== "gemini" || !t.search) return base;
+  return t.search.ok ? `${base} · web search works (${t.search.model})` : `${base} · the key works, but web search is off: ${t.search.error || "refused"}`;
 }
 
 function InstantlyCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
@@ -450,9 +452,25 @@ function AiCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrat
           No AI key yet, so nothing can be written, researched or answered. Gemini is the one to add first.
         </div>
       )}
-      {ai.configured && !ai.canSearch && (
+      {ai.configured && !ai.canSearch && !ai.search?.blocked && (
         <div className="mt-3 rounded-lg border border-wnl bg-wnb px-3 py-2 text-[12.5px] leading-relaxed text-warn">
           Writing and replies work. Finding new companies needs web search, and only Gemini can do that.
+        </div>
+      )}
+      {ai.search?.blocked && (
+        <div className="mt-3 rounded-lg border border-wnl bg-wnb px-3 py-2 text-[12.5px] leading-relaxed text-warn">
+          <div className="font-semibold">Web search is off · research and writing still use Gemini</div>
+          <p className="mt-0.5">{ai.search.blocked.reason}</p>
+          <p className="mt-1 break-words font-mono text-[11px] opacity-80">Google said: {ai.search.blocked.error}</p>
+          {ai.search.blocked.kind === "key" && (
+            <p className="mt-1">
+              Turn billing on in{" "}
+              <a href="https://aistudio.google.com/api-keys" target="_blank" rel="noreferrer" className="font-semibold underline">
+                Google AI Studio
+              </a>
+              , then press Test on the Gemini key below. Search comes back on as soon as the test passes.
+            </p>
+          )}
         </div>
       )}
       <div className="mt-4 border-t border-line-soft">
@@ -636,6 +654,8 @@ function KeyRow({
     try {
       const t = await agentApi.test(target);
       setResult(t.ok ? { ok: true, text: describeOk(target, t) } : { ok: false, text: t.error || "The test failed." });
+      // The Gemini test also re-checks web search: refresh the card's search notice.
+      if (target === "gemini") onChange(await v2.integrations());
     } catch (e: any) {
       setResult({ ok: false, text: e.message });
     } finally {

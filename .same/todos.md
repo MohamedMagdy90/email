@@ -14,6 +14,26 @@ live `assets/index-*.js` for a new string. Netlify is NOT part of the live setup
 every older "USER: republish Netlify" item below was wrong and is void. Keep leaving the 4 Same-preview frontend
 files out of commits: the frontend service builds from the repo.
 
+# Research ran "without AI" with a Gemini key saved (2026-11-04)
+ROOT CAUSE: discovery runs first and asks Gemini to search (Google Search grounding). Grounding is "Not available" on
+the FREE tier for every Gemini 3+ model (pricing page; paid = 5,000 searches/mo free then $14/1k). The refused search
+threw LlmUnavailable -> discover set `aiStopped` -> runPass set aiOk=false for the WHOLE pass -> research fell back to
+"Read N page(s) of X without AI", no scoring/writing; discovery also `break`-ed without trying the free search.
+The key test only sends a plain prompt to Flash-Lite, so it passed.
+- [x] llm.ts: per-key `ai_search_block` setting (kind key=12h / busy=15m, Google's error, reason); a blocked search
+      throws at once (no network); success / passing key test clears it; aiStatus().canSearch false while blocked +
+      `search.blocked`; testProvider("gemini") checks search separately (`search: {ok, model, error}`, 1 search request);
+      no 8 s retry on 429 "limit: 0".
+- [x] discover.ts: refused search -> same step via the free web search, `searchUnavailable` (AI stays on); only the
+      daily budget sets `aiStopped`. contact.ts: refused person search -> `searchFailed`, hold (not skip).
+- [x] service.ts: pass-local `canSearch`; stopAi note + research event say WHY AI was skipped.
+- [x] Agent tab: "Web search is off · research and writing still use Gemini" notice with Google's answer + billing hint;
+      Test result shows "web search works" / "the key works, but web search is off".
+- [x] `.same-test/ai-search-test.ts` 21/21 (fake Gemini refusing grounding like a free key; failed 12 checks before
+      the fix); cp 47 · sq 39 · db 58 · ld 45 · tg 72 · tg-results 48 · n2b 34 · engine 121; both tsc; vite build.
+- [ ] USER: to let Gemini find companies + decision makers, turn billing on for the key's AI Studio project, then
+      press Test on the Gemini key (clears the block). Without billing: free web search + AI research/writing.
+
 # Own sending engine (STARTED 2026-10-24) — plan in `.same/own-engine-plan.md`
 Decisions: all accepted — both Google + Microsoft, warmup test with Instantly, ramp 5 -> +2 -> 30.
 Env 2026-10-24: snapshot restore again -> DB parked in `.same/corrupt-db-backup-20/`, .git re-cloned, deps reinstalled.
@@ -57,6 +77,8 @@ behaviour and fake servers; the Phase 0 items below need REAL accounts to confir
 - [x] Two-host sign-in + unsubscribe base fix (2026-11-01): engine-test 121/121 (+12: two hosts, unsubscribe base);
       real browser on the live layout (app :4173 built with VITE_API_URL, API :3997, Google consent faked): shows the
       backend redirect URI, returns to the app, toast "…is connected.", mailbox saved, no page errors.
+      PUSHED d75f7ba (fast-forward from 79e2479, 4 files). Both Railway services success ~30s after the push
+      (email 11:56:55Z, easygoing-kindness 11:56:59Z); live bundle index-DAxiJ1NV.js has dnaOauth + returnTo.
 - [ ] USER: in the Google / Microsoft sign-in apps register https://email-production-3c14.up.railway.app/api/v2/oauth/callback
 - [ ] USER: set APP_SECRET on Railway BEFORE connecting real mailboxes (else tokens are encrypted
       with a key kept in the same database).

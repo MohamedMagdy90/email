@@ -80,6 +80,8 @@ export interface TestResult {
   ms?: number;
   accounts?: number;
   sample?: string;
+  /** Gemini only: web search (Google Search grounding) checked on its own. */
+  search?: { ok: boolean; model: string; error?: string };
 }
 
 export const agentApi = {

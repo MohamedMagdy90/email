@@ -970,12 +970,17 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     const agent = await getAgentSettings();
     const ai = await aiStatus();
     let aiOk = ai.configured && (await budgetRemaining()) > 0;
+    // Web search (Gemini grounding) is separate from the AI: a key can write but be refused search.
+    let canSearch = ai.canSearch;
+    let aiDownReason = "";
     const stopAi = (e: unknown) => {
       if (!aiOk) return;
       aiOk = false;
-      res.notes.push(e instanceof LlmBudgetExceeded ? "Today's AI budget is used up; AI steps continue tomorrow." : "No AI provider answered; AI steps were skipped this time.");
+      aiDownReason = e instanceof LlmBudgetExceeded ? "today's AI budget is used up" : String((e as any)?.message || e).slice(0, 220);
+      res.notes.push(e instanceof LlmBudgetExceeded ? "Today's AI budget is used up; AI steps continue tomorrow." : `No AI provider answered (${aiDownReason}); AI steps were skipped this time.`);
     };
     if (!ai.configured) res.notes.push("No AI key: research is basic and nothing is scored or written yet.");
+    else if (ai.search.blocked) res.notes.push(`Web search is off for now (${ai.search.blocked.error.slice(0, 160)}), so new companies come from the free web search. Research and writing still use the AI.`);
     const segRows = await q(`SELECT * FROM segments WHERE campaign_id = ? AND enabled = 1 ORDER BY updated_at`, [id]);
     const segById = new Map(segRows.map((s) => [String(s.id), s]));
     const allSegs = await q(`SELECT * FROM segments WHERE campaign_id = ?`, [id]);
@@ -1007,11 +1012,16 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
       const ordered = discoveryOrder(segRows.filter((s) => Number(s.exhausted) !== 1), foundToday, await getRules());
       for (const seg of ordered) {
         if (res.discovered >= 10 || searches >= 2 || !timeLeft()) break;
-        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch: ai.canSearch, aiOk, eff: effFor(seg.id) });
+        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch, aiOk, eff: effFor(seg.id) });
         res.discovered += r.added;
         searches += r.searches;
         res.notes.push(...r.notes);
-        if (r.aiStopped) aiOk = false;
+        if (r.searchUnavailable) canSearch = false;
+        if (r.aiStopped) {
+          // Only the daily budget stops the AI here (discovery already said so in its notes).
+          aiOk = false;
+          aiDownReason = "today's AI budget is used up";
+        }
       }
       if (!segRows.length) res.notes.push("No enabled segment, so no new companies are searched.");
     }
@@ -1041,8 +1051,9 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
             stopAi(e);
             out = await researchCompany(co, { ai: false });
           }
-          note = out.note;
-          await logEvent("research", out.note, { campaignId: id, refType: "prospect", refId: p.id });
+          // Say WHY a pass with an AI key researched without it.
+          note = out.status === "partial" && ai.configured && aiDownReason ? `${out.note} AI was skipped: ${aiDownReason}.` : out.note;
+          await logEvent("research", note, { campaignId: id, refType: "prospect", refId: p.id });
         }
         res.researched++;
         // Target check on the facts, before any person search, score or email.
@@ -1085,11 +1096,15 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
         const allowPerson = (title: string) => personAllowed(title, eff);
         let r;
         try {
-          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: ai.canSearch, aiOk, allowRole: roleOk(eff), allowPerson });
+          r = await findContact(co, researchJson(co.research_json), titles, { canSearch, aiOk, allowRole: roleOk(eff), allowPerson });
         } catch (e) {
           if (!isAiStop(e)) throw e;
           stopAi(e);
           r = await findContact(co, researchJson(co.research_json), titles, { canSearch: false, aiOk: false, allowRole: roleOk(eff), allowPerson });
+        }
+        if (r.searchFailed && canSearch) {
+          canSearch = false;
+          res.notes.push("Gemini couldn't search the web, so decision makers are taken from the company sites only this pass.");
         }
         if (r.ok && r.email) {
           await setStage(p, "contact_found", r.reason, {
