@@ -329,7 +329,7 @@ export const PROSPECT_SELECT = `
     LEFT JOIN campaigns cp ON cp.id = p.campaign_id
     LEFT JOIN companies co ON co.id = p.company_id`;
 
-const EMAIL_SOURCES = ["published", "pattern", "role", "manual", "import"];
+const EMAIL_SOURCES = ["published", "pattern", "role", "manual", "import", "finder"];
 const LEAD_SOURCES = ["gemini", "search", "manual", "import"];
 const VERIFY_STATUSES = ["valid", "invalid", "risky", "catch_all", "unknown"];
 

@@ -6,6 +6,7 @@ import { logEvent, parseJson, todayUtc, uid, type AgentEvent } from "../events";
 import { aiStatus, budgetRemaining, LlmBudgetExceeded, LlmUnavailable } from "../llm";
 import { getAgentSettings } from "../agent-settings";
 import { verifierConfigured, splitName } from "../verify";
+import { finderConfigured } from "../finder";
 import { instantlyConfigured, patchCampaign } from "../instantly";
 import { cleanEmail, isValidEmail } from "../../crawler/validate";
 import { learnOffer } from "./offer";
@@ -1076,7 +1077,9 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     }
     if (offTarget) res.notes.push(`${offTarget} researched compan${offTarget === 1 ? "y was" : "ies were"} outside the target and skipped (see Leads, Skipped).`);
 
-    // 3. Decision maker + candidate address.
+    // 3. Decision maker + candidate address (Anymail Finder as the paid last resort).
+    let finderOn = await finderConfigured();
+    let finderCredits = 0;
     for (const p of await due(id, "researched", 4)) {
       if (!timeLeft()) break;
       try {
@@ -1096,15 +1099,21 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
         const allowPerson = (title: string) => personAllowed(title, eff);
         let r;
         try {
-          r = await findContact(co, researchJson(co.research_json), titles, { canSearch, aiOk, allowRole: roleOk(eff), allowPerson });
+          r = await findContact(co, researchJson(co.research_json), titles, { canSearch, aiOk, allowRole: roleOk(eff), allowPerson, finder: finderOn });
         } catch (e) {
           if (!isAiStop(e)) throw e;
           stopAi(e);
-          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: false, aiOk: false, allowRole: roleOk(eff), allowPerson });
+          r = await findContact(co, researchJson(co.research_json), titles, { canSearch: false, aiOk: false, allowRole: roleOk(eff), allowPerson, finder: finderOn });
         }
         if (r.searchFailed && canSearch) {
           canSearch = false;
           res.notes.push("Gemini couldn't search the web, so decision makers are taken from the company sites only this pass.");
+        }
+        if (r.finderCredits) finderCredits += r.finderCredits;
+        if (r.finderUnavailable && finderOn) {
+          // Cap reached, out of credits, key rejected …: don't ask again this pass; the leads wait.
+          finderOn = false;
+          res.notes.push(`Anymail Finder wasn't asked: ${r.finderUnavailable}. Leads that need it wait and are tried again later.`);
         }
         if (r.ok && r.email) {
           await setStage(p, "contact_found", r.reason, {
@@ -1131,6 +1140,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
         await failStep(p, e);
       }
     }
+    if (finderCredits) res.notes.push(`Anymail Finder used ${finderCredits} credit${finderCredits === 1 ? "" : "s"} this pass.`);
 
     // 4. Verify + suppression.
     for (const p of await due(id, "contact_found", 8)) {

@@ -34,12 +34,24 @@ export interface Integrations {
     budget: number;
     usage: { calls: number; errors: number; byProvider: Record<string, number> };
   };
-  keys: { gemini: string; groq: string; openrouter: string; instantly: string; no2bounce: string };
+  keys: { gemini: string; groq: string; openrouter: string; instantly: string; no2bounce: string; anymail?: string };
   instantly: { configured: boolean; mailboxes?: { total: number; sending: number } };
   no2bounce: { configured: boolean };
+  /** Anymail Finder: the paid last resort for finding an address. */
+  anymail?: { configured: boolean; usage: FinderUsage | null };
 }
 
-export type IntegrationTarget = "gemini" | "groq" | "openrouter" | "instantly" | "no2bounce";
+/** Anymail Finder credits this calendar month (UTC), against the cap set here. */
+export interface FinderUsage {
+  month: string;
+  credits: number;
+  lookups: number;
+  found: number;
+  cap: number;
+  left: number;
+}
+
+export type IntegrationTarget = "gemini" | "groq" | "openrouter" | "instantly" | "no2bounce" | "anymail";
 
 export interface IntegrationsPatch {
   geminiKey?: string;
@@ -47,6 +59,8 @@ export interface IntegrationsPatch {
   openrouterKey?: string;
   instantlyKey?: string;
   no2bounceKey?: string;
+  anymailKey?: string;
+  anymailMonthlyCap?: string;
   geminiModel?: string;
   geminiFastModel?: string;
   groqModel?: string;

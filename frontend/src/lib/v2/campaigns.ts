@@ -239,7 +239,7 @@ export interface ProspectRow {
   linkedinUrl: string | null;
   email: string | null;
   emailStatus: VerifyResult["status"] | null;
-  emailSource: "published" | "pattern" | "role" | "manual" | "import" | null;
+  emailSource: "published" | "pattern" | "role" | "manual" | "import" | "finder" | null;
   fitScore: number | null;
   fitReason: string | null;
   stage: ProspectStage;

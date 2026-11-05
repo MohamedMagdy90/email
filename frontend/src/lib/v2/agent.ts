@@ -82,6 +82,8 @@ export interface TestResult {
   sample?: string;
   /** Gemini only: web search (Google Search grounding) checked on its own. */
   search?: { ok: boolean; model: string; error?: string };
+  /** Anymail Finder: credits left on the account. */
+  credits?: number;
 }
 
 export const agentApi = {

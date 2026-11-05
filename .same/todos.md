@@ -14,6 +14,27 @@ live `assets/index-*.js` for a new string. Netlify is NOT part of the live setup
 every older "USER: republish Netlify" item below was wrong and is void. Keep leaving the 4 Same-preview frontend
 files out of commits: the frontend service builds from the repo.
 
+# Anymail Finder = paid last resort for addresses (2026-11-05)
+API v5.1 (docs read 2026-11-05): POST /find-email/person {domain, full_name, linkedin_url?} 1 credit only when VALID;
+POST /find-email/decision-maker {domain, decision_maker_category[]} 2 credits only when valid (ceo/finance/operations/it/
+buyer/logistics/sales/marketing/engineering/hr); GET /account free (credits_left). Header `Authorization: <key>`.
+Not found / blacklisted free; repeats within 30 days free; since 5 Oct 2026 risky -> not_found (only valid returned).
+- [x] `backend/src/v2/finder.ts`: key (setting anymail_api_key / env ANYMAIL_API_KEY), monthly credit cap
+      (anymail_monthly_cap, default 400 = $29 plan), tables finder_usage (month, kind) + finder_cache (found 90 d,
+      miss 30 d), 402 -> 1 h pause (cleared by a passing key test), 90 s timeout, categoriesForTitles (campaign order,
+      max 3, CEO always kept as fallback), testAnymail.
+- [x] contact.ts order: site people -> Gemini search -> Anymail decision maker (title filter applies) ; address:
+      published -> pattern (+No2Bounce) -> if not published/valid: Anymail person -> else keep our guess. Finder
+      unavailable (cap/credits/key) = HOLD, never skip. email_source "finder"; verify.ts rememberFinderVerified caches it
+      as valid (source anymail) so No2Bounce is never spent on it.
+- [x] service.ts: finderOn per pass, stops asking for the pass after "unavailable", notes credits used.
+- [x] Agent -> Connections "Email finder · Anymail Finder" card (key test-before-save, credits this month / cap meter,
+      cap field); LeadDrawer "found by Anymail Finder".
+- [x] `.same-test/finder-test.ts` 37/37 (fake API); all suites 522/522; both tsc; vite build.
+- [ ] USER: save the Anymail Finder API key in Agent -> Connections (Test & connect), set the monthly cap.
+- Stuck leads (held "no people named", or skipped "no working address") are retried automatically only for holds
+  (24 h). Skipped ones: Leads -> select -> "Research again" sends them back through the contact step.
+
 # Research ran "without AI" with a Gemini key saved (2026-11-04)
 ROOT CAUSE: discovery runs first and asks Gemini to search (Google Search grounding). Grounding is "Not available" on
 the FREE tier for every Gemini 3+ model (pricing page; paid = 5,000 searches/mo free then $14/1k). The refused search
@@ -31,6 +52,8 @@ The key test only sends a plain prompt to Flash-Lite, so it passed.
       Test result shows "web search works" / "the key works, but web search is off".
 - [x] `.same-test/ai-search-test.ts` 21/21 (fake Gemini refusing grounding like a free key; failed 12 checks before
       the fix); cp 47 · sq 39 · db 58 · ld 45 · tg 72 · tg-results 48 · n2b 34 · engine 121; both tsc; vite build.
+- [x] PUSHED 6571a99 (fast-forward from d75f7ba, 8 files; staged tree built + booted in /tmp/stage first). Railway:
+      easygoing-kindness success 14:02:12Z, email success 14:02:54Z; health 200; live bundle index-BjxcfQsn.js has the notice.
 - [ ] USER: to let Gemini find companies + decision makers, turn billing on for the key's AI Studio project, then
       press Test on the Gemini key (clears the block). Without billing: free web search + AI research/writing.
 

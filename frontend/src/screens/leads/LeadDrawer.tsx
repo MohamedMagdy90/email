@@ -362,7 +362,7 @@ function Overview({ p, busy, act }: { p: LeadDetail; busy: string | null; act: (
           <div className="flex flex-wrap items-center gap-2">
             <span>{p.email || "No address yet"}</span>
             <EmailStatusChip status={p.emailStatus} />
-            {p.emailSource && <span className="text-[12px] text-muted">{p.emailSource === "published" ? "published on the site" : p.emailSource === "pattern" ? "from the name pattern" : p.emailSource === "role" ? "role address" : p.emailSource === "import" ? "imported from a file" : "entered by hand"}</span>}
+            {p.emailSource && <span className="text-[12px] text-muted">{p.emailSource === "published" ? "published on the site" : p.emailSource === "pattern" ? "from the name pattern" : p.emailSource === "finder" ? "found by Anymail Finder" : p.emailSource === "role" ? "role address" : p.emailSource === "import" ? "imported from a file" : "entered by hand"}</span>}
           </div>
           {p.verify?.reasons?.length ? <div className="text-[12px] text-muted">{p.verify.reasons.join(" · ")}</div> : null}
           {p.verify && (

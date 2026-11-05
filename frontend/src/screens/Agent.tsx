@@ -358,6 +358,7 @@ function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: 
       <div className="space-y-4">
         <AiCard intg={intg} onChange={onChange} />
         <VerifierCard intg={intg} onChange={onChange} />
+        <FinderCard intg={intg} onChange={onChange} />
       </div>
     </div>
   );
@@ -366,6 +367,7 @@ function ConnectionsSection({ intg, onChange }: { intg: Integrations; onChange: 
 function describeOk(target: IntegrationTarget, t: TestResult): string {
   if (target === "instantly") return `Instantly answered · ${t.accounts ?? 0} mailbox${t.accounts === 1 ? "" : "es"} on the account`;
   if (target === "no2bounce") return "No2Bounce accepted the token · no credit was used for this test";
+  if (target === "anymail") return `Anymail Finder accepted the key · ${(t.credits ?? 0).toLocaleString()} credits left on the account · no credit was used`;
   const base = `Answered in ${t.ms != null ? `${(t.ms / 1000).toFixed(1)} s` : "—"}${t.model ? ` · ${t.model}` : ""}`;
   if (target !== "gemini" || !t.search) return base;
   return t.search.ok ? `${base} · web search works (${t.search.model})` : `${base} · the key works, but web search is off: ${t.search.error || "refused"}`;
@@ -831,6 +833,96 @@ function VerifierCard({ intg, onChange }: { intg: Integrations; onChange: (i: In
           onChange={onChange}
         />
       </div>
+    </Card>
+  );
+}
+
+function FinderCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
+  const on = !!intg.anymail?.configured;
+  const u = intg.anymail?.usage || null;
+  const [cap, setCap] = useState(String(u?.cap ?? 400));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setCap(String(u?.cap ?? 400)), [u?.cap]);
+  const pct = u ? Math.min(100, Math.round((u.credits / Math.max(1, u.cap)) * 100)) : 0;
+  const capChanged = !!u && cap !== String(u.cap);
+
+  async function saveCap() {
+    setBusy(true);
+    try {
+      onChange(await v2.saveIntegrations({ anymailMonthlyCap: cap }));
+      toast("Monthly cap saved.", "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="p-5 sm:p-6">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <Label>Email finder</Label>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <h2 className="text-[1.05rem] font-[650] tracking-[-0.01em]">Anymail Finder</h2>
+            <Badge className={on ? "bg-okb text-good" : "bg-ink/[0.06] text-muted"}>{on ? "Last resort on" : "Off"}</Badge>
+          </div>
+        </div>
+        {on && u && (
+          <div className="w-[150px] shrink-0 text-right">
+            <div className="text-[1.15rem] font-bold leading-none tabular-nums">
+              {u.credits.toLocaleString()}
+              <span className="text-[12px] font-semibold text-muted"> / {u.cap.toLocaleString()}</span>
+            </div>
+            <div className="mt-1 text-[11px] text-muted">
+              credits this month · {u.found} found
+            </div>
+            <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-ink/[0.08]">
+              <div className={cn("h-full rounded-full", pct >= 85 ? "bg-warn" : "bg-brand")} style={{ width: `${Math.max(pct, u.credits ? 2 : 0)}%` }} />
+            </div>
+          </div>
+        )}
+      </div>
+      <p className="mt-2 text-[13px] leading-relaxed text-muted">
+        Used only when the company website and the agent's own guess don't give a working address. It looks up the person by name and domain (1 credit), or
+        finds the decision maker when the site names nobody (2 credits). Credits are only charged when a verified address is found, so its results skip
+        No2Bounce.
+      </p>
+      <div className="mt-4 border-t border-line-soft pt-4">
+        <KeyRow
+          target="anymail"
+          field="anymailKey"
+          name="API key"
+          service="Anymail Finder"
+          role={on ? "Leads with no published or confirmed address are looked up here." : "Without it, leads with no published or confirmed address wait or are skipped."}
+          masked={intg.keys.anymail || ""}
+          configured={on}
+          placeholder="Paste the Anymail Finder API key"
+          getKey={
+            <>
+              In{" "}
+              <a href="https://app.anymailfinder.com/settings/api" target="_blank" rel="noreferrer" className="font-medium text-accent hover:underline">
+                app.anymailfinder.com/settings/api
+              </a>
+              : click "Enable API" if the key is hidden, then copy it.
+            </>
+          }
+          removeWarning="Without it, leads that need a paid lookup wait or are skipped."
+          onChange={onChange}
+        />
+      </div>
+      {on && (
+        <div className="mt-4 border-t border-line-soft pt-4">
+          <Field label="Monthly credit cap" hint="The most credits the agent may spend per calendar month (UTC). Leads that need a lookup wait when it is reached. 400 = the $29 plan.">
+            <div className="flex gap-2">
+              <Input inputMode="numeric" value={cap} onChange={(e) => setCap(e.target.value.replace(/[^\d]/g, ""))} className="max-w-[160px] tabular-nums" aria-label="Monthly credit cap" />
+              <Button size="sm" variant={capChanged ? "solid" : "outline"} onClick={saveCap} loading={busy} disabled={!capChanged || !cap}>
+                Save cap
+              </Button>
+            </div>
+          </Field>
+        </div>
+      )}
     </Card>
   );
 }

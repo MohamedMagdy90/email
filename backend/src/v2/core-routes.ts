@@ -6,6 +6,7 @@ import { getSetting, setSetting, q } from "../db";
 import { aiStatus, testProvider, llm, LlmBudgetExceeded, type LlmProvider } from "./llm";
 import { getInstantlyKey, testConnection } from "./instantly";
 import { getNo2BounceKey, testNo2Bounce, verifyEmail } from "./verify";
+import { getAnymailKey, testAnymail, usageThisMonth } from "./finder";
 import {
   getAgentSettings,
   saveAgentSettings,
@@ -27,6 +28,8 @@ async function integrationsView() {
   const ai = await aiStatus();
   const instantlyKey = await getInstantlyKey();
   const no2bounceKey = await getNo2BounceKey();
+  const anymailKey = await getAnymailKey();
+  const anymailUsage = await usageThisMonth().catch(() => null);
   let mailboxes = { total: 0, sending: 0 };
   try {
     const r = await q(
@@ -46,9 +49,11 @@ async function integrationsView() {
       openrouter: mask(((await getSetting("ai_openrouter_key")) || process.env.OPENROUTER_API_KEY || "").trim()),
       instantly: mask(instantlyKey),
       no2bounce: mask(no2bounceKey),
+      anymail: mask(anymailKey),
     },
     instantly: { configured: !!instantlyKey, mailboxes },
     no2bounce: { configured: !!no2bounceKey },
+    anymail: { configured: !!anymailKey, usage: anymailUsage },
   };
 }
 
@@ -59,6 +64,8 @@ const FIELD_TO_SETTING: Record<string, string> = {
   openrouterKey: "ai_openrouter_key",
   instantlyKey: "instantly_api_key",
   no2bounceKey: "no2bounce_api_key",
+  anymailKey: "anymail_api_key",
+  anymailMonthlyCap: "anymail_monthly_cap",
   geminiModel: "ai_gemini_model",
   geminiFastModel: "ai_gemini_fast_model",
   groqModel: "ai_groq_model",
@@ -84,6 +91,11 @@ export function register(app: Hono) {
       if (!(field in b)) continue;
       let v = String(b[field] ?? "").trim();
       if (field === "aiDailyBudget" && v && !(Number(v) > 0)) return c.json({ error: "Daily budget must be a positive number" }, 400);
+      if (field === "anymailMonthlyCap" && v) {
+        const n = Math.floor(Number(v));
+        if (!(n > 0) || n > 1_000_000) return c.json({ error: "The monthly credit cap must be a whole number above 0" }, 400);
+        v = String(n);
+      }
       await setSetting(key, v);
     }
     return c.json(await integrationsView());
@@ -96,6 +108,7 @@ export function register(app: Hono) {
     const candidate = typeof key === "string" && key.trim() ? key.trim() : undefined;
     if (target === "instantly") return c.json(await testConnection(candidate));
     if (target === "no2bounce") return c.json(await testNo2Bounce(candidate));
+    if (target === "anymail") return c.json(await testAnymail(candidate));
     if (["gemini", "groq", "openrouter"].includes(target)) return c.json(await testProvider(target as LlmProvider, candidate));
     return c.json({ ok: false, error: "Unknown target" }, 400);
   });

@@ -21,7 +21,7 @@ export type VerifyStatus = "valid" | "invalid" | "risky" | "catch_all" | "unknow
 export interface VerifyResult {
   email: string;
   status: VerifyStatus;
-  source: "builtin" | "no2bounce" | "cache";
+  source: "builtin" | "no2bounce" | "anymail" | "cache";
   reasons: string[];
   checks: {
     syntax: boolean;
@@ -176,6 +176,22 @@ async function readCache(email: string): Promise<VerifyResult | null> {
     detail.source === "builtin" && detail.status !== "invalid" && (detail.reasons || []).some((x) => /no (smtp|email) verifier/i.test(x));
   if (unverified && (await verifierConfigured())) return null;
   return { ...detail, source: "cache" };
+}
+
+/**
+ * An address the paid finder (Anymail Finder) returned: it only returns emails
+ * it verified live, so remember it as valid and the verify step won't spend a
+ * No2Bounce credit checking it again.
+ */
+export async function rememberFinderVerified(raw: string): Promise<void> {
+  const email = String(raw || "").trim().toLowerCase();
+  if (!isValidEmail(email)) return;
+  const domain = email.split("@")[1] || "";
+  const checks: VerifyResult["checks"] = { syntax: true, mx: true, disposable: DISPOSABLE.has(domain), role: isRole(email), free: FREE.has(domain), smtp: "deliverable" };
+  const reasons = ["verified by Anymail Finder"];
+  if (checks.role) reasons.push("role address (info@, sales@ …)");
+  if (checks.free) reasons.push("free mail provider");
+  await writeCache({ email, status: checks.role ? "risky" : "valid", source: "anymail", reasons, checks });
 }
 
 async function writeCache(res: VerifyResult) {
