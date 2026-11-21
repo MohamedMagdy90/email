@@ -28,6 +28,8 @@ const ALTERS = [
   `ALTER TABLE segments ADD COLUMN suggested_reason TEXT`,
   `ALTER TABLE segments ADD COLUMN suggested_at TEXT`,
   `ALTER TABLE segments ADD COLUMN status_reason TEXT`,
+  // 1 = put back by hand: the "not a company site" checks never skip it again.
+  `ALTER TABLE prospects ADD COLUMN site_ok INTEGER NOT NULL DEFAULT 0`,
 ];
 
 const INDEXES = [

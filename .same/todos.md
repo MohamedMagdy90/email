@@ -1,3 +1,27 @@
+# Gemini over quota + stuck pipeline (2026-11-21) — live campaign "Factories/Manufacturing", started 11:54Z
+Live login in backend/.env (not committed; USER to rotate the password). Read-only check found: Gemini 0 OK / 24 failed today, every call
+429 "exceeded your current quota" -> each research call waited on 2 Gemini tries + 8 s, then Groq; discovery + research
+used the 50 s pass, the contact step never ran (0 contacts every pass, Anymail 0 lookups); free search let directories in
+(tradeling, abraa, souqbulk, emis …); banner said "No Gemini key" with a key saved.
+- [x] llm.ts: per-key Gemini MODEL PAUSE (setting `ai_gemini_paused`, per model): 429 per-day / "limit: 0" / 401-403-404
+      -> 60 min; per-minute -> Google's RetryInfo (15 s-5 min); unknown -> 2,4,8…60 min by strikes. Paused models are
+      skipped (no request); no 8 s retry on a Gemini quota error; success or a passing Test clears it. Not applied to
+      search calls (free key = "limit: 0" on SEARCH quota only; search block covers it). aiStatus: providers.gemini.paused,
+      canSearch false while the main model is paused.
+- [x] service.ts runPass order: contact -> verify -> score -> write -> research -> discovery -> queue ("finish before you
+      start"); no searches while >= 12 found wait; no search with < 8 s left.
+- [x] Directories: CONTENT_BLOCK += tradeling go4worldbusiness merkandi emis kuwaitlocal dubailocal placedigger abraa
+      revenuebase kurationai reachuae wholesalersnetwork souqbulk tradedubai (titles checked; b2bfoods/bismi/quickbasket
+      are REAL companies, not blocked). discover.notACompanyReason() shared; research asks the AI `siteType`
+      (+ siteTypeFromText fallback); service.notCompanySite() skips before research / after research / before contact.
+      prospects.site_ok = 1 on "Put back" -> never skipped for its site again.
+- [x] Banner: no key / "Gemini isn't answering: <reason>" / "Gemini web search is off"; readiness.geminiKey + geminiPaused.
+      Agent tab: "Gemini isn't answering · Groq does the research and writing meanwhile" box with Google's error + until.
+- [x] `.same-test/quota-test.ts` 41/41; cp 47 · sq 39 · db 58 · ld 45 · tg 72 · tg-results 48 · n2b 34 · ai-search 21 ·
+      finder 37 · engine 121 = 563/563; both tsc; vite build.
+- [ ] USER: Google AI Studio -> the key's project -> usage + billing; then Agent -> Gemini -> Test (lifts the pause).
+- [ ] USER: connect a test inbox (own mailbox b.alshayeb@ is warming on "No test inbox"), or switch the campaign to
+      Instantly (m.magdy@ is ramping there). Nothing can send until one of these.
 # DEPLOYMENT (verified 2026-11-01) — a push to main deploys EVERYTHING; there is NO manual publish
 Railway project `magnificent-rejoicing`, both services auto-deploy from `MohamedMagdy90/email` main on every push:
 - `email` = backend -> https://email-production-3c14.up.railway.app
@@ -31,6 +55,8 @@ Not found / blacklisted free; repeats within 30 days free; since 5 Oct 2026 risk
 - [x] Agent -> Connections "Email finder · Anymail Finder" card (key test-before-save, credits this month / cap meter,
       cap field); LeadDrawer "found by Anymail Finder".
 - [x] `.same-test/finder-test.ts` 37/37 (fake API); all suites 522/522; both tsc; vite build.
+- [x] PUSHED d80520c (fast-forward from 6571a99, 12 files; staged tree built + booted in /tmp/stage, byte-identical).
+      Railway: email success 10:20:56Z, easygoing-kindness 10:21:09Z; health 200; live bundle index-DwA6OUNv.js has the card.
 - [ ] USER: save the Anymail Finder API key in Agent -> Connections (Test & connect), set the monthly cap.
 - Stuck leads (held "no people named", or skipped "no working address") are retried automatically only for holds
   (24 h). Skipped ones: Leads -> select -> "Research again" sends them back through the contact step.

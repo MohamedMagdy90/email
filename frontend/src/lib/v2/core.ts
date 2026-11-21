@@ -21,13 +21,26 @@ export interface SearchBlocked {
   until: string;
   at: string;
 }
+/**
+ * A Gemini model over its quota (or refusing the key). The other AI providers
+ * do the work until `until`; a passing key test lifts it at once.
+ */
+export interface GeminiPause {
+  model: string;
+  /** minute / day = that limit is used up; plan = not on the key's plan; key = key refused; quota = Google didn't say which. */
+  kind: "minute" | "day" | "plan" | "key" | "quota";
+  reason: string;
+  error: string;
+  until: string;
+  at: string;
+}
 export interface Integrations {
   ai: {
     configured: boolean;
     canSearch: boolean;
     search?: { blocked: SearchBlocked | null };
     providers: {
-      gemini: { configured: boolean; model: string; fastModel: string };
+      gemini: { configured: boolean; model: string; fastModel: string; paused?: GeminiPause[] };
       groq: { configured: boolean; model: string };
       openrouter: { configured: boolean; model: string };
     };

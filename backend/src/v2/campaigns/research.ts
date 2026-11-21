@@ -7,7 +7,7 @@ import { extractEmails } from "../../crawler/extract";
 import { cleanEmail, isValidEmail } from "../../crawler/validate";
 import { normalizeCountry } from "../../country";
 import { detectLanguage, fetchPage, metaDescription, nameFromTitle, phoneFrom, pickLinks, titleOf } from "./web";
-import { researchJson, str, strList, type ResearchJson, type Row } from "./types";
+import { researchJson, str, strList, SITE_TYPES, type ResearchJson, type Row, type SiteType } from "./types";
 import { classifyIndustry, sizeFromText } from "../targeting/taxonomy";
 
 export const RESEARCH_TTL_DAYS = 90;
@@ -19,6 +19,20 @@ const PEOPLE_PAGES = [
   /contact|get-in-touch|reach-us/,
   /من-نحن|فريق|الإدارة|تواصل|اتصل/,
 ];
+
+/**
+ * Obvious non-company sites from the page title and description alone
+ * ("UAE Wholesale Suppliers Directory", "Parked Domain name on Hostinger").
+ * The AI's answer wins when there is one; this covers research without AI.
+ */
+export function siteTypeFromText(title: string, description: string): SiteType | null {
+  const t = `${title} ${description}`.toLowerCase();
+  if (/\b(parked domain|domain (name )?(is )?for sale|buy this domain|this domain (may be|is) for sale|domain parking)\b/.test(t)) return "parked";
+  if (/\b(business|online|suppliers?|wholesale|companies|trade|b2b|yellow pages?) director(y|ies)\b|\blist your (business|company)\b|\badd your (business|company)\b/.test(t)) return "directory";
+  if (/\b(wholesale|b2b|online|largest|trade) marketplace\b|\bmarketplace for (b2b|suppliers|wholesalers|buyers)\b/.test(t)) return "marketplace";
+  if (/\b(b2b data|lead database|contact data|company data(base)?|sales intelligence|market intelligence)\b/.test(t)) return "lead_database";
+  return null;
+}
 
 export function researchIsFresh(co: Row, aiAvailable: boolean): boolean {
   if (!co.researched_at) return false;
@@ -60,9 +74,10 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
   const sources = pages.map((p) => p.url);
   // Kept for the target check (keywords, size, industry): the visible text of the pages read.
   const siteText = pages.map((p) => p.text).join("\n").slice(0, SITE_TEXT_MAX);
+  const textSiteType = siteTypeFromText(title, metaDescription(home.html));
 
   if (!opts.ai) {
-    const rj: ResearchJson = { hooks: [], people: [], emailsOnSite, sources };
+    const rj: ResearchJson = { hooks: [], people: [], emailsOnSite, sources, ...(textSiteType ? { siteType: textSiteType } : {}) };
     const size = sizeFromText(null, siteText);
     const industry = classifyIndustry({ name: heuristicName, description: heuristicDesc, text: siteText });
     await q(
@@ -87,7 +102,8 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
       "Pages:",
       corpus,
       "",
-      'Return JSON: {"name": string, "description": string (1-2 factual sentences: what they do, for whom), "industry": string, "sizeHint": string (e.g. "about 50 staff", "3 branches", "" if unknown), "city": string, "country": string, "people": [{"name": string, "title": string, "email": string|null}], "hooks": string[] (2-4), "linkedinUrl": string|null (company page only, if linked on the site), "language": "en"|"ar"|"mixed"}',
+      'siteType: "company" = the site of ONE operating business (its own products or services; a distributor or factory selling its own range online is still "company"); "directory" = lists many businesses; "marketplace" = sells products from many other sellers; "lead_database" = sells company or contact data; "media" = news, blog or list articles; "government" = a ministry, authority or chamber; "parked" = no real site (parked, for sale, placeholder); "other" = anything else.',
+      'Return JSON: {"siteType": "company"|"directory"|"marketplace"|"lead_database"|"media"|"government"|"parked"|"other", "name": string, "description": string (1-2 factual sentences: what they do, for whom), "industry": string, "sizeHint": string (e.g. "about 50 staff", "3 branches", "" if unknown), "city": string, "country": string, "people": [{"name": string, "title": string, "email": string|null}], "hooks": string[] (2-4), "linkedinUrl": string|null (company page only, if linked on the site), "language": "en"|"ar"|"mixed"}',
     ]
       .filter(Boolean)
       .join("\n"),
@@ -100,7 +116,9 @@ export async function researchCompany(co: Row, opts: { ai: boolean }): Promise<{
       const e = p.email ? cleanEmail(String(p.email)) : null;
       return { name: str(p.name, 100), title: str(p.title, 120), email: e && isValidEmail(e) ? e : null };
     });
-  const rj: ResearchJson = { hooks: strList(d.hooks, 4, 300), people, emailsOnSite, sources, summary: str(d.description, 500) || undefined };
+  const aiSiteType = SITE_TYPES.includes(d.siteType) ? (d.siteType as SiteType) : null;
+  const siteType = aiSiteType || textSiteType;
+  const rj: ResearchJson = { hooks: strList(d.hooks, 4, 300), people, emailsOnSite, sources, summary: str(d.description, 500) || undefined, ...(siteType ? { siteType } : {}) };
   const linkedin = typeof d.linkedinUrl === "string" && /linkedin\.com\/company\//i.test(d.linkedinUrl) ? d.linkedinUrl.slice(0, 300) : co.linkedin_url || null;
   const country = normalizeCountry(str(d.country, 60)) || str(d.country, 60) || co.country || null;
   const name = str(d.name, 120) || heuristicName;

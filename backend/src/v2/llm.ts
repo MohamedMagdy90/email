@@ -234,7 +234,7 @@ async function blockSearch(geminiKey: string, errors: string[], statuses: number
     kind,
     reason:
       kind === "key"
-        ? "Google refused web search on this Gemini key. On Gemini 3 models, Google Search only works once billing is on for the key's Google Cloud project (5,000 searches a month are free). Until then new companies come from the free web search; research, scoring and writing still use Gemini."
+        ? "Google refused web search on this Gemini key. On Gemini 3 models, Google Search only works once billing is on for the key's Google Cloud project (5,000 searches a month are free). Until then new companies come from the free web search; research, scoring and writing carry on with the AI."
         : "Gemini search is rate-limited or busy right now. New companies come from the free web search for the next 15 minutes; research, scoring and writing still use the AI.",
     error,
     until: new Date(now + (kind === "key" ? SEARCH_BLOCK_KEY_MS : SEARCH_BLOCK_BUSY_MS)).toISOString(),
@@ -247,6 +247,114 @@ async function blockSearch(geminiKey: string, errors: string[], statuses: number
 
 async function clearSearchBlock(): Promise<void> {
   if (await getSetting(SEARCH_BLOCK)) await setSetting(SEARCH_BLOCK, "").catch(() => {});
+}
+
+/* --------------------------- Gemini model pause --------------------------- */
+// Google answers 429 "You exceeded your current quota" when a model's limit
+// (per minute or per day) is used up on the key, or the model isn't on its plan
+// at all ("limit: 0"). Asking again only fails again, and each try used to cost
+// an 8 s wait before the work fell back to Groq, so slow research starved the
+// rest of the pipeline. Now the model is paused and calls go straight to the
+// next provider. A successful call or a passing key test lifts the pause.
+
+const MODEL_PAUSE = "ai_gemini_paused";
+const PAUSE_LONG_MS = 60 * 60_000; // daily limit / not on the plan / key refused: try again hourly
+const PAUSE_UNKNOWN_START_MS = 2 * 60_000; // Google didn't say which limit: 2, 4, 8 … 60 min
+
+export type PauseKind = "minute" | "day" | "plan" | "key" | "quota";
+
+export interface ModelPause {
+  model: string;
+  kind: PauseKind;
+  /** Plain-English reason for the UI and the activity log. */
+  reason: string;
+  /** What Google answered, shortened. */
+  error: string;
+  until: string;
+  at: string;
+  /** Failures in a row (grows the wait when Google doesn't say how long). */
+  strikes: number;
+  /** Last characters of the key it applies to (a new key starts unpaused). */
+  key: string;
+}
+
+async function readPauses(geminiKey: string): Promise<Record<string, ModelPause>> {
+  if (!geminiKey) return {};
+  const raw = await getSetting(MODEL_PAUSE);
+  if (!raw) return {};
+  try {
+    const all = JSON.parse(raw) as Record<string, ModelPause>;
+    const out: Record<string, ModelPause> = {};
+    for (const [model, p] of Object.entries(all || {})) if (p && p.key === keyTag(geminiKey)) out[model] = p;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+const isPaused = (p: ModelPause | undefined): p is ModelPause => !!p && Date.parse(p.until) > Date.now();
+
+/** Models of this key that are paused right now. */
+export async function pausedModels(geminiKey: string): Promise<ModelPause[]> {
+  return Object.values(await readPauses(geminiKey)).filter(isPaused);
+}
+
+/** How long to pause a Gemini model after this error, or null when the error isn't about quota or access. */
+function pauseFor(e: ProviderError, prev: ModelPause | undefined): { kind: PauseKind; ms: number; strikes: number } | null {
+  const msg = e.message;
+  const strikes = (prev?.strikes || 0) + 1;
+  if (e.status === 401 || e.status === 403 || (e.status === 400 && /api[ _]?key/i.test(msg))) return { kind: "key", ms: PAUSE_LONG_MS, strikes };
+  if (e.status === 404) return { kind: "plan", ms: PAUSE_LONG_MS, strikes };
+  if (e.status !== 429) return null;
+  const ids = e.quotaIds.join(" ");
+  if (/limit:\s*0\b/.test(msg)) return { kind: "plan", ms: PAUSE_LONG_MS, strikes };
+  if (/per ?day/i.test(ids) || /per day|daily/i.test(msg)) return { kind: "day", ms: PAUSE_LONG_MS, strikes };
+  if (/per ?minute/i.test(ids) || e.retryMs != null) return { kind: "minute", ms: Math.min(5 * 60_000, Math.max(15_000, e.retryMs ?? 60_000)), strikes };
+  return { kind: "quota", ms: Math.min(PAUSE_LONG_MS, PAUSE_UNKNOWN_START_MS * 2 ** Math.min(5, strikes - 1)), strikes };
+}
+
+function pauseReason(kind: PauseKind, model: string): string {
+  switch (kind) {
+    case "minute":
+      return `Gemini's per-minute limit for ${model} is used up. The other AI providers take over and Gemini is asked again in a moment.`;
+    case "day":
+      return `Gemini's daily limit for ${model} is used up on this key. The other AI providers do the research, scoring and writing meanwhile; Gemini is asked again every hour (Google resets daily limits at midnight Pacific time).`;
+    case "plan":
+      return `${model} isn't available on this key's plan (Google allows it 0 requests). Turn billing on for the key's Google Cloud project, then press Test on the Gemini key.`;
+    case "key":
+      return "Google refused this Gemini key. Check the key in Google AI Studio, then press Test on it.";
+    default:
+      return `Google says this key is over its quota for ${model}. The other AI providers take over meanwhile; check usage and billing in Google AI Studio.`;
+  }
+}
+
+/** Remember a quota / access failure. Returns the pause, or null when the error isn't one. */
+async function noteGeminiFailure(geminiKey: string, model: string, e: unknown): Promise<ModelPause | null> {
+  if (!geminiKey || !(e instanceof ProviderError)) return null;
+  const all = await readPauses(geminiKey);
+  const how = pauseFor(e, all[model]);
+  if (!how) return null;
+  const now = Date.now();
+  const p: ModelPause = {
+    model,
+    kind: how.kind,
+    reason: pauseReason(how.kind, model),
+    error: e.message.slice(0, 240),
+    until: new Date(now + how.ms).toISOString(),
+    at: new Date(now).toISOString(),
+    strikes: how.strikes,
+    key: keyTag(geminiKey),
+  };
+  await setSetting(MODEL_PAUSE, JSON.stringify({ ...all, [model]: p })).catch(() => {});
+  return p;
+}
+
+/** The model answered: lift its pause (no write when there is none). */
+async function clearGeminiPause(geminiKey: string, model: string): Promise<void> {
+  const all = await readPauses(geminiKey);
+  if (!all[model]) return;
+  delete all[model];
+  await setSetting(MODEL_PAUSE, Object.keys(all).length ? JSON.stringify(all) : "").catch(() => {});
 }
 
 /* ------------------------------ JSON parse ----------------------------- */
@@ -290,11 +398,35 @@ export function extractJson<T = any>(text: string): T | null {
 class ProviderError extends Error {
   status: number;
   retryable: boolean;
-  constructor(msg: string, status: number) {
+  /** Gemini: the quota(s) Google says were hit, e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier". */
+  quotaIds: string[];
+  /** Gemini: how long Google says to wait (RetryInfo), in ms. */
+  retryMs: number | null;
+  constructor(msg: string, status: number, extra: { quotaIds?: string[]; retryMs?: number | null } = {}) {
     super(msg);
     this.status = status;
     this.retryable = status === 0 || status === 429 || status >= 500;
+    this.quotaIds = extra.quotaIds || [];
+    this.retryMs = extra.retryMs ?? null;
   }
+}
+
+/** The quota ids and retry delay in a Google error body (google.rpc.QuotaFailure / RetryInfo). */
+function googleErrorDetails(data: any): { quotaIds: string[]; retryMs: number | null } {
+  const details: any[] = Array.isArray(data?.error?.details) ? data.error.details : [];
+  const quotaIds: string[] = [];
+  let retryMs: number | null = null;
+  for (const d of details) {
+    for (const v of Array.isArray(d?.violations) ? d.violations : []) {
+      const id = String(v?.quotaId || v?.quotaMetric || "").trim();
+      if (id) quotaIds.push(id.slice(0, 120));
+    }
+    if (typeof d?.retryDelay === "string") {
+      const s = Number.parseFloat(d.retryDelay);
+      if (Number.isFinite(s) && s >= 0) retryMs = Math.round(s * 1000);
+    }
+  }
+  return { quotaIds, retryMs };
 }
 
 async function callGemini(
@@ -335,7 +467,7 @@ async function callGemini(
     throw new ProviderError(`gemini network: ${String(e?.message || e)}`, 0);
   }
   const data: any = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ProviderError(`gemini ${res.status}: ${data?.error?.message || res.statusText}`, res.status);
+  if (!res.ok) throw new ProviderError(`gemini ${res.status}: ${data?.error?.message || res.statusText}`, res.status, googleErrorDetails(data));
   const cand = data?.candidates?.[0];
   const text = (cand?.content?.parts || []).map((p: any) => p.text || "").join("").trim();
   if (!text) throw new ProviderError(`gemini empty response (${cand?.finishReason || "no candidate"})`, 502);
@@ -457,7 +589,14 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
 
   const errors: string[] = [];
   const statuses: number[] = [];
+  // Gemini models over their quota are skipped until the pause runs out.
+  const pauses = cfg.keys.gemini ? await readPauses(cfg.keys.gemini) : {};
+  const skipped: ModelPause[] = [];
   for (const route of routes) {
+    if (route.provider === "gemini" && isPaused(pauses[route.model])) {
+      skipped.push(pauses[route.model]);
+      continue;
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       await pace(route.slot);
       try {
@@ -485,12 +624,25 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
           }
         }
         if (req.search) await clearSearchBlock();
+        if (route.provider === "gemini" && pauses[route.model]) await clearGeminiPause(cfg.keys.gemini, route.model);
         return { text: r.text, data, provider: route.provider, model: route.model, sources: r.sources };
       } catch (e: any) {
         await recordUsage(route.provider, route.model, 0, 0, true);
         const msg = String(e?.message || e);
         errors.push(msg);
         if (e instanceof ProviderError) statuses.push(e.status);
+        // Gemini over its quota (or refusing the key): pause the model and move
+        // on at once. No 8 s wait: a second try right away fails the same way.
+        // Not for searches: a free key is refused search ("limit: 0" on the
+        // search quota) while plain prompts to the same model still work; the
+        // search block above covers that.
+        if (route.provider === "gemini" && !req.search) {
+          const p = await noteGeminiFailure(cfg.keys.gemini, route.model, e);
+          if (p) {
+            pauses[route.model] = p;
+            break;
+          }
+        }
         // "limit: 0" = not on this plan at all; waiting won't help.
         if (e instanceof ProviderError && e.status === 429 && attempt === 0 && !/limit:\s*0\b/.test(msg)) {
           await sleep(8000);
@@ -506,6 +658,12 @@ export async function llm<T = any>(req: LlmRequest): Promise<LlmResult<T>> {
     const b = await blockSearch(cfg.keys.gemini, errors, statuses);
     throw new LlmUnavailable(`Gemini couldn't search the web: ${b.error}`, statuses);
   }
+  // Every route was a paused Gemini model (or the rest failed too): say so.
+  if (skipped.length) {
+    const p = skipped[0];
+    const why = `Gemini ${p.model} is paused until ${p.until.slice(11, 16)} UTC (${p.error.slice(0, 120)})`;
+    throw new LlmUnavailable(errors.length ? `All AI providers failed${req.task ? ` (${req.task})` : ""}: ${why} | ${errors.slice(-2).join(" | ")}` : why, statuses);
+  }
   throw new LlmUnavailable(`All AI providers failed${req.task ? ` (${req.task})` : ""}: ${errors.slice(-3).join(" | ")}`, statuses);
 }
 
@@ -514,15 +672,24 @@ export async function aiStatus() {
   const cfg = await getLlmConfig();
   const usage = await usageToday();
   const blocked = await readSearchBlock(cfg.keys.gemini);
+  const paused = await pausedModels(cfg.keys.gemini);
+  // Search runs on the main model: paused for quota = no search either.
+  const searchModelPaused = paused.some((p) => p.model === cfg.models.gemini);
   return {
     configured: !!(cfg.keys.gemini || cfg.keys.groq || cfg.keys.openrouter),
-    /** A Gemini key exists and Google hasn't refused search on it lately. */
-    canSearch: !!cfg.keys.gemini && !blocked,
+    /** A Gemini key exists, Google hasn't refused search on it lately, and its model isn't paused. */
+    canSearch: !!cfg.keys.gemini && !blocked && !searchModelPaused,
     search: {
       blocked: blocked ? { kind: blocked.kind, reason: blocked.reason, error: blocked.error, until: blocked.until, at: blocked.at } : null,
     },
     providers: {
-      gemini: { configured: !!cfg.keys.gemini, model: cfg.models.gemini, fastModel: cfg.models.geminiFast },
+      gemini: {
+        configured: !!cfg.keys.gemini,
+        model: cfg.models.gemini,
+        fastModel: cfg.models.geminiFast,
+        /** Models over their quota right now; the other providers do the work until `until`. */
+        paused: paused.map((p) => ({ model: p.model, kind: p.kind, reason: p.reason, error: p.error, until: p.until, at: p.at })),
+      },
       groq: { configured: !!cfg.keys.groq, model: cfg.models.groq },
       openrouter: { configured: !!cfg.keys.openrouter, model: cfg.models.openrouter },
     },
@@ -555,10 +722,14 @@ export async function testProvider(
           : await callOpenAICompat("https://openrouter.ai/api/v1", key, model, req);
     await recordUsage(provider, model, r.inTok, r.outTok);
   } catch (e: any) {
+    // Testing the saved key: remember a quota failure like any other call would.
+    if (provider === "gemini" && !keyOverride) await noteGeminiFailure(key, model, e);
     return { ok: false, error: String(e?.message || e) };
   }
   const ms = Date.now() - t0;
   if (provider !== "gemini") return { ok: true, model, ms };
+  // The key answered: lift a pause on this model (a NEW key starts without one anyway).
+  await clearGeminiPause(key, model);
   // A key can pass the plain prompt and still be refused web search (free
   // tier), so check search on its own. Uses one search request.
   return { ok: true, model, ms, search: await testGeminiSearch(key, cfg.models.gemini) };
@@ -576,6 +747,7 @@ async function testGeminiSearch(key: string, model: string): Promise<{ ok: boole
     const r = await callGemini(key, model, req);
     await recordUsage("gemini", model, r.inTok, r.outTok);
     await clearSearchBlock();
+    await clearGeminiPause(key, model);
     return { ok: true, model };
   } catch (e: any) {
     await recordUsage("gemini", model, 0, 0, true);

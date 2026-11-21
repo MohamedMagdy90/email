@@ -162,6 +162,10 @@ export type CampaignEngine = "own" | "instantly";
 export interface CampaignReadiness {
   ai: boolean; // any AI key
   aiSearch: boolean; // Gemini key (Google Search grounding)
+  /** A Gemini key is saved (aiSearch can still be false: search refused, or the model paused). */
+  geminiKey?: boolean;
+  /** Why Gemini's main model is paused (over its quota), or null. */
+  geminiPaused?: string | null;
   instantly: boolean;
   /** Which engine `mailboxes` describes: the campaign's own, or both (campaign list). */
   engine?: CampaignEngine | "all";

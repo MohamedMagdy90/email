@@ -33,6 +33,21 @@ export interface Screened {
   rule?: SkipRule;
 }
 
+/**
+ * Why this site is not a company we could sell to (a directory, marketplace,
+ * lead database, setup agency or government body), or null. Also used on leads
+ * already in the pipeline, so a site added to the lists later never costs
+ * research or an Anymail Finder lookup.
+ */
+export function notACompanyReason(domain: string, host: string = domain): string | null {
+  if (isJunkHost(host) || isProfileHost(host) || isDirectoryHost(host) || isJunkHost(domain) || isProfileHost(domain) || isDirectoryHost(domain)) {
+    return "A directory, marketplace or social page, not a company site";
+  }
+  if (CONTENT_BLOCK.test(domain) || SETUP_BLOCK.test(domain)) return "A lead database, listing site or company-setup agency, not a prospect";
+  if (OFFICIAL_BLOCK.test(domain)) return "A government body or regulator, not a prospect";
+  return null;
+}
+
 /** Would this search result be added? No writes. Shared by discovery and the targeting preview. */
 export async function screenCandidate(cand: CandidateCompany, settings: CampaignSettings, eff: EffectiveTargeting | null): Promise<Screened> {
   const domain = domainOf(cand.website);
@@ -43,11 +58,8 @@ export async function screenCandidate(cand: CandidateCompany, settings: Campaign
   } catch {
     /* keep domain */
   }
-  if (isJunkHost(host) || isProfileHost(host) || isDirectoryHost(host) || isJunkHost(domain) || isProfileHost(domain) || isDirectoryHost(domain)) {
-    return { ok: false, domain, reason: "A directory, marketplace or social page, not a company site" };
-  }
-  if (CONTENT_BLOCK.test(domain) || SETUP_BLOCK.test(domain)) return { ok: false, domain, reason: "A lead database, listing site or company-setup agency, not a prospect" };
-  if (OFFICIAL_BLOCK.test(domain)) return { ok: false, domain, reason: "A government body or regulator, not a prospect" };
+  const notCompany = notACompanyReason(domain, host);
+  if (notCompany) return { ok: false, domain, reason: notCompany };
   if (cand.title && isContentTitle(cand.title)) return { ok: false, domain, reason: `An article or list about companies ("${cand.title.slice(0, 60)}"), not a company` };
   const blocked = await domainBlockReason(domain, settings);
   if (blocked) return { ok: false, domain, reason: blocked };

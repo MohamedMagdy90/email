@@ -8,7 +8,7 @@
 // Connections save one at a time, and only after the key has been tested.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Badge, Button, Card, Field, Input, PageHeader, Select, Spinner, Textarea, cn, toast } from "../lib/ui";
-import { v2, type AgentSettings, type Integrations, type IntegrationsPatch, type IntegrationTarget } from "../lib/v2/core";
+import { ago, v2, type AgentSettings, type Integrations, type IntegrationsPatch, type IntegrationTarget } from "../lib/v2/core";
 import {
   agentApi,
   type AgentMeta,
@@ -427,6 +427,9 @@ function InstantlyCard({ intg, onChange }: { intg: Integrations; onChange: (i: I
 function AiCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrations) => void }) {
   const ai = intg.ai;
   const pct = Math.min(100, Math.round((ai.usage.calls / Math.max(1, ai.budget)) * 100));
+  // Gemini models over their quota: the backup providers do the work meanwhile.
+  const paused = ai.providers.gemini.paused || [];
+  const backup = [ai.providers.groq.configured && "Groq", ai.providers.openrouter.configured && "OpenRouter"].filter(Boolean).join(" / ");
   return (
     <Card className="p-5 sm:p-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -454,12 +457,32 @@ function AiCard({ intg, onChange }: { intg: Integrations; onChange: (i: Integrat
           No AI key yet, so nothing can be written, researched or answered. Gemini is the one to add first.
         </div>
       )}
-      {ai.configured && !ai.canSearch && !ai.search?.blocked && (
+      {paused.length > 0 && (
+        <div className="mt-3 rounded-lg border border-wnl bg-wnb px-3 py-2 text-[12.5px] leading-relaxed text-warn">
+          <div className="font-semibold">
+            Gemini isn't answering · {backup ? `${backup} does the research and writing meanwhile` : "no other AI key is saved, so AI work waits"}
+          </div>
+          {paused.map((p) => (
+            <p key={p.model} className="mt-0.5">
+              {p.reason} <span className="opacity-80">Asked again {ago(p.until)}.</span>
+            </p>
+          ))}
+          <p className="mt-1 break-words font-mono text-[11px] opacity-80">Google said: {paused[0].error}</p>
+          <p className="mt-1">
+            Check usage and billing for the key's project in{" "}
+            <a href="https://aistudio.google.com/usage" target="_blank" rel="noreferrer" className="font-semibold underline">
+              Google AI Studio
+            </a>
+            , then press Test on the Gemini key below. Gemini is used again as soon as the test passes.
+          </p>
+        </div>
+      )}
+      {ai.configured && !ai.canSearch && !ai.search?.blocked && !paused.length && (
         <div className="mt-3 rounded-lg border border-wnl bg-wnb px-3 py-2 text-[12.5px] leading-relaxed text-warn">
           Writing and replies work. Finding new companies needs web search, and only Gemini can do that.
         </div>
       )}
-      {ai.search?.blocked && (
+      {ai.search?.blocked && !paused.length && (
         <div className="mt-3 rounded-lg border border-wnl bg-wnb px-3 py-2 text-[12.5px] leading-relaxed text-warn">
           <div className="font-semibold">Web search is off · research and writing still use Gemini</div>
           <p className="mt-0.5">{ai.search.blocked.reason}</p>

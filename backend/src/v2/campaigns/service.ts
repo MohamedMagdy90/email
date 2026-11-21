@@ -11,7 +11,7 @@ import { instantlyConfigured, patchCampaign } from "../instantly";
 import { cleanEmail, isValidEmail } from "../../crawler/validate";
 import { learnOffer } from "./offer";
 import { proposeSegments } from "./icp";
-import { addCompany, discoverForSegment } from "./discover";
+import { addCompany, discoverForSegment, notACompanyReason } from "./discover";
 import { researchCompany, researchIsFresh } from "./research";
 import { findContact } from "./contact";
 import { scoreProspect, verifyProspect } from "./qualify";
@@ -36,6 +36,7 @@ import {
   CampaignError,
   CONTACTED_STAGES,
   DEFAULT_SETTINGS,
+  NOT_A_COMPANY,
   PROSPECT_SELECT,
   STAGE_GROUPS,
   STAGES,
@@ -59,6 +60,10 @@ import {
 
 const LOCK_STALE_MS = 10 * 60 * 1000;
 const BACKOFF_MIN = [15, 60, 360];
+/** No new searches while this many companies wait for research (3 passes of research). */
+const FOUND_BACKLOG_MAX = 12;
+/** Don't start a search with less than this left in the pass. */
+const MIN_SEARCH_MS = 8000;
 const SYNC_EVERY_MS = 30 * 60 * 1000;
 const lastSync = new Map<string, number>();
 
@@ -129,9 +134,14 @@ export async function readiness(engine: "instantly" | "own" | "all" = "all") {
       : engine === "instantly"
         ? inst
         : { total: inst.total + ownMb.total, sending: inst.sending + ownMb.sending, dailyCapacity: inst.dailyCapacity + ownMb.dailyCapacity };
+  const mainPause = ai.providers.gemini.paused.find((p) => p.model === ai.providers.gemini.model) || null;
   return {
     ai: ai.configured,
     aiSearch: ai.canSearch,
+    /** A Gemini key is saved (aiSearch can still be false: search refused, or the model paused). */
+    geminiKey: ai.providers.gemini.configured,
+    /** Why Gemini's main model is paused (over its quota), or null. */
+    geminiPaused: mainPause ? mainPause.reason : null,
     instantly: await instantlyConfigured(),
     engine,
     mailboxes,
@@ -182,7 +192,11 @@ function blockersFor(c: Row, settings: CampaignSettings, offer: Offer | null, se
   }
   if (c.status === "paused") out.push("Paused: nothing is researched, written or sent until you resume.");
   if (!r.ai) out.push("No AI key: companies get a basic read only, and nothing is scored or written. Connect Gemini, Groq or OpenRouter in the Agent tab.");
-  else if (!r.aiSearch) out.push("No Gemini key: companies are found with the free web search (slow and often rate-limited) and decision makers come only from company websites.");
+  else if (!r.aiSearch) {
+    if (!r.geminiKey) out.push("No Gemini key: companies are found with the free web search (slow and often rate-limited), and decision makers come from company websites (and Anymail Finder, when connected).");
+    else if (r.geminiPaused) out.push(`Gemini isn't answering: ${r.geminiPaused} New companies come from the free web search meanwhile.`);
+    else out.push("Gemini web search is off: Google refused search on this key (it needs billing on for the key's Google Cloud project). New companies come from the free web search; research and writing still use the AI.");
+  }
   if (r.ai && r.budgetRemaining <= 0) out.push("Today's AI budget is used up; the agent carries on tomorrow.");
   if (!r.verifier && !allowGuesses) out.push("Guessed addresses wait for the email verifier. Connect No2Bounce in the Agent tab, or allow unverified guesses in the agent's sending rules.");
   if (settings.reviewFirst && funnel.written > 0) out.push(`${funnel.written} email${funnel.written === 1 ? "" : "s"} waiting for your review.`);
@@ -613,6 +627,21 @@ async function skipProspect(p: Row, reason: string, rule: SkipRule | null = null
   await logEvent("campaign", `Skipped ${p.email || p.co_domain || "a lead"}: ${reason}`, { campaignId: p.campaign_id, refType: "prospect", refId: p.id });
 }
 
+/**
+ * Why this lead's site is not a company we could sell to (on the directory /
+ * marketplace lists, or the research said so), or null. Leads put back by hand
+ * (site_ok = 1) are never skipped for it again.
+ */
+function notCompanySite(p: Row, co: Row | null | undefined): string | null {
+  if (!co || Number(p.site_ok) === 1) return null;
+  const domain = String(co.domain || "");
+  const listed = domain ? notACompanyReason(domain) : null;
+  if (listed) return listed;
+  const site = researchJson(co.research_json).siteType;
+  const what = site ? NOT_A_COMPANY[site] : undefined;
+  return what ? `Not a company site: ${domain} is ${what} (from the research)` : null;
+}
+
 async function holdProspect(p: Row, reason: string, hours: number) {
   const now = nowIso();
   await q(`UPDATE prospects SET stage_reason = ?, next_action_at = ?, updated_at = ? WHERE id = ?`, [reason.slice(0, 500), new Date(Date.now() + hours * 3600000).toISOString(), now, p.id]);
@@ -664,7 +693,7 @@ export async function restoreProspects(id: string, body: any) {
     const p = (await q(`SELECT * FROM prospects WHERE id = ? AND campaign_id = ?`, [pid, id]))[0];
     if (!p || !["skipped", "failed"].includes(p.stage)) continue;
     const back = (STAGES as string[]).includes(p.skipped_from) && !["skipped", "failed"].includes(p.skipped_from) ? p.skipped_from : "found";
-    await setStage(p, back, "Put back by hand", { skipped_from: null, skip_rule: null, attempts: 0, last_error: null, next_action_at: null });
+    await setStage(p, back, "Put back by hand", { skipped_from: null, skip_rule: null, attempts: 0, last_error: null, next_action_at: null, site_ok: 1 });
     restored++;
   }
   return { restored };
@@ -1002,84 +1031,16 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     };
     const roleOk = (eff: EffectiveTargeting) => (eff.roleAddresses === "inherit" ? agent.sending.allowRoleAddresses : eff.roleAddresses === "allow");
 
-    // 1. Discover while the pre-write backlog is small.
-    const backlog = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage IN ('found','researched','contact_found','verified') AND (next_action_at IS NULL OR next_action_at <= ?)`, [id, nowIso()]))[0]?.n) || 0;
-    if (backlog < settings.dailyNewLeads * 3) {
-      let searches = 0;
-      // Quota split (learning loop): the segment furthest below its share of today's finds goes first.
-      const foundToday = new Map<string, number>(
-        (await q(`SELECT segment_id, CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND created_at >= ? AND segment_id IS NOT NULL GROUP BY segment_id`, [id, `${todayUtc()}T00:00:00.000Z`])).map((r) => [String(r.segment_id), Number(r.n) || 0])
-      );
-      const ordered = discoveryOrder(segRows.filter((s) => Number(s.exhausted) !== 1), foundToday, await getRules());
-      for (const seg of ordered) {
-        if (res.discovered >= 10 || searches >= 2 || !timeLeft()) break;
-        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch, aiOk, eff: effFor(seg.id) });
-        res.discovered += r.added;
-        searches += r.searches;
-        res.notes.push(...r.notes);
-        if (r.searchUnavailable) canSearch = false;
-        if (r.aiStopped) {
-          // Only the daily budget stops the AI here (discovery already said so in its notes).
-          aiOk = false;
-          aiDownReason = "today's AI budget is used up";
-        }
-      }
-      if (!segRows.length) res.notes.push("No enabled segment, so no new companies are searched.");
-    }
+    // Finish before you start: leads already in the pipeline move on first
+    // (contact, verify, score, write), then research, then new searches. In the
+    // old order a slow site or a queuing AI used up the pass in discovery and
+    // research, and the contact step never ran (0 contacts, pass after pass).
+    // A lead found now is researched next pass and reaches the writer the pass after.
 
-    // 2. Research.
-    const researchedToday = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects p JOIN companies co ON co.id = p.company_id WHERE p.campaign_id = ? AND co.researched_at >= ?`, [id, `${todayUtc()}T00:00:00.000Z`]))[0]?.n) || 0;
-    const researchBudget = Math.max(0, Math.min(4, settings.researchPerDay - researchedToday));
-    if (!researchBudget) res.notes.push(`Today's research limit (${settings.researchPerDay}) is reached.`);
-    let offTarget = 0;
-    for (const p of await due(id, "found", researchBudget)) {
-      if (!timeLeft()) break;
-      try {
-        const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
-        if (!co) {
-          await skipProspect(p, "The company record is missing");
-          continue;
-        }
-        let note: string;
-        if (researchIsFresh(co, aiOk)) {
-          note = `Research reused from ${String(co.researched_at).slice(0, 10)}.`;
-        } else {
-          let out;
-          try {
-            out = await researchCompany(co, { ai: aiOk });
-          } catch (e) {
-            if (!isAiStop(e)) throw e;
-            stopAi(e);
-            out = await researchCompany(co, { ai: false });
-          }
-          // Say WHY a pass with an AI key researched without it.
-          note = out.status === "partial" && ai.configured && aiDownReason ? `${out.note} AI was skipped: ${aiDownReason}.` : out.note;
-          await logEvent("research", note, { campaignId: id, refType: "prospect", refId: p.id });
-        }
-        res.researched++;
-        // Target check on the facts, before any person search, score or email.
-        const fresh = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0] || co;
-        const t = checkCompany(fresh, effFor(p.segment_id));
-        if (!t.ok) {
-          await skipProspect(p, t.reason, t.rule, "researched");
-          offTarget++;
-          continue;
-        }
-        await setStage(p, "researched", t.notes.length ? `${note} ${t.notes.join("; ")}.` : note, {
-          attempts: 0,
-          last_error: null,
-          target_penalty: t.penalty,
-          target_notes: t.notes.join("; ") || null,
-        });
-      } catch (e) {
-        await failStep(p, e);
-      }
-    }
-    if (offTarget) res.notes.push(`${offTarget} researched compan${offTarget === 1 ? "y was" : "ies were"} outside the target and skipped (see Leads, Skipped).`);
-
-    // 3. Decision maker + candidate address (Anymail Finder as the paid last resort).
+    // 1. Decision maker + candidate address (Anymail Finder as the paid last resort).
     let finderOn = await finderConfigured();
     let finderCredits = 0;
+    let notCompanies = 0;
     for (const p of await due(id, "researched", 4)) {
       if (!timeLeft()) break;
       try {
@@ -1094,6 +1055,13 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
           continue;
         }
         const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
+        // A directory or marketplace researched before it was recognised: no paid lookup for it.
+        const notCompany = notCompanySite(p, co);
+        if (notCompany) {
+          await skipProspect(p, notCompany);
+          notCompanies++;
+          continue;
+        }
         const eff = effFor(p.segment_id);
         const titles = eff.titles;
         const allowPerson = (title: string) => personAllowed(title, eff);
@@ -1142,7 +1110,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     }
     if (finderCredits) res.notes.push(`Anymail Finder used ${finderCredits} credit${finderCredits === 1 ? "" : "s"} this pass.`);
 
-    // 4. Verify + suppression.
+    // 2. Verify + suppression.
     for (const p of await due(id, "contact_found", 8)) {
       if (!timeLeft()) break;
       try {
@@ -1162,7 +1130,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
       }
     }
 
-    // 5. Score (AI).
+    // 3. Score (AI).
     if (aiOk) {
       for (const p of await due(id, "verified", 6, "AND p.fit_score IS NULL")) {
         if (!timeLeft() || !aiOk) break;
@@ -1185,7 +1153,7 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
       }
     }
 
-    // 6. Write (AI, following the campaign's sequence). Leads that already have copy (edited by hand) skip the writer.
+    // 4. Write (AI, following the campaign's sequence). Leads that already have copy (edited by hand) skip the writer.
     const seq = await sequenceFor(id);
     const ready = await due(id, "verified", 3, "AND p.fit_score IS NOT NULL");
     for (const p of ready) {
@@ -1217,6 +1185,100 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     if (!aiOk) {
       const waiting = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage = 'verified'`, [id]))[0]?.n) || 0;
       if (waiting) res.notes.push(`${waiting} verified lead(s) are waiting for the AI to score and write their emails.`);
+    }
+
+    // 5. Research what is waiting.
+    const researchedToday = Number((await q(`SELECT CAST(count(*) AS INTEGER) AS n FROM prospects p JOIN companies co ON co.id = p.company_id WHERE p.campaign_id = ? AND co.researched_at >= ?`, [id, `${todayUtc()}T00:00:00.000Z`]))[0]?.n) || 0;
+    const researchBudget = Math.max(0, Math.min(4, settings.researchPerDay - researchedToday));
+    if (!researchBudget) res.notes.push(`Today's research limit (${settings.researchPerDay}) is reached.`);
+    let offTarget = 0;
+    for (const p of await due(id, "found", researchBudget)) {
+      if (!timeLeft()) break;
+      try {
+        const co = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0];
+        if (!co) {
+          await skipProspect(p, "The company record is missing");
+          continue;
+        }
+        // Found before the lists knew it was a directory: don't spend research on it.
+        const listed = notCompanySite(p, co);
+        if (listed) {
+          await skipProspect(p, listed);
+          notCompanies++;
+          continue;
+        }
+        let note: string;
+        if (researchIsFresh(co, aiOk)) {
+          note = `Research reused from ${String(co.researched_at).slice(0, 10)}.`;
+        } else {
+          let out;
+          try {
+            out = await researchCompany(co, { ai: aiOk });
+          } catch (e) {
+            if (!isAiStop(e)) throw e;
+            stopAi(e);
+            out = await researchCompany(co, { ai: false });
+          }
+          // Say WHY a pass with an AI key researched without it.
+          note = out.status === "partial" && ai.configured && aiDownReason ? `${out.note} AI was skipped: ${aiDownReason}.` : out.note;
+          await logEvent("research", note, { campaignId: id, refType: "prospect", refId: p.id });
+        }
+        res.researched++;
+        const fresh = (await q(`SELECT * FROM companies WHERE id = ?`, [p.company_id]))[0] || co;
+        // The research says it's a directory / marketplace / data vendor, not a company.
+        const notCompany = notCompanySite(p, fresh);
+        if (notCompany) {
+          await skipProspect(p, notCompany, null, "researched");
+          notCompanies++;
+          continue;
+        }
+        // Target check on the facts, before any person search, score or email.
+        const t = checkCompany(fresh, effFor(p.segment_id));
+        if (!t.ok) {
+          await skipProspect(p, t.reason, t.rule, "researched");
+          offTarget++;
+          continue;
+        }
+        await setStage(p, "researched", t.notes.length ? `${note} ${t.notes.join("; ")}.` : note, {
+          attempts: 0,
+          last_error: null,
+          target_penalty: t.penalty,
+          target_notes: t.notes.join("; ") || null,
+        });
+      } catch (e) {
+        await failStep(p, e);
+      }
+    }
+    if (offTarget) res.notes.push(`${offTarget} researched compan${offTarget === 1 ? "y was" : "ies were"} outside the target and skipped (see Leads, Skipped).`);
+    if (notCompanies) res.notes.push(`${notCompanies} site${notCompanies === 1 ? " was a directory, marketplace or data vendor" : "s were directories, marketplaces or data vendors"}, not ${notCompanies === 1 ? "a company" : "companies"}, and ${notCompanies === 1 ? "was" : "were"} skipped (see Leads, Skipped).`);
+
+    // 6. Discover new companies, only while few are waiting for research and there is time left.
+    const pending = await q(`SELECT stage, CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND stage IN ('found','researched','contact_found','verified') AND (next_action_at IS NULL OR next_action_at <= ?) GROUP BY stage`, [id, nowIso()]);
+    const backlog = pending.reduce((n, r) => n + (Number(r.n) || 0), 0);
+    const foundWaiting = Number(pending.find((r) => r.stage === "found")?.n) || 0;
+    if (foundWaiting >= FOUND_BACKLOG_MAX) {
+      res.notes.push(`${foundWaiting} companies are waiting for research, so no new searches this pass.`);
+    } else if (backlog < settings.dailyNewLeads * 3) {
+      let searches = 0;
+      // Quota split (learning loop): the segment furthest below its share of today's finds goes first.
+      const foundToday = new Map<string, number>(
+        (await q(`SELECT segment_id, CAST(count(*) AS INTEGER) AS n FROM prospects WHERE campaign_id = ? AND created_at >= ? AND segment_id IS NOT NULL GROUP BY segment_id`, [id, `${todayUtc()}T00:00:00.000Z`])).map((r) => [String(r.segment_id), Number(r.n) || 0])
+      );
+      const ordered = discoveryOrder(segRows.filter((s) => Number(s.exhausted) !== 1), foundToday, await getRules());
+      for (const seg of ordered) {
+        if (res.discovered >= 10 || searches >= 2 || deadline - Date.now() < MIN_SEARCH_MS) break;
+        const r = await discoverForSegment(id, seg, settings, { max: 10 - res.discovered, maxSearches: 2 - searches, canSearch, aiOk, eff: effFor(seg.id) });
+        res.discovered += r.added;
+        searches += r.searches;
+        res.notes.push(...r.notes);
+        if (r.searchUnavailable) canSearch = false;
+        if (r.aiStopped) {
+          // Only the daily budget stops the AI here (discovery already said so in its notes).
+          aiOk = false;
+          aiDownReason = "today's AI budget is used up";
+        }
+      }
+      if (!segRows.length) res.notes.push("No enabled segment, so no new companies are searched.");
     }
 
     // 7. Push + sync (active campaigns only; drafts never send).

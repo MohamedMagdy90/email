@@ -376,17 +376,33 @@ export function prospectRowView(r: Row) {
   };
 }
 
+/** What the researched website is. Only "company" (or unknown) goes on to the contact step. */
+export type SiteType = "company" | "directory" | "marketplace" | "lead_database" | "media" | "government" | "parked" | "other";
+export const SITE_TYPES: SiteType[] = ["company", "directory", "marketplace", "lead_database", "media", "government", "parked", "other"];
+/** Site types that are never a prospect. ("other" is left alone: too vague to drop a lead on.) */
+export const NOT_A_COMPANY: Partial<Record<SiteType, string>> = {
+  directory: "a business directory",
+  marketplace: "a marketplace selling many companies' products",
+  lead_database: "a company or contact data vendor",
+  media: "a news site, blog or list article",
+  government: "a government body",
+  parked: "a parked domain with no real company site",
+};
+
 export interface ResearchJson {
   hooks: string[];
   people: { name: string; title: string; linkedin?: string | null; email?: string | null }[];
   emailsOnSite: string[];
   sources: string[];
   summary?: string;
+  /** What the site is (from the research). Missing on research done before 2026-11-21. */
+  siteType?: SiteType;
 }
 
 export function researchJson(raw: unknown): ResearchJson {
   const r = parseJson<any>(raw, {}) || {};
   return {
+    ...(SITE_TYPES.includes(r.siteType) ? { siteType: r.siteType as SiteType } : {}),
     hooks: strList(r.hooks, 6, 300),
     people: Array.isArray(r.people)
       ? r.people
