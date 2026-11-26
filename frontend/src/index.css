@@ -160,7 +160,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
   display: flex; align-items: center; justify-content: center;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.45);
 }
-.mk img { height: 19px; width: 19px; display: block; }
+.mk img { height: 21px; width: 21px; display: block; }
 .brand .bn { font-size: 0.9rem; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
 .brand .bn i {
   display: block; font-style: normal; font-size: 0.66rem; font-weight: 600; color: var(--ac);
@@ -225,7 +225,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--acb); }
 .gate .gl .logo { height: 38px; width: auto; margin: 0 auto; display: block; }
 .gate .gl p { margin-top: 12px; font-size: 0.68rem; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ac); font-weight: 700; }
 .gate .mk { width: 44px; height: 44px; margin: 0 auto 14px; }
-.gate .mk img { height: 26px; width: 26px; }
+.gate .mk img { height: 29px; width: 29px; }
 .gtop { display: flex; justify-content: flex-end; margin-bottom: 6px; }
 
 /* ---- toast ---- */

@@ -84,10 +84,11 @@ export function Logo({ className }: { className?: string }) {
   return <img className={cn("logo", className)} src={theme === "light" ? LOGO_ON_LIGHT : LOGO_ON_DARK} alt="DNA ERP" />;
 }
 
+/** The app's mark: the megaphone, on a light disc so the black artwork shows in both themes. */
 export function Mark() {
   return (
     <span className="mk">
-      <img src="/dna-mark.png" alt="" />
+      <img src="/mark-megaphone.png" alt="" />
     </span>
   );
 }
