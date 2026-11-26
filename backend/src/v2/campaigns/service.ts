@@ -16,7 +16,7 @@ import { researchCompany, researchIsFresh } from "./research";
 import { findContact } from "./contact";
 import { scoreProspect, verifyProspect } from "./qualify";
 import { writableWithoutAi, writeEmails, WriterRejected } from "./writer";
-import { campaignCountry, instantlyPayload, pushApproved, queuedToday, sendableMailboxes, setInstantlyRunning, syncCampaign } from "./sender";
+import { campaignCountry, instantlyPayload, pushApproved, queuedToday, repairInstantlyDelays, sendableMailboxes, setInstantlyRunning, syncCampaign } from "./sender";
 import { ensureSequenceTables, sequenceFor } from "../sequences/store";
 import { discoveryOrder, getRules } from "../targeting/learning";
 import {
@@ -1341,5 +1341,11 @@ export function startCampaignWorker() {
   if (timer) return;
   timer = setInterval(() => tick().catch(() => {}), 60_000);
   setTimeout(() => tick().catch(() => {}), 20_000);
+  // Instantly campaigns created before the step-delay fix: send them the corrected sequence once.
+  setTimeout(() => {
+    repairInstantlyDelays()
+      .then((r) => (r.fixed || r.errors.length) && console.log(`[campaigns] follow-up timing fixed in ${r.fixed} Instantly campaign(s)${r.errors.length ? `; ${r.errors.length} failed: ${r.errors[0]}` : ""}`))
+      .catch((e) => console.error(`[campaigns] repairing follow-up timing: ${String(e?.message || e)}`));
+  }, 10_000);
   console.log("[campaigns] worker started (every 60s)");
 }

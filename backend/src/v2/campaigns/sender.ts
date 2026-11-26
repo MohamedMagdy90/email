@@ -40,13 +40,54 @@ function scheduleFor(settings: CampaignSettings, country: string | null): inst.C
   };
 }
 
-/** The Instantly sequence for our steps: each step's copy travels in the lead's custom variables. */
+/**
+ * The Instantly sequence for our steps: each step's copy travels in the lead's custom variables.
+ *
+ * Instantly's `delay` is the wait AFTER a step, before the NEXT one (API spec: "the delay
+ * value before sending the NEXT email"). Our `delayDays` is the wait BEFORE a step. So step
+ * i carries step i+1's delayDays, and the last step carries 0. Until 2026-11-26 the first
+ * step was sent with delay 0, so Instantly sent follow-up 1 minutes after the first email.
+ */
 export function instantlySteps(seq: SequenceStep[]): inst.CreateCampaignInput["sequences"][0]["steps"] {
-  return seq.map((s, i) =>
-    i === 0
-      ? { type: "email", delay: 0, variants: [{ subject: "{{subject_1}}", body: "{{body_1}}" }] }
-      : { type: "email", delay: s.delayDays || 3, delay_unit: "days", variants: [{ subject: s.newThread ? `{{subject_${i + 1}}}` : "", body: `{{body_${i + 1}}}` }] }
-  ) as inst.CreateCampaignInput["sequences"][0]["steps"];
+  return seq.map((s, i) => {
+    const next = seq[i + 1];
+    const delay = next ? Math.max(1, Math.round(Number(next.delayDays) || 3)) : 0;
+    const subject = i === 0 ? "{{subject_1}}" : s.newThread ? `{{subject_${i + 1}}}` : "";
+    return { type: "email", delay, delay_unit: "days", variants: [{ subject, body: `{{body_${i + 1}}}` }] };
+  }) as inst.CreateCampaignInput["sequences"][0]["steps"];
+}
+
+/** Marker in stats_json: the Instantly campaign's sequence has the corrected delays. */
+const DELAYS_FIXED = "stepDelaysFixed";
+
+/**
+ * Re-send the sequence to Instantly campaigns created before the delay fix, so their
+ * follow-ups wait the right number of days. Once per campaign; retried until it works.
+ * Runs before a campaign is resumed and when the worker starts.
+ */
+export async function repairInstantlyDelays(only?: string): Promise<{ fixed: number; errors: string[] }> {
+  const errors: string[] = [];
+  let fixed = 0;
+  if (!(await inst.instantlyConfigured())) return { fixed, errors };
+  const rows = await q(`SELECT id, name, instantly_campaign_id, stats_json FROM campaigns WHERE instantly_campaign_id IS NOT NULL${only ? " AND id = ?" : ""}`, only ? [only] : []);
+  for (const c of rows) {
+    const stats = parseJson<any>(c.stats_json, {}) || {};
+    if (stats[DELAYS_FIXED]) continue;
+    try {
+      const seq = await sequenceFor(String(c.id));
+      const steps = instantlySteps(seq.steps);
+      await inst.patchCampaign(String(c.instantly_campaign_id), { sequences: [{ steps }] });
+      const fresh = parseJson<any>((await q(`SELECT stats_json FROM campaigns WHERE id = ?`, [c.id]))[0]?.stats_json, {}) || {};
+      fresh[DELAYS_FIXED] = nowIso();
+      await q(`UPDATE campaigns SET stats_json = ? WHERE id = ?`, [JSON.stringify(fresh), c.id]);
+      const waits = steps.slice(0, -1).map((s: any) => `${s.delay} day${s.delay === 1 ? "" : "s"}`).join(", then ");
+      await logEvent("send", `Fixed the follow-up timing in Instantly for "${c.name}": ${waits ? `follow-ups now wait ${waits}` : "single email"}. Before this, Instantly sent follow-up 1 minutes after the first email.`, { level: "warn", campaignId: String(c.id) });
+      fixed++;
+    } catch (e: any) {
+      errors.push(`${c.name}: ${String(e?.message || e).slice(0, 200)}`);
+    }
+  }
+  return { fixed, errors };
 }
 
 export function instantlyPayload(c: Row, settings: CampaignSettings, country: string | null, mailboxes: { email: string; dailyLimit: number }[], seq?: SequenceStep[]): inst.CreateCampaignInput {
@@ -107,11 +148,19 @@ export async function ensureInstantlyCampaign(c: Row, settings: CampaignSettings
   const created = await inst.createCampaign(instantlyPayload(c, settings, await campaignCountry(c.id), mailboxes, seq.steps));
   await q(`UPDATE campaigns SET instantly_campaign_id = ?, instantly_status = ?, updated_at = ? WHERE id = ?`, [created.id, created.status ?? 0, nowIso(), c.id]);
   await saveMailboxSet(c.id, emails);
+  await markDelaysFixed(c.id); // created with the corrected step delays
   await logEvent("send", `Created the Instantly campaign "${c.name} · DNA" with ${emails.length} sending mailbox(es).`, { campaignId: c.id });
   c.instantly_campaign_id = created.id;
   // Instantly creates campaigns as drafts; ours is already running.
   if (c.status === "active") await setInstantlyRunning(c, true);
   return created.id;
+}
+
+async function markDelaysFixed(campaignId: string) {
+  const row = (await q(`SELECT stats_json FROM campaigns WHERE id = ?`, [campaignId]))[0];
+  const stats = parseJson<any>(row?.stats_json, {}) || {};
+  stats[DELAYS_FIXED] = nowIso();
+  await q(`UPDATE campaigns SET stats_json = ? WHERE id = ?`, [JSON.stringify(stats), campaignId]);
 }
 
 async function saveMailboxSet(campaignId: string, emails: string[]) {
@@ -244,8 +293,12 @@ export async function pushApproved(c: Row, settings: CampaignSettings): Promise<
 export async function setInstantlyRunning(c: Row, running: boolean): Promise<void> {
   if (!c.instantly_campaign_id || !(await inst.instantlyConfigured())) return;
   try {
-    if (running) await inst.activateCampaign(c.instantly_campaign_id);
-    else await inst.pauseCampaign(c.instantly_campaign_id);
+    if (running) {
+      // Never let Instantly send with the old (wrong) follow-up timing.
+      const fix = await repairInstantlyDelays(String(c.id));
+      if (fix.errors.length) throw new Error(`the follow-up timing couldn't be updated first (${fix.errors[0]}), so it stays paused`);
+      await inst.activateCampaign(c.instantly_campaign_id);
+    } else await inst.pauseCampaign(c.instantly_campaign_id);
     await q(`UPDATE campaigns SET instantly_status = ?, updated_at = ? WHERE id = ?`, [running ? 1 : 2, nowIso(), c.id]);
   } catch (e: any) {
     const msg = `Couldn't ${running ? "activate" : "pause"} the Instantly campaign: ${String(e?.message || e).slice(0, 200)}`;

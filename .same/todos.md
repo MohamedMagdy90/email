@@ -24,6 +24,17 @@ used the 50 s pass, the contact step never ran (0 contacts every pass, Anymail 0
 - [x] Follow-up: verify step also skips directories already at contact_found (the old code had an Anymail "CEO" at
       go4worldbusiness.com there). quota-test 42/42; all suites 564/564.
 - [ ] USER: Google AI Studio -> the key's project -> usage + billing; then Agent -> Gemini -> Test (lifts the pause).
+# FOLLOW-UP 1 SENT MINUTES AFTER EMAIL 1 (found + fixed 2026-11-26)
+Instantly's step `delay` = wait AFTER that step, before the NEXT (spec: "the delay value before sending the NEXT
+email"); instantlySteps() sent delay 0 on step 1 and each follow-up's own delayDays on itself -> follow-up 1 went out
+minutes after the first email. Live 09:08Z: 5 first emails + 4 follow-up-1 = 9 sends. Campaign PAUSED 09:10Z (app +
+Instantly status 2) by me.
+- [x] sender.ts instantlySteps: step i carries step i+1's delayDays (min 1), last step 0, delay_unit days.
+- [x] repairInstantlyDelays(): re-sends the sequence once per old Instantly campaign (stats_json.stepDelaysFixed marker,
+      event "Fixed the follow-up timing…"); runs 10 s after the worker starts and inside setInstantlyRunning(true)
+      BEFORE activate — if it fails, activate is refused (stays paused). New campaigns are marked at creation.
+- [x] sq-test 46/46 (updated 2 old expectations that encoded the wrong mapping + 6 new checks); all suites 571/571.
+- [ ] USER: resume the campaign once the deploy is verified (Campaigns -> Factories/Manufacturing -> Start).
 # Both mailboxes on Instantly (2026-11-26, USER chose "option 1")
 b.alshayeb@getdnaerp.com had been connected with "Sign in with Google" on 5 Nov -> own-engine mailbox, judged on inbox
 tests (no test inbox -> "warming" forever, warmup_mode off so no warmup graph) although Instantly warmed it (21 d, 100%).
