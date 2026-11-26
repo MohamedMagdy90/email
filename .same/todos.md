@@ -19,9 +19,21 @@ used the 50 s pass, the contact step never ran (0 contacts every pass, Anymail 0
       Agent tab: "Gemini isn't answering · Groq does the research and writing meanwhile" box with Google's error + until.
 - [x] `.same-test/quota-test.ts` 41/41; cp 47 · sq 39 · db 58 · ld 45 · tg 72 · tg-results 48 · n2b 34 · ai-search 21 ·
       finder 37 · engine 121 = 563/563; both tsc; vite build.
+- [x] PUSHED 11b0c6f (fast-forward from d80520c, 11 files). Railway email 12:47:13Z, easygoing-kindness 12:47:14Z;
+      live bundle index-D12t0JTP.js has the Agent notice; /integrations returns providers.gemini.paused.
+- [x] Follow-up: verify step also skips directories already at contact_found (the old code had an Anymail "CEO" at
+      go4worldbusiness.com there). quota-test 42/42; all suites 564/564.
 - [ ] USER: Google AI Studio -> the key's project -> usage + billing; then Agent -> Gemini -> Test (lifts the pause).
-- [ ] USER: connect a test inbox (own mailbox b.alshayeb@ is warming on "No test inbox"), or switch the campaign to
-      Instantly (m.magdy@ is ramping there). Nothing can send until one of these.
+# Both mailboxes on Instantly (2026-11-26, USER chose "option 1")
+b.alshayeb@getdnaerp.com had been connected with "Sign in with Google" on 5 Nov -> own-engine mailbox, judged on inbox
+tests (no test inbox -> "warming" forever, warmup_mode off so no warmup graph) although Instantly warmed it (21 d, 100%).
+- [x] DELETE /api/v2/mailboxes/<its id> (removeOwnMailbox; nothing was queued) + POST /mailboxes/sync (forceDns) ->
+      re-added as an Instantly mailbox, all 5 checks pass, ramping at 5/day. m.magdy@ ramping at 19/day.
+- [x] Campaign "Factories/Manufacturing" engine -> instantly: next pass created Instantly campaign
+      "Factories/Manufacturing · DNA" (2 mailboxes) and queued 17 of 18 approved (pic.com.kw = catch-all, waits under
+      the 15% daily catch-all share). The Google sign-in APP (connection) is still saved; no own mailboxes left.
+- [ ] USER: No2Bounce is OUT OF CREDITS (00:46Z "You don't have enough credit") -> guessed addresses can't be checked.
+- Possible later: show Instantly warmup on own mailboxes (warmup_mode stays "off" even when Instantly warms it).
 # DEPLOYMENT (verified 2026-11-01) — a push to main deploys EVERYTHING; there is NO manual publish
 Railway project `magnificent-rejoicing`, both services auto-deploy from `MohamedMagdy90/email` main on every push:
 - `email` = backend -> https://email-production-3c14.up.railway.app

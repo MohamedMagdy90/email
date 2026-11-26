@@ -1114,6 +1114,13 @@ export async function runPass(id: string, opts: { budgetMs?: number; manual?: bo
     for (const p of await due(id, "contact_found", 8)) {
       if (!timeLeft()) break;
       try {
+        // A directory that reached the contact step before it was recognised: no email for it.
+        const site = notCompanySite(p, (await q(`SELECT domain, research_json FROM companies WHERE id = ?`, [p.company_id]))[0]);
+        if (site) {
+          await skipProspect(p, site);
+          notCompanies++;
+          continue;
+        }
         const v = await verifyProspect(p, { ...agent.sending, allowRoleAddresses: roleOk(effFor(p.segment_id)) });
         if (v.verdict === "ok") {
           await setStage(p, "verified", v.reason, { verify_json: JSON.stringify(v.result), email_status: v.result.status, catch_all: v.catchAll ? 1 : 0, attempts: 0, last_error: null, next_action_at: null });
