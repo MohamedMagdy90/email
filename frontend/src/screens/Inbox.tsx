@@ -71,6 +71,23 @@ export default function Inbox() {
   const ibRef = useRef<HTMLDivElement>(null);
   const example = mode === "example";
 
+  // Asked for a thread while the Inbox is already open (a tapped alert, Recent alerts).
+  useEffect(() => {
+    const h = (e: Event) => {
+      const id = String((e as CustomEvent).detail || "");
+      if (!id) return;
+      try {
+        localStorage.removeItem("dnaInboxOpen");
+      } catch {
+        /* private mode */
+      }
+      setMode("live");
+      setSelected(id);
+    };
+    window.addEventListener("dna-open-thread", h);
+    return () => window.removeEventListener("dna-open-thread", h);
+  }, []);
+
   // Size the inbox to the space left below the banners (desktop only; phones scroll the page).
   useEffect(() => {
     const el = ibRef.current;

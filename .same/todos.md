@@ -24,6 +24,31 @@ used the 50 s pass, the contact step never ran (0 contacts every pass, Anymail 0
 - [x] Follow-up: verify step also skips directories already at contact_found (the old code had an Anymail "CEO" at
       go4worldbusiness.com there). quota-test 42/42; all suites 564/564.
 - [ ] USER: Google AI Studio -> the key's project -> usage + billing; then Agent -> Gemini -> Test (lifts the pause).
+# Alerts on phone + computer (Web Push, 2026-11-26)
+USER chose: replies handed to you · interested · drafts waiting for approval. Nothing else alerts.
+- [x] backend `v2/push/`: webpush.ts (VAPID ES256 JWT + RFC 8291 aes128gcm with WebCrypto, no library), service.ts
+      (push_subscriptions, push_log UNIQUE(message_id, kind), VAPID keys encrypted in settings `push_vapid` via
+      engine/crypto — unreadable keys -> new keys + devices dropped, app re-subscribes on load; prefs `push_prefs`;
+      alertForMessage: interested > handoff (needs_human/failed) > draft, < 24 h old only, one per reply+kind, claim
+      serialized, > 5 sent in 10 min -> held, flushHeld (worker, 60 s) sends ONE grouped alert, handled ones dropped;
+      404/410 -> device removed, 403 x3 -> removed), module.ts (GET /api/v2/push, subscribe, unsubscribe,
+      DELETE devices/:id, PUT prefs, POST test). Subject: env PUSH_SUBJECT || mailto:outreach@dna.systems.
+- [x] inbox/service.ts: alertFor() after processPending + sendDue (worker work only, never human clicks), fire and
+      forget; settleAlerts() for tests.
+- [x] frontend: public/manifest.json + icon-192/512/maskable-512 (light square) + badge-96 (white silhouette);
+      public/sw.js = push-only worker (no cache, no fetch handler; still clears the old PWA's caches);
+      lib/v2/push.ts; screens/Alerts.tsx (bell in the brand bar, dialog PORTALLED — the bar's backdrop-filter traps
+      fixed children); App.tsx /?thread= + /?tab= deep links, SW "dna-open" message, icon badge, resyncPush;
+      Inbox listens to "dna-open-thread".
+- [x] push-test 49/49 (payload decrypted with http_ece, VAPID verified, real Inbox flow, burst, gone devices);
+      all suites 620/620; REAL round trip through Mozilla's push service (WebSocket client) delivered + decrypted;
+      headless Chromium: worker registered, manifest found, Off -> On, iPhone steps, both themes, 390 px, 0 errors.
+- [ ] USER: on iPhone open the app in Safari -> Share -> Add to Home Screen -> open Outreach, sign in -> bell -> Turn on.
+      (iOS 16.4+; the Home Screen app has its own sign-in.) Desktop/Android: bell -> Turn on, then Send a test.
+# Megaphone logo (2026-11-26) — PUSHED b713490, live
+Source: uploads/DNA_ERP_Main_Icons_(OR).webp (1000x870, transparent). Made with sharp in a scratch dir:
+public/mark-megaphone.png (256, transparent; header + sign-in disc), favicon-megaphone-32/64.png (on #f2f3f5 disc),
+apple-touch-icon.png (180, light square). Old dna-mark.png + favicon-32.png removed. Wordmark (CDN) unchanged.
 # FOLLOW-UP 1 SENT MINUTES AFTER EMAIL 1 (found + fixed 2026-11-26)
 Instantly's step `delay` = wait AFTER that step, before the NEXT (spec: "the delay value before sending the NEXT
 email"); instantlySteps() sent delay 0 on step 1 and each follow-up's own delayDays on itself -> follow-up 1 went out

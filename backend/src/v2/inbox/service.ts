@@ -625,6 +625,22 @@ export async function processMessage(id: string, opts: { forceCategory?: string 
   }
 }
 
+/* -------------------------------- alerts -------------------------------- */
+// Phone / desktop alerts (v2/push) for replies that need you. Only the worker's
+// own work alerts (never your clicks), and it never waits on a push service.
+const alerts = new Set<Promise<unknown>>();
+function alertFor(id: string) {
+  const p: Promise<unknown> = import("../push/service")
+    .then((m) => m.alertForMessage(id))
+    .catch((e) => console.error(`[push] alert for ${id}: ${errMsg(e)}`))
+    .finally(() => alerts.delete(p));
+  alerts.add(p);
+}
+/** Tests: wait for the alerts started so far. */
+export async function settleAlerts(): Promise<void> {
+  while (alerts.size) await Promise.all([...alerts]);
+}
+
 let processing = false;
 export async function processPending(limit = 4): Promise<number> {
   if (processing) return 0;
@@ -642,6 +658,7 @@ export async function processPending(limit = 4): Promise<number> {
         if (m) await recompute(m.thread_id).catch(() => {});
         console.error(`[inbox] process ${r.id}: ${errMsg(e)}`);
       }
+      alertFor(r.id);
     }
   } finally {
     processing = false;
@@ -775,6 +792,8 @@ export async function sendDue(limit = 5): Promise<number> {
       } catch (e) {
         console.error(`[inbox] send ${r.id}: ${errMsg(e)}`);
       }
+      // Held for you, or couldn't be sent: that now needs you.
+      alertFor(r.id);
     }
     return rows.length;
   } finally {

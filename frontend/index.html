@@ -8,6 +8,12 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-megaphone-32.png" />
     <link rel="icon" type="image/png" sizes="64x64" href="/favicon-megaphone-64.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <!-- Installable app: phones and desktops can add it to the Home Screen / dock,
+         which is what lets an iPhone receive alerts (iOS 16.4+). -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Outreach" />
     <script>
       /* Theme before first paint - same key as the DNA partner / support / leads
          consoles, so somebody who chose light there gets light here too. */

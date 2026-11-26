@@ -20,6 +20,7 @@ const FEATURE_MODULES = [
   "./sequences/module",
   "./dashboard/module",
   "./engine/module",
+  "./push/module",
 ] as const;
 
 type FeatureModule = { register?: (app: Hono) => void | Promise<void>; start?: () => void };

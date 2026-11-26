@@ -12,7 +12,9 @@ import Sequences from "./screens/Sequences";
 import Mailboxes from "./screens/Mailboxes";
 import Agent from "./screens/Agent";
 import AccountDialog from "./screens/Account";
+import { AlertsButton } from "./screens/Alerts";
 import { req } from "./lib/api";
+import { registerWorker, resyncPush, setIconBadge } from "./lib/v2/push";
 
 type Tab = "dashboard" | "inbox" | "leads" | "campaigns" | "targeting" | "sequences" | "mailboxes" | "agent";
 
@@ -40,7 +42,35 @@ function initials(name: string) {
   return ((parts[0]?.[0] || "") + (parts[1]?.[0] || "")).toUpperCase() || "?";
 }
 
+/**
+ * An alert opens the app at /?thread=<id> (that conversation) or /?tab=inbox.
+ * Read it once on load: the thread is handed to the Inbox like "Open in Inbox".
+ */
+function deepLinkTab(): Tab | null {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const thread = p.get("thread");
+    const tab = p.get("tab") as Tab | null;
+    if (thread) localStorage.setItem("dnaInboxOpen", thread);
+    if (thread || tab) window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+    if (thread) return "inbox";
+    if (tab && TABS.some((x) => x.id === tab)) return tab;
+  } catch {
+    /* private mode */
+  }
+  return null;
+}
+
 function initialTab(): Tab {
+  const linked = deepLinkTab();
+  if (linked) {
+    try {
+      sessionStorage.setItem(TAB_KEY, linked);
+    } catch {
+      /* private mode */
+    }
+    return linked;
+  }
   try {
     const t = sessionStorage.getItem(TAB_KEY) as Tab | null;
     if (t && TABS.some((x) => x.id === t)) return t;
@@ -89,7 +119,32 @@ export default function App() {
       .me()
       .then((r) => setUsername(r.username || ""))
       .catch(() => {});
+    // This device's alert sign-up, kept in step with the server.
+    resyncPush().catch(() => {});
   }, [authed]);
+
+  // The alerts worker: registered on every visit (it caches nothing). A tapped
+  // alert while the app is open arrives as a message: open that conversation.
+  useEffect(() => {
+    registerWorker();
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (e: MessageEvent) => {
+      const d = e.data || {};
+      if (d.type !== "dna-open") return;
+      if (d.threadId) {
+        try {
+          localStorage.setItem("dnaInboxOpen", String(d.threadId));
+        } catch {
+          /* private mode */
+        }
+        window.dispatchEvent(new CustomEvent("dna-open-thread", { detail: String(d.threadId) }));
+      }
+      setTab("inbox");
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    navigator.serviceWorker.startMessages?.();
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
 
   // Any screen can switch tabs (e.g. "Connect Instantly" -> Agent tab).
   useEffect(() => {
@@ -110,7 +165,12 @@ export default function App() {
     const poll = () => {
       if (document.hidden) return;
       req<{ unread: number; needsHuman: number }>("/api/v2/inbox/counts")
-        .then((r) => alive && setInboxCount({ unread: Number(r.unread) || 0, needsHuman: Number(r.needsHuman) || 0 }))
+        .then((r) => {
+          if (!alive) return;
+          const c = { unread: Number(r.unread) || 0, needsHuman: Number(r.needsHuman) || 0 };
+          setInboxCount(c);
+          setIconBadge(c.unread + c.needsHuman); // the installed app's icon
+        })
         .catch(() => {});
       req<{ review: number }>("/api/v2/leads/counts")
         .then((r) => alive && setReviewCount(Number(r.review) || 0))
@@ -167,6 +227,7 @@ export default function App() {
             </div>
           </div>
           <div className="who">
+            <AlertsButton />
             <ThemeButton />
             <div className="av">{initials(who)}</div>
             <div className="meta-lines">
